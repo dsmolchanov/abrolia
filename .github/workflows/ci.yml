@@ -46,7 +46,11 @@ jobs:
           fetch-depth: 0  # Gate -1 требует зелёного скана по всей истории
       - name: Install gitleaks
         env:
-          GITLEAKS_VERSION: 8.18.4
+          # Версия закреплена и проверена локально на этом репозитории вместе с
+          # .gitleaks.toml: набор правил по умолчанию меняется между релизами,
+          # и «зелено у меня» без пина ничего не значит. Проверено на 8.18.4 и
+          # 8.30.1 — обе чистые; в CI идёт более строгая из них.
+          GITLEAKS_VERSION: 8.30.1
         run: |
           set -euo pipefail
           curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \

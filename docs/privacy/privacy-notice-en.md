@@ -86,8 +86,16 @@ providers that would be untrue.
 | Conversation with the assistant | 180 days |
 | Tasks and reminders | 90 days after completion |
 | Action journal and delivery receipts | 365 days |
+| Calendar events (our internal mapping to your calendar) | 365 days; the event itself stays in your Google account |
 | Memory | until you delete it; we prompt a review every 90 days |
+| Emails that failed processing: content / technical failure reason | 30 days / 90 days |
+| Technical logs (identifiers and statuses, no content) | 30 days |
 | Backups | rolling 30-day window |
+| Consent receipts, records of your rights requests, incident records | 3 years — evidence the law requires us to keep |
+| Family member identifiers and settings | while the account is active + 30 days |
+
+The full matrix including storage locations is in the technical documentation
+(`docs/privacy/data-map.md`); this table repeats it without omissions.
 
 ## If you chose Gmail access
 

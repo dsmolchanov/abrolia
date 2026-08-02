@@ -78,9 +78,23 @@ BINARY_SUFFIXES = {
     ".woff2", ".ttf", ".pyc", ".so", ".dylib",
 }
 MAX_FILE_BYTES = 2_000_000
+# Письмо читается MIME-парсером даже когда распухло от вложения: отсекается
+# только патология, при которой парсер съест память.
+MAX_EML_BYTES = 50_000_000
 
-# Окно контекста для Telegram-ID: в JSON ключ `"from": {` и `"id": …` стоят на
-# разных строках, поэтому построчная проверка их не связывает.
+# Части письма, которые санитайзер действительно понимает как текст.
+TEXTUAL_MIME_TYPES = {
+    "application/json",
+    "application/xml",
+    "application/xhtml+xml",
+    "application/rtf",
+    "message/delivery-status",
+    "message/rfc822",
+}
+
+# Окно контекста для Telegram-ID (в обе стороны): в JSON ключ `"from": {` и
+# `"id": …` стоят на разных строках и в любом порядке, поэтому построчная
+# проверка их не связывает.
 CONTEXT_WINDOW = 4
 
 RULE_EMAIL = "email"
@@ -113,8 +127,12 @@ ALLOWED_IBANS = {
 # --- регулярки поиска -------------------------------------------------------
 
 EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b")
-PHONE_PLUS_RE = re.compile(r"\+\d[\d\s().\-]{5,17}\d")
-PHONE_00_RE = re.compile(r"(?<![\d.])00[1-9]\d{6,14}\b")
+# Разделители внутри номера и IBAN: обычный пробел, неразрывный, узкий
+# неразрывный, тонкий. NBSP приходит из вставок в Word/Outlook и раньше
+# разрывал распознавание.
+SPACERS = " \u00a0\u202f\u2009"
+PHONE_PLUS_RE = re.compile(rf"\+\d[\d{SPACERS}().\-]{{5,17}}\d")
+PHONE_00_RE = re.compile(rf"(?<![\d.])00[1-9][\d{SPACERS}().\-]{{5,16}}\d")
 TELEGRAM_CONTEXT_RE = re.compile(
     r"(telegram|tg_id|chat_id|chat-id|chatId|user_id|userId|from_id|sender_id"
     r"|from_user|update_id|\"from\"|\"chat\"|\"user\"|\"message\")",
@@ -124,7 +142,7 @@ TELEGRAM_CONTEXT_RE = re.compile(
 # SHA, IBAN и API-ключей под это правило не подпадают (их ловят свои правила),
 # иначе окно контекста заливает вывод ложными находками.
 INT_RE = re.compile(r"(?<![\w.])-?\d{6,14}(?![\w.])")
-IBAN_START_RE = re.compile(r"\b[A-Za-z]{2}\d{2}(?=[A-Za-z0-9 ]{10,})")
+IBAN_START_RE = re.compile(rf"\b[A-Za-z]{{2}}\d{{2}}(?=[A-Za-z0-9{SPACERS}]{{10,}})")
 
 SECRET_RES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("anthropic-key", re.compile(r"sk-ant-[A-Za-z0-9\-_]{16,}")),
@@ -207,6 +225,25 @@ def mask(value: str) -> str:
 # --- правила ----------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class Hit:
+    """Срабатывание правила на строке.
+
+    Диапазон нужен, чтобы правила не спорили друг с другом: цифры внутри
+    найденного IBAN — не телефон и не Telegram ID. `reportable=False` — это
+    разрешённое значение, которое всё равно занимает свой участок строки.
+    """
+
+    rule: str
+    value: str
+    start: int
+    end: int
+    reportable: bool = True
+
+    def overlaps(self, span: tuple[int, int]) -> bool:
+        return self.start < span[1] and span[0] < self.end
+
+
 def _email_domain_allowed(domain: str) -> bool:
     domain = domain.lower().rstrip(".")
     if domain in ALLOWED_EMAIL_DOMAINS:
@@ -216,22 +253,31 @@ def _email_domain_allowed(domain: str) -> bool:
     return domain.endswith(ALLOWED_EMAIL_TLDS)
 
 
-def check_email(line: str) -> Iterator[tuple[str, str]]:
+def check_email(line: str) -> Iterator[Hit]:
     for match in EMAIL_RE.finditer(line):
         address = match.group(0)
         if not _email_domain_allowed(address.rsplit("@", 1)[1]):
-            yield RULE_EMAIL, address.lower()
+            yield Hit(RULE_EMAIL, address.lower(), *match.span())
 
 
-def check_phone(line: str) -> Iterator[tuple[str, str]]:
-    for match in PHONE_PLUS_RE.finditer(line):
-        digits = re.sub(r"\D", "", match.group(0))
-        if len(digits) >= 7 and not SYNTHETIC_PHONE_RE.match(digits):
-            yield RULE_PHONE, "+" + digits
-    for match in PHONE_00_RE.finditer(line):
-        digits = match.group(0)[2:]
-        if not SYNTHETIC_PHONE_RE.match(digits):
-            yield RULE_PHONE, "+" + digits
+def check_phone(line: str) -> Iterator[Hit]:
+    """Найти телефон в формах `+34…` и `0034…`, в том числе с разделителями.
+
+    Разрешённые (синтетические) номера тоже возвращаются, но с
+    ``reportable=False``: их диапазон нужен, чтобы те же цифры не были потом
+    объявлены Telegram-ID.
+    """
+    for regex, offset in ((PHONE_PLUS_RE, 0), (PHONE_00_RE, 2)):
+        for match in regex.finditer(line):
+            digits = re.sub(r"\D", "", match.group(0))[offset:]
+            if len(digits) < 7:
+                continue
+            yield Hit(
+                RULE_PHONE,
+                "+" + digits,
+                *match.span(),
+                reportable=not SYNTHETIC_PHONE_RE.match(digits),
+            )
 
 
 def iban_checksum_ok(candidate: str) -> bool:
@@ -243,7 +289,7 @@ def iban_checksum_ok(candidate: str) -> bool:
     return int(digits) % 97 == 1
 
 
-def check_iban(line: str) -> Iterator[tuple[str, str]]:
+def check_iban(line: str) -> Iterator[Hit]:
     """Найти IBAN независимо от регистра и расстановки пробелов.
 
     Наивный `\\b[A-Z]{2}\\d{2}[A-Z0-9]{11,30}\\b` не видит «de89 3704 0044 …»
@@ -253,13 +299,15 @@ def check_iban(line: str) -> Iterator[tuple[str, str]]:
     seen: set[str] = set()
     for start in IBAN_START_RE.finditer(line):
         chars: list[str] = []
+        positions: list[int] = []
         i = start.start()
         while i < len(line) and len(chars) < 34:
             ch = line[i]
             if ch.isalnum():
                 chars.append(ch.upper())
-            elif ch == " " and chars:
-                pass  # пробелы внутри IBAN допустимы при печати
+                positions.append(i)
+            elif ch in SPACERS and chars:
+                pass  # пробелы (в т.ч. неразрывные) внутри IBAN допустимы при печати
             else:
                 break
             i += 1
@@ -268,17 +316,18 @@ def check_iban(line: str) -> Iterator[tuple[str, str]]:
             if iban_checksum_ok(candidate):
                 if candidate not in ALLOWED_IBANS and candidate not in seen:
                     seen.add(candidate)
-                    yield RULE_IBAN, candidate
+                yield Hit(RULE_IBAN, candidate, start.start(), positions[length - 1] + 1,
+                          reportable=candidate not in ALLOWED_IBANS)
                 break
 
 
-def check_secret(line: str) -> Iterator[tuple[str, str]]:
+def check_secret(line: str) -> Iterator[Hit]:
     for name, pattern in SECRET_RES:
         for match in pattern.finditer(line):
-            yield f"secret:{name}", match.group(0)
+            yield Hit(f"secret:{name}", match.group(0), *match.span())
 
 
-LINE_CHECKS: tuple[Callable[[str], Iterator[tuple[str, str]]], ...] = (
+LINE_CHECKS: tuple[Callable[[str], Iterator[Hit]], ...] = (
     check_email,
     check_phone,
     check_iban,
@@ -286,11 +335,13 @@ LINE_CHECKS: tuple[Callable[[str], Iterator[tuple[str, str]]], ...] = (
 )
 
 
-def telegram_ids(line: str) -> Iterator[str]:
+def telegram_ids(line: str) -> Iterator[Hit]:
     for match in INT_RE.finditer(line):
         value = match.group(0)
+        if value.lstrip("-").startswith("0"):
+            continue  # Telegram ID не начинается с нуля — это номер или код
         if not SYNTHETIC_TELEGRAM_RE.match(value):
-            yield value
+            yield Hit(RULE_TELEGRAM, value, *match.span())
 
 
 # --- загрузка конфигурации ---------------------------------------------------
@@ -353,42 +404,65 @@ class Scannable:
     opaque_parts: tuple[str, ...] = ()
 
 
+def _is_textual(content_type: str) -> bool:
+    """Считается ли часть письма текстом.
+
+    Успешный `decode()` текстом не делает: ASCII-only PDF декодируется без
+    ошибок, но его содержимое санитайзер не понимает. Решает объявленный тип.
+    """
+    if content_type.startswith("text/"):
+        return True
+    return content_type in TEXTUAL_MIME_TYPES
+
+
 def eml_to_text(raw: bytes, *, stem: str = "eml") -> tuple[str, list[str]]:
-    """Развернуть .eml: заголовки + декодированные части, отдельно — непрозрачные.
+    """Развернуть .eml: заголовки + текстовые части, отдельно — непрозрачные.
 
     Тело письма приходит в base64/quoted-printable, и без декодирования
-    санитайзер «не видит» ни адресов, ни телефонов внутри фикстуры.
+    санитайзер «не видит» ни адресов, ни телефонов внутри фикстуры. Текстовые
+    части читаются всегда (при неизвестной кодировке — с заменой символов:
+    адреса, телефоны и ID остаются в ASCII), нетекстовые всегда непрозрачны.
     """
-    message = email.message_from_bytes(raw, policy=email.policy.default)
-    chunks: list[str] = [f"{header}: {value}" for header, value in message.items()]
+    try:
+        # policy.default раскрывает encoded-words в заголовках (=?utf-8?B?…?=),
+        # иначе адрес в теме письма проходит мимо проверки.
+        message = email.message_from_bytes(raw, policy=email.policy.default)
+        chunks: list[str] = [f"{header}: {value}" for header, value in message.items()]
+    except Exception:  # битые заголовки — разбираем в совместимом режиме
+        message = email.message_from_bytes(raw, policy=email.policy.compat32)
+        chunks = [f"{header}: {value}" for header, value in message.items()]
     opaque: list[str] = []
     for index, part in enumerate(message.walk()):
         if part.is_multipart():
             continue
         content_type = part.get_content_type()
-        payload = part.get_payload(decode=True)
+        try:
+            payload = part.get_payload(decode=True)
+        except Exception:  # pragma: no cover - битый transfer-encoding
+            payload = None
+        name = part.get_filename() or f"{stem}#{index}"
+        if not _is_textual(content_type):
+            # PDF, картинка, архив: даже если байты декодируются, содержимое
+            # непрозрачно — нужна запись о происхождении.
+            opaque.append(f"{name} ({content_type})")
+            continue
         if payload is None:
             continue
         charset = part.get_content_charset() or "utf-8"
-        try:
-            chunks.append(payload.decode(charset, errors="strict"))
-            continue
-        except (LookupError, UnicodeDecodeError):
-            pass
-        if charset != "utf-8":
+        for candidate in (charset, "utf-8", "latin-1"):
             try:
-                chunks.append(payload.decode("utf-8", errors="strict"))
+                chunks.append(payload.decode(candidate, errors="strict"))
+                break
+            except (LookupError, UnicodeDecodeError):
                 continue
-            except UnicodeDecodeError:
-                pass
-        name = part.get_filename() or f"{stem}#{index}"
-        opaque.append(f"{name} ({content_type})")
+        else:  # pragma: no cover - latin-1 не падает, ветка на будущее
+            chunks.append(payload.decode("utf-8", errors="replace"))
     return "\n".join(chunks), opaque
 
 
 def opaque_part_name(label: str) -> str:
     """Имя вложения из метки `имя (тип)` — его и ищем в PROVENANCE.md."""
-    return label.split(" (", 1)[0]
+    return label.rsplit(" (", 1)[0]
 
 
 def read_scannable(path: Path) -> Scannable:
@@ -397,6 +471,19 @@ def read_scannable(path: Path) -> Scannable:
         size = path.stat().st_size
     except OSError as exc:  # pragma: no cover - файловая система
         raise Unscannable(f"недоступен: {exc}") from exc
+
+    if path.suffix.lower() == ".eml":
+        # Письмо разбирается MIME-парсером до любых отсечек по кодировке и
+        # размеру: иначе 8bit-письмо в ISO-8859-1 или письмо, распухшее от
+        # вложения, целиком выпадало из проверки — вместе с заголовками и
+        # текстом, которые прочитать можно всегда.
+        if size > MAX_EML_BYTES:
+            raise Unscannable(f"больше {MAX_EML_BYTES} байт")
+        raw = path.read_bytes()
+        decoded, opaque = eml_to_text(raw, stem=path.name)
+        envelope = raw.decode("utf-8", errors="replace")
+        return Scannable(envelope + "\n" + decoded, tuple(opaque))
+
     if size > MAX_FILE_BYTES:
         raise Unscannable(f"больше {MAX_FILE_BYTES} байт")
     if path.suffix.lower() in BINARY_SUFFIXES:
@@ -408,22 +495,45 @@ def read_scannable(path: Path) -> Scannable:
         text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise Unscannable("не UTF-8") from exc
-    if path.suffix.lower() == ".eml":
-        decoded, opaque = eml_to_text(raw, stem=path.name)
-        return Scannable(text + "\n" + decoded, tuple(opaque))
     return Scannable(text)
 
 
+# Запись манифеста: `- \`имя-или-путь\` — описание` вне блоков кода.
+PROVENANCE_ENTRY_RE = re.compile(r"^\s*[-*]\s+`([^`]+)`\s*[—–-]\s*\S")
+
+
+def load_provenance(manifest: Path) -> set[str]:
+    """Разобрать PROVENANCE.md в набор описанных файлов.
+
+    Ищется структурированная запись, а не подстрока: пояснение в прозе или
+    пример в блоке кода не должны молча разрешать одноимённый файл.
+    """
+    try:
+        text = manifest.read_text(encoding="utf-8")
+    except OSError:  # pragma: no cover
+        return set()
+    entries: set[str] = set()
+    in_fence = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        match = PROVENANCE_ENTRY_RE.match(line)
+        if match:
+            entries.add(match.group(1).strip().lstrip("./"))
+    return entries
+
+
 def provenance_mentions(token: str, near: Path, repo_root: Path) -> bool:
-    """Упомянут ли токен в PROVENANCE.md одного из родительских каталогов."""
+    """Описан ли файл записью в PROVENANCE.md одного из родительских каталогов."""
     for parent in near.parents:
         manifest = parent / PROVENANCE_FILE
         if manifest.is_file():
-            try:
-                text = manifest.read_text(encoding="utf-8")
-            except OSError:  # pragma: no cover
-                text = ""
-            if token in text:
+            entries = load_provenance(manifest)
+            if token in entries or any(entry.endswith("/" + token) for entry in entries):
                 return True
         if parent == repo_root:
             break
@@ -460,17 +570,34 @@ def scan_text(
     lines = text.splitlines()
     for index, line in enumerate(lines):
         line_no = index + 1
-        raw_hits: list[tuple[str, str]] = []
+        raw_hits: list[Hit] = []
         for check in LINE_CHECKS:
             raw_hits.extend(check(line))
-        window = lines[max(0, index - context_window) : index + 1]
+        # Окно симметричное: в JSON ключ контекста стоит и до значения
+        # (`"from": {` … `"id": …`), и после него (`"id": …` … `"chat": {`).
+        window = lines[max(0, index - context_window) : index + context_window + 1]
         if any(TELEGRAM_CONTEXT_RE.search(candidate) for candidate in window):
-            raw_hits.extend((RULE_TELEGRAM, value) for value in telegram_ids(line))
-        for rule, value in raw_hits:
-            if any(entry.matches(path, rule, value) for entry in allow):
+            raw_hits.extend(telegram_ids(line))
+        # Цифры внутри распознанного IBAN — не телефон и не Telegram ID:
+        # «DE02 1203 0044 …» иначе давал ложный номер вида 0044…
+        iban_spans = [(hit.start, hit.end) for hit in raw_hits if hit.rule == RULE_IBAN]
+        phone_spans = [(hit.start, hit.end) for hit in raw_hits if hit.rule == RULE_PHONE]
+        # ID бота внутри токена `<id>:<секрет>` уже покрыт правилом secret.
+        secret_spans = [
+            (hit.start, hit.end) for hit in raw_hits if hit.rule.startswith("secret:")
+        ]
+        for hit in raw_hits:
+            if not hit.reportable:
                 continue
-            detail = RULE_DETAIL.get(rule, "запрещённый паттерн")
-            findings.append(Finding(path, line_no, rule, detail, mask(value), value))
+            blocking = iban_spans if hit.rule == RULE_PHONE else []
+            if hit.rule == RULE_TELEGRAM:
+                blocking = iban_spans + phone_spans + secret_spans
+            if blocking and any(hit.overlaps(span) for span in blocking):
+                continue
+            if any(entry.matches(path, hit.rule, hit.value) for entry in allow):
+                continue
+            detail = RULE_DETAIL.get(hit.rule, "запрещённый паттерн")
+            findings.append(Finding(path, line_no, hit.rule, detail, mask(hit.value), hit.value))
         # Приватные deny-паттерны исключениями не подавляются.
         for pattern in deny:
             match = pattern.search(line)

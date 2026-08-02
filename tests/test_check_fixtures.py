@@ -68,6 +68,10 @@ REAL_IBAN = joined("DE02", "1203", "0000", "0000", "2020", "51")
         (joined("phone = '+34 ", "612 345 678'"), "phone"),
         (joined("phone = '+7 ", "916 123 45 67'"), "phone"),
         (joined("phone = '0034", "612345678'"), "phone"),
+        # форматированный префикс 00 и неразрывные пробелы (вставка из Word/Outlook)
+        (joined("phone = '0034 ", "612 345 678'"), "phone"),
+        (joined("phone = '+34 ", "612 345 678'"), "phone"),
+        (joined("iban = 'DE02 1203 ", "0000 0000 2020 51'"), "iban"),
         (f"OWNER_CHAT_ID = {CHAT_ID}", "telegram"),
         (f'{{"from_id": {FROM_ID}}}', "telegram"),
         (f"iban = '{REAL_IBAN}'", "iban"),
@@ -178,6 +182,12 @@ def test_telegram_id_is_caught_across_lines() -> None:
     assert "telegram" in rules(payload)
 
 
+def test_telegram_id_is_caught_when_context_follows_the_value() -> None:
+    """Обратный порядок в JSON: значение раньше ключа контекста."""
+    payload = '{\n  "id": ' + CHAT_ID + ',\n  "is_bot": false\n}, "chat": {\n'
+    assert "telegram" in rules(payload)
+
+
 def test_telegram_context_does_not_leak_far_down_the_file() -> None:
     payload = '{"chat_id": 990000001}\n' + "\n" * 8 + f"build_number = {BUILD_NUMBER}\n"
     assert rules(payload) == []
@@ -246,6 +256,91 @@ def test_opaque_attachment_does_not_hide_the_rest_of_the_email(tmp_path: Path) -
     )
     findings = checker.scan_paths([tmp_path / "tests"], repo_root=tmp_path)
     assert sorted({f.rule for f in findings}) == ["email", "unscannable"]
+
+
+def test_latin1_8bit_email_is_still_scanned(tmp_path: Path) -> None:
+    """Кодировка тела не должна выводить письмо из-под проверки целиком."""
+    body = f"Grüße, bitte antworten an {GMAIL}\n".encode("iso-8859-1")
+    eml = (
+        "From: Anna Beispiel <anna@example.com>\n"
+        "Subject: Test\n"
+        "MIME-Version: 1.0\n"
+        'Content-Type: text/plain; charset="iso-8859-1"\n'
+        "Content-Transfer-Encoding: 8bit\n\n"
+    ).encode("ascii") + body
+    path = tmp_path / "latin1.eml"
+    path.write_bytes(eml)
+    scannable = checker.read_scannable(path)
+    assert scannable.opaque_parts == ()
+    assert "email" in [f.rule for f in checker.scan_text(scannable.text, path="latin1.eml")]
+
+
+def test_large_email_is_still_scanned(tmp_path: Path) -> None:
+    """Письмо, распухшее от вложения, не должно терять текстовую часть."""
+    filler = base64.b64encode(b"x" * (checker.MAX_FILE_BYTES + 1000)).decode()
+    eml = (
+        "From: Anna Beispiel <anna@example.com>\n"
+        "Subject: Anhang\n"
+        "MIME-Version: 1.0\n"
+        'Content-Type: multipart/mixed; boundary="b1"\n\n'
+        "--b1\n"
+        'Content-Type: text/plain; charset="utf-8"\n\n'
+        f"Bitte antworten an {GMAIL}\n\n"
+        "--b1\n"
+        "Content-Type: application/pdf\n"
+        'Content-Disposition: attachment; filename="gross.pdf"\n'
+        "Content-Transfer-Encoding: base64\n\n"
+        f"{filler}\n"
+        "--b1--\n"
+    )
+    path = tmp_path / "gross.eml"
+    path.write_text(eml, encoding="utf-8")
+    scannable = checker.read_scannable(path)
+    assert [checker.opaque_part_name(p) for p in scannable.opaque_parts] == ["gross.pdf"]
+    assert "email" in [f.rule for f in checker.scan_text(scannable.text, path="gross.eml")]
+
+
+def test_ascii_pdf_attachment_is_opaque_by_type(tmp_path: Path) -> None:
+    """Успешный decode не делает PDF текстом — решает объявленный MIME-тип."""
+    ascii_pdf = base64.b64encode(b"%PDF-1.4 plain ascii payload").decode()
+    eml = (
+        "From: Anna Beispiel <anna@example.com>\n"
+        "MIME-Version: 1.0\n"
+        'Content-Type: multipart/mixed; boundary="b1"\n\n'
+        "--b1\n"
+        'Content-Type: text/plain; charset="utf-8"\n\n'
+        "Anbei die Einladung.\n\n"
+        "--b1\n"
+        "Content-Type: application/pdf\n"
+        'Content-Disposition: attachment; filename="ascii.pdf"\n'
+        "Content-Transfer-Encoding: base64\n\n"
+        f"{ascii_pdf}\n"
+        "--b1--\n"
+    )
+    path = tmp_path / "ascii_pdf.eml"
+    path.write_text(eml, encoding="utf-8")
+    assert [checker.opaque_part_name(p) for p in checker.read_scannable(path).opaque_parts] == [
+        "ascii.pdf"
+    ]
+
+
+def test_provenance_needs_a_structured_entry(tmp_path: Path) -> None:
+    """Упоминание имени в прозе или в примере не является записью о файле."""
+    fixtures = tmp_path / "tests" / "fixtures" / "media"
+    fixtures.mkdir(parents=True)
+    (fixtures / "notice.png").write_bytes(b"\x89PNG\r\n\x1a\n\x00binary")
+    manifest = tmp_path / "tests" / "fixtures" / "PROVENANCE.md"
+
+    manifest.write_text(
+        "Формат записи:\n\n```\n- `notice.png` — пример записи\n```\n\n"
+        "В прозе тоже можно упомянуть notice.png — это не запись.\n",
+        encoding="utf-8",
+    )
+    findings = checker.scan_paths([tmp_path / "tests"], repo_root=tmp_path)
+    assert [f.rule for f in findings] == ["unscannable"]
+
+    manifest.write_text("- `notice.png` — сгенерирован scripts/make_media.py\n", encoding="utf-8")
+    assert checker.scan_paths([tmp_path / "tests"], repo_root=tmp_path) == []
 
 
 def test_provenance_for_the_email_does_not_cover_its_attachment(tmp_path: Path) -> None:

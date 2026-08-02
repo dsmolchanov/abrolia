@@ -19,8 +19,14 @@
 ```bash
 export HERMES_EXTRA_DENY_FILE=~/.config/hermes-cloud/deny-patterns.txt
 python3 scripts/check_fixtures.py --all --require-deny   # то же, что в CI
-gitleaks detect --config .gitleaks.toml --log-opts="--all" --redact
+gitleaks detect --source . --config .gitleaks.toml --log-opts="--all" --redact
 ```
+
+Версия gitleaks в CI закреплена (`.github/workflows/ci.yml`). Набор правил по
+умолчанию меняется между релизами, поэтому «зелено локально» ничего не значит,
+если локальная версия другая: изменения в `.gitleaks.toml` проверяются на
+закреплённой версии, а её подъём — отдельным коммитом с прогоном по всей
+истории.
 
 Оба гоняются в CI на каждый PR: санитайзер — по всему дереву (`--all`), gitleaks
 — по всей истории. Приватные deny-паттерны (реальные имена и ID донора, которые
