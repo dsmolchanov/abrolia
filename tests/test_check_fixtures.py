@@ -324,6 +324,128 @@ def test_ascii_pdf_attachment_is_opaque_by_type(tmp_path: Path) -> None:
     ]
 
 
+def _read(tmp_path: Path, name: str, eml: str | bytes):
+    path = tmp_path / name
+    if isinstance(eml, bytes):
+        path.write_bytes(eml)
+    else:
+        path.write_text(eml, encoding="utf-8")
+    return checker.read_scannable(path)
+
+
+def test_nested_base64_email_is_parsed(tmp_path: Path) -> None:
+    """message/rfc822 в base64 раньше проходил как multipart-обёртка."""
+    inner = (
+        f"From: Lehrer <{GMAIL}>\n"
+        "Subject: Weiterleitung\n"
+        'Content-Type: text/plain; charset="utf-8"\n\n'
+        "Bitte um Rueckmeldung.\n"
+    )
+    nested = base64.b64encode(inner.encode()).decode()
+    eml = (
+        "From: Anna Beispiel <anna@example.com>\n"
+        "MIME-Version: 1.0\n"
+        'Content-Type: multipart/mixed; boundary="b1"\n\n'
+        "--b1\n"
+        'Content-Type: text/plain; charset="utf-8"\n\n'
+        "Siehe Anhang.\n\n"
+        "--b1\n"
+        "Content-Type: message/rfc822\n"
+        "Content-Transfer-Encoding: base64\n\n"
+        f"{nested}\n"
+        "--b1--\n"
+    )
+    scannable = _read(tmp_path, "nested.eml", eml)
+    assert "email" in [f.rule for f in checker.scan_text(scannable.text, path="nested.eml")]
+
+
+def test_unknown_transfer_encoding_is_opaque(tmp_path: Path) -> None:
+    eml = (
+        "From: Anna Beispiel <anna@example.com>\n"
+        "MIME-Version: 1.0\n"
+        'Content-Type: multipart/mixed; boundary="b1"\n\n'
+        "--b1\n"
+        'Content-Type: text/plain; charset="utf-8"\n'
+        "Content-Transfer-Encoding: x-base64\n"
+        'Content-Disposition: attachment; filename="mystery.txt"\n\n'
+        f"{base64.b64encode(GMAIL.encode()).decode()}\n"
+        "--b1--\n"
+    )
+    scannable = _read(tmp_path, "cte.eml", eml)
+    assert [checker.opaque_part_name(x) for x in scannable.opaque_parts] == ["mystery.txt"]
+
+
+def test_part_headers_are_scanned(tmp_path: Path) -> None:
+    """Адрес умеет прятаться в заголовке вложения, а не только в корневых."""
+    encoded = base64.b64encode(f"Kontakt {GMAIL}".encode()).decode()
+    eml = (
+        "From: Anna Beispiel <anna@example.com>\n"
+        "MIME-Version: 1.0\n"
+        'Content-Type: multipart/mixed; boundary="b1"\n\n'
+        "--b1\n"
+        'Content-Type: text/plain; charset="utf-8"\n'
+        f"Content-Description: =?utf-8?B?{encoded}?=\n\n"
+        "Kein Text.\n"
+        "--b1--\n"
+    )
+    scannable = _read(tmp_path, "hdr.eml", eml)
+    assert "email" in [f.rule for f in checker.scan_text(scannable.text, path="hdr.eml")]
+
+
+def test_html_entities_are_normalised(tmp_path: Path) -> None:
+    local, domain = GMAIL.split("@")
+    eml = (
+        "From: Anna Beispiel <anna@example.com>\n"
+        "MIME-Version: 1.0\n"
+        'Content-Type: text/html; charset="utf-8"\n\n'
+        f"<p>Kontakt: <b>{local}</b>&#64;{domain}</p>\n"
+    )
+    scannable = _read(tmp_path, "html.eml", eml)
+    assert "email" in [f.rule for f in checker.scan_text(scannable.text, path="html.eml")]
+
+
+def test_json_unicode_escape_is_normalised() -> None:
+    local, domain = GMAIL.split("@")
+    payload = '{"to": "' + local + "\\u0040" + domain + '"}'
+    assert "email" in rules(checker.normalize_text(payload))
+
+
+def test_rtf_attachment_is_opaque(tmp_path: Path) -> None:
+    """RTF прячет содержимое в hex-escape, парсера у нас нет."""
+    rtf = base64.b64encode(rb"{\rtf1 Kontakt: parent\'40gmail.com}").decode()
+    eml = (
+        "From: Anna Beispiel <anna@example.com>\n"
+        "MIME-Version: 1.0\n"
+        'Content-Type: multipart/mixed; boundary="b1"\n\n'
+        "--b1\n"
+        "Content-Type: application/rtf\n"
+        'Content-Disposition: attachment; filename="brief.rtf"\n'
+        "Content-Transfer-Encoding: base64\n\n"
+        f"{rtf}\n"
+        "--b1--\n"
+    )
+    scannable = _read(tmp_path, "rtf.eml", eml)
+    assert [checker.opaque_part_name(x) for x in scannable.opaque_parts] == ["brief.rtf"]
+
+
+def test_pdf_declared_as_text_is_opaque(tmp_path: Path) -> None:
+    """Тип может врать — сигнатура байтов решает."""
+    pdf = base64.b64encode(b"%PDF-1.4 fake but declared as text").decode()
+    eml = (
+        "From: Anna Beispiel <anna@example.com>\n"
+        "MIME-Version: 1.0\n"
+        'Content-Type: multipart/mixed; boundary="b1"\n\n'
+        "--b1\n"
+        'Content-Type: text/plain; charset="utf-8"\n'
+        'Content-Disposition: attachment; filename="liar.txt"\n'
+        "Content-Transfer-Encoding: base64\n\n"
+        f"{pdf}\n"
+        "--b1--\n"
+    )
+    scannable = _read(tmp_path, "liar.eml", eml)
+    assert [checker.opaque_part_name(x) for x in scannable.opaque_parts] == ["liar.txt"]
+
+
 def test_provenance_needs_a_structured_entry(tmp_path: Path) -> None:
     """Упоминание имени в прозе или в примере не является записью о файле."""
     fixtures = tmp_path / "tests" / "fixtures" / "media"
@@ -339,7 +461,9 @@ def test_provenance_needs_a_structured_entry(tmp_path: Path) -> None:
     findings = checker.scan_paths([tmp_path / "tests"], repo_root=tmp_path)
     assert [f.rule for f in findings] == ["unscannable"]
 
-    manifest.write_text("- `notice.png` — сгенерирован scripts/make_media.py\n", encoding="utf-8")
+    manifest.write_text(
+        "- `media/notice.png` — сгенерирован scripts/make_media.py\n", encoding="utf-8"
+    )
     assert checker.scan_paths([tmp_path / "tests"], repo_root=tmp_path) == []
 
 
@@ -355,12 +479,43 @@ def test_provenance_for_the_email_does_not_cover_its_attachment(tmp_path: Path) 
     findings = checker.scan_paths([tmp_path / "tests"], repo_root=tmp_path)
     assert sorted({f.rule for f in findings}) == ["email", "unscannable"]
 
-    # Запись именно о вложении снимает только находку по вложению.
+    # Запись о вложении связывает его с конкретным письмом.
     (fixtures / "PROVENANCE.md").write_text(
-        "- `einladung.pdf` — сгенерирован scripts/make_pdf.py, синтетика\n", encoding="utf-8"
+        "- `with_pdf.eml#einladung.pdf` — сгенерирован scripts/make_pdf.py, синтетика\n",
+        encoding="utf-8",
     )
     findings = checker.scan_paths([tmp_path / "tests"], repo_root=tmp_path)
     assert [f.rule for f in findings] == ["email"]
+
+
+def test_attachment_entry_does_not_cover_the_same_name_in_another_email(
+    tmp_path: Path,
+) -> None:
+    fixtures = tmp_path / "tests" / "fixtures" / "email"
+    fixtures.mkdir(parents=True)
+    for name in ("first.eml", "second.eml"):
+        (fixtures / name).write_text(_eml_with_pdf_attachment("Anbei."), encoding="utf-8")
+    (fixtures / "PROVENANCE.md").write_text(
+        "- `first.eml#einladung.pdf` — синтетика\n", encoding="utf-8"
+    )
+    findings = checker.scan_paths([tmp_path / "tests"], repo_root=tmp_path)
+    assert [(f.path, f.rule) for f in findings] == [
+        ("tests/fixtures/email/second.eml", "unscannable")
+    ]
+
+
+def test_opaque_attachment_name_is_masked_in_output(tmp_path: Path) -> None:
+    """Имя вложения само может быть персональными данными."""
+    fixtures = tmp_path / "tests" / "fixtures" / "email"
+    fixtures.mkdir(parents=True)
+    eml = _eml_with_pdf_attachment("Anbei.").replace(
+        "einladung.pdf", "Krankmeldung Erika Mustermann.pdf"
+    )
+    (fixtures / "sick.eml").write_text(eml, encoding="utf-8")
+    findings = checker.scan_paths([tmp_path / "tests"], repo_root=tmp_path)
+    assert [f.rule for f in findings] == ["unscannable"]
+    assert "Krankmeldung Erika Mustermann.pdf" not in findings[0].render()
+    assert "application/pdf" in findings[0].render()
 
 
 def test_binary_fixture_without_provenance_is_a_finding(tmp_path: Path) -> None:
@@ -376,9 +531,31 @@ def test_binary_fixture_with_provenance_passes(tmp_path: Path) -> None:
     fixtures.mkdir(parents=True)
     (fixtures / "notice.png").write_bytes(b"\x89PNG\r\n\x1a\n\x00binary")
     (tmp_path / "tests" / "fixtures" / "PROVENANCE.md").write_text(
-        "- `notice.png` — сгенерирован scripts/make_media.py, синтетика\n", encoding="utf-8"
+        "- `media/notice.png` — сгенерирован scripts/make_media.py, синтетика\n",
+        encoding="utf-8",
     )
     assert checker.scan_paths([tmp_path / "tests"], repo_root=tmp_path) == []
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "- `other/notice.png` — запись про файл в другом каталоге",
+        "- `notice.png` — запись без каталога",
+        "- `../notice.png` — выход за пределы каталога манифеста",
+        "- `/media/notice.png` — абсолютный путь",
+        "    - `media/notice.png` — отступ в четыре пробела: это блок кода",
+    ],
+)
+def test_provenance_entry_must_match_the_exact_path(tmp_path: Path, entry: str) -> None:
+    fixtures = tmp_path / "tests" / "fixtures" / "media"
+    fixtures.mkdir(parents=True)
+    (fixtures / "notice.png").write_bytes(b"\x89PNG\r\n\x1a\n\x00binary")
+    (tmp_path / "tests" / "fixtures" / "PROVENANCE.md").write_text(
+        entry + "\n", encoding="utf-8"
+    )
+    findings = checker.scan_paths([tmp_path / "tests"], repo_root=tmp_path)
+    assert [f.rule for f in findings] == ["unscannable"]
 
 
 def test_require_deny_fails_without_private_patterns(monkeypatch, capsys) -> None:

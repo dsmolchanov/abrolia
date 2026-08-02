@@ -88,14 +88,18 @@ providers that would be untrue.
 | Action journal and delivery receipts | 365 days |
 | Calendar events (our internal mapping to your calendar) | 365 days; the event itself stays in your Google account |
 | Memory | until you delete it; we prompt a review every 90 days |
-| Emails that failed processing: content / technical failure reason | 30 days / 90 days |
+| Incoming messages on any channel (webhook, WhatsApp) before processing | 30 days — same as other source content |
+| Messages that failed processing: content / technical failure reason | 30 days / 90 days |
+| Outgoing emails and messages: text and recipient in the journal | 365 days; the copy at the recipient and at the mail provider is outside our control |
+| Requests to the language model | not stored separately: the prompt is built at processing time and not retained; at Anthropic, per their terms, with no training on your data |
+| Passwords and access keys (app password, channel tokens) | while the connection is active; deleted when the channel is disconnected or the account closed — no later than 30 days |
 | Technical logs (identifiers and statuses, no content) | 30 days |
 | Backups | rolling 30-day window |
-| Consent receipts, records of your rights requests, incident records | 3 years — evidence the law requires us to keep |
+| Consent receipts, records of your rights requests, incident records | 3 years. The law requires us to be able to demonstrate consent and to keep incident records, but the specific period is ours to set — chosen against the limitation period and to be confirmed by counsel before launch |
 | Family member identifiers and settings | while the account is active + 30 days |
 
-The full matrix including storage locations is in the technical documentation
-(`docs/privacy/data-map.md`); this table repeats it without omissions.
+This table lists every class of data we retain. The technical version with
+storage locations and jurisdictions is in `docs/privacy/data-map.md`.
 
 ## If you chose Gmail access
 

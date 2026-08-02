@@ -44,16 +44,20 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import contextlib
 import email
 import email.policy
+import html
 import json
 import os
+import quopri
 import re
 import sys
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from fnmatch import fnmatch
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -83,14 +87,27 @@ MAX_FILE_BYTES = 2_000_000
 MAX_EML_BYTES = 50_000_000
 
 # Части письма, которые санитайзер действительно понимает как текст.
+# RTF сюда не входит намеренно: hex-escape вида \\'40 прячет содержимое, а
+# парсера RTF у нас нет — такая часть считается непрозрачной.
 TEXTUAL_MIME_TYPES = {
     "application/json",
     "application/xml",
     "application/xhtml+xml",
-    "application/rtf",
     "message/delivery-status",
-    "message/rfc822",
 }
+
+# Транспортные кодировки, которые умеет разворачивать stdlib. Всё остальное
+# (`x-base64`, `x-uuencode`, мусор) — непрозрачно: содержимое неизвестно.
+KNOWN_TRANSFER_ENCODINGS = {"7bit", "8bit", "binary", "quoted-printable", "base64"}
+
+# Сигнатуры бинарных форматов: тип части может врать (PDF как text/plain).
+BINARY_MAGIC = (
+    b"%PDF-", b"\x89PNG", b"\xff\xd8\xff", b"PK\x03\x04", b"\x1f\x8b",
+    b"{\\rtf", b"\xd0\xcf\x11\xe0", b"OggS", b"ID3", b"SQLite format 3",
+)
+
+# Защита от «матрёшки» из вложенных писем.
+MAX_MIME_DEPTH = 12
 
 # Окно контекста для Telegram-ID (в обе стороны): в JSON ключ `"from": {` и
 # `"id": …` стоят на разных строках и в любом порядке, поэтому построчная
@@ -408,55 +425,158 @@ def _is_textual(content_type: str) -> bool:
     """Считается ли часть письма текстом.
 
     Успешный `decode()` текстом не делает: ASCII-only PDF декодируется без
-    ошибок, но его содержимое санитайзер не понимает. Решает объявленный тип.
+    ошибок, но его содержимое санитайзер не понимает. Решает объявленный тип —
+    и, дополнительно, сигнатура байтов (см. `_looks_binary`).
     """
     if content_type.startswith("text/"):
         return True
     return content_type in TEXTUAL_MIME_TYPES
 
 
+def _looks_binary(payload: bytes) -> bool:
+    """Похоже ли содержимое на бинарь вопреки объявленному типу.
+
+    PDF, объявленный `text/plain`, декодируется как ASCII и молча проходил бы
+    проверку, ничего при этом не значив.
+    """
+    if b"\x00" in payload[:4096]:
+        return True
+    return any(payload.startswith(magic) for magic in BINARY_MAGIC)
+
+
+def normalize_text(text: str) -> str:
+    """Снять экранирование, за которым прячется значение.
+
+    `parent&#64;gmail.com` в HTML, `\u0040` в JSON и разметка вокруг адреса —
+    всё это проходит мимо правил, если сканировать байты как есть.
+    """
+    unescaped = html.unescape(text)
+    unescaped = re.sub(
+        r"\\u([0-9a-fA-F]{4})", lambda m: chr(int(m.group(1), 16)), unescaped
+    )
+    # Разметку снимаем в двух вариантах: со склейкой (адрес, разорванный
+    # тегами, собирается обратно) и с пробелом (соседние слова не слипаются).
+    joined = re.sub(r"<[^>]{1,200}>", "", unescaped)
+    spaced = re.sub(r"<[^>]{1,200}>", " ", unescaped)
+    return joined if joined == spaced else joined + "\n" + spaced
+
+
+def _decode(payload: bytes, charset: str) -> str:
+    for candidate in (charset, "utf-8", "latin-1"):
+        try:
+            return payload.decode(candidate, errors="strict")
+        except (LookupError, UnicodeDecodeError):
+            continue
+    return payload.decode("utf-8", errors="replace")  # pragma: no cover
+
+
+def _walk_part(part, *, stem: str, index: int, chunks: list[str], opaque: list[str],
+               depth: int = 0) -> None:
+    """Разобрать часть письма: заголовки, текст, вложенные письма.
+
+    Заголовки берутся у **каждой** части, а не только у корня: адрес умеет
+    прятаться в `Content-Description` вложения. Вложенное письмо
+    (`message/rfc822`) разбирается рекурсивно, в том числе когда оно приехало
+    в base64.
+    """
+    with contextlib.suppress(Exception):  # битые заголовки не должны ронять разбор
+        chunks.extend(f"{header}: {value}" for header, value in part.items())
+    content_type = part.get_content_type()
+    name = part.get_filename() or f"{stem}#{index}"
+    if depth > MAX_MIME_DEPTH:
+        opaque.append(f"{name} ({content_type}, глубина вложенности)")
+        return
+
+    if content_type.startswith("multipart/"):
+        payload = part.get_payload()
+        if isinstance(payload, list):
+            for sub_index, sub in enumerate(payload):
+                _walk_part(sub, stem=stem, index=sub_index, chunks=chunks,
+                           opaque=opaque, depth=depth + 1)
+            return
+        # multipart без разобранных частей: тело осталось строкой — разбираем
+        # его как сырьё ниже, чтобы содержимое не исчезло из проверки.
+
+    cte = (part.get("Content-Transfer-Encoding") or "").strip().lower()
+    if cte and cte not in KNOWN_TRANSFER_ENCODINGS:
+        # Неизвестное кодирование: считать его текстом нельзя — что именно
+        # лежит внутри, мы не знаем.
+        opaque.append(f"{name} ({content_type}, transfer-encoding {cte})")
+        return
+
+    if content_type.startswith("message/"):
+        # stdlib не разворачивает transfer-encoding у message/*: вложенное
+        # письмо в base64 иначе остаётся нечитаемым блобом, а не письмом.
+        source = part.get_payload(decode=True)
+        if source is None:
+            nested_payload = part.get_payload()
+            if isinstance(nested_payload, list):
+                source = b"\n".join(
+                    item.as_bytes() if hasattr(item, "as_bytes") else str(item).encode()
+                    for item in nested_payload
+                )
+            else:
+                source = str(nested_payload).encode("utf-8", errors="replace")
+        try:
+            if cte == "base64":
+                source = base64.b64decode(source, validate=False)
+            elif cte == "quoted-printable":
+                source = quopri.decodestring(source)
+        except Exception:
+            opaque.append(f"{name} ({content_type}, не разворачивается)")
+            return
+        try:
+            nested = email.message_from_bytes(source, policy=email.policy.default)
+        except Exception:  # pragma: no cover - не разобралось как письмо
+            opaque.append(f"{name} ({content_type})")
+            return
+        _walk_part(nested, stem=f"{stem}#{index}", index=0, chunks=chunks,
+                   opaque=opaque, depth=depth + 1)
+        return
+
+    try:
+        payload = part.get_payload(decode=True)
+    except Exception:  # pragma: no cover - битый transfer-encoding
+        payload = None
+    if payload is None:
+        raw_payload = part.get_payload()
+        if isinstance(raw_payload, list):
+            for sub_index, sub in enumerate(raw_payload):
+                _walk_part(sub, stem=stem, index=sub_index, chunks=chunks,
+                           opaque=opaque, depth=depth + 1)
+            return
+        if isinstance(raw_payload, str):
+            payload = raw_payload.encode("utf-8", errors="replace")
+        else:  # pragma: no cover
+            return
+
+    if not _is_textual(content_type) or _looks_binary(payload):
+        # PDF, картинка, архив — и то же самое, объявленное текстом.
+        opaque.append(f"{name} ({content_type})")
+        return
+
+    text = _decode(payload, part.get_content_charset() or "utf-8")
+    chunks.append(text)
+    normalized = normalize_text(text)
+    if normalized != text:
+        chunks.append(normalized)
+
+
 def eml_to_text(raw: bytes, *, stem: str = "eml") -> tuple[str, list[str]]:
-    """Развернуть .eml: заголовки + текстовые части, отдельно — непрозрачные.
+    """Развернуть .eml: заголовки всех частей + текст, отдельно — непрозрачные.
 
     Тело письма приходит в base64/quoted-printable, и без декодирования
-    санитайзер «не видит» ни адресов, ни телефонов внутри фикстуры. Текстовые
-    части читаются всегда (при неизвестной кодировке — с заменой символов:
-    адреса, телефоны и ID остаются в ASCII), нетекстовые всегда непрозрачны.
+    санитайзер «не видит» ни адресов, ни телефонов внутри фикстуры.
     """
     try:
         # policy.default раскрывает encoded-words в заголовках (=?utf-8?B?…?=),
         # иначе адрес в теме письма проходит мимо проверки.
         message = email.message_from_bytes(raw, policy=email.policy.default)
-        chunks: list[str] = [f"{header}: {value}" for header, value in message.items()]
-    except Exception:  # битые заголовки — разбираем в совместимом режиме
+    except Exception:  # pragma: no cover - битые заголовки
         message = email.message_from_bytes(raw, policy=email.policy.compat32)
-        chunks = [f"{header}: {value}" for header, value in message.items()]
+    chunks: list[str] = []
     opaque: list[str] = []
-    for index, part in enumerate(message.walk()):
-        if part.is_multipart():
-            continue
-        content_type = part.get_content_type()
-        try:
-            payload = part.get_payload(decode=True)
-        except Exception:  # pragma: no cover - битый transfer-encoding
-            payload = None
-        name = part.get_filename() or f"{stem}#{index}"
-        if not _is_textual(content_type):
-            # PDF, картинка, архив: даже если байты декодируются, содержимое
-            # непрозрачно — нужна запись о происхождении.
-            opaque.append(f"{name} ({content_type})")
-            continue
-        if payload is None:
-            continue
-        charset = part.get_content_charset() or "utf-8"
-        for candidate in (charset, "utf-8", "latin-1"):
-            try:
-                chunks.append(payload.decode(candidate, errors="strict"))
-                break
-            except (LookupError, UnicodeDecodeError):
-                continue
-        else:  # pragma: no cover - latin-1 не падает, ветка на будущее
-            chunks.append(payload.decode("utf-8", errors="replace"))
+    _walk_part(message, stem=stem, index=0, chunks=chunks, opaque=opaque)
     return "\n".join(chunks), opaque
 
 
@@ -498,15 +618,19 @@ def read_scannable(path: Path) -> Scannable:
     return Scannable(text)
 
 
-# Запись манифеста: `- \`имя-или-путь\` — описание` вне блоков кода.
-PROVENANCE_ENTRY_RE = re.compile(r"^\s*[-*]\s+`([^`]+)`\s*[—–-]\s*\S")
+# Запись манифеста: `- \`путь\` — описание` вне блоков кода.
+# Отступ ограничен тремя пробелами: четыре и больше — это indented code block
+# по CommonMark, то есть пример, а не запись.
+PROVENANCE_ENTRY_RE = re.compile(r"^ {0,3}[-*] +`([^`]+)`\s*[—–-]\s*\S")
 
 
 def load_provenance(manifest: Path) -> set[str]:
-    """Разобрать PROVENANCE.md в набор описанных файлов.
+    """Разобрать PROVENANCE.md в набор описанных путей.
 
-    Ищется структурированная запись, а не подстрока: пояснение в прозе или
-    пример в блоке кода не должны молча разрешать одноимённый файл.
+    Путь — относительно каталога самого манифеста. Ищется структурированная
+    запись, а не подстрока: пояснение в прозе или пример в блоке кода не
+    должны молча разрешать одноимённый файл. Абсолютные пути и `..`
+    отбрасываются — иначе запись из одного каталога разрешала бы файл в другом.
     """
     try:
         text = manifest.read_text(encoding="utf-8")
@@ -522,18 +646,31 @@ def load_provenance(manifest: Path) -> set[str]:
         if in_fence:
             continue
         match = PROVENANCE_ENTRY_RE.match(line)
-        if match:
-            entries.add(match.group(1).strip().lstrip("./"))
+        if not match:
+            continue
+        token = match.group(1).strip()
+        path_part, _, attachment = token.partition("#")
+        if path_part.startswith("/") or ".." in PurePosixPath(path_part).parts:
+            continue
+        normalized = PurePosixPath(path_part).as_posix().removeprefix("./")
+        entries.add(f"{normalized}#{attachment}" if attachment else normalized)
     return entries
 
 
-def provenance_mentions(token: str, near: Path, repo_root: Path) -> bool:
-    """Описан ли файл записью в PROVENANCE.md одного из родительских каталогов."""
-    for parent in near.parents:
+def provenance_covers(file_path: Path, repo_root: Path, *, part: str | None = None) -> bool:
+    """Описан ли файл (или вложение внутри него) записью в PROVENANCE.md.
+
+    Сравнивается точный путь относительно каталога манифеста: запись
+    `other/notice.png` не разрешает `media/notice.png`, а вложение
+    привязывается к письму (`email/with_pdf.eml#einladung.pdf`), поэтому одно
+    имя не покрывает одноимённые вложения разных писем.
+    """
+    for parent in file_path.parents:
         manifest = parent / PROVENANCE_FILE
         if manifest.is_file():
-            entries = load_provenance(manifest)
-            if token in entries or any(entry.endswith("/" + token) for entry in entries):
+            relative = file_path.relative_to(parent).as_posix()
+            token = f"{relative}#{part}" if part else relative
+            if token in load_provenance(manifest):
                 return True
         if parent == repo_root:
             break
@@ -633,8 +770,8 @@ def scan_paths(
         except Unscannable as exc:
             # Непроверяемый файл — слепая зона, поэтому он либо описан в
             # PROVENANCE.md ближайшего родительского каталога, либо это находка.
-            if file_path.name not in OS_JUNK and not provenance_mentions(
-                file_path.name, file_path, repo_root
+            if file_path.name not in OS_JUNK and not provenance_covers(
+                file_path, repo_root
             ):
                 findings.append(
                     Finding(rel, 0, RULE_UNSCANNABLE, RULE_DETAIL[RULE_UNSCANNABLE],
@@ -658,10 +795,19 @@ def scan_paths(
         for label in scannable.opaque_parts:
             # Provenance на само письмо не покрывает вложение внутри него:
             # иначе одна бинарная часть прятала бы весь файл от проверки.
-            if not provenance_mentions(opaque_part_name(label), file_path, repo_root):
+            name = opaque_part_name(label)
+            if not provenance_covers(file_path, repo_root, part=name):
                 findings.append(
-                    Finding(rel, 0, RULE_UNSCANNABLE, "непроверяемая часть письма",
-                            label, label)
+                    Finding(
+                        rel,
+                        0,
+                        RULE_UNSCANNABLE,
+                        "непроверяемая часть письма",
+                        # Имя вложения может само оказаться персональными
+                        # данными («Krankmeldung Erika Mustermann.pdf»).
+                        label.replace(name, mask(name), 1),
+                        label,
+                    )
                 )
     return findings
 
