@@ -4,9 +4,9 @@ Family operations assistant for households living in a foreign language. Forward
 
 - **Email layer**: [Nerve](https://github.com/dsmolchanov) — managed inbox on our domain, or bring your own domain (DNS verification).
 - **Model layer**: Anthropic Claude API (commercial terms) — typed tools only, no shell, no direct send capability for the model.
-- **Channels**: Telegram for confirmations and notifications; a dedicated WhatsApp number per household.
+- **Channels**: Telegram for confirmations and notifications (WhatsApp planned post-pilot via the official WhatsApp Business Platform).
 - **Calendar**: family Google Calendar shared to a dedicated assistant account.
-- **Privacy**: EU processing, no training on your data, per-household isolation, full export and delete.
+- **Privacy**: EU-hosted application with documented international subprocessors (model API, email delivery) under DPA/SCC; no training on your data; per-household isolation; full export and delete.
 
 Status: pilot MVP under construction. See `thoughts/shared/plans/2026-08-02-family-ops-assistant-mvp.md` for the implementation plan.
 

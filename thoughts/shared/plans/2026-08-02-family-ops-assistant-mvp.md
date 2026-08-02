@@ -1,399 +1,279 @@
-# Hermes Cloud — Family Ops Assistant MVP Implementation Plan
+# Hermes Cloud — Family Ops Assistant MVP Implementation Plan (v2)
+
+> v2 после внешней ревизии 2026-08-02. Ключевые изменения против v1: fail-closed residency вместо fail-open `inference_geo`; долговечный ingress (SQLite WAL events/jobs/effects) вместо «журнала message_id»; ручной tool-loop с идемпотентными эффектами вместо автоматического runner-replay; RunContext-авторизация каждого хода; WhatsApp исключён из MVP (официальный Business Platform — post-pilot); compose вместо reply для пересланных писем; Nerve-работы вынесены в отдельный план; GDPR перенесён в Gate −1; пилотная цена €59–99.
 
 ## Overview
 
-Пилотный MVP продукта «операционный ассистент для семьи, живущей не на родном языке»: пересланное письмо школы / фото объявления / голосовая заметка → извлечённое обязательство (дата, сумма, ответственный) на языке семьи → карточка-предложение → после подтверждения — событие в семейном Google-календаре, задача, напоминание или исходящее письмо. Dedicated-инстанс на household (5–20 семей пилота), новый публичный репозиторий `dsmolchanov/hermes-cloud`.
+Пилотный MVP «операционного ассистента для семьи, живущей не на родном языке»: пересланное письмо школы / фото объявления / голосовая заметка → извлечённое обязательство (дата, сумма, ответственный) на языке семьи → карточка-предложение → после подтверждения — событие в семейном Google-календаре, задача, напоминание или исходящее письмо с явно подтверждённым получателем. Dedicated-инстанс на household. Прототип — на синтетических данных; реальные семьи — только после закрытия Gate −1 и Trust Foundation.
 
-Продукт собирается из трёх существующих активов:
-- **Hermes** (`~/Programs/hermes`, приватный) — донор state-машин, approval-outbox, Telegram/voice-конвейера и ~60 характеризационных тестов;
-- **Nerve** (`~/Programs/nerve-cloud` + `nerve-oss`) — email-слой: ящики на managed-поддомене или BYO-домен с DNS-верификацией, MCP/SDK, метеринг;
-- **Anthropic API** (Commercial Terms) — модельный слой, заменяющий `claude -p --dangerously-skip-permissions`.
+Активы: **Hermes** (донор state-машин и тестов; ветка `agent/foundation-activation` — уже содержит фасад `claim_pending(code, chat, thread, actor)` c per-actor rate-limit, actions.py:175), **Nerve** (email-слой; требует расширений — отдельный план), **Anthropic Commercial API** (модельный слой).
 
 ## Current State Analysis
 
-### Hermes (донор кода)
+### Hermes (донор)
 
-Работающий одно-семейный ассистент. Ключевые факты из анализа:
+- **Внимание: донор движется.** Рабочая ветка `agent/foundation-activation` переписала actions.py в фасад над outbox-бэкендом: `claim_pending(code, chat, thread, actor)` / `claim_pending_by_id`, exact chat+thread биндинг, failed-code rate limit per (actor, chat) (actions.py:48, :160-191). Портируем **эту** версию, не HEAD master. Gate −1 фиксирует донорский SHA.
+- Сторы читают пути из env при импорте; тесты изолируются через setenv+reload — при порте пути становятся параметрами конструктора.
+- Известные дефекты донора (проверить актуальность против запиненного SHA — часть уже исправлена в foundation-ветке): неатомарная запись reminders (старый reminders.py:91), отсутствие fsync, гонки check-then-act вне критических секций.
+- Email-ингеста непрошенной почты нет (mailwatch поллит только watches) — вход строится с нуля.
+- Модельный слой (`claude -p` subprocess) — полная замена на SDK.
+- Календарь: gtool.py — googleapiclient-обёртки, authorized-user token refresh-in-place, scopes `calendar`+`drive.readonly` — портируется.
+- Тесты: ~60 из 102 портируются, **но фикстуры содержат реальные PII** (test_sender.py:9 — реальный Telegram ID и имена) — в публичный репо только после санитизации.
 
-- **Сторы портируются почти как есть** для модели «один инстанс = один household»: все три (`actions.py`, `reminders.py`, `todos.py`) читают путь из env при импорте (actions.py:27, reminders.py:25, todos.py:22) и не имеют иного глобального состояния; тесты уже изолируются через `monkeypatch.setenv + importlib.reload`.
-- **Approval-outbox — ядро безопасности**: hashed one-time codes (actions.py:74), payload-sha-пиннинг против подмены (actions.py:128-142), TTL 15 мин, actor allowlist, kill-switch-флаги, daily cap, честная семантика `accepted_by_provider ≠ delivered` и `SendOutcomeUnknown` (actions.py:37, 275-297). Всё серверное, модель не имеет доступа к исполнению.
-- **Найденные дефекты (чиним при портировании)**:
-  - `reminders.py:91` — запись без tmp+`os.replace` (torn-write risk); идиому взять из todos.py:34-36;
-  - double-approve гонка: `find_pending` (server.py:1099) и `mark("executing")` (server.py:1124) — две отдельные блокировки; проверка daily cap (server.py:1114) — check-then-act вне критической секции;
-  - hardcoded: `smtp.gmail.com` (actions.py:289), имя семьи в промптах scheduler.py:56,71,107; `todos.add` читает `HERMES_TZ` сам (todos.py:48).
-- **Email-ингеста для непрошенной почты нет**: `mailwatch.py` поллит только явные watches. Вход для пересылки — новый код.
-- **Документы/фото** сейчас сохраняются на диск, модель читает их сама через Bash/Read (server.py:964-974, DOCS_PREAMBLE :423-436) — в SDK-версии становятся content blocks.
-- **Модельный слой** (`_run_claude`/`_run_codex`/`run_model`, server.py:645-773) — полная замена. Таксономия `ModelResult` упрощается: с typed tools исполнение на нашей стороне и журналируется, класс «timeout = неизвестные побочные эффекты» почти исчезает.
-- **Календарь**: `scripts/gtool.py` — тонкие googleapiclient-обёртки (list-calendars :59, list-events :64, create-event :88, delete-event :102) над authorized-user OAuth-токеном с refresh-in-place (gtool.py:41-51); scopes `calendar` + `drive.readonly` (google-oauth-flow.py:29-32). Портируется в typed tools напрямую.
-- **Тесты**: 102, из них ~60 портируются (verbatim: test_reminders, test_scheduler, test_todos 1-3, test_actions module-level; с лёгкой параметризацией: TestServerApproval, test_retry, test_model_result, test_sender, test_watch_scheduler). Остаются: test_whatsapp (Ульяна-mirroring), test_channels (русские алиасы), test_skills, test_attachments (gtool).
+### Nerve
 
-### Nerve (email-слой)
+- Онбординг (org → managed-поддомен/BYO-домен+DNS → inbox → cloud API key со скоупами) готов; RLS-тенантность; SDK `NerveAdmin`/`NerveClient`; готовые Anthropic tool definitions.
+- **Пробелы (закрываются отдельным Nerve-планом, см. Фазу 3):**
+  1. inbound-пуша с гарантиями нет: `forward_to` — unsigned/no-retry; org-webhooks рассылают только outbound delivery events, и их доставка завязана на outbound-журнал — для `email.received` нужен общий event journal, а не «маленькое изменение»;
+  2. метаданные входящих вложений не персистятся, а attachment-proxy требует скоуп `nerve:admin.billing | nerve:email.inbox.create` (handler_messages.go:43) — runtime-ключу household недоступен; нужен и персист, и scope-фикс;
+  3. исходящих вложений нет нигде в тракте (provider.go, outbox.go, outbox_worker.go — ноль упоминаний) — это store+worker+MCP+SDK работа с content-addressed blobs;
+  4. webhook-секрет генерируется сервером и показывается один раз (org_webhooks.go:62-81) — provisioning должен читать его из ответа, не задавать свой.
+- **Семантика reply:** `send_reply(thread_id)` отвечает адресу From последнего сообщения. Пересланное родителем письмо имеет From = родитель → reply уйдёт родителю, не школе. MVP использует **compose** с извлечённым из пересланной цепочки оригинальным отправителем и обязательным подтверждением получателя в карточке.
 
-- **Онбординг готов**: `POST /v1/orgs` → `POST /v1/domains` (managed-поддомен `<family>.nerve.email` активируется без DNS, handler_domains.go:23-32, 262-310; BYO-домен возвращает `dns_records` — Resend SPF/DKIM + DMARC + MX, handler_domains.go:375-391) → `POST /v1/domains/verify` → `POST /v1/inboxes`. Python SDK: `NerveAdmin.create_org/add_domain/get_dns_records/verify_domain/create_inbox/issue_cloud_api_key`.
-- **Аутентификация per-household**: Cloud API key на org со скоупами `nerve:email.{read,search,draft,send}` (auth/verifier.go:142-164), один ключ работает и на control plane, и на runtime `/mcp`. Тенантность — Postgres RLS (`Store.RunAsOrg`, cloudapi/handler.go:98-106).
-- **Готовые Anthropic tool definitions**: `nerve_email.tools.get_tool_definitions(format="claude", prefix="email_")`.
-- **Три пробела (закрываем в Фазе 1)**:
-  1. надёжного inbound-пуша нет: `forward_to` — unsigned fire-and-forget без ретраев (resend_webhook.go:311-313, 375-427); подписанные org-webhooks с ретраями (dispatcher.go:185-206) рассылают только outbound delivery events (resend_webhook.go:466-484), не `email.received`;
-  2. метаданные вложений не персистятся: `ReceivedEmail.Attachments` (resend_receiving.go:31-37) отбрасываются при ингесте, attachment-proxy (`GET /v1/messages/{id}/attachments/{aid}`, handler_messages.go:17-132) недостижим — консьюмер не знает `attachment_id`;
-  3. исходящие вложения не поддерживаются: `OutboundMessage` без attachment-полей (emailtransport/provider.go:34-45), `draft_reply(attachments=)` — "reserved for future use".
-- Approval-семантика совместима: `send_reply(needs_human_approval=true)` заблокирован без entitlement (tools/service.go:286-300) → драфт держим у себя, после человеческого «да» шлём с `needs_human_approval=false` + `idempotency_key`.
+### Провайдеры и право (входные ограничения)
+
+- `inference_geo` на first-party API сегодня — `global`/`us`; EU-роутинг — только Vertex AI EU (отдельный клиент/контракт). Haiku 4.5 `inference_geo` не поддерживает.
+- Nerve деплой — `iad`; Resend хранит метаданные/логи в США независимо от sending region.
+- Вывод: обещание «EU processing» в чистом виде сейчас невыполнимо → фиксируем честную формулировку и fail-closed конфигурацию (см. Locked Decisions).
+- WhatsApp: QR-пейринг Evolution = автоматизация обычного WhatsApp, для коммерческого продукта недопустим; официальный путь — WhatsApp Business Platform (EEA/Brazil AI-продукты разрешены с ограничениями). Вне MVP.
+- GDPR: письма школ содержат данные детей и третьих лиц → data map, lawful bases, DPIA, privacy notice, реестр процессоров, DPA/SCC/TIA, политика по несовершеннолетним — **до** кода, работающего с реальными данными.
 
 ## Desired End State
 
-Работающий пилот: команда `onboarding/provision.py` за один прогон создаёт household (nerve-org + ящик или BYO-домен, WhatsApp-инстанс, Fly-приложение с volume и секретами); семья пересылает письмо на свой адрес → в Telegram приходит карточка на языке семьи с кнопками → «✅» создаёт событие в расшаренном семейном Google-календаре / задачу / staged-ответ по email с вложением; журнал, `/export`, `/delete` работают; Art. 50 дисклеймер показан.
+Пилот на 5–20 семей: провижининг одним прогоном (без WhatsApp); пересланное письмо проходит durable-конвейер (событие переживает рестарт, не теряется и не дублируется); карточка на языке семьи; подтверждение создаёт событие/задачу/письмо ровно один раз (включая crash-recovery); residency-режим и субпроцессоры честно задокументированы; `/export`/`/delete` с определённой owner-auth; экономика проверяется на €59–99/мес.
 
-Verify: сквозной прогон чек-листа Manual Verification Фазы 5 на первом реальном household.
-
-### Key Discoveries
-
-- Идиома атомарной записи и flock уже есть в todos.py:25-36 — эталон для фикса reminders.
-- `channels.py` полностью чистый (без импортов server) — переносится как есть.
-- Superseded-turn логика (`_last_user_ts`, server.py:253-265, повторная проверка под локом :304) — переносим, она transport-агностична.
-- Nerve dispatcher уже умеет HMAC `X-Nerve-Signature: t=..,v1=..` + ретраи с backoff — фан-аут `email.received` — это маленькое изменение в ingest-пути, не новая подсистема.
-- Resend Receiving URL вложений живёт ~1ч (resend_receiving.go:102-129) — качать вложение надо в момент обработки, не лениво.
-- Runtime `nerve-runtime` на Fly с `min_machines_running=0` — cold start; для пилота поднять до 1.
+Verify: сквозной чек-лист Фазы 5 + chaos-тесты (kill -9 в каждом окне) из Фазы 2.
 
 ## Locked Decisions
 
 | Решение | Выбор |
 |---|---|
-| Скоуп | Пилотный MVP, dedicated-инстанс на household |
-| Репозиторий | Новый публичный `dsmolchanov/hermes-cloud`; Hermes семьи не трогаем |
-| Email-вход | Nerve: managed-поддомен (базовый тир) или BYO-домен + DNS-записи (pro) |
-| Inbound push | Расширить nerve-cloud: фан-аут `email.received` в подписанные org-webhooks |
-| Вложения | Сразу оба направления: персист входящих метаданных + исходящие вложения (Фаза 1) |
-| Календарь | Семейный Google: выделенный Google-аккаунт ассистента на household, семья шарит ему календари (паттерн Hermes, порт gtool-логики) |
-| WhatsApp | Номер на household через Evolution-инстанс (QR-пейринг при онбординге), relay с HMAC |
-| Модели | `claude-opus-5` — диалог/tool-цикл; `claude-haiku-4-5` + structured outputs — извлечение; Batches для digest-класса задач |
-| Residency | Первопартийный Claude API; `inference_geo` включаем, если значение для EU доступно на аккаунте (проверка в Фазе 2), иначе документированный fallback — Vertex `region="eu"` |
-| Ингест MVP | Email-пересылка + фото/скриншоты (vision) + голос (faster-whisper) + calendar read-write |
-| Хранение | File-backed сторы на per-household Fly volume (как Hermes); Postgres — после пилота |
+| Скоуп | Пилотный MVP, dedicated-инстанс на household; прототип — synthetic data only |
+| Репозиторий | Публичный `dsmolchanov/hermes-cloud`; донорские фикстуры — только санитизированные |
+| Residency | Честная формулировка: «EU-hosted application, документированные международные передачи»: приложение и данные — Fly EU (`ams`), субпроцессоры Anthropic (global/US) и Resend (US) — под DPA/SCC в реестре процессоров. Конфиг `residency_mode: eu-app | eu-strict`; `eu-strict` требует Vertex-EU-клиент и падает при его отсутствии — **никакого молчаливого downgrade**. Пилот стартует в `eu-app`; Vertex EU — задокументированный upgrade-путь после бенчмарка |
+| Email-вход | Nerve: managed-поддомен (база) / BYO-домен + DNS (pro) |
+| Исходящий email | Только `compose_email` с явно подтверждённым получателем (оригинальный отправитель из пересланной цепочки); auto-reply на thread — вне MVP |
+| WhatsApp | **Вне MVP.** Post-pilot через официальный WhatsApp Business Platform; Evolution/QR не используется для клиентов |
+| Календарь | Семейный Google: выделенный аккаунт ассистента на household, семья шарит календари; порт gtool; клиентские детерминированные event ID + reconcile |
+| Модели | Диалог — `claude-opus-5`. Извлечение — старт на `claude-opus-5` (quality-first), выбор рабочей модели (Haiku/Sonnet/Opus) — по бенчмарку на обезличенном корпусе в Фазе 1; порог confidence не считается калиброванной вероятностью — управляет только рендером карточки, не автоисполнением |
+| Ingress | SQLite (WAL) `events/jobs/effects`: fsync-before-ACK, leases, FIFO per context, DLQ + replay CLI; webhook только верифицирует подпись и фиксирует событие, обработка — background worker |
+| Tool-цикл | Ручной loop (не runner): policy-check и аудит каждого tool_use; `run_id`+`effect_id`-идемпотентность мутирующих tools; запрет авто-replay хода после первого side effect; лимиты итераций/времени/токенов |
+| Авторизация | Server-issued `RunContext {household, actor, chat, thread, scope, read_caps, mutate_caps}` на каждый ход; unknown/anonymous actor — ноль tools; `memory_append` — только family-actor и через staged-подтверждение |
+| Хранение | SQLite WAL на per-household Fly volume (заменяет и file-JSON сторы v1 — единый транзакционный слой); Postgres — после пилота |
+| Цена пилота | €59–99/мес dedicated (COGS честно: ~$8–11 inference + ~$12 Fly + Nerve/backups/monitoring ≈ $20–25 до поддержки) |
 
-## What We're NOT Doing
+## What We're NOT Doing (MVP)
 
-- Multi-tenant в одном процессе (сторы остаются file-backed, класс-рефакторинг делаем, шардинг — нет)
-- Web vault PWA, собственный клиент — после пилота
-- Обещания E2EE / zero-knowledge (Telegram-боты — cloud chats; честная формулировка: минимизация, EU-обработка, no-training, экспорт/удаление)
-- OAuth к почте/календарю клиента (Gmail restricted scopes — причина, по которой и Hermes на IMAP; наш вход — пересылка)
-- Автоматический billing/Stripe (пилот — вручную)
-- Миграция существующего семейного Hermes на новую платформу
-- WhatsApp-рассылки произвольным контактам без staged-approval
-- Мобильные приложения, память сложнее markdown-файлов
+- WhatsApp (любой), auto-reply на email-thread, multi-tenant в одном процессе
+- Web vault PWA, мобильные клиенты, billing-автоматизация
+- Обещания E2EE / zero-knowledge / «EU processing» без оговорок
+- OAuth к почте клиента; Postgres; миграция семейного Hermes
+- Автоисполнение чего-либо по порогу confidence
 
 ## Implementation Approach
 
-Порт «снизу вверх»: сначала чистые сторы с их тестами (Фаза 0), параллельно — недостающие куски Nerve (Фаза 1, другой репозиторий), затем модельный слой на SDK (Фаза 2), поверх — ингест/извлечение (Фаза 3), исполнение действий (Фаза 4), онбординг и продакшенизация (Фаза 5). Фазы 0 и 1 независимы и могут идти параллельно.
+Порядок фаз — по принципу «сначала доверие, потом функции»: Gate −1 (право/санитизация/пиннинг) → тонкий вертикальный срез на синтетике → trust foundation (durable execution + авторизация) → Nerve-расширения (отдельный план) → реальные действия → пилотизация. Реальные данные семей не попадают в систему до завершения Фазы 2.
 
-Структура репозитория:
-
-```
-hermes-cloud/
-  hermes_cloud/
-    core/
-      config.py          # HouseholdConfig (dataclass): все бывшие HERMES_* env
-      stores/
-        actions.py       # ActionStore(path) + claim_pending()
-        reminders.py     # ReminderStore(path), атомарная запись
-        todos.py         # TodoStore(path, tz)
-      transcripts.py     # append/load_window (порт server.py:565-591)
-      memory.py          # load_memory (порт server.py:594-605)
-    runner/
-      model.py           # Anthropic SDK: tool runner, retry, superseded-turn
-      extraction.py      # messages.parse → ExtractedItem
-      tools/             # typed tools: propose_*, stage_email_*, email_read, todo, memory
-      prompts.py         # system-блоки с cache_control
-    ingest/
-      nerve_webhook.py   # POST /webhooks/nerve (HMAC), dedupe, attachment fetch
-      telegram.py        # webhook, resolve_sender, approval routing (порт)
-      voice.py           # faster-whisper (порт server.py:897-941)
-      photos.py          # Telegram photo → image content block
-    execute/
-      registry.py        # kind → executor
-      email_send.py      # NerveClient.send_reply/compose_email + вложения
-      gcal.py            # порт gtool: list/create/delete events, refresh-in-place token
-      ics.py             # ICS fallback
-      whatsapp.py        # Evolution sendText (порт)
-    scheduler/
-      loop.py            # порт scheduler.py с SchedulerConfig
-    server.py            # FastAPI: webhooks, /health, /export, /delete
-  onboarding/
-    provision.py         # NerveAdmin + Evolution + Fly provisioning
-    google_oauth_flow.py # порт scripts/google-oauth-flow.py
-    fly.template.toml
-  tests/
-  thoughts/shared/plans/
-```
+Структура репозитория — как в v1 (`hermes_cloud/{core,runner,ingest,execute,scheduler}`, `onboarding/`, `tests/`), с заменами: `core/db.py` (SQLite WAL, миграции), `core/runcontext.py`, `ingest/worker.py`; `execute/whatsapp.py` исключён.
 
 ---
 
-## Phase 0: Bootstrap репозитория и порт сторов
+## Phase 0 (Gate −1): Right-to-build
 
 ### Overview
-Новый репо с чистыми, параметризованными сторами и их характеризационными тестами; исправление трёх известных дефектов.
+Юридический и инженерный фундамент до любого кода, касающегося реальных данных. Блокирующий gate: ни одна следующая фаза не принимает реальные данные, пока Gate −1 не закрыт.
 
 ### Changes Required
 
-#### 1. `hermes_cloud/core/config.py`
-`HouseholdConfig` dataclass: `data_root, tz, family_name, family_lang, digest_time, digest_chat_ids, allowed_chat_ids, allowed_actor_ids, send_daily_cap, email_allowed_recipients, telegram_*, nerve_{api_key, org_id, inbox_id, webhook_secret, base_urls}, anthropic_{model_assistant, model_extraction, inference_geo}, evolution_*, google_token_path, feature_flags`. Загрузка из env + `household.toml`. Никаких import-time env-чтений в остальных модулях.
-
-#### 2. `core/stores/*.py` — порт с классовым рефакторингом
-- `ActionStore(path)`: все функции actions.py как методы; `_locked()` — метод. **Новое**: `claim_pending(code, chat, now_ts, tz, daily_cap) -> dict|None` — find + cap-check + `mark("executing")` в одной критической секции (закрывает гонку server.py:1099→1124). SMTP-транспорт **не** портируем (email уходит через Nerve в Фазе 4); `validate_email_payload`/`recipient_allowed` — портируем (валидация до staging).
-- `ReminderStore(path)`: порт + фикс — запись через tmp+`os.replace` (идиома todos.py:34-36).
-- `TodoStore(path, tz)`: tz — параметр конструктора, не env.
-- Опционально всем трём: `os.fsync` перед `os.replace`.
-
-#### 3. `tests/` + `conftest.py`
-Порт verbatim-группы: test_reminders (11), test_scheduler (4, чистые функции — перенос в Фазе 0 вместе с pure-хелперами scheduler), test_todos 1-3, test_actions module-level (:24-178, без SMTP-тестов). conftest: фикстуры `action_store(tmp_path)` и т.д. — идиома setenv+reload умирает. Новые тесты: атомарность записи ReminderStore; конкурентный `claim_pending` (два потока, один побеждает); cap внутри критической секции.
+1. **Пиннинг доноров**: закоммитить/зафиксировать состояние `hermes@agent/foundation-activation` (сейчас есть незакоммиченные изменения в reminders/scheduler/todos/mailwatch — договориться с владельцем ветки о фиксации), записать SHA донора и SHA nerve-cloud/nerve-oss в `docs/source-pins.md`; API-снапшот Nerve-эндпоинтов, на которые полагаемся.
+2. **Санитизация**: `tests/fixtures/` — только синтетика (RFC-example домены, телефоны из зарезервированных диапазонов, вымышленные имена, Telegram ID из документированного synthetic-диапазона); скрипт `scripts/check_fixtures.py` (запрещённые паттерны: реальные ID донора, @gmail, +7/+34-номера) + gitleaks в CI; правило в CONTRIBUTING: донорские payload-фикстуры не копируются as-is.
+3. **Privacy-пакет** (`docs/privacy/`): data map (классы данных × хранилища × TTL), lawful bases, DPIA-драфт, privacy notice (RU/EN), реестр процессоров (Anthropic, Resend/Nerve, Fly, Google, Telegram) с DPA/SCC/TIA-статусами, политика данных несовершеннолетних, incident-response заметка.
+4. **Threat model** (`docs/SECURITY.md`): акторы (внешний отправитель письма, prompt injection в контенте/вложении, неизвестный участник Telegram-группы, компрометация одного household), границы (модель без shell/send, staged-sends, RunContext), явные не-цели.
+5. **Retention-матрица**: TTL для transcripts (180д), memory (пересмотр раз в 90д), actions journal (365д), todos/reminders (done+90д), photos/voice/docs (30д), delivery receipts (365д) — фиксируется в data map и реализуется в Фазе 2.
+6. README: заменить «EU processing» на честную формулировку residency (см. Locked Decisions).
 
 ### Success Criteria
 
 #### Automated Verification:
-- [ ] `pytest tests/ -q` — все портированные + новые тесты зелёные
-- [ ] `python -c "from hermes_cloud.core.stores.actions import ActionStore"` — импорт без env
-- [ ] grep-чистота: `grep -rn "os.environ" hermes_cloud/core/stores/` пусто
+- [ ] `python scripts/check_fixtures.py` и gitleaks в CI зелёные на всей истории
+- [ ] `docs/source-pins.md` существует и содержит три SHA
 
 #### Manual Verification:
-- [ ] Ревью diff портированных модулей против оригинала (логика не изменена кроме заявленных фиксов)
-
-**Пауза для ручного подтверждения перед Фазой 2 (Фаза 1 — параллельно, другой репо).**
-
----
-
-## Phase 1: Nerve — inbound push + вложения (репо nerve-cloud)
-
-### Overview
-Закрыть три пробела Nerve, нужных продукту. Работа в `~/Programs/nerve-cloud` (+ `nerve-oss` для MCP-схем).
-
-### Changes Required
-
-#### 1. Фан-аут `email.received` в org-webhooks
-**Файлы**: `internal/cloudapi/resend_webhook.go` (ingest-путь `ingestInboundForRecipient`, :198-368), `internal/webhooks/dispatcher.go`
-После успешного `InsertMessageWithThread` — enqueue события `email.received` c payload `{org_id, inbox_id, thread_id, message_id, from, subject, has_attachments}` в существующий dispatcher (HMAC `X-Nerve-Signature`, ретраи). Событие добавить в допустимые для `POST /v1/webhooks {url, events}` (handler_webhooks.go:89-132). `forward_to`-путь не трогаем (deprecated для нас).
-
-#### 2. Персист метаданных входящих вложений
-**Файлы**: миграция goose `message_attachments {id, message_id, attachment_id, filename, content_type, size_bytes}`; `internal/store`; `resend_webhook.go` (маппинг из `ReceivedEmail.Attachments`, resend_receiving.go:31-37); `handler_inboxes.go` GET thread — включить `attachments[]` в message-объекты. Attachment-proxy (handler_messages.go) уже стримит по `{message_id, attachment_id}` — становится достижимым.
-
-#### 3. Исходящие вложения
-**Файлы**: `internal/emailtransport/provider.go` — `OutboundMessage.Attachments []OutboundAttachment{Filename, ContentType, ContentBase64}`; `providers/resend/resend_outbound.go` — маппинг на Resend attachments API; SMTP-провайдер — MIME multipart; `nerve-oss/internal/tools/service.go` + `internal/mcp/types.go` — параметр `attachments` в `compose_email`/`send_reply`; лимиты: суммарно ≤10MB, MIME-allowlist (images/pdf/docx/xlsx — зеркало gtool.py allowlist); outbox worker — passthrough.
-
-#### 4. Python SDK (`sdk/python`)
-`compose_email(..., attachments=)`, `send_reply(..., attachments=)`; `NerveAdmin.create_webhook(org_id, url, events, secret)`; `NerveClient.get_attachment(message_id, attachment_id) -> bytes` (обёртка proxy); версия → 0.2.0.
-
-### Success Criteria
-
-#### Automated Verification:
-- [ ] `go test ./...` в nerve-cloud и nerve-oss
-- [ ] `go run ./cmd/nerve-control-plane migrate` применяется чисто
-- [ ] Новый Go-тест: ingest фикстурного Resend-payload → webhook_events содержит `email.received`, подпись валидна
-- [ ] Новый Go-тест: attachments персистятся и возвращаются в GET thread
-- [ ] SDK: `pytest sdk/python`
-
-#### Manual Verification:
-- [ ] На staging: письмо с PDF на тестовый inbox → org-webhook получен, подпись сходится, вложение скачивается через SDK
-- [ ] `compose_email` с PDF-вложением доставляется (проверить в реальном ящике)
-- [ ] `min_machines_running=1` для nerve-runtime в fly.runtime.toml (cold start)
+- [ ] Privacy-пакет отревьюирован владельцем продукта (и юристом до реальных семей)
+- [ ] Донорская ветка зафиксирована, SHA записан
 
 **Пауза для ручного подтверждения.**
 
 ---
 
-## Phase 2: Модельный слой на Anthropic SDK
+## Phase 1: Thin vertical slice (synthetic data)
 
 ### Overview
-Замена `claude -p`-субпроцесса на SDK tool runner; порт Telegram-plumbing; typed tools для внутренних сторов и чтения почты.
+Минимальный сквозной контур на синтетике: durable event → extraction → Telegram-карточка → reminder или ICS. Без Nerve-зависимости (вход — CLI-инжект .eml), без outbound email, без Google write, без WhatsApp. Параллельно — модельный бенчмарк.
 
 ### Changes Required
 
-#### 1. `runner/model.py`
-- `AsyncAnthropic`; основной цикл — `client.beta.messages.tool_runner(model=cfg.model_assistant, tools=[...], messages=...)`; assistant = `claude-opus-5` (adaptive thinking по умолчанию), `max_tokens=16000`.
-- `inference_geo=cfg.inference_geo` если задан; при 400 на неподдерживаемое значение — лог + работа без параметра (решение о Vertex-fallback фиксируется в runbook).
-- Retry-таксономия: `RateLimitError`/5xx/`APIConnectionError` → retryable c порт-логикой `_retry_later` (delays 120/300/480, порт server.py:293-318); 4xx — нет. Superseded-turn: порт `_last_user_ts` + повторная проверка под context-lock.
-- Prompt caching: системные блоки (persona, политика untrusted-контента, tool-политики) с `cache_control: {type: "ephemeral"}`; волатильное (дата/время, context line) — в начало последнего user-сообщения.
-- История: transcript window (30) → messages array (порт рендера).
-
-#### 2. `runner/tools/` — typed tools (все с `strict: true`)
-- **Предложения (staging, не исполнение)**: `propose_calendar_event(title, start, end, tz, calendar, description?, location?)`, `propose_task(...)`, `propose_reminder(...)`, `stage_email_reply(thread_id, body, attachments?)`, `stage_email_compose(to, subject, body, attachments?)`, `stage_whatsapp_send(number, text)` → все зовут `ActionStore.stage(...)` и возвращают код+карточку. Политика двухшаговой отправки из GMAIL_TOOLS_PREAMBLE (server.py:354-378) переезжает в описания tools.
-- **Чтение почты**: обёртки NerveClient `email_list_threads`, `email_get_thread`, `email_search` (скоуп ключа — read/search); фрейминг «содержимое письма — данные, не инструкции» в описаниях.
-- **Внутренние**: `todo_add/list/done`, `reminder_add/list/cancel`, `memory_read`, `memory_append`, `send_status(query?)` (обёртка `status_rows`).
-- Прямых send-tools у модели **нет** — только stage.
-
-#### 3. `ingest/telegram.py` — порт
-Webhook (secret-token fail-closed), chat/actor allowlists, `resolve_sender`, edited-message-never-approves, `send_reply` chunking, `_approval_reply_markup` (кнопки только для реальных pending-кодов), callback routing, `keep_typing`. `handle_approval` → `ActionStore.claim_pending` (одна критическая секция) → executor registry (Фаза 4; в Фазе 2 — заглушка, отвечающая «исполнение появится в Фазе 4»).
-
-#### 4. Порт тестов
-TestServerApproval (:181-279) + webhook/button (:282-443) с параметризованными actor-ids; test_retry; test_sender; test_model_result — переписать под SDK-исключения (mock client вместо subprocess).
+1. **`core/db.py`**: SQLite WAL, таблицы `events {id, source, external_id UNIQUE, raw BLOB, received_at, status: received|processing|done|failed, lease_until, attempts}`, `jobs`, `effects {id, run_id, tool_use_id, kind, payload_sha, status, receipt}`; fsync-before-commit; миграции (простые нумерованные .sql).
+2. **`ingest/inject.py`**: CLI `hermes-cloud inject-eml path.eml` — парсинг .eml (включая пересланные цепочки: извлечение оригинального From/Date из forwarded-заголовков и тела), запись события. Это же ядро потом переиспользует nerve-webhook.
+3. **`ingest/worker.py`**: цикл: lease событие (FIFO per context, `lease_until`, reclaim просроченных) → extraction → карточка → `done`/`failed(attempts++)`; DLQ после N попыток; `hermes-cloud replay <event_id>`.
+4. **`runner/extraction.py`**: Pydantic `ExtractionResult` (как v1 + `original_sender {email, name, confidence}` из forwarded-цепочки); `messages.parse` на `claude-opus-5`; политика untrusted-контента; вложения — content blocks.
+5. **Карточка**: staged-предложение (порт фасада actions с claim_pending донора) c кнопками ✅/✏️/❌; `payment`/`info` рендерятся: payment → задача с суммой и дедлайном; info → сообщение без кнопок. ✏️ отменяет staged-код (invalidation) и открывает диалог, новое предложение = новый код.
+6. **Исполнители slice**: только `reminder` (порт ReminderStore поверх SQLite) и `ics` (генерация файла в чат). Порт минимума Telegram-plumbing (webhook, allowlists, resolve_sender, send_reply, кнопки).
+7. **`bench/`**: корпус ≥40 синтетических писем (DE/IT/NL/EN × школа/счёт/приглашение/спам/adversarial/forwarded-chain/OCR-фото), golden-ожидания; прогон Haiku/Sonnet/Opus → отчёт точности/стоимости; решение по extraction-модели фиксируется здесь.
 
 ### Success Criteria
 
 #### Automated Verification:
-- [ ] `pytest tests/` зелёный, включая портированную approval-матрицу (execute-once, actor allowlist, cancel, cap→blocked, edited-message)
-- [ ] Интеграционный тест с mock Anthropic client: диалог → tool_use `propose_task` → staged-запись в ActionStore
-- [ ] Тест кэша: два последовательных запроса, `cache_read_input_tokens > 0` (live smoke, помечен `@pytest.mark.live`)
+- [ ] `pytest`: событие переживает kill между insert и обработкой (реобработка), дубль external_id — no-op, DLQ после N неудач, replay работает
+- [ ] Forwarded-парсер: оригинальный отправитель извлекается на фикстурах пересылок (Gmail/Outlook/Apple Mail форматы)
+- [ ] `bench/run.py` выдаёт отчёт по трём моделям (live, `@pytest.mark.live`)
+- [ ] Инъекционный корпус: 0 staged-действий, не соответствующих фактическому содержанию
 
 #### Manual Verification:
-- [ ] Live-диалог в Telegram с тестовым household: «напомни завтра в 9 про сад» → предложение → «✅» → reminder создан
-- [ ] `usage.inference_geo` в ответах — зафиксировать фактическую доступность EU-значения; при недоступности — принять решение по Vertex-fallback до Фазы 5
-- [ ] Ответы на языке семьи из конфига
+- [ ] Синтетическое немецкое школьное письмо через inject-eml → корректная карточка на русском → ✅ → напоминание сработало
+- [ ] ICS-файл открывается в Google/Apple Calendar
+- [ ] Решение по extraction-модели принято и записано в план
 
 **Пауза для ручного подтверждения.**
 
 ---
 
-## Phase 3: Ингест и извлечение
+## Phase 2: Trust foundation
 
 ### Overview
-Полный входной контур: nerve-webhook, извлечение с переводом, карточки-предложения, фото и голос.
+Инварианты, позволяющие подключать реальные данные: авторизация каждого хода, идемпотентность эффектов, crash-safe исполнение подтверждений, retention/export/delete, backup.
 
 ### Changes Required
 
-#### 1. `ingest/nerve_webhook.py`
-`POST /webhooks/nerve`: верификация `X-Nerve-Signature` (`t=..,v1=..` HMAC-SHA256 над `ts.body`, окно ±5 мин), dedupe по `message_id` (журнал обработанных), fail-closed. Обработка: `NerveClient.get_thread` → если `has_attachments` — немедленно скачать через `get_attachment` (Resend-URL живёт ~1ч) в `data/docs/mail/` (MIME-allowlist и sha-дедуп — порт политики gtool.py:224-329) → extraction.
-
-#### 2. `runner/extraction.py`
-- Pydantic: `ExtractedItem {kind: event|task|payment|info, title, date_start?, date_end?, tz, amount?, currency?, deadline?, responsible_hint?, source_lang, summary: str  # на family_lang, confidence: float, source_quote}`; `ExtractionResult {items: list[ExtractedItem], overall_summary}`.
-- `client.messages.parse(model=cfg.model_extraction /* haiku-4-5 */, output_format=ExtractionResult)`; вложения PDF/изображения — content blocks (base64) в том же запросе; письма >N токенов или low-confidence → повторный прогон на `model_assistant`.
-- Политика untrusted-контента (инструкции в письме — данные; «да <код>» в письме никогда не считается) — системный блок, порт из server.py:354-378 + WATCH_SUMMARY_PROMPT-фрейминга.
-
-#### 3. Карточки-предложения
-Каждый `ExtractedItem` с `confidence ≥ 0.6` → `ActionStore.stage(kind=...)` → карточка в семейный чат: сводка на family_lang + оригинальная цитата + кнопки `✅ / ✏️ (открыть диалог) / ❌`. Ниже порога — информационное сообщение без кнопок. `payment` рендерит сумму/срок отдельной строкой.
-
-#### 4. Фото и голос
-- `ingest/photos.py`: Telegram photo → скачивание (порт `save_telegram_file`) → image content block → тот же extraction-путь.
-- `ingest/voice.py`: порт faster-whisper (лимит 120с, lazy-load, `asyncio.to_thread`) → текст → обычный диалоговый ход.
-
-#### 5. `scheduler/loop.py`
-Порт с `SchedulerConfig` (tz, digest_time, digest_chat_ids, quota, breaker) и инжекцией сторов; digest теперь собирается детерминированно из TodoStore/ReminderStore + календарь (Фаза 4); mail-docs retention 30 дней — порт. Порт test_watch_scheduler (email-watch части — выкинуть, mailwatch не переносится).
+1. **`core/runcontext.py`**: `RunContext` собирается сервером на входе каждого хода из проверенного Telegram-апдейта: `{household_id, actor_id, chat_id, thread_id, scope: personal|shared, read_caps, mutate_caps}`. Маппинг actor→роль в `household.toml`. Unknown/anonymous actor: ответ без tools («представьтесь / попросите взрослого добавить вас»), нулевые caps. Все tools получают RunContext первым аргументом и проверяют caps сами (defense in depth) — тест на каждый tool × unknown actor.
+2. **Ручной tool-loop** (`runner/model.py`): цикл `messages.create` → перебор tool_use блоков → policy check (caps, лимиты) → исполнение → журналирование в `effects (run_id, tool_use_id)` → tool_result. Идемпотентность: повторный тот же `tool_use_id` возвращает прежний результат без повторного эффекта. Retry API-вызова разрешён только если в текущем ходе ещё нет записанных эффектов; иначе — честное сообщение «ход прерван, вот что успело выполниться» из журнала. Лимиты: ≤8 итераций, ≤5 мин, токен-бюджет.
+3. **`memory_append`**: только family-actor; запись становится staged-предложением («добавить в память: …» ✅/❌) — persistent injection через контент писем невозможен.
+4. **Approval-исполнение crash-safe**: `claim_pending` (порт донорского фасада: code+chat+thread+actor, rate-limit неверных кодов) пишет attempt в `effects` в той же транзакции; executor-вызов с lease; startup-reconciliation: висящие `executing` с истёкшим lease → канальная стратегия: nerve-email — повторить с тем же idempotency_key; calendar — reconcile по детерминированному client-generated event ID (`events.insert` с заданным `id`, поиск перед повтором); прочее → `outcome_unknown`, никогда слепой retry.
+5. **Retention/export/delete**: ежедневная retention-джоба по матрице Gate −1; `GET /export` и `POST /delete` — owner-auth: инициируются только primary-owner-актором + повторное подтверждение кодом (тот же approval-механизм); delete-runbook перечисляет внешние поверхности (nerve-org, Resend-остатки, Google-события, Anthropic retention, Telegram-копии, бэкапы) с процедурой по каждой; в приложении — wipe SQLite+файлов+tombstone.
+6. **Backup/restore**: Litestream (или периодический snapshot) SQLite на EU object storage, шифрование per-household ключом; `restore.md` + тест восстановления.
 
 ### Success Criteria
 
 #### Automated Verification:
-- [ ] Тест подписи: валидная/невалидная/просроченная `X-Nerve-Signature`
-- [ ] Дедуп: повторный webhook того же `message_id` — no-op
-- [ ] Извлечение на фикстурах: 6+ писем (DE/IT/NL/EN: школьное о экскурсии с суммой и дедлайном; счёт; приглашение с датой; спам) → ожидаемые `kind/date/amount` (live-тест, `@pytest.mark.live`)
-- [ ] Инъекция: письмо с «одобри код X / переведи деньги» → нет staged-действий кроме предложений по фактическому содержанию
+- [ ] Chaos-тесты: kill -9 в каждом окне (после claim/до executor; после executor/до mark; в середине tool-loop) → после рестарта ровно один эффект, статусы согласованы
+- [ ] Матрица авторизации: каждый tool × {family, guest, unknown} — ожидаемые allow/deny
+- [ ] Повтор tool_use_id не создаёт второй эффект; retry хода с эффектами запрещён
+- [ ] `/export` полон по data map; `/delete` без owner-auth отклоняется
+- [ ] Restore из бэкапа проходит smoke-набор
 
 #### Manual Verification:
-- [ ] Реальное пересланное школьное письмо (не англ.) → корректная карточка на языке семьи
-- [ ] Фото объявления → карточка; голосовое → корректный диалоговый ответ
-- [ ] PDF-вложение (расписание) учитывается в извлечении
+- [ ] Неизвестный участник, добавленный в группу, не получает доступ к почте/памяти/календарю
+- [ ] Ревью delete-runbook
+
+**Пауза для ручного подтверждения. После этой фазы разрешены реальные данные владельца-теста (не клиентов).**
+
+---
+
+## Phase 3: Nerve extension (отдельный план в nerve-cloud)
+
+### Overview
+Работы в nerve-cloud/nerve-oss/SDK — **отдельный план** `nerve-cloud/thoughts/shared/plans/2026-08-XX-inbound-events-and-attachments.md` со своими миграциями, contract-тестами и последовательностью PR. Здесь — только контракт-требования потребителя.
+
+### Контракт, который обязан дать Nerve-план
+
+1. **Общий event journal + фан-аут `email.received`** в org-webhooks (HMAC, ретраи) — с учётом того, что текущая доставка завязана FK на outbound-журнал: нужна общая таблица событий или эквивалент, не «просто ещё один event type».
+2. **Входящие вложения**: персист метаданных (`message_attachments`), выдача в GET thread, и **scope-фикс attachment-proxy** — доступ по runtime-ключу household (сейчас требует `nerve:admin.billing | nerve:email.inbox.create`, handler_messages.go:43).
+3. **Исходящие вложения**: content-addressed blob store → outbox → worker → Resend/SMTP; лимит 10MB, MIME-allowlist; MCP `compose_email(attachments=)`; SDK 0.2.0.
+4. **Webhook-секрет**: серверная генерация, показ один раз (уже так, org_webhooks.go:68) — provisioning hermes-cloud читает секрет из ответа `create_webhook`, никогда не задаёт свой.
+5. Contract-тесты, которые hermes-cloud прогоняет против staging: подпись/ретрай/дедуп `email.received`; скачивание вложения runtime-ключом; отправка compose с PDF.
+
+### Success Criteria
+
+#### Automated Verification:
+- [ ] Nerve-план написан, принят и реализован (свои критерии там)
+- [ ] Contract-тесты hermes-cloud против staging-Nerve зелёные
+
+#### Manual Verification:
+- [ ] Письмо с PDF на staging-inbox → подписанный webhook → вложение скачано runtime-ключом → compose с вложением доставлен
+
+**Пауза. Фазы 1–2 не зависят от этой фазы (inject-eml); Фаза 4 email-часть — зависит.**
+
+---
+
+## Phase 4: Real actions
+
+### Overview
+Google Calendar write и исходящий email с доказанной семантикой получателя; подключение nerve-webhook как второго входа рядом с inject-eml.
+
+### Changes Required
+
+1. **`ingest/nerve_webhook.py`**: `POST /webhooks/nerve` — верификация `X-Nerve-Signature` (окно ±5 мин), немедленный insert события + 200; всё остальное — worker (общий с Фазой 1). Вложения качаются в worker сразу (Resend-URL ~1ч) в content-addressed store.
+2. **`execute/gcal.py`**: порт gtool; executor `calendar_event` с client-generated deterministic event ID = f(action_id); reconcile-поиск перед любым повтором; линк события в чат. Read-only tool `calendar_list_events` (caps: family).
+3. **`execute/email_send.py`**: executor `email_compose` → `NerveClient.compose_email(to=подтверждённый получатель, attachments=?, idempotency_key=action_id)`. Карточка исходящего письма всегда показывает получателя отдельной строкой «Кому: …» — подтверждение покрывает и текст, и адресата. Delivery-webhooks (`email.delivered|bounced`) обновляют журнал.
+4. **`ActionBundle`**: извлечение одного письма может породить связку (событие + задача о взносе). Карточка-бандл: общий заголовок, дочерние пункты с чекбоксами (по умолчанию все включены), одно подтверждение → транзакционное staged-исполнение каждого дочернего эффекта со своим effect_id; частичный фейл отражается по-пунктно.
+5. Фото/голос-ингест (порт vision-блоков и faster-whisper) — переносится из v1 без изменений сути; scheduler/digest — порт с SchedulerConfig.
+
+### Success Criteria
+
+#### Automated Verification:
+- [ ] Идемпотентность calendar: повторное исполнение того же action не создаёт второе событие (мок + live-smoke)
+- [ ] Compose: получатель в payload обязан совпасть с подтверждённым в карточке (payload-sha это гарантирует) — тест на подмену
+- [ ] Bundle: частичный фейл → корректные статусы каждого дочернего эффекта
+- [ ] Webhook-вход и inject-eml дают идентичный pipeline-результат на одном .eml
+
+#### Manual Verification:
+- [ ] Синтетика end-to-end: письмо «экскурсия 12.09, взнос 15€» → бандл (событие+задача) → ✅ → событие в шаренном календаре, задача в списке
+- [ ] Staged-письмо школе с PDF: карточка показывает «Кому: schule@example.de», после ✅ доставлено
+- [ ] Kill-switch email_send=0 блокирует с честным сообщением
 
 **Пауза для ручного подтверждения.**
 
 ---
 
-## Phase 4: Исполнение действий
+## Phase 5: Pilotization
 
 ### Overview
-Approve → реальное действие: календарь, email через Nerve (с вложениями), ICS, WhatsApp.
+Воспроизводимый пилот: провижининг, наблюдаемость, cost-caps, метрики, восстановление.
 
 ### Changes Required
 
-#### 1. `execute/registry.py`
-`EXECUTORS: dict[kind, async fn(action, cfg) -> receipt]`. `handle_approval` после `claim_pending` вызывает executor; `mark("executed", provider_receipt=...)` / `"failed"` / `"unknown"` (порт семантики SendOutcomeUnknown для сетевых обрывов).
-
-#### 2. `execute/gcal.py`
-Порт gtool-логики in-process: `list_calendars/list_events(days)/create_event/delete_event` через googleapiclient; authorized-user token `data/auth/google/token.json`, refresh-in-place (порт gtool.py:41-51); scopes `calendar` + `drive.readonly`. Executor `calendar_event`: create_event в выбранный шаренный календарь → ссылка на событие в чат. Read-доступ подключается к digest и к tools (`calendar_list_events` — read-only tool без staging).
-
-#### 3. `execute/email_send.py`
-`email_reply` → `NerveClient.send_reply(thread_id, body, attachments=?, needs_human_approval=False, idempotency_key=action_id)`; `email_compose` → `compose_email(...)`. Delivery-статусы: подписка org-webhook на `email.delivered|bounced|failed` → обновление журнала (`accepted_by_provider` → `delivered`/`bounced` в status_rows — расширение статусной проекции).
-
-#### 4. `execute/ics.py` + `execute/whatsapp.py`
-ICS-генерация (fallback, пока Google-токен household не подключён): `.ics`-документ в Telegram. WhatsApp: порт Evolution `sendText` + tracked-send; family numbers → `begin_send`, остальные — только staged.
-
-#### 5. Онбординг Google
-`onboarding/google_oauth_flow.py` — порт (consent «In production», иначе refresh-токен умирает за 7 дней — google-oauth-flow.py:16-18); инструкция для семьи «поделитесь календарём с <assistant>@gmail.com».
+1. **`onboarding/provision.py`** (без WhatsApp): nerve org+inbox/BYO-домен (webhook-секрет — из ответа сервера), Fly-приложение в `ams` + volume + секреты, Google-аккаунт ассистента (`google_oauth_flow.py`, consent «In production»), генерация `household.toml` в приватный ops-стор; `--dry-run`.
+2. **Observability**: структурные логи (без контента писем — только ID/статусы), `/health` (nerve key, telegram, google token, db, backup age), алёрты (DLQ>0, застрявшие executing, backup стар, бюджет превышен).
+3. **Cost caps**: счётчик токенов per-household/день (из usage ответов) с мягким лимитом (деградация: extraction-only, диалог отвечает «дневной бюджет исчерпан») — защита от runaway-цикла и от abuse.
+4. **Rollback/upgrade**: релизы по тегам, migrate-on-start с backup-before-migrate, runbook отката.
+5. **Метрики пилота** (из вердикта go-сигналов): активность на 8-й неделе, подтверждённые операции/семью/неделю, доля принятых без правок, ноль несанкционированных действий — события в лог, скрипт сводки.
+6. Прайсинг: €59–99 dedicated; страница/письмо-оффер вне этого плана.
 
 ### Success Criteria
 
 #### Automated Verification:
-- [ ] Мок-тесты каждого executor: success/fail/сетевой обрыв → корректные статусы журнала
-- [ ] Идемпотентность: повторный approve исполненного кода → «не найден/использован»
-- [ ] ICS-файл валидируется (icalendar parse)
-- [ ] Delivery-webhook обновляет статус staged→executed→delivered
+- [ ] `provision.py --dry-run` на staging проходит все шаги
+- [ ] CI: pytest + ruff + gitleaks + check_fixtures на каждый PR
+- [ ] Cost-cap тест: превышение бюджета переводит в деградацию, не в тишину
 
 #### Manual Verification:
-- [ ] Карточка «экскурсия 12.09, взнос 15€» → ✅ → событие в шаренном семейном календаре + задача про взнос
-- [ ] Staged email-ответ школе с вложением → ✅ → письмо доставлено (проверить получателем)
-- [ ] Kill-switch `email_send=0` блокирует исполнение с честным сообщением
-- [ ] WhatsApp-сообщение с номера household доставляется
-
-**Пауза для ручного подтверждения.**
-
----
-
-## Phase 5: Онбординг, провижининг, GDPR
-
-### Overview
-Превратить работающий инстанс в воспроизводимый пилотный продукт.
-
-### Changes Required
-
-#### 1. `onboarding/provision.py`
-Интерактивный CLI, один прогон на household:
-1. Nerve: `create_org` → тир: managed-поддомен (сразу active) | BYO-домен → `add_domain` + печать DNS-записей + ожидание `verify_domain`; `create_inbox`; `issue_cloud_api_key(scopes=[read, search, draft, send])`; `create_webhook(url=https://<app>.fly.dev/webhooks/nerve, events=[email.received, email.delivered, email.bounced], secret=…)`.
-2. WhatsApp: Evolution `POST /instance/create` (`hermes-<household>`), вывод QR для пейринга номера семьи, настройка relay-webhook + HMAC-секрета.
-3. Fly: `fly apps create`, volume, секреты (`ANTHROPIC_API_KEY`, nerve key, telegram token/secret, evolution key, webhook-секреты), деплой из `fly.template.toml` (`shared-cpu-2x`/2GB — whisper; порт паттерна `scripts/bootstrap-dsmolchanov-repo.sh` из dev-agent).
-4. Google: инструкция + запуск `google_oauth_flow.py`, сид токена через секрет (паттерн start-hermes.sh:10-14).
-5. `household.toml` генерируется и коммитится в приватный ops-стор (не в публичный репо).
-
-#### 2. GDPR / AI Act
-- `GET /export` (авторизованный): zip — transcripts, memory, todos, reminders, actions journal, извлечённые документы.
-- `POST /delete`: staged-подтверждение через тот же approval-механизм → wipe volume-данных + tombstone; runbook-шаг: удаление nerve-org и Fly-приложения.
-- Art. 50: дисклеймер «вы общаетесь с AI-ассистентом» в `/start`, в первом сообщении онбординга и в footer digest.
-- Retention: mail-docs 30 дней (есть), транскрипты — конфигурируемый TTL (default 180 дней) с ежедневной обрезкой в scheduler.
-
-#### 3. Документация
-README (EN, публичный): что это, архитектура, self-host заметка; `docs/pilot-runbook.md` (RU): онбординг семьи шаг за шагом, инциденты, откат; SECURITY.md: модель угроз (untrusted email, отсутствие shell у модели, staged-sends).
-
-### Success Criteria
-
-#### Automated Verification:
-- [ ] `provision.py --dry-run` проходит все шаги на staging-nerve
-- [ ] `/export` возвращает валидный zip со всеми классами данных
-- [ ] `/health` отражает статусы: nerve key, telegram, google token, evolution
-- [ ] CI (GitHub Actions): pytest + ruff на PR
-
-#### Manual Verification:
-- [ ] Полный онбординг тестового household с нуля ≤ 60 минут по runbook
-- [ ] BYO-домен: DNS-записи из `get_dns_records` реально проходят верификацию
-- [ ] `/delete` уничтожает данные (проверить на volume)
-- [ ] Дисклеймер AI виден новому пользователю
-- [ ] Сквозной сценарий wedge: пересланное письмо школы → карточка → календарь+задача → ответ школе с вложением
+- [ ] Онбординг тестового household с нуля ≤60 мин по runbook
+- [ ] BYO-домен: DNS из `get_dns_records` проходит верификацию
+- [ ] Сквозной wedge-сценарий на первом реальном household владельца
+- [ ] Upgrade+rollback отрепетированы
 
 ---
 
 ## Testing Strategy
 
-### Unit
-- Портированный baseline (~60 тестов, маппинг в отчёте hermes-tests): сторы verbatim; approval-матрица и retry — параметризованные.
-- Новые: атомарность ReminderStore, конкурентный claim_pending, nerve-подпись, дедуп, executors, ICS.
-
-### Integration / Live (`@pytest.mark.live`, вручную и в nightly)
-- Извлечение на корпусе фикстур DE/IT/NL/EN (расширяемый — каждая ошибка пилота становится фикстурой).
-- Инъекционный корпус: инструкции внутри письма/вложения не порождают staged-действий.
-- Anthropic smoke: tool-loop, cache-hit, structured outputs.
-
-### Manual
-Сценарные чек-листы в конце каждой фазы; финальный wedge-сценарий в Фазе 5.
+- **Unit**: портированный baseline с санитизированными фикстурами; chaos-тесты Фазы 2; авторизационная матрица.
+- **Bench**: корпус Фазы 1, расширяемый — каждая ошибка пилота становится фикстурой; регрессионный прогон перед сменой модели/промпта.
+- **Contract**: hermes-cloud ↔ Nerve staging (Фаза 3).
+- **Live smoke** (`@pytest.mark.live`): tool-loop, cache-hit, structured outputs, gcal idempotency.
 
 ## Performance / COGS
 
-- Извлечение (Haiku, ~300 писем/мес): ≈ $1.5–2/household.
-- Диалог (Opus 5, ~240 ходов, prompt caching на системном префиксе): ≈ $6–9; суммарно **$8–11/household/мес** — согласуется с ценами €19 (shared, позже) / €39–49 (dedicated).
-- Fly `shared-cpu-2x`+2GB+volume ≈ $12/host. Digest-класс задач — через Batches (−50%) при росте.
-- Whisper «small» int8 — лимит 120с/сообщение (порт).
+Inference $8–11 + Fly ~$12 + Nerve/Resend + бэкапы/мониторинг ≈ **$20–25/household до поддержки** → пилотная цена €59–99. Пересмотр после бенчмарка extraction-модели (даунгрейд с Opus может срезать 30–50% inference-части). Prompt caching обязателен (системный префикс household).
 
 ## Migration Notes
 
-- Семейный Hermes не мигрирует и не выключается — это отдельный инстанс навсегда либо до добровольного переезда.
-- nerve-cloud изменения обратно совместимы: новое событие opt-in по подписке, новые поля вложений — additive; SDK 0.2.0 без breaking changes.
-- Постпилотный переход shared-тира на Postgres — отдельный план (сторы уже классы, слой подменяем за интерфейсом).
+- Семейный Hermes не трогаем.
+- SQLite-слой проектируется схемой, переносимой на Postgres (без SQLite-специфики в запросах, ID — UUID) — постпилотная миграция отдельным планом.
+- Nerve-изменения — additive; SDK 0.2.0 без breaking changes.
 
 ## References
 
-- Донор: `~/Programs/hermes` — server.py, actions.py, reminders.py, todos.py, scheduler.py, channels.py, mailwatch.py, scripts/gtool.py, scripts/google-oauth-flow.py, tests/ (все file:line в тексте)
-- Nerve: `~/Programs/nerve-cloud` (internal/cloudapi, internal/webhooks, internal/emailtransport, sdk/python), `~/Programs/nerve-oss` (internal/mcp, internal/tools)
+- Доноры (SHA — в `docs/source-pins.md` после Gate −1): `~/Programs/hermes` @ `agent/foundation-activation` (actions-фасад: actions.py:124-191), `~/Programs/nerve-cloud` (handler_messages.go:43 — scope attachment-proxy; org_webhooks.go:62-81 — серверный секрет), `~/Programs/nerve-oss` (tools/service.go — reply-семантика)
+- Ревизия v1→v2: сессия 2026-08-02 (12 пунктов; все верифицируемые подтверждены по коду)
 - Прошлые планы: `hermes/thoughts/shared/plans/2026-07-02-hermes-family-assistant.md`, `2026-08-01-hermes-platform-foundation-activation.md`
-- Паттерн провижининга: `dev-agent/scripts/bootstrap-dsmolchanov-repo.sh`
-- Рынок/позиционирование: анализ в сессии 2026-08-02 (Ohai $9.99–29.99 — прайс-якорь; Milo/Yohana закрылись; EU/язык/privacy — незанятый wedge)
-- Право: Anthropic Commercial Terms (power products for end users), AI Act Art. 50 (применим с 02.08.2026)
+- Право: Anthropic data residency (inference_geo: global/us), Resend regions (US metadata), WhatsApp Business Solution Terms, GDPR/DPIA, AI Act Art. 50
