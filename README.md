@@ -4,7 +4,7 @@ Family operations assistant for households living in a foreign language. Forward
 
 - **Email layer**: three options per family — a managed inbox on our domain ([Nerve](https://github.com/dsmolchanov)), your own domain (DNS verification), or direct access to your existing Gmail (label-scoped: only messages you label `Hermes` are ever read).
 - **Model layer**: Anthropic Claude API (commercial terms) — typed tools only, no shell, no direct send capability for the model.
-- **Channels**: Telegram for confirmations and notifications (WhatsApp planned post-pilot via the official WhatsApp Business Platform).
+- **Channels**: Telegram for confirmations and notifications; WhatsApp on the family's own number (QR-paired browser session — unofficial automation, risks disclosed at onboarding; official Business Platform is the GA path).
 - **Calendar**: family Google Calendar shared to a dedicated assistant account.
 - **Privacy**: EU-hosted application with documented international subprocessors (model API, email delivery) under DPA/SCC; no training on your data; per-household isolation; full export and delete.
 

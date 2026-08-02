@@ -1,6 +1,6 @@
 # Hermes Cloud — Family Ops Assistant MVP Implementation Plan (v2)
 
-> v2 после внешней ревизии 2026-08-02. Ключевые изменения против v1: fail-closed residency вместо fail-open `inference_geo`; долговечный ingress (SQLite WAL events/jobs/effects) вместо «журнала message_id»; ручной tool-loop с идемпотентными эффектами вместо автоматического runner-replay; RunContext-авторизация каждого хода; WhatsApp исключён из MVP (официальный Business Platform — post-pilot); compose вместо reply для пересланных писем; Nerve-работы вынесены в отдельный план; GDPR перенесён в Gate −1; пилотная цена €59–99.
+> v2 после внешней ревизии 2026-08-02 (+ правки владельца: три email-опции, WhatsApp возвращён в MVP как неофициальный контур с informed consent). Ключевые изменения против v1: fail-closed residency вместо fail-open `inference_geo`; долговечный ingress (SQLite WAL events/jobs/effects) вместо «журнала message_id»; ручной tool-loop с идемпотентными эффектами вместо автоматического runner-replay; RunContext-авторизация каждого хода; compose вместо reply для пересланных писем (кроме Gmail-опции, где reply возможен); Nerve-работы вынесены в отдельный план; GDPR перенесён в Gate −1; пилотная цена €59–99.
 
 ## Overview
 
@@ -35,7 +35,7 @@
 - `inference_geo` на first-party API сегодня — `global`/`us`; EU-роутинг — только Vertex AI EU (отдельный клиент/контракт). Haiku 4.5 `inference_geo` не поддерживает.
 - Nerve деплой — `iad`; Resend хранит метаданные/логи в США независимо от sending region.
 - Вывод: обещание «EU processing» в чистом виде сейчас невыполнимо → фиксируем честную формулировку и fail-closed конфигурацию (см. Locked Decisions).
-- WhatsApp: QR-пейринг Evolution = автоматизация обычного WhatsApp, для коммерческого продукта недопустим; официальный путь — WhatsApp Business Platform (EEA/Brazil AI-продукты разрешены с ограничениями). Вне MVP.
+- WhatsApp: QR-пейринг Evolution = автоматизация обычного WhatsApp Web — вне официальных условий; реальный риск — блокировка номера. Решение владельца: в MVP с informed consent семьи (номер принадлежит семье, риск раскрыт при онбординге, рекомендован выделенный номер); официальный Business Platform — GA-путь. Обязательное следствие: per-instance apikey и per-household relay-секрет (сервис-глобальный ключ Evolution — недопустим).
 - GDPR: письма школ содержат данные детей и третьих лиц → data map, lawful bases, DPIA, privacy notice, реестр процессоров, DPA/SCC/TIA, политика по несовершеннолетним — **до** кода, работающего с реальными данными.
 
 ## Desired End State
@@ -53,7 +53,7 @@ Verify: сквозной чек-лист Фазы 5 + chaos-тесты (kill -9 
 | Residency | Честная формулировка: «EU-hosted application, документированные международные передачи»: приложение и данные — Fly EU (`ams`), субпроцессоры Anthropic (global/US) и Resend (US) — под DPA/SCC в реестре процессоров. Конфиг `residency_mode: eu-app | eu-strict`; `eu-strict` требует Vertex-EU-клиент и падает при его отсутствии — **никакого молчаливого downgrade**. Пилот стартует в `eu-app`; Vertex EU — задокументированный upgrade-путь после бенчмарка |
 | Email-вход | Три опции на выбор семьи: **(a)** ящик на нашем managed-поддомене (Nerve, ноль DNS); **(b)** BYO-домен семьи + DNS-записи (Nerve, pro); **(c)** Gmail-доступ к существующей почте семьи — в пилоте через IMAP + app password (паттерн донора, без OAuth-verification), ингест **только писем с ярлыком `Hermes`** (минимизация — семья ставит ярлык или фильтр); Gmail API OAuth + verification/CASA — upgrade-путь к GA |
 | Исходящий email | Только `compose_email` (a/b — через Nerve) либо SMTP от адреса семьи (c — порт `send_email_smtp` донора) с явно подтверждённым получателем; для (a/b) оригинальный отправитель извлекается из пересланной цепочки, для (c) From виден напрямую; auto-reply на thread — вне MVP |
-| WhatsApp | **Вне MVP.** Post-pilot через официальный WhatsApp Business Platform; Evolution/QR не используется для клиентов |
+| WhatsApp | **В MVP, неофициальный контур с informed consent.** Семья предоставляет номер; пейринг — QR-код браузерной сессии (Evolution/Baileys-инстанс per household, **per-instance** apikey и per-household relay-HMAC — не сервис-глобальный ключ). Входящие на номер семьи → общий events-конвейер (учителя/школьные чаты в WA — часть wedge); исходящие — только staged approval (донорская семантика tracked-send/`SendOutcomeUnknown`). Онбординг: явное предупреждение о риске блокировки номера WhatsApp'ом + рекомендация выделенного номера/SIM. Официальный WhatsApp Business Platform — GA-путь |
 | Календарь | Семейный Google: выделенный аккаунт ассистента на household, семья шарит календари; порт gtool; клиентские детерминированные event ID + reconcile |
 | Модели | Диалог — `claude-opus-5`. Извлечение — старт на `claude-opus-5` (quality-first), выбор рабочей модели (Haiku/Sonnet/Opus) — по бенчмарку на обезличенном корпусе в Фазе 1; порог confidence не считается калиброванной вероятностью — управляет только рендером карточки, не автоисполнением |
 | Ingress | SQLite (WAL) `events/jobs/effects`: fsync-before-ACK, leases, FIFO per context, DLQ + replay CLI; webhook только верифицирует подпись и фиксирует событие, обработка — background worker |
@@ -64,7 +64,7 @@ Verify: сквозной чек-лист Фазы 5 + chaos-тесты (kill -9 
 
 ## What We're NOT Doing (MVP)
 
-- WhatsApp (любой), auto-reply на email-thread, multi-tenant в одном процессе
+- Официальный WhatsApp Business Platform (GA-путь), auto-reply на email-thread, multi-tenant в одном процессе
 - Web vault PWA, мобильные клиенты, billing-автоматизация
 - Обещания E2EE / zero-knowledge / «EU processing» без оговорок
 - Gmail API OAuth с verification/CASA (пилот — IMAP+app password; OAuth — GA-путь); чтение ящика семьи за пределами ярлыка `Hermes`; Postgres; миграция семейного Hermes
@@ -74,7 +74,7 @@ Verify: сквозной чек-лист Фазы 5 + chaos-тесты (kill -9 
 
 Порядок фаз — по принципу «сначала доверие, потом функции»: Gate −1 (право/санитизация/пиннинг) → тонкий вертикальный срез на синтетике → trust foundation (durable execution + авторизация) → Nerve-расширения (отдельный план) → реальные действия → пилотизация. Реальные данные семей не попадают в систему до завершения Фазы 2.
 
-Структура репозитория — как в v1 (`hermes_cloud/{core,runner,ingest,execute,scheduler}`, `onboarding/`, `tests/`), с заменами: `core/db.py` (SQLite WAL, миграции), `core/runcontext.py`, `ingest/worker.py`; `execute/whatsapp.py` исключён.
+Структура репозитория — как в v1 (`hermes_cloud/{core,runner,ingest,execute,scheduler}`, `onboarding/`, `tests/`), с заменами: `core/db.py` (SQLite WAL, миграции), `core/runcontext.py`, `ingest/worker.py`, `ingest/whatsapp_webhook.py` + `execute/whatsapp.py`.
 
 ---
 
@@ -88,7 +88,7 @@ Verify: сквозной чек-лист Фазы 5 + chaos-тесты (kill -9 
 1. **Пиннинг доноров**: закоммитить/зафиксировать состояние `hermes@agent/foundation-activation` (сейчас есть незакоммиченные изменения в reminders/scheduler/todos/mailwatch — договориться с владельцем ветки о фиксации), записать SHA донора и SHA nerve-cloud/nerve-oss в `docs/source-pins.md`; API-снапшот Nerve-эндпоинтов, на которые полагаемся.
 2. **Санитизация**: `tests/fixtures/` — только синтетика (RFC-example домены, телефоны из зарезервированных диапазонов, вымышленные имена, Telegram ID из документированного synthetic-диапазона); скрипт `scripts/check_fixtures.py` (запрещённые паттерны: реальные ID донора, @gmail, +7/+34-номера) + gitleaks в CI; правило в CONTRIBUTING: донорские payload-фикстуры не копируются as-is.
 3. **Privacy-пакет** (`docs/privacy/`): data map (классы данных × хранилища × TTL), lawful bases, DPIA-драфт (отдельный раздел — Gmail-опция (c): доступ к личному ящику, минимизация через ярлык `Hermes`, хранение app password как household-секрета, право отзыва), privacy notice (RU/EN), реестр процессоров (Anthropic, Resend/Nerve, Fly, Google, Telegram) с DPA/SCC/TIA-статусами, политика данных несовершеннолетних, incident-response заметка.
-4. **Threat model** (`docs/SECURITY.md`): акторы (внешний отправитель письма, prompt injection в контенте/вложении, неизвестный участник Telegram-группы, компрометация одного household), границы (модель без shell/send, staged-sends, RunContext), явные не-цели.
+4. **Threat model** (`docs/SECURITY.md`): акторы (внешний отправитель письма/WA-сообщения, prompt injection в контенте/вложении, неизвестный участник Telegram-группы, компрометация одного household — включая изоляцию Evolution-инстансов per-instance-ключами), границы (модель без shell/send, staged-sends, RunContext), WhatsApp-риски (неофициальная сессия, блокировка номера, consent-текст для онбординга), явные не-цели.
 5. **Retention-матрица**: TTL для transcripts (180д), memory (пересмотр раз в 90д), actions journal (365д), todos/reminders (done+90д), photos/voice/docs (30д), delivery receipts (365д) — фиксируется в data map и реализуется в Фазе 2.
 6. README: заменить «EU processing» на честную формулировку residency (см. Locked Decisions).
 
@@ -207,7 +207,8 @@ Google Calendar write и исходящий email с доказанной сем
 2. **`execute/gcal.py`**: порт gtool; executor `calendar_event` с client-generated deterministic event ID = f(action_id); reconcile-поиск перед любым повтором; линк события в чат. Read-only tool `calendar_list_events` (caps: family).
 3. **`execute/email_send.py`**: executor `email_compose` — два транспорта по конфигу household: (a/b) `NerveClient.compose_email(to=подтверждённый получатель, attachments=?, idempotency_key=action_id)` с delivery-webhooks (`email.delivered|bounced`); (c) порт `send_email_smtp` донора (SMTP_SSL от адреса семьи, header-injection-валидация, In-Reply-To/References, `SendOutcomeUnknown`-семантика; хост из конфига, не hardcode) — для (c) доступен и настоящий reply в исходный thread, т.к. Message-ID оригинала известен. Карточка исходящего письма всегда показывает получателя отдельной строкой «Кому: …» — подтверждение покрывает и текст, и адресата.
 4. **`ActionBundle`**: извлечение одного письма может породить связку (событие + задача о взносе). Карточка-бандл: общий заголовок, дочерние пункты с чекбоксами (по умолчанию все включены), одно подтверждение → транзакционное staged-исполнение каждого дочернего эффекта со своим effect_id; частичный фейл отражается по-пунктно.
-5. Фото/голос-ингест (порт vision-блоков и faster-whisper) — переносится из v1 без изменений сути; scheduler/digest — порт с SchedulerConfig.
+5. **WhatsApp** (`ingest/whatsapp_webhook.py` + `execute/whatsapp.py`): порт донорского контура — relay-webhook с per-household HMAC (fail-closed), входящие на номер семьи → тот же `events`-конвейер (сообщение учителя/чата → extraction → карточка; обычный диалог семьи с ассистентом в WA — как в Telegram, под RunContext); исходящие: family-адресаты — tracked `begin_send`, все прочие — только staged approval; транспортная таксономия донора (redirect→failed, ReadTimeout→`SendOutcomeUnknown`, ConnectError→failed). Evolution-инстанс per household со своим apikey.
+6. Фото/голос-ингест (порт vision-блоков и faster-whisper) — переносится из v1 без изменений сути; scheduler/digest — порт с SchedulerConfig.
 
 ### Success Criteria
 
@@ -222,6 +223,7 @@ Google Calendar write и исходящий email с доказанной сем
 - [ ] Синтетика end-to-end: письмо «экскурсия 12.09, взнос 15€» → бандл (событие+задача) → ✅ → событие в шаренном календаре, задача в списке
 - [ ] Staged-письмо школе с PDF: карточка показывает «Кому: schule@example.de», после ✅ доставлено
 - [ ] Опция (c) на тестовом Gmail: письмо с ярлыком `Hermes` → карточка; reply от адреса семьи попадает в исходный thread получателя
+- [ ] WhatsApp: сообщение на номер семьи → карточка/диалог; staged-отправка внешнему контакту исполняется только после ✅; неверный HMAC relay — отклонён
 - [ ] Kill-switch email_send=0 блокирует с честным сообщением
 
 **Пауза для ручного подтверждения.**
@@ -235,7 +237,7 @@ Google Calendar write и исходящий email с доказанной сем
 
 ### Changes Required
 
-1. **`onboarding/provision.py`** (без WhatsApp): выбор email-опции — (a) nerve org + inbox на managed-поддомене; (b) nerve `add_domain` → печать DNS-записей → ожидание verify → inbox (webhook-секрет — из ответа сервера); (c) пошаговая инструкция семье: 2FA → app password → создание ярлыка/фильтра `Hermes`, секрет — в Fly secrets household; далее общее: Fly-приложение в `ams` + volume + секреты, Google-аккаунт ассистента (`google_oauth_flow.py`, consent «In production»), генерация `household.toml` в приватный ops-стор; `--dry-run`.
+1. **`onboarding/provision.py`**: WhatsApp — семья указывает номер, consent-текст о рисках, создание Evolution-инстанса `hermes-<household>` с per-instance apikey, вывод QR для пейринга браузерной сессии, настройка relay-webhook + per-household HMAC-секрета; выбор email-опции — (a) nerve org + inbox на managed-поддомене; (b) nerve `add_domain` → печать DNS-записей → ожидание verify → inbox (webhook-секрет — из ответа сервера); (c) пошаговая инструкция семье: 2FA → app password → создание ярлыка/фильтра `Hermes`, секрет — в Fly secrets household; далее общее: Fly-приложение в `ams` + volume + секреты, Google-аккаунт ассистента (`google_oauth_flow.py`, consent «In production»), генерация `household.toml` в приватный ops-стор; `--dry-run`.
 2. **Observability**: структурные логи (без контента писем — только ID/статусы), `/health` (nerve key, telegram, google token, db, backup age), алёрты (DLQ>0, застрявшие executing, backup стар, бюджет превышен).
 3. **Cost caps**: счётчик токенов per-household/день (из usage ответов) с мягким лимитом (деградация: extraction-only, диалог отвечает «дневной бюджет исчерпан») — защита от runaway-цикла и от abuse.
 4. **Rollback/upgrade**: релизы по тегам, migrate-on-start с backup-before-migrate, runbook отката.
