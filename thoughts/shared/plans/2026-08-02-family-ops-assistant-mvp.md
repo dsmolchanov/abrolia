@@ -172,7 +172,7 @@ Verify: сквозной чек-лист Фазы 5 + chaos-тесты (kill -9 
 ## Phase 3: Nerve extension (отдельный план в nerve-cloud)
 
 ### Overview
-Работы в nerve-cloud/nerve-oss/SDK — **отдельный план** `nerve-cloud/thoughts/shared/plans/2026-08-XX-inbound-events-and-attachments.md` со своими миграциями, contract-тестами и последовательностью PR. Здесь — только контракт-требования потребителя.
+Работы в nerve-cloud/nerve-oss/SDK — **отдельный план** `nerve-cloud/thoughts/shared/plans/2026-08-02-inbound-events-and-attachments.md` (написан, закоммичен в nerve-cloud @ `0ec3758`: org event journal → email.received fan-out → attachments в обе стороны → SDK 0.2.0, миграции 0018–0020) со своими миграциями, contract-тестами и последовательностью PR. Здесь — только контракт-требования потребителя.
 
 ### Контракт, который обязан дать Nerve-план
 
