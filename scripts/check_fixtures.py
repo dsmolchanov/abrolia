@@ -19,9 +19,11 @@
                    в любом регистре и с любыми пробелами, вне списка примеров.
 * ``secret``     — форма ключа/токена (Anthropic, Nerve, Telegram bot, GitHub,
                    AWS, Google OAuth, Slack, PEM private key).
-* ``unscannable``— файл, содержимое которого проверить нельзя (бинарь, не-UTF-8,
-                   слишком большой) и который не описан в PROVENANCE.md
-                   ближайшего родительского каталога.
+* ``unscannable``— файл или отдельное вложение письма, содержимое которого
+                   проверить нельзя (бинарь, не-UTF-8, слишком большой) и
+                   которое не описано в PROVENANCE.md ближайшего родительского
+                   каталога. Заголовки и текстовые части письма проверяются в
+                   любом случае — непрозрачное вложение не прячет письмо.
 * ``custom``     — паттерны из приватного файла (env ``HERMES_EXTRA_DENY_FILE``):
                    реальные имена/ID донора, которые нельзя коммитить даже в
                    виде правила. **Исключениями не подавляется никогда.**
@@ -338,42 +340,59 @@ class Unscannable(Exception):
         self.reason = reason
 
 
-def eml_to_text(raw: bytes) -> str:
-    """Развернуть .eml в текст: заголовки + декодированные части.
+@dataclass(frozen=True)
+class Scannable:
+    """Что удалось прочитать из файла и что осталось непрозрачным.
+
+    Непрозрачная часть письма не должна прятать остальное письмо: заголовки и
+    текстовые части проверяются всегда, а provenance требуется отдельно для
+    каждого нечитаемого вложения.
+    """
+
+    text: str
+    opaque_parts: tuple[str, ...] = ()
+
+
+def eml_to_text(raw: bytes, *, stem: str = "eml") -> tuple[str, list[str]]:
+    """Развернуть .eml: заголовки + декодированные части, отдельно — непрозрачные.
 
     Тело письма приходит в base64/quoted-printable, и без декодирования
     санитайзер «не видит» ни адресов, ни телефонов внутри фикстуры.
     """
     message = email.message_from_bytes(raw, policy=email.policy.default)
-    chunks: list[str] = []
-    for header, value in message.items():
-        chunks.append(f"{header}: {value}")
-    undecodable: list[str] = []
-    for part in message.walk():
+    chunks: list[str] = [f"{header}: {value}" for header, value in message.items()]
+    opaque: list[str] = []
+    for index, part in enumerate(message.walk()):
         if part.is_multipart():
             continue
         content_type = part.get_content_type()
         payload = part.get_payload(decode=True)
         if payload is None:
             continue
-        if content_type.startswith("text/"):
-            charset = part.get_content_charset() or "utf-8"
-            try:
-                chunks.append(payload.decode(charset, errors="strict"))
-            except (LookupError, UnicodeDecodeError):
-                undecodable.append(f"{content_type} ({part.get_filename() or 'inline'})")
-            continue
+        charset = part.get_content_charset() or "utf-8"
         try:
-            chunks.append(payload.decode("utf-8", errors="strict"))
-        except UnicodeDecodeError:
-            undecodable.append(f"{content_type} ({part.get_filename() or 'inline'})")
-    if undecodable:
-        raise Unscannable("нечитаемые части письма: " + ", ".join(undecodable))
-    return "\n".join(chunks)
+            chunks.append(payload.decode(charset, errors="strict"))
+            continue
+        except (LookupError, UnicodeDecodeError):
+            pass
+        if charset != "utf-8":
+            try:
+                chunks.append(payload.decode("utf-8", errors="strict"))
+                continue
+            except UnicodeDecodeError:
+                pass
+        name = part.get_filename() or f"{stem}#{index}"
+        opaque.append(f"{name} ({content_type})")
+    return "\n".join(chunks), opaque
 
 
-def read_scannable_text(path: Path) -> str:
-    """Текст файла для проверки. Бросает Unscannable, если проверить нельзя."""
+def opaque_part_name(label: str) -> str:
+    """Имя вложения из метки `имя (тип)` — его и ищем в PROVENANCE.md."""
+    return label.split(" (", 1)[0]
+
+
+def read_scannable(path: Path) -> Scannable:
+    """Содержимое файла для проверки. Бросает Unscannable, если нечего читать."""
     try:
         size = path.stat().st_size
     except OSError as exc:  # pragma: no cover - файловая система
@@ -390,21 +409,21 @@ def read_scannable_text(path: Path) -> str:
     except UnicodeDecodeError as exc:
         raise Unscannable("не UTF-8") from exc
     if path.suffix.lower() == ".eml":
-        return text + "\n" + eml_to_text(raw)
-    return text
+        decoded, opaque = eml_to_text(raw, stem=path.name)
+        return Scannable(text + "\n" + decoded, tuple(opaque))
+    return Scannable(text)
 
 
-def provenance_covers(rel_path: str, repo_root: Path) -> bool:
-    """Есть ли запись о файле в PROVENANCE.md одного из родительских каталогов."""
-    absolute = repo_root / rel_path
-    for parent in absolute.parents:
+def provenance_mentions(token: str, near: Path, repo_root: Path) -> bool:
+    """Упомянут ли токен в PROVENANCE.md одного из родительских каталогов."""
+    for parent in near.parents:
         manifest = parent / PROVENANCE_FILE
         if manifest.is_file():
             try:
                 text = manifest.read_text(encoding="utf-8")
             except OSError:  # pragma: no cover
                 text = ""
-            if absolute.name in text:
+            if token in text:
                 return True
         if parent == repo_root:
             break
@@ -483,17 +502,40 @@ def scan_paths(
         except ValueError:
             rel = str(file_path)
         try:
-            text = read_scannable_text(file_path)
+            scannable = read_scannable(file_path)
         except Unscannable as exc:
             # Непроверяемый файл — слепая зона, поэтому он либо описан в
             # PROVENANCE.md ближайшего родительского каталога, либо это находка.
-            if file_path.name not in OS_JUNK and not provenance_covers(rel, repo_root):
+            if file_path.name not in OS_JUNK and not provenance_mentions(
+                file_path.name, file_path, repo_root
+            ):
                 findings.append(
                     Finding(rel, 0, RULE_UNSCANNABLE, RULE_DETAIL[RULE_UNSCANNABLE],
                             exc.reason, rel)
                 )
             continue
-        findings.extend(scan_text(text, path=rel, allow=allow, deny=deny))
+        file_findings = scan_text(scannable.text, path=rel, allow=allow, deny=deny)
+        if file_path.suffix.lower() == ".eml":
+            # .eml сканируется дважды — как сырьё и как развёрнутый текст, —
+            # поэтому одно и то же значение не показывается пользователю дважды.
+            seen: set[tuple[str, str]] = set()
+            deduped: list[Finding] = []
+            for finding in file_findings:
+                key = (finding.rule, finding.value)
+                if key in seen:
+                    continue
+                seen.add(key)
+                deduped.append(finding)
+            file_findings = deduped
+        findings.extend(file_findings)
+        for label in scannable.opaque_parts:
+            # Provenance на само письмо не покрывает вложение внутри него:
+            # иначе одна бинарная часть прятала бы весь файл от проверки.
+            if not provenance_mentions(opaque_part_name(label), file_path, repo_root):
+                findings.append(
+                    Finding(rel, 0, RULE_UNSCANNABLE, "непроверяемая часть письма",
+                            label, label)
+                )
     return findings
 
 

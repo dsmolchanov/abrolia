@@ -212,8 +212,60 @@ def test_eml_body_is_decoded_before_scanning(tmp_path: Path) -> None:
     )
     path = tmp_path / "encoded.eml"
     path.write_text(eml, encoding="utf-8")
-    text = checker.read_scannable_text(path)
-    assert "email" in [f.rule for f in checker.scan_text(text, path="encoded.eml")]
+    scannable = checker.read_scannable(path)
+    assert scannable.opaque_parts == ()
+    assert "email" in [f.rule for f in checker.scan_text(scannable.text, path="encoded.eml")]
+
+
+def _eml_with_pdf_attachment(text_body: str) -> str:
+    """Письмо с текстовой частью и нечитаемым PDF-вложением."""
+    pdf = base64.b64encode(b"%PDF-1.4\n\x00\x01\x02binary-\xff\xfe-payload\n").decode()
+    return (
+        "From: Anna Beispiel <anna@example.com>\n"
+        "Subject: Klassenfahrt\n"
+        "MIME-Version: 1.0\n"
+        'Content-Type: multipart/mixed; boundary="b1"\n\n'
+        "--b1\n"
+        'Content-Type: text/plain; charset="utf-8"\n\n'
+        f"{text_body}\n\n"
+        "--b1\n"
+        "Content-Type: application/pdf\n"
+        'Content-Disposition: attachment; filename="einladung.pdf"\n'
+        "Content-Transfer-Encoding: base64\n\n"
+        f"{pdf}\n"
+        "--b1--\n"
+    )
+
+
+def test_opaque_attachment_does_not_hide_the_rest_of_the_email(tmp_path: Path) -> None:
+    """Одна бинарная часть не должна выключать проверку письма целиком."""
+    fixtures = tmp_path / "tests" / "fixtures" / "email"
+    fixtures.mkdir(parents=True)
+    (fixtures / "with_pdf.eml").write_text(
+        _eml_with_pdf_attachment(f"Bitte antworten an {GMAIL}"), encoding="utf-8"
+    )
+    findings = checker.scan_paths([tmp_path / "tests"], repo_root=tmp_path)
+    assert sorted({f.rule for f in findings}) == ["email", "unscannable"]
+
+
+def test_provenance_for_the_email_does_not_cover_its_attachment(tmp_path: Path) -> None:
+    fixtures = tmp_path / "tests" / "fixtures" / "email"
+    fixtures.mkdir(parents=True)
+    (fixtures / "with_pdf.eml").write_text(
+        _eml_with_pdf_attachment(f"Bitte antworten an {GMAIL}"), encoding="utf-8"
+    )
+    (fixtures / "PROVENANCE.md").write_text(
+        "- `with_pdf.eml` — синтетическое письмо\n", encoding="utf-8"
+    )
+    findings = checker.scan_paths([tmp_path / "tests"], repo_root=tmp_path)
+    assert sorted({f.rule for f in findings}) == ["email", "unscannable"]
+
+    # Запись именно о вложении снимает только находку по вложению.
+    (fixtures / "PROVENANCE.md").write_text(
+        "- `einladung.pdf` — сгенерирован scripts/make_pdf.py, синтетика\n", encoding="utf-8"
+    )
+    findings = checker.scan_paths([tmp_path / "tests"], repo_root=tmp_path)
+    assert [f.rule for f in findings] == ["email"]
 
 
 def test_binary_fixture_without_provenance_is_a_finding(tmp_path: Path) -> None:
@@ -262,5 +314,6 @@ def test_repo_is_clean_including_prose() -> None:
 
 def test_shipped_email_fixture_is_synthetic() -> None:
     fixture = REPO_ROOT / "tests" / "fixtures" / "email" / "forwarded_school_de.eml"
-    text = checker.read_scannable_text(fixture)
-    assert [f.render() for f in checker.scan_text(text, path=str(fixture))] == []
+    scannable = checker.read_scannable(fixture)
+    assert scannable.opaque_parts == ()
+    assert [f.render() for f in checker.scan_text(scannable.text, path=str(fixture))] == []
