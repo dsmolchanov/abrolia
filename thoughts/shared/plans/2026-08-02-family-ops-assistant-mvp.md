@@ -51,8 +51,8 @@ Verify: сквозной чек-лист Фазы 5 + chaos-тесты (kill -9 
 | Скоуп | Пилотный MVP, dedicated-инстанс на household; прототип — synthetic data only |
 | Репозиторий | Публичный `dsmolchanov/hermes-cloud`; донорские фикстуры — только санитизированные |
 | Residency | Честная формулировка: «EU-hosted application, документированные международные передачи»: приложение и данные — Fly EU (`ams`), субпроцессоры Anthropic (global/US) и Resend (US) — под DPA/SCC в реестре процессоров. Конфиг `residency_mode: eu-app | eu-strict`; `eu-strict` требует Vertex-EU-клиент и падает при его отсутствии — **никакого молчаливого downgrade**. Пилот стартует в `eu-app`; Vertex EU — задокументированный upgrade-путь после бенчмарка |
-| Email-вход | Nerve: managed-поддомен (база) / BYO-домен + DNS (pro) |
-| Исходящий email | Только `compose_email` с явно подтверждённым получателем (оригинальный отправитель из пересланной цепочки); auto-reply на thread — вне MVP |
+| Email-вход | Три опции на выбор семьи: **(a)** ящик на нашем managed-поддомене (Nerve, ноль DNS); **(b)** BYO-домен семьи + DNS-записи (Nerve, pro); **(c)** Gmail-доступ к существующей почте семьи — в пилоте через IMAP + app password (паттерн донора, без OAuth-verification), ингест **только писем с ярлыком `Hermes`** (минимизация — семья ставит ярлык или фильтр); Gmail API OAuth + verification/CASA — upgrade-путь к GA |
+| Исходящий email | Только `compose_email` (a/b — через Nerve) либо SMTP от адреса семьи (c — порт `send_email_smtp` донора) с явно подтверждённым получателем; для (a/b) оригинальный отправитель извлекается из пересланной цепочки, для (c) From виден напрямую; auto-reply на thread — вне MVP |
 | WhatsApp | **Вне MVP.** Post-pilot через официальный WhatsApp Business Platform; Evolution/QR не используется для клиентов |
 | Календарь | Семейный Google: выделенный аккаунт ассистента на household, семья шарит календари; порт gtool; клиентские детерминированные event ID + reconcile |
 | Модели | Диалог — `claude-opus-5`. Извлечение — старт на `claude-opus-5` (quality-first), выбор рабочей модели (Haiku/Sonnet/Opus) — по бенчмарку на обезличенном корпусе в Фазе 1; порог confidence не считается калиброванной вероятностью — управляет только рендером карточки, не автоисполнением |
@@ -67,7 +67,7 @@ Verify: сквозной чек-лист Фазы 5 + chaos-тесты (kill -9 
 - WhatsApp (любой), auto-reply на email-thread, multi-tenant в одном процессе
 - Web vault PWA, мобильные клиенты, billing-автоматизация
 - Обещания E2EE / zero-knowledge / «EU processing» без оговорок
-- OAuth к почте клиента; Postgres; миграция семейного Hermes
+- Gmail API OAuth с verification/CASA (пилот — IMAP+app password; OAuth — GA-путь); чтение ящика семьи за пределами ярлыка `Hermes`; Postgres; миграция семейного Hermes
 - Автоисполнение чего-либо по порогу confidence
 
 ## Implementation Approach
@@ -87,7 +87,7 @@ Verify: сквозной чек-лист Фазы 5 + chaos-тесты (kill -9 
 
 1. **Пиннинг доноров**: закоммитить/зафиксировать состояние `hermes@agent/foundation-activation` (сейчас есть незакоммиченные изменения в reminders/scheduler/todos/mailwatch — договориться с владельцем ветки о фиксации), записать SHA донора и SHA nerve-cloud/nerve-oss в `docs/source-pins.md`; API-снапшот Nerve-эндпоинтов, на которые полагаемся.
 2. **Санитизация**: `tests/fixtures/` — только синтетика (RFC-example домены, телефоны из зарезервированных диапазонов, вымышленные имена, Telegram ID из документированного synthetic-диапазона); скрипт `scripts/check_fixtures.py` (запрещённые паттерны: реальные ID донора, @gmail, +7/+34-номера) + gitleaks в CI; правило в CONTRIBUTING: донорские payload-фикстуры не копируются as-is.
-3. **Privacy-пакет** (`docs/privacy/`): data map (классы данных × хранилища × TTL), lawful bases, DPIA-драфт, privacy notice (RU/EN), реестр процессоров (Anthropic, Resend/Nerve, Fly, Google, Telegram) с DPA/SCC/TIA-статусами, политика данных несовершеннолетних, incident-response заметка.
+3. **Privacy-пакет** (`docs/privacy/`): data map (классы данных × хранилища × TTL), lawful bases, DPIA-драфт (отдельный раздел — Gmail-опция (c): доступ к личному ящику, минимизация через ярлык `Hermes`, хранение app password как household-секрета, право отзыва), privacy notice (RU/EN), реестр процессоров (Anthropic, Resend/Nerve, Fly, Google, Telegram) с DPA/SCC/TIA-статусами, политика данных несовершеннолетних, incident-response заметка.
 4. **Threat model** (`docs/SECURITY.md`): акторы (внешний отправитель письма, prompt injection в контенте/вложении, неизвестный участник Telegram-группы, компрометация одного household), границы (модель без shell/send, staged-sends, RunContext), явные не-цели.
 5. **Retention-матрица**: TTL для transcripts (180д), memory (пересмотр раз в 90д), actions journal (365д), todos/reminders (done+90д), photos/voice/docs (30д), delivery receipts (365д) — фиксируется в data map и реализуется в Фазе 2.
 6. README: заменить «EU processing» на честную формулировку residency (см. Locked Decisions).
@@ -191,7 +191,7 @@ Verify: сквозной чек-лист Фазы 5 + chaos-тесты (kill -9 
 #### Manual Verification:
 - [ ] Письмо с PDF на staging-inbox → подписанный webhook → вложение скачано runtime-ключом → compose с вложением доставлен
 
-**Пауза. Фазы 1–2 не зависят от этой фазы (inject-eml); Фаза 4 email-часть — зависит.**
+**Пауза. Фазы 1–2 не зависят от этой фазы (inject-eml); в Фазе 4 от неё зависит только тракт опций (a/b) — Gmail-опция (c) работает без Nerve-расширений.**
 
 ---
 
@@ -203,8 +203,9 @@ Google Calendar write и исходящий email с доказанной сем
 ### Changes Required
 
 1. **`ingest/nerve_webhook.py`**: `POST /webhooks/nerve` — верификация `X-Nerve-Signature` (окно ±5 мин), немедленный insert события + 200; всё остальное — worker (общий с Фазой 1). Вложения качаются в worker сразу (Resend-URL ~1ч) в content-addressed store.
+1b. **`ingest/gmail_poll.py`** (email-опция c): порт паттерна mailwatch.py донора — IMAP4_SSL + app password семьи, запрос только по ярлыку `Hermes` (`X-GM-RAW label:Hermes`), Message-ID-cursor (bounded, UIDVALIDITY-safe), poll из scheduler-loop; каждое новое письмо → insert в тот же `events` (external_id = Message-ID) → общий worker. Вложения — по MIME-allowlist донора (gtool.py:224-329). Порт test_mailwatch (5 тестов, FakeIMAP-seam) возвращается в baseline. Для опции (c) `original_sender` = From письма напрямую (без forwarded-парсера).
 2. **`execute/gcal.py`**: порт gtool; executor `calendar_event` с client-generated deterministic event ID = f(action_id); reconcile-поиск перед любым повтором; линк события в чат. Read-only tool `calendar_list_events` (caps: family).
-3. **`execute/email_send.py`**: executor `email_compose` → `NerveClient.compose_email(to=подтверждённый получатель, attachments=?, idempotency_key=action_id)`. Карточка исходящего письма всегда показывает получателя отдельной строкой «Кому: …» — подтверждение покрывает и текст, и адресата. Delivery-webhooks (`email.delivered|bounced`) обновляют журнал.
+3. **`execute/email_send.py`**: executor `email_compose` — два транспорта по конфигу household: (a/b) `NerveClient.compose_email(to=подтверждённый получатель, attachments=?, idempotency_key=action_id)` с delivery-webhooks (`email.delivered|bounced`); (c) порт `send_email_smtp` донора (SMTP_SSL от адреса семьи, header-injection-валидация, In-Reply-To/References, `SendOutcomeUnknown`-семантика; хост из конфига, не hardcode) — для (c) доступен и настоящий reply в исходный thread, т.к. Message-ID оригинала известен. Карточка исходящего письма всегда показывает получателя отдельной строкой «Кому: …» — подтверждение покрывает и текст, и адресата.
 4. **`ActionBundle`**: извлечение одного письма может породить связку (событие + задача о взносе). Карточка-бандл: общий заголовок, дочерние пункты с чекбоксами (по умолчанию все включены), одно подтверждение → транзакционное staged-исполнение каждого дочернего эффекта со своим effect_id; частичный фейл отражается по-пунктно.
 5. Фото/голос-ингест (порт vision-блоков и faster-whisper) — переносится из v1 без изменений сути; scheduler/digest — порт с SchedulerConfig.
 
@@ -214,11 +215,13 @@ Google Calendar write и исходящий email с доказанной сем
 - [ ] Идемпотентность calendar: повторное исполнение того же action не создаёт второе событие (мок + live-smoke)
 - [ ] Compose: получатель в payload обязан совпасть с подтверждённым в карточке (payload-sha это гарантирует) — тест на подмену
 - [ ] Bundle: частичный фейл → корректные статусы каждого дочернего эффекта
-- [ ] Webhook-вход и inject-eml дают идентичный pipeline-результат на одном .eml
+- [ ] Webhook-вход, gmail_poll и inject-eml дают идентичный pipeline-результат на одном .eml
+- [ ] gmail_poll: портированный test_mailwatch-baseline зелёный (cursor, UIDVALIDITY-replay-защита); письмо без ярлыка `Hermes` не попадает в events
 
 #### Manual Verification:
 - [ ] Синтетика end-to-end: письмо «экскурсия 12.09, взнос 15€» → бандл (событие+задача) → ✅ → событие в шаренном календаре, задача в списке
 - [ ] Staged-письмо школе с PDF: карточка показывает «Кому: schule@example.de», после ✅ доставлено
+- [ ] Опция (c) на тестовом Gmail: письмо с ярлыком `Hermes` → карточка; reply от адреса семьи попадает в исходный thread получателя
 - [ ] Kill-switch email_send=0 блокирует с честным сообщением
 
 **Пауза для ручного подтверждения.**
@@ -232,7 +235,7 @@ Google Calendar write и исходящий email с доказанной сем
 
 ### Changes Required
 
-1. **`onboarding/provision.py`** (без WhatsApp): nerve org+inbox/BYO-домен (webhook-секрет — из ответа сервера), Fly-приложение в `ams` + volume + секреты, Google-аккаунт ассистента (`google_oauth_flow.py`, consent «In production»), генерация `household.toml` в приватный ops-стор; `--dry-run`.
+1. **`onboarding/provision.py`** (без WhatsApp): выбор email-опции — (a) nerve org + inbox на managed-поддомене; (b) nerve `add_domain` → печать DNS-записей → ожидание verify → inbox (webhook-секрет — из ответа сервера); (c) пошаговая инструкция семье: 2FA → app password → создание ярлыка/фильтра `Hermes`, секрет — в Fly secrets household; далее общее: Fly-приложение в `ams` + volume + секреты, Google-аккаунт ассистента (`google_oauth_flow.py`, consent «In production»), генерация `household.toml` в приватный ops-стор; `--dry-run`.
 2. **Observability**: структурные логи (без контента писем — только ID/статусы), `/health` (nerve key, telegram, google token, db, backup age), алёрты (DLQ>0, застрявшие executing, backup стар, бюджет превышен).
 3. **Cost caps**: счётчик токенов per-household/день (из usage ответов) с мягким лимитом (деградация: extraction-only, диалог отвечает «дневной бюджет исчерпан») — защита от runaway-цикла и от abuse.
 4. **Rollback/upgrade**: релизы по тегам, migrate-on-start с backup-before-migrate, runbook отката.
