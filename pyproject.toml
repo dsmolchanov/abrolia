@@ -1,0 +1,20 @@
+# Конфигурация инструментов. Пакет `hermes_cloud` появляется в Фазе 1 плана —
+# до этого здесь только настройки линтера и тестов, общие для CI и локали.
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+exclude = ["tests/fixtures"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E501"]  # параметризованные строки-образцы не переносятся
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+markers = [
+    "live: обращается к внешним API (Anthropic, Nerve, Google) — не идёт в обычном CI",
+]

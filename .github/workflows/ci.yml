@@ -1,0 +1,45 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  fixtures:
+    name: fixtures & lint & tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install tooling
+        run: pip install --disable-pip-version-check ruff pytest
+      - name: Sanitised fixtures (Gate -1)
+        run: python scripts/check_fixtures.py
+      - name: Lint
+        run: ruff check .
+      - name: Tests
+        run: pytest -m "not live"
+
+  secrets:
+    name: gitleaks (full history)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Gate -1 требует зелёного скана по всей истории
+      - name: Install gitleaks
+        env:
+          GITLEAKS_VERSION: 8.18.4
+        run: |
+          set -euo pipefail
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            | tar -xz -C /usr/local/bin gitleaks
+          gitleaks version
+      - name: Scan full history
+        run: gitleaks detect --source . --config .gitleaks.toml --log-opts="--all" --redact --verbose

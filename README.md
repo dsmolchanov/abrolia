@@ -8,7 +8,16 @@ Family operations assistant for households living in a foreign language. Forward
 - **Calendar**: family Google Calendar shared to a dedicated assistant account.
 - **Privacy**: EU-hosted application with documented international subprocessors (model API, email delivery) under DPA/SCC; no training on your data; per-household isolation; full export and delete.
 
-Status: pilot MVP under construction. See `thoughts/shared/plans/2026-08-02-family-ops-assistant-mvp.md` for the implementation plan.
+Status: pilot MVP under construction — Gate −1 (right-to-build) closed, synthetic data only.
+See `thoughts/shared/plans/2026-08-02-family-ops-assistant-mvp.md` for the implementation plan.
+
+## Documentation
+
+- [`docs/SECURITY.md`](docs/SECURITY.md) — threat model, trust boundaries, vulnerability reporting
+- [`docs/privacy/`](docs/privacy/README.md) — data map and retention, lawful bases, DPIA, processor register, privacy notice (RU/EN), minors policy, incident response
+- [`docs/source-pins.md`](docs/source-pins.md) — pinned donor revisions
+- [`docs/roadmap-channels.md`](docs/roadmap-channels.md) — post-MVP channels and voice
+- [`CONTRIBUTING.md`](CONTRIBUTING.md) — fixture sanitisation rules, secrets policy, working order
 
 ## License
 

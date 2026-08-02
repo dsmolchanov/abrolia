@@ -95,12 +95,14 @@ Verify: сквозной чек-лист Фазы 5 + chaos-тесты (kill -9 
 ### Success Criteria
 
 #### Automated Verification:
-- [ ] `python scripts/check_fixtures.py` и gitleaks в CI зелёные на всей истории
-- [ ] `docs/source-pins.md` существует и содержит три SHA
+- [x] `python scripts/check_fixtures.py` и gitleaks в CI зелёные на всей истории — локально чисто (`check_fixtures`, `--all`, `gitleaks detect --log-opts=--all`, `gitleaks protect --staged`); `.github/workflows/ci.yml` гоняет оба на каждый PR (gitleaks — с `fetch-depth: 0`), плюс ruff и pytest
+- [x] `docs/source-pins.md` существует и содержит три SHA (проверено: все три коммита существуют в донорских репозиториях, hermes-пин — предок HEAD ветки `agent/foundation-activation`)
 
 #### Manual Verification:
 - [ ] Privacy-пакет отревьюирован владельцем продукта (и юристом до реальных семей)
 - [ ] Донорская ветка зафиксирована, SHA записан
+
+Реализовано в Gate −1: `scripts/check_fixtures.py` + `.check-fixtures-allow` + `tests/test_check_fixtures.py`, конвенции `tests/fixtures/README.md`, `CONTRIBUTING.md`, `.gitleaks.toml`, CI, `docs/privacy/` (data map с retention-матрицей, lawful bases, DPIA, реестр процессоров, notice RU/EN, политика по несовершеннолетним, incident response), `docs/SECURITY.md`.
 
 **Пауза для ручного подтверждения.**
 
