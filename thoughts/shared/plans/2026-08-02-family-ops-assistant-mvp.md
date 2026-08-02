@@ -95,14 +95,18 @@ Verify: сквозной чек-лист Фазы 5 + chaos-тесты (kill -9 
 ### Success Criteria
 
 #### Automated Verification:
-- [x] `python scripts/check_fixtures.py` и gitleaks в CI зелёные на всей истории — локально чисто (`check_fixtures`, `--all`, `gitleaks detect --log-opts=--all`, `gitleaks protect --staged`); `.github/workflows/ci.yml` гоняет оба на каждый PR (gitleaks — с `fetch-depth: 0`), плюс ruff и pytest
-- [x] `docs/source-pins.md` существует и содержит три SHA (проверено: все три коммита существуют в донорских репозиториях, hermes-пин — предок HEAD ветки `agent/foundation-activation`)
+- [x] `python3 scripts/check_fixtures.py` и gitleaks в CI зелёные на всей истории — локально чисто (`--all`, `gitleaks detect --log-opts=--all`); CI гоняет санитайзер по всему дереву с `--require-deny` и gitleaks с `fetch-depth: 0`, плюс ruff и pytest
+- [x] `docs/source-pins.md` существует и содержит три SHA (все три коммита существуют в донорских репозиториях; решение о перепине hermes на `a02ab33` после push ветки — в самом документе)
 
 #### Manual Verification:
 - [ ] Privacy-пакет отревьюирован владельцем продукта (и юристом до реальных семей)
 - [ ] Донорская ветка зафиксирована, SHA записан
 
-Реализовано в Gate −1: `scripts/check_fixtures.py` + `.check-fixtures-allow` + `tests/test_check_fixtures.py`, конвенции `tests/fixtures/README.md`, `CONTRIBUTING.md`, `.gitleaks.toml`, CI, `docs/privacy/` (data map с retention-матрицей, lawful bases, DPIA, реестр процессоров, notice RU/EN, политика по несовершеннолетним, incident response), `docs/SECURITY.md`.
+**Статус: Gate −1 открыт** (ревизия 2026-08-02, отчёт — `thoughts/shared/implementations/2026-08-02-family-ops-assistant-mvp-validation.md`). Зелёные автопроверки означают лишь, что текущие образцы удовлетворяют текущим правилам; закрытие гейта требует ручной приёмки обоих пунктов выше и снятия юридических блокеров.
+
+Реализовано в Gate −1: `scripts/check_fixtures.py` + `.check-fixtures-allow` + `tests/test_check_fixtures.py` + `tests/fixtures/PROVENANCE.md`, конвенции `tests/fixtures/README.md`, `CONTRIBUTING.md`, `.gitleaks.toml`, CI, `docs/privacy/` (data map с retention-матрицей, lawful bases, DPIA, реестр процессоров, notice RU/EN, политика по несовершеннолетним, incident response), `docs/SECURITY.md`.
+
+Исправлено после ревизии: формат ключа Nerve (`nrv_live_…`) в обоих гейтах; точечные исключения `путь|правило|значение` вместо построчного маркера (приватные deny-паттерны не подавляются); Telegram-ID в многострочном JSON; IBAN с пробелами и в нижнем регистре по контрольной сумме; `00`-префикс телефона; разворачивание base64/quoted-printable тела `.eml`; требование PROVENANCE.md для непроверяемых фикстур; CI без исключений по путям и с fail-closed deny-паттернами; staged approval для **всех** исходящих WhatsApp; ст. 9(2) как блокирующий вопрос вместо «остаточного риска»; DLQ — payload 30 дней / метаданные 90; честный статус DPA/SCC в README и notice.
 
 **Пауза для ручного подтверждения.**
 
@@ -209,7 +213,7 @@ Google Calendar write и исходящий email с доказанной сем
 2. **`execute/gcal.py`**: порт gtool; executor `calendar_event` с client-generated deterministic event ID = f(action_id); reconcile-поиск перед любым повтором; линк события в чат. Read-only tool `calendar_list_events` (caps: family).
 3. **`execute/email_send.py`**: executor `email_compose` — два транспорта по конфигу household: (a/b) `NerveClient.compose_email(to=подтверждённый получатель, attachments=?, idempotency_key=action_id)` с delivery-webhooks (`email.delivered|bounced`); (c) порт `send_email_smtp` донора (SMTP_SSL от адреса семьи, header-injection-валидация, In-Reply-To/References, `SendOutcomeUnknown`-семантика; хост из конфига, не hardcode) — для (c) доступен и настоящий reply в исходный thread, т.к. Message-ID оригинала известен. Карточка исходящего письма всегда показывает получателя отдельной строкой «Кому: …» — подтверждение покрывает и текст, и адресата.
 4. **`ActionBundle`**: извлечение одного письма может породить связку (событие + задача о взносе). Карточка-бандл: общий заголовок, дочерние пункты с чекбоксами (по умолчанию все включены), одно подтверждение → транзакционное staged-исполнение каждого дочернего эффекта со своим effect_id; частичный фейл отражается по-пунктно.
-5. **WhatsApp** (`ingest/whatsapp_webhook.py` + `execute/whatsapp.py`): порт донорского контура — relay-webhook с per-household HMAC (fail-closed), входящие на номер семьи → тот же `events`-конвейер (сообщение учителя/чата → extraction → карточка; обычный диалог семьи с ассистентом в WA — как в Telegram, под RunContext); исходящие: family-адресаты — tracked `begin_send`, все прочие — только staged approval; транспортная таксономия донора (redirect→failed, ReadTimeout→`SendOutcomeUnknown`, ConnectError→failed). Evolution-инстанс per household со своим apikey.
+5. **WhatsApp** (`ingest/whatsapp_webhook.py` + `execute/whatsapp.py`): порт донорского контура — relay-webhook с per-household HMAC (fail-closed), входящие на номер семьи → тот же `events`-конвейер (сообщение учителя/чата → extraction → карточка; обычный диалог семьи с ассистентом в WA — как в Telegram, под RunContext); исходящие: **все без исключения — только staged approval** (правка после ревизии Gate −1: прежняя формулировка выводила family-адресатов на tracked `begin_send` в обход подтверждения и противоречила Locked Decision и инварианту README; донорский tracked-send остаётся механикой доставки *после* подтверждения, а не заменой ему); транспортная таксономия донора (redirect→failed, ReadTimeout→`SendOutcomeUnknown`, ConnectError→failed). Evolution-инстанс per household со своим apikey.
 6. Фото/голос-ингест (порт vision-блоков и faster-whisper) — переносится из v1 без изменений сути; scheduler/digest — порт с SchedulerConfig.
 
 ### Success Criteria
@@ -225,7 +229,7 @@ Google Calendar write и исходящий email с доказанной сем
 - [ ] Синтетика end-to-end: письмо «экскурсия 12.09, взнос 15€» → бандл (событие+задача) → ✅ → событие в шаренном календаре, задача в списке
 - [ ] Staged-письмо школе с PDF: карточка показывает «Кому: schule@example.de», после ✅ доставлено
 - [ ] Опция (c) на тестовом Gmail: письмо с ярлыком `Hermes` → карточка; reply от адреса семьи попадает в исходный thread получателя
-- [ ] WhatsApp: сообщение на номер семьи → карточка/диалог; staged-отправка внешнему контакту исполняется только после ✅; неверный HMAC relay — отклонён
+- [ ] WhatsApp: сообщение на номер семьи → карточка/диалог; **любая** исходящая отправка (и внешнему контакту, и семейному) исполняется только после ✅; неверный HMAC relay — отклонён
 - [ ] Kill-switch email_send=0 блокирует с честным сообщением
 
 **Пауза для ручного подтверждения.**

@@ -6,10 +6,10 @@ Family operations assistant for households living in a foreign language. Forward
 - **Model layer**: Anthropic Claude API (commercial terms) — typed tools only, no shell, no direct send capability for the model.
 - **Channels**: Telegram for confirmations and notifications; WhatsApp on the family's own number (QR-paired browser session — unofficial automation, risks disclosed at onboarding; official Business Platform is the GA path).
 - **Calendar**: family Google Calendar shared to a dedicated assistant account.
-- **Privacy**: EU-hosted application with documented international subprocessors (model API, email delivery) under DPA/SCC; no training on your data; per-household isolation; full export and delete.
+- **Privacy**: EU-hosted application with documented international subprocessors (model API, email delivery); no training on your data; per-household isolation; full export and delete. DPAs and transfer mechanisms are still being put in place — see [`docs/privacy/processors.md`](docs/privacy/processors.md) for the actual, unfinished status.
 
-Status: pilot MVP under construction — Gate −1 (right-to-build) closed, synthetic data only.
-See `thoughts/shared/plans/2026-08-02-family-ops-assistant-mvp.md` for the implementation plan.
+Status: pilot MVP under construction. **Gate −1 (right-to-build) is open**: the engineering and privacy drafts exist and are under review, and the system runs on synthetic data only. Real data — including the owner's own mailbox — is not connected before Phase 2 and counsel sign-off.
+See `thoughts/shared/plans/2026-08-02-family-ops-assistant-mvp.md` for the implementation plan and `thoughts/shared/implementations/2026-08-02-family-ops-assistant-mvp-validation.md` for the Gate −1 validation report.
 
 ## Documentation
 

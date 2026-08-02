@@ -19,8 +19,19 @@ jobs:
           python-version: "3.12"
       - name: Install tooling
         run: pip install --disable-pip-version-check ruff pytest
+      - name: Materialise private deny patterns
+        # Реальные имена и ID донора нельзя держать в публичном репозитории даже
+        # как правило, поэтому они приходят из секрета. Секрет не настроен =>
+        # файл пуст => следующий шаг падает: гейт fail-closed.
+        env:
+          HERMES_DENY_PATTERNS: ${{ secrets.HERMES_DENY_PATTERNS }}
+        run: |
+          umask 077
+          printf '%s\n' "$HERMES_DENY_PATTERNS" > "$RUNNER_TEMP/deny-patterns.txt"
       - name: Sanitised fixtures (Gate -1)
-        run: python scripts/check_fixtures.py
+        env:
+          HERMES_EXTRA_DENY_FILE: ${{ runner.temp }}/deny-patterns.txt
+        run: python scripts/check_fixtures.py --all --require-deny
       - name: Lint
         run: ruff check .
       - name: Tests

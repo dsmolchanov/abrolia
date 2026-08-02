@@ -16,10 +16,21 @@ reference text; both are kept in sync.*
   email delivery) are outside the EU and are listed by name below.
 - You can **export everything** and **delete everything** at any time.
 
+> **Pilot status.** The service currently runs on test data: provider
+> agreements and international-transfer mechanisms are still being put in
+> place, so we do not process real family correspondence yet. This text
+> describes how processing will work and will be updated with actual details
+> before the first family is connected.
+
 ## Who processes your data
 
-Hermes Cloud service operator — TODO: legal name, address, registration details.
-Questions and requests: TODO: contact address.
+Controller — Hermes Cloud service operator: TODO: legal name, registered
+address, registration details, EU representative (if required under Art. 27).
+Questions, requests and withdrawal of consent: TODO: contact address.
+No Data Protection Officer has been appointed; whether one is required is
+checked before any real family is connected.
+You may lodge a complaint with the supervisory authority of your habitual
+residence or place of work, or of the operator's establishment: TODO: authority.
 
 ## What we process and why
 
@@ -60,8 +71,11 @@ children. See our minors policy for detail.
 | Google | your calendar; your mailbox only in the Gmail-access option | global |
 | Telegram / WhatsApp | the channels you chose | outside the EU |
 
-Transfers outside the EU rely on Standard Contractual Clauses with a transfer
-risk assessment. We do **not** claim "EU-only processing" — with today's
+Some of these providers are outside the EU. Data processing agreements and
+Standard Contractual Clauses with a transfer risk assessment are **still being
+put in place**: until they are signed, the service does not process real family
+correspondence. You can request a copy of the safeguards in force at the
+contact address. We do **not** claim "EU-only processing" — with today's
 providers that would be untrue.
 
 ## Retention
@@ -93,10 +107,40 @@ is a **real risk that WhatsApp blocks the number**. We recommend a dedicated
 number/SIM. The channel is only enabled after you confirm you accept this. You
 can disconnect at any time by ending the session.
 
+## Special categories of data
+
+School emails sometimes contain health information (a sick note, an allergy, an
+exemption) and occasionally religious information. We do not extract it and use
+it in no logic at all. The law requires a specific condition for processing
+such data; that condition is determined before any real family is connected,
+and until then such emails are not processed by the system.
+
+## Is providing data mandatory
+
+The data required for the service (your messenger ID, the content you forward)
+is provided under our contract: without it the service cannot work. Everything
+else is your choice — memory, mailbox access and the WhatsApp channel are
+enabled by consent and disabled by withdrawal, with no effect on the rest of
+the service.
+
+## Where data about other people comes from
+
+Data about teachers, other parents and children reaches us not from them but
+from the content you forward or label, and from messages arriving on connected
+channels. Categories: names, contact details, roles, participation in events,
+payment details. We do not collect it from external sources and do not enrich it.
+
+## Automated decision-making
+
+There is no automated decision-making producing legal or similarly significant
+effects (Art. 22). The assistant only proposes; only what a human confirms is
+carried out.
+
 ## Your rights
 
 Access, rectification, erasure, restriction, objection, portability, withdrawal
-of consent, and complaint to a supervisory authority. In practice:
+of consent (withdrawal does not affect the lawfulness of processing before it),
+and complaint to a supervisory authority. In practice:
 
 - `/export` — a full export of your data;
 - `/delete` — erasure, initiated by the account owner with a confirmation code;
