@@ -17,12 +17,15 @@ from hermes_cloud.channels.telegram import TelegramTransport
 from hermes_cloud.core.approvals import ApprovalStore
 from hermes_cloud.core.config import load_config, load_dotenv
 from hermes_cloud.core.db import open_database
+from hermes_cloud.core.effects import EffectJournal
 from hermes_cloud.core.events import EventStore
 from hermes_cloud.execute.reminder import ReminderStore
 from hermes_cloud.ingest.inject import ingest_file
 from hermes_cloud.ingest.worker import Worker
 from hermes_cloud.runner.extraction import Extractor
+from hermes_cloud.runner.model import ToolLoop
 from hermes_cloud.runner.pipeline import Pipeline
+from hermes_cloud.runner.tools import Services
 
 DEFAULT_DB_PATH = "data/hermes.db"
 DB_ENV = "HERMES_DB"
@@ -62,15 +65,22 @@ def _pipeline(args: argparse.Namespace, database) -> Pipeline:
     )
     if not use_telegram:
         print("карточки печатаю в консоль; подтверждать командой `confirm <id>`")
+    approvals = ApprovalStore(database)
+    reminders = ReminderStore(database)
     return Pipeline(
-        approvals=ApprovalStore(database),
-        reminders=ReminderStore(database),
+        approvals=approvals,
+        reminders=reminders,
         transport=transport,
         extractor=Extractor(
             model=config.model, effort=config.effort, family_language=config.language
         ),
         chat=config.require_chat(),
         thread=config.thread,
+        loop=ToolLoop(
+            journal=EffectJournal(database),
+            services=Services(approvals=approvals, reminders=reminders),
+            family_language=config.language,
+        ),
     )
 
 

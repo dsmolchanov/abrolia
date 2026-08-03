@@ -8,7 +8,8 @@
 
 * `after_claim`   — подтверждение засчитано, исполнитель ещё не звался;
 * `after_effect`  — исполнитель отработал, отметка о завершении не поставлена;
-* `during_send`   — падение посреди отправки наружу (исход неизвестен).
+* `during_send`   — падение посреди отправки наружу (исход неизвестен);
+* `mid_loop`      — падение в середине хода модели, между двумя её вызовами.
 """
 
 from __future__ import annotations
@@ -79,10 +80,69 @@ class CrashingReminders(ReminderStore):
         return reminder
 
 
+# Ход модели, который родительский тест повторит после перезапуска.
+RUN_ID = "chaos00000000000000000000000run"
+TOOL_USE_ID = "tu-chaos"
+TOOL_ARGUMENTS = {"text": "оплатить взнос 15 EUR", "due_date": "2026-09-08"}
+
+
+def crash_mid_loop(database) -> None:
+    """Модель попросила инструмент, эффект записан — и тут процесс умирает."""
+    from hermes_cloud.core.effects import EffectJournal
+    from hermes_cloud.core.runcontext import Household, build_run_context
+    from hermes_cloud.runner.model import ToolLoop
+    from hermes_cloud.runner.tools import Services
+
+    class DyingClient:
+        """Первый ответ — просьба об инструменте, на втором вызове смерть."""
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        @property
+        def messages(self):
+            return self
+
+        def create(self, **_: object):
+            self.calls += 1
+            if self.calls > 1:
+                die()
+            return _ToolUseResponse()
+
+    class _Block:
+        type = "tool_use"
+        id = TOOL_USE_ID
+        name = "propose_reminder"
+        input = TOOL_ARGUMENTS
+
+    class _ToolUseResponse:
+        stop_reason = "tool_use"
+        content = [_Block()]
+        usage = None
+
+    household = Household(
+        owner=ACTOR, family=frozenset({ACTOR}), allowed_chats=frozenset({CHAT})
+    )
+    context = build_run_context(
+        household=household, actor_id=ACTOR, chat_id=CHAT, run_id=RUN_ID
+    )
+    loop = ToolLoop(
+        journal=EffectJournal(database),
+        services=Services(
+            approvals=ApprovalStore(database), reminders=ReminderStore(database)
+        ),
+        client=DyingClient(),
+    )
+    loop.run(context, "напомни оплатить взнос")
+
+
 def main(argv: list[str]) -> int:
     database_path, window = argv[1], argv[2]
     database = open_database(Path(database_path))
     approvals = ApprovalStore(database)
+    if window == "mid_loop":
+        crash_mid_loop(database)
+        raise SystemExit("процесс обязан был умереть в середине хода")
     payload = ICS_PAYLOAD if window == "during_send" else REMINDER_PAYLOAD
     reminders = (
         CrashingReminders(database) if window == "after_effect" else ReminderStore(database)

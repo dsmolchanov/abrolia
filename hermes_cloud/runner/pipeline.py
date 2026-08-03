@@ -38,6 +38,7 @@ from hermes_cloud.runner.card import (
     render_card,
 )
 from hermes_cloud.runner.extraction import Extractor
+from hermes_cloud.runner.model import ToolLoop
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +95,7 @@ class Pipeline:
         thread: int | None = None,
         actor: str = "system",
         effects: EffectJournal | None = None,
+        loop: ToolLoop | None = None,
     ) -> None:
         self.approvals = approvals
         self.reminders = reminders
@@ -105,6 +107,8 @@ class Pipeline:
         # Журнал живёт в той же базе: запись попытки обязана коммититься вместе
         # с claim'ом, а через две базы это невозможно.
         self.effects = effects or EffectJournal(approvals.db)
+        # Диалог необязателен: воркер и tick обходятся без него.
+        self.loop = loop
 
     # --- входящее событие ---------------------------------------------------
 
@@ -198,8 +202,9 @@ class Pipeline:
     def handle_update(self, update: dict, household) -> Handled | None:
         """Апдейт из канала → действие. None — апдейт нам не интересен.
 
-        Сообщения в Фазе 1 только подсказывают человеку, что делать: диалог с
-        моделью — Фаза 2, и до RunContext-авторизации его тут быть не должно.
+        Нажатие кнопки идёт через `claim`, обычное сообщение — в диалог, и
+        только если известен актор: неизвестному отвечают одной строкой и без
+        инструментов.
         """
         from hermes_cloud.channels.telegram import IncomingCallback, parse_update
 
@@ -219,7 +224,19 @@ class Pipeline:
                 thread=parsed.context.thread_id,
             )
             return Handled(message=TEXT_UNKNOWN_ACTOR)
-        return None
+        if self.loop is None or not parsed.text.strip():
+            return None
+        # Ход диалога. Права уже собраны на входе: `run` получает их готовыми и
+        # сам ничего не расширяет.
+        answer = self.loop.run(parsed.context, parsed.text)
+        self.transport.send_message(
+            chat=parsed.context.chat_id, text=answer.text, thread=parsed.context.thread_id
+        )
+        logger.info(
+            "ход %s: %s итераций, %s токенов, конец — %s",
+            parsed.context.run_id, answer.iterations, answer.tokens, answer.stopped,
+        )
+        return Handled(message=answer.text)
 
     # --- исполнение ---------------------------------------------------------
 

@@ -45,6 +45,11 @@ python3 -m hermes_cloud.cli --console tick
 Nothing leaves the machine without a human pressing ✅: the worker only stages a
 proposal, and execution happens after `claim` (see [`docs/SECURITY.md`](docs/SECURITY.md)).
 
+An ordinary message in the chat is a dialogue turn: the model sees only the
+tools the sender's role allows, every tool call is journalled before it happens,
+and a tool that changes anything only stages a proposal — the confirmation is
+still a human pressing ✅.
+
 Actor roles decide who may press it. The mapping comes from `household.toml`
 when the file exists and from the variables above otherwise; anyone not listed —
 and anyone writing from a chat outside `HERMES_CHAT` — gets zero capabilities,
