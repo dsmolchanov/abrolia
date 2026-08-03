@@ -149,7 +149,7 @@ def test_guest_sees_only_the_tools_of_their_role(world) -> None:
     loop.run(context_for(NANNY), "что у нас на неделе?")
 
     offered = {tool["name"] for tool in client.calls[0]["tools"]}
-    assert offered == {"list_reminders", "list_pending_proposals"}
+    assert offered == {"list_reminders", "list_pending_proposals", "calendar_list_events"}
     assert "propose_reminder" not in offered, "гость не предлагает действий"
 
 

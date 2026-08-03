@@ -24,12 +24,14 @@ from hermes_cloud.core.commitments import CommitmentStore
 from hermes_cloud.core.memory import KIND_FACT, KINDS, MemoryStore
 from hermes_cloud.core.runcontext import (
     ALL_WRITE,
+    READ_CALENDAR,
     READ_MEMORY,
     READ_TASKS,
     WRITE_MEMORY,
     WRITE_REMINDER,
     RunContext,
 )
+from hermes_cloud.execute.gcal import Calendar
 from hermes_cloud.execute.reminder import ReminderStore, due_timestamp
 from hermes_cloud.runner.card import KIND_MEMORY
 
@@ -50,15 +52,17 @@ class Services:
     reminders: ReminderStore
     memory: MemoryStore | None = None
     commitments: CommitmentStore | None = None
+    calendar: Calendar | None = None
 
     @classmethod
-    def on(cls, database) -> Services:
+    def on(cls, database, *, calendar: Calendar | None = None) -> Services:
         """Собрать полный набор сторов над одной базой."""
         return cls(
             approvals=ApprovalStore(database),
             reminders=ReminderStore(database),
             memory=MemoryStore(database),
             commitments=CommitmentStore(database),
+            calendar=calendar,
         )
 
 
@@ -214,6 +218,48 @@ def list_pending_proposals(
         "proposals": [
             {"id": approval.id, "kind": approval.kind, "expires_at": approval.expires_at}
             for approval in pending
+        ]
+    }
+
+
+@REGISTRY.tool(
+    name="calendar_list_events",
+    capability=READ_CALENDAR,
+    description=(
+        "Показать ближайшие события семейного календаря: что и когда. "
+        "Ничего не меняет."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "days": {
+                "type": "integer",
+                "description": "На сколько дней вперёд смотреть, максимум 60.",
+                "minimum": 1,
+                "maximum": 60,
+            }
+        },
+        "required": [],
+    },
+)
+def calendar_list_events(
+    context: RunContext, services: Services, arguments: dict[str, Any]
+) -> dict[str, Any]:
+    context.require(READ_CALENDAR)
+    if services.calendar is None:
+        # Честный ответ лучше пустого списка: «событий нет» и «календарь не
+        # подключён» — разные вещи, и модель обязана их различать.
+        raise ToolInputError("календарь household'а не подключён")
+    days = _int(arguments.get("days", 14), "days", low=1, high=60)
+    return {
+        "events": [
+            {
+                "summary": event.get("summary"),
+                "start": (event.get("start") or {}).get("dateTime")
+                or (event.get("start") or {}).get("date"),
+                "location": event.get("location"),
+            }
+            for event in services.calendar.upcoming(days=days)
         ]
     }
 

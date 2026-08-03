@@ -59,7 +59,11 @@ def context_for(actor: str, *, chat: str = CHAT, thread: int | None = None):
 
 @pytest.fixture
 def services(tmp_path: Path) -> Services:
-    return Services.on(open_database(tmp_path / "hermes.db"))
+    from hermes_cloud.execute.gcal import Calendar, FakeCalendar
+
+    return Services.on(
+        open_database(tmp_path / "hermes.db"), calendar=Calendar(FakeCalendar())
+    )
 
 
 # --- роли ---------------------------------------------------------------------
@@ -145,6 +149,7 @@ EXPECTED_CAPABILITY = {
     "list_reminders": READ_TASKS,
     "list_pending_proposals": READ_TASKS,
     "memory_search": READ_MEMORY,
+    "calendar_list_events": READ_CALENDAR,
     "propose_reminder": WRITE_REMINDER,
     "memory_append": WRITE_MEMORY,
 }
@@ -153,6 +158,7 @@ VALID_ARGUMENTS = {
     "list_reminders": {"limit": 5},
     "list_pending_proposals": {},
     "memory_search": {"query": "плавание"},
+    "calendar_list_events": {"days": 14},
     "propose_reminder": {"text": "оплатить взнос 15 EUR", "due_date": "2026-09-08"},
     "memory_append": {"text": "Лиза ходит на плавание по вторникам", "kind": "routine"},
 }

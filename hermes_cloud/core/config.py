@@ -22,12 +22,15 @@ ENV_LANGUAGE = "HERMES_FAMILY_LANGUAGE"
 ENV_MODEL = "HERMES_EXTRACTION_MODEL"
 ENV_EFFORT = "HERMES_EXTRACTION_EFFORT"
 ENV_TELEGRAM = "TELEGRAM_BOT_TOKEN"
+ENV_GOOGLE_TOKEN = "HERMES_GOOGLE_TOKEN"
+ENV_CALENDAR = "HERMES_CALENDAR_ID"
 
 DEFAULT_DB_PATH = "data/hermes.db"
 DEFAULT_LANGUAGE = "русский"
 # Модель извлечения выбрана бенчмарком Фазы 1 (bench/README.md).
 DEFAULT_MODEL = "claude-sonnet-5"
 DEFAULT_EFFORT = "medium"
+DEFAULT_CALENDAR = "primary"
 
 
 def load_dotenv(path: Path | str = ".env") -> None:
@@ -51,11 +54,22 @@ class Config:
     language: str
     model: str
     effort: str | None
+    google_token_path: Path | None
+    calendar_id: str
     telegram_token: str | None
 
     @property
     def has_telegram(self) -> bool:
         return bool(self.telegram_token)
+
+    @property
+    def has_calendar(self) -> bool:
+        """Календарь подключён, только если токен ассистента реально существует.
+
+        Путь в переменной без файла — не «почти подключён», а не подключён:
+        событие уедет файлом .ics, и семья ничего не потеряет.
+        """
+        return self.google_token_path is not None and self.google_token_path.is_file()
 
     def require_chat(self) -> str:
         if not self.chat:
@@ -77,4 +91,8 @@ def load_config(*, env: dict[str, str] | None = None) -> Config:
         model=source.get(ENV_MODEL) or DEFAULT_MODEL,
         effort=effort or DEFAULT_EFFORT,
         telegram_token=source.get(ENV_TELEGRAM) or None,
+        google_token_path=(
+            Path(source[ENV_GOOGLE_TOKEN]) if source.get(ENV_GOOGLE_TOKEN) else None
+        ),
+        calendar_id=source.get(ENV_CALENDAR) or DEFAULT_CALENDAR,
     )

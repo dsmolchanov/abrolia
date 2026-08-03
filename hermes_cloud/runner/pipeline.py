@@ -35,6 +35,11 @@ from hermes_cloud.core.runcontext import (
     WRITE_REMINDER,
     RunContext,
 )
+from hermes_cloud.execute.gcal import (
+    Calendar,
+    CalendarOutcomeUnknown,
+    build_calendar_event,
+)
 from hermes_cloud.execute.ics import build_event, filename_for, render_ics
 from hermes_cloud.execute.reminder import ReminderStore, due_timestamp
 from hermes_cloud.ingest.eml import parse_eml
@@ -42,6 +47,7 @@ from hermes_cloud.runner.card import (
     ACTION_CONFIRM,
     ACTION_EDIT,
     ACTION_REJECT,
+    KIND_CALENDAR,
     KIND_DELETE,
     KIND_EXPORT,
     KIND_ICS,
@@ -77,6 +83,7 @@ TEXT_OUTCOME_UNKNOWN = (
 # это разрешение на эффект, поэтому спрашивается mutate-cap, а не «знакомость».
 CAPABILITY_FOR_KIND = {
     KIND_REMINDER: WRITE_REMINDER,
+    KIND_CALENDAR: WRITE_CALENDAR,
     KIND_ICS: WRITE_CALENDAR,
     KIND_MEMORY: WRITE_MEMORY,
     KIND_EXPORT: DATA_EXPORT,
@@ -86,7 +93,9 @@ CAPABILITY_FOR_KIND = {
 # Виды эффектов, которые можно доделать после падения: локальные и
 # идемпотентные по id подтверждения. Всё остальное — наружу, и повтору не
 # подлежит (`Locked Decisions` → «Идемпотентность», `docs/SECURITY.md`, T9).
-REPLAYABLE_KINDS = frozenset({KIND_REMINDER, KIND_MEMORY})
+# Календарь здесь не по недосмотру: у события есть заданный нами id, поэтому
+# повтор находит его и обновляет, а не создаёт второе (`execute/gcal.py`).
+REPLAYABLE_KINDS = frozenset({KIND_REMINDER, KIND_MEMORY, KIND_CALENDAR})
 
 
 def evidence_needles(result) -> list[str]:
@@ -134,6 +143,7 @@ class Pipeline:
         actor: str = "system",
         effects: EffectJournal | None = None,
         loop: ToolLoop | None = None,
+        calendar: Calendar | None = None,
     ) -> None:
         self.approvals = approvals
         self.reminders = reminders
@@ -147,6 +157,9 @@ class Pipeline:
         self.effects = effects or EffectJournal(approvals.db)
         # Диалог необязателен: воркер и tick обходятся без него.
         self.loop = loop
+        # Календарь household'а. Без него событие уезжает файлом .ics — тот же
+        # результат для семьи, просто мы не можем писать сами.
+        self.calendar = calendar
         # Онтологический слой: провенанс, обязательства, память. Живёт в той же
         # базе — иначе «откуда эта сумма» пришлось бы собирать из двух мест.
         self.evidence = EvidenceStore(approvals.db)
@@ -178,7 +191,7 @@ class Pipeline:
         )
         source = self.evidence.render_source(ref)
 
-        preview = render_card(result, source=source)
+        preview = render_card(result, source=source, calendar=self.calendar is not None)
         if preview.proposal is None:
             # Информационное письмо: сообщение без кнопок, подтверждать нечего.
             self.transport.send_message(
@@ -205,7 +218,10 @@ class Pipeline:
             context_key=event.context_key,
             event_id=event.id,
         )
-        card = render_card(result, approval_id=staged.id, code=staged.code, source=source)
+        card = render_card(
+            result, approval_id=staged.id, code=staged.code, source=source,
+            calendar=self.calendar is not None,
+        )
         self.transport.send_message(
             chat=self.chat,
             text=card.text,
@@ -336,6 +352,8 @@ class Pipeline:
         try:
             if payload["kind"] == KIND_REMINDER:
                 text = self._execute_reminder(approval, payload, now=now)
+            elif payload["kind"] == KIND_CALENDAR:
+                text = self._execute_calendar(approval, payload, now=now)
             elif payload["kind"] == KIND_ICS:
                 text = self._execute_ics(approval, payload)
             elif payload["kind"] == KIND_MEMORY:
@@ -346,7 +364,7 @@ class Pipeline:
                 text = self._execute_delete(approval, now=now)
             else:
                 raise ValueError(f"неизвестный вид предложения: {payload['kind']!r}")
-        except SendOutcomeUnknown as error:
+        except (SendOutcomeUnknown, CalendarOutcomeUnknown) as error:
             # Отправка могла дойти. Повторять нельзя, молчать — тем более.
             self.effects.outcome_unknown(effect.id, f"{type(error).__name__}: {error}", now=now)
             self.approvals.mark(
@@ -453,6 +471,27 @@ class Pipeline:
         reminder = self.reminders.for_approval(approval.id)
         if reminder is not None:
             self.commitments.link(commitment_id, reminder_id=reminder.id, now=now)
+
+    def _execute_calendar(self, approval, payload: dict, *, now: float | None) -> str:
+        """Событие в календарь семьи. Повтор находит его по id и обновляет."""
+        if self.calendar is None:  # pragma: no cover — карточка бы не появилась
+            raise ValueError("календарь не подключён")
+        start = datetime.fromisoformat(payload["start"])
+        event = build_calendar_event(
+            approval_id=approval.id,
+            title=payload["title"],
+            start=start,
+            end=datetime.fromisoformat(payload["end"]) if payload.get("end") else None,
+            description=payload.get("description"),
+            location=payload.get("location"),
+        )
+        written = self.calendar.upsert(event)
+        commitment_id = payload.get("commitment_id")
+        if commitment_id:
+            self.commitments.link(commitment_id, calendar_event_id=event.id, now=now)
+        verb = "обновил" if written.updated else "добавил"
+        link = f"\n{written.link}" if written.link else ""
+        return f"Готово: {verb} в календаре «{payload['title']}».{link}"
 
     def _execute_ics(self, approval, payload: dict) -> str:
         start = datetime.fromisoformat(payload["start"])

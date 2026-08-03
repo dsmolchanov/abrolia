@@ -67,6 +67,7 @@ def _pipeline(args: argparse.Namespace, database) -> Pipeline:
         print("карточки печатаю в консоль; подтверждать командой `confirm <id>`")
     approvals = ApprovalStore(database)
     reminders = ReminderStore(database)
+    calendar = _calendar(config)
     return Pipeline(
         approvals=approvals,
         reminders=reminders,
@@ -76,11 +77,24 @@ def _pipeline(args: argparse.Namespace, database) -> Pipeline:
         ),
         chat=config.require_chat(),
         thread=config.thread,
+        calendar=calendar,
         loop=ToolLoop(
             journal=EffectJournal(database),
-            services=Services.on(database),
+            services=Services.on(database, calendar=calendar),
             family_language=config.language,
         ),
+    )
+
+
+def _calendar(config):
+    """Календарь household'а — только при живом токене ассистента."""
+    if not config.has_calendar:
+        return None
+    from hermes_cloud.execute.gcal import Calendar, GoogleCalendar
+
+    return Calendar(
+        GoogleCalendar.from_token_file(str(config.google_token_path)),
+        calendar_id=config.calendar_id,
     )
 
 

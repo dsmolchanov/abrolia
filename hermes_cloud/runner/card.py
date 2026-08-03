@@ -25,6 +25,9 @@ ACTION_EDIT = "edit"
 ACTION_REJECT = "reject"
 
 KIND_REMINDER = "reminder"
+# Событие уезжает в календарь семьи, если он подключён, и файлом — если нет.
+# Для человека это одна и та же карточка: разница в том, куда мы можем писать.
+KIND_CALENDAR = "calendar"
 KIND_ICS = "ics"
 # Запись в память — тоже предложение с кнопками: попасть в память иначе как
 # через человека нельзя (`core/memory.py`).
@@ -70,18 +73,20 @@ def _format_date(value: date | datetime | None) -> str | None:
     return value.strftime("%d.%m.%Y")
 
 
-def proposal_for(result: ExtractionResult) -> dict[str, Any] | None:
+def proposal_for(
+    result: ExtractionResult, *, calendar: bool = False
+) -> dict[str, Any] | None:
     """Что именно предлагается сделать. None — предлагать нечего.
 
-    В Фазе 1 доступны два исполнителя: напоминание и файл-приглашение (ICS).
-    Событие с известным началом → ICS; всё остальное, что требует действия, →
-    напоминание к дедлайну.
+    Событие с известным началом уезжает в календарь семьи, если он подключён, и
+    файлом `.ics` — если нет. Всё остальное, что требует действия, становится
+    напоминанием к дедлайну.
     """
     if result.kind in {"info", "spam"} or not result.action_required:
         return None
     if result.kind == "event" and result.event_start is not None:
         return {
-            "kind": KIND_ICS,
+            "kind": KIND_CALENDAR if calendar else KIND_ICS,
             "title": result.title,
             "start": result.event_start.isoformat(),
             "end": result.event_end.isoformat() if result.event_end else None,
@@ -109,6 +114,7 @@ def render_card(
     approval_id: str | None = None,
     code: str | None = None,
     source: str | None = None,
+    calendar: bool = False,
 ) -> Card:
     """Собрать карточку. Без `approval_id` карточка получается без кнопок.
 
@@ -146,7 +152,7 @@ def render_card(
         lines.append("")
         lines.extend(facts)
 
-    proposal = proposal_for(result)
+    proposal = proposal_for(result, calendar=calendar)
     if proposal is None:
         if result.kind == "spam":
             lines.append("")
