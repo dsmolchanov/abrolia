@@ -224,7 +224,7 @@ def test_eml_body_is_decoded_before_scanning(tmp_path: Path) -> None:
     path.write_text(eml, encoding="utf-8")
     scannable = checker.read_scannable(path)
     assert scannable.opaque_parts == ()
-    assert "email" in [f.rule for f in checker.scan_text(scannable.text, path="encoded.eml")]
+    assert "email" in [f.rule for f in checker.scan_scannable(scannable, path="encoded.eml")]
 
 
 def _eml_with_pdf_attachment(text_body: str) -> str:
@@ -272,7 +272,7 @@ def test_latin1_8bit_email_is_still_scanned(tmp_path: Path) -> None:
     path.write_bytes(eml)
     scannable = checker.read_scannable(path)
     assert scannable.opaque_parts == ()
-    assert "email" in [f.rule for f in checker.scan_text(scannable.text, path="latin1.eml")]
+    assert "email" in [f.rule for f in checker.scan_scannable(scannable, path="latin1.eml")]
 
 
 def test_large_email_is_still_scanned(tmp_path: Path) -> None:
@@ -297,7 +297,7 @@ def test_large_email_is_still_scanned(tmp_path: Path) -> None:
     path.write_text(eml, encoding="utf-8")
     scannable = checker.read_scannable(path)
     assert [checker.opaque_part_name(p) for p in scannable.opaque_parts] == ["gross.pdf"]
-    assert "email" in [f.rule for f in checker.scan_text(scannable.text, path="gross.eml")]
+    assert "email" in [f.rule for f in checker.scan_scannable(scannable, path="gross.eml")]
 
 
 def test_ascii_pdf_attachment_is_opaque_by_type(tmp_path: Path) -> None:
@@ -356,7 +356,7 @@ def test_nested_base64_email_is_parsed(tmp_path: Path) -> None:
         "--b1--\n"
     )
     scannable = _read(tmp_path, "nested.eml", eml)
-    assert "email" in [f.rule for f in checker.scan_text(scannable.text, path="nested.eml")]
+    assert "email" in [f.rule for f in checker.scan_scannable(scannable, path="nested.eml")]
 
 
 def test_unknown_transfer_encoding_is_opaque(tmp_path: Path) -> None:
@@ -389,7 +389,7 @@ def test_part_headers_are_scanned(tmp_path: Path) -> None:
         "--b1--\n"
     )
     scannable = _read(tmp_path, "hdr.eml", eml)
-    assert "email" in [f.rule for f in checker.scan_text(scannable.text, path="hdr.eml")]
+    assert "email" in [f.rule for f in checker.scan_scannable(scannable, path="hdr.eml")]
 
 
 def test_html_entities_are_normalised(tmp_path: Path) -> None:
@@ -401,7 +401,7 @@ def test_html_entities_are_normalised(tmp_path: Path) -> None:
         f"<p>Kontakt: <b>{local}</b>&#64;{domain}</p>\n"
     )
     scannable = _read(tmp_path, "html.eml", eml)
-    assert "email" in [f.rule for f in checker.scan_text(scannable.text, path="html.eml")]
+    assert "email" in [f.rule for f in checker.scan_scannable(scannable, path="html.eml")]
 
 
 def test_json_unicode_escape_is_normalised() -> None:
@@ -444,6 +444,96 @@ def test_pdf_declared_as_text_is_opaque(tmp_path: Path) -> None:
     )
     scannable = _read(tmp_path, "liar.eml", eml)
     assert [checker.opaque_part_name(x) for x in scannable.opaque_parts] == ["liar.txt"]
+
+
+def _scan_fixture_file(tmp_path: Path, name: str, content) -> list[str]:
+    """Прогнать один файл через настоящий гейт (scan_paths), а не через helper."""
+    fixtures = tmp_path / "tests" / "fixtures"
+    fixtures.mkdir(parents=True, exist_ok=True)
+    target = fixtures / name
+    if isinstance(content, bytes):
+        target.write_bytes(content)
+    else:
+        target.write_text(content, encoding="utf-8")
+    return [f.rule for f in checker.scan_paths([tmp_path / "tests"], repo_root=tmp_path)]
+
+
+def test_json_escape_in_plain_file_is_caught(tmp_path: Path) -> None:
+    """Нормализация обязана работать и вне писем — файл фикстуры это файл."""
+    local, domain = GMAIL.split("@")
+    payload = '{"to": "' + local + "\\u0040" + domain + '"}\n'
+    assert "email" in _scan_fixture_file(tmp_path, "webhook.json", payload)
+
+
+def test_html_entity_in_plain_file_is_caught(tmp_path: Path) -> None:
+    local, domain = GMAIL.split("@")
+    page = f"<p>Kontakt: <b>{local}</b>&#64;{domain}</p>\n"
+    assert "email" in _scan_fixture_file(tmp_path, "page.html", page)
+
+
+def test_ascii_rtf_file_is_opaque(tmp_path: Path) -> None:
+    rtf = rb"{\rtf1 Kontakt: parent\'40gmail.com}"
+    assert _scan_fixture_file(tmp_path, "brief.rtf", rtf) == ["unscannable"]
+
+
+def test_pdf_with_text_extension_is_opaque(tmp_path: Path) -> None:
+    assert _scan_fixture_file(tmp_path, "liar.txt", b"%PDF-1.4 plain ascii payload") == [
+        "unscannable"
+    ]
+
+
+def test_corrupted_base64_part_is_opaque(tmp_path: Path) -> None:
+    """stdlib не бросает исключение: он возвращает огрызок и пишет дефект."""
+    eml = (
+        "From: Anna Beispiel <anna@example.com>\n"
+        "MIME-Version: 1.0\n"
+        'Content-Type: multipart/mixed; boundary="b1"\n\n'
+        "--b1\n"
+        'Content-Type: text/plain; charset="utf-8"\n'
+        'Content-Disposition: attachment; filename="broken.txt"\n'
+        "Content-Transfer-Encoding: base64\n\n"
+        "%%%%\n"
+        "--b1--\n"
+    )
+    path = tmp_path / "broken.eml"
+    path.write_text(eml, encoding="utf-8")
+    scannable = checker.read_scannable(path)
+    assert [checker.opaque_part_name(x) for x in scannable.opaque_parts] == ["broken.txt"]
+
+
+def test_corrupted_base64_nested_email_is_opaque(tmp_path: Path) -> None:
+    eml = (
+        "From: Anna Beispiel <anna@example.com>\n"
+        "MIME-Version: 1.0\n"
+        'Content-Type: multipart/mixed; boundary="b1"\n\n'
+        "--b1\n"
+        "Content-Type: message/rfc822\n"
+        'Content-Disposition: attachment; filename="inner.eml"\n'
+        "Content-Transfer-Encoding: base64\n\n"
+        "!!!!not base64!!!!\n"
+        "--b1--\n"
+    )
+    path = tmp_path / "broken_nested.eml"
+    path.write_text(eml, encoding="utf-8")
+    scannable = checker.read_scannable(path)
+    assert scannable.opaque_parts, "повреждённое вложенное письмо обязано быть непрозрачным"
+
+
+def test_tilde_line_inside_backtick_fence_does_not_open_entries(tmp_path: Path) -> None:
+    """Смешанные fence: `~~~` внутри ```-блока не выводит парсер наружу."""
+    fixtures = tmp_path / "tests" / "fixtures" / "media"
+    fixtures.mkdir(parents=True)
+    (fixtures / "notice.png").write_bytes(b"\x89PNG\r\n\x1a\n\x00binary")
+    (tmp_path / "tests" / "fixtures" / "PROVENANCE.md").write_text(
+        "Пример формата:\n\n"
+        "```\n"
+        "~~~\n"
+        "- `media/notice.png` — это пример внутри блока кода, а не запись\n"
+        "```\n",
+        encoding="utf-8",
+    )
+    findings = checker.scan_paths([tmp_path / "tests"], repo_root=tmp_path)
+    assert [f.rule for f in findings] == ["unscannable"]
 
 
 def test_provenance_needs_a_structured_entry(tmp_path: Path) -> None:
@@ -588,4 +678,4 @@ def test_shipped_email_fixture_is_synthetic() -> None:
     fixture = REPO_ROOT / "tests" / "fixtures" / "email" / "forwarded_school_de.eml"
     scannable = checker.read_scannable(fixture)
     assert scannable.opaque_parts == ()
-    assert [f.render() for f in checker.scan_text(scannable.text, path=str(fixture))] == []
+    assert [f.render() for f in checker.scan_scannable(scannable, path=str(fixture))] == []

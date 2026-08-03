@@ -85,7 +85,8 @@ providers that would be untrue.
 | Source emails, photos, voice notes, attachments | 30 days |
 | Conversation with the assistant | 180 days |
 | Tasks and reminders | 90 days after completion |
-| Action journal and delivery receipts | 365 days |
+| Action journal | 365 days |
+| Email delivery receipts | 365 days with us; at the mail provider (Resend) per their own retention policy |
 | Calendar events (our internal mapping to your calendar) | 365 days; the event itself stays in your Google account |
 | Memory | until you delete it; we prompt a review every 90 days |
 | Incoming messages on any channel (webhook, WhatsApp) before processing | 30 days — same as other source content |
@@ -95,8 +96,15 @@ providers that would be untrue.
 | Passwords and access keys (app password, channel tokens) | while the connection is active; deleted when the channel is disconnected or the account closed — no later than 30 days |
 | Technical logs (identifiers and statuses, no content) | 30 days |
 | Backups | rolling 30-day window |
-| Consent receipts, records of your rights requests, incident records | 3 years. The law requires us to be able to demonstrate consent and to keep incident records, but the specific period is ours to set — chosen against the limitation period and to be confirmed by counsel before launch |
+| Consent receipts | for as long as the consent is in force, plus 3 years after withdrawal |
+| Records of your rights requests (what was asked, what was done, when) | 3 years from closing the request |
+| Incident records | 3 years from closing the incident |
 | Family member identifiers and settings | while the account is active + 30 days |
+
+The three-year periods are our choice, not a statutory figure: the law requires
+us to be able to demonstrate consent and to keep incident records, but names no
+period. Three years follows the limitation period and will be confirmed by
+counsel before launch.
 
 This table lists every class of data we retain. The technical version with
 storage locations and jurisdictions is in `docs/privacy/data-map.md`.

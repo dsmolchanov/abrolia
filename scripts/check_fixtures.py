@@ -47,6 +47,7 @@ import argparse
 import base64
 import contextlib
 import email
+import email.errors
 import email.policy
 import html
 import json
@@ -108,6 +109,13 @@ BINARY_MAGIC = (
 
 # Защита от «матрёшки» из вложенных писем.
 MAX_MIME_DEPTH = 12
+
+# Дефекты, при которых прочитанное — не содержимое, а его огрызок.
+DECODING_DEFECTS = (
+    email.errors.InvalidBase64CharactersDefect,
+    email.errors.InvalidBase64PaddingDefect,
+    email.errors.InvalidBase64LengthDefect,
+)
 
 # Окно контекста для Telegram-ID (в обе стороны): в JSON ключ `"from": {` и
 # `"id": …` стоят на разных строках и в любом порядке, поэтому построчная
@@ -419,6 +427,14 @@ class Scannable:
 
     text: str
     opaque_parts: tuple[str, ...] = ()
+    # Дополнительные представления того же файла (развёрнутое письмо,
+    # нормализованный текст). Сканируются отдельно, чтобы нумерация строк
+    # оставалась верной; одно значение в отчёт попадает один раз.
+    extra_views: tuple[str, ...] = ()
+
+    @property
+    def multi_view(self) -> bool:
+        return bool(self.extra_views)
 
 
 def _is_textual(content_type: str) -> bool:
@@ -431,6 +447,11 @@ def _is_textual(content_type: str) -> bool:
     if content_type.startswith("text/"):
         return True
     return content_type in TEXTUAL_MIME_TYPES
+
+
+def _has_decoding_defect(part) -> bool:
+    """Записал ли парсер дефект кодирования у этой части."""
+    return any(isinstance(defect, DECODING_DEFECTS) for defect in getattr(part, "defects", ()))
 
 
 def _looks_binary(payload: bytes) -> bool:
@@ -447,18 +468,31 @@ def _looks_binary(payload: bytes) -> bool:
 def normalize_text(text: str) -> str:
     """Снять экранирование, за которым прячется значение.
 
-    `parent&#64;gmail.com` в HTML, `\u0040` в JSON и разметка вокруг адреса —
-    всё это проходит мимо правил, если сканировать байты как есть.
+    `anna&#64;example.com` в HTML, `\\u0040` в JSON и разметка вокруг адреса —
+    всё это проходит мимо правил, если сканировать байты как есть. Обработка
+    построчная: нумерация строк в отчёте остаётся верной.
     """
     unescaped = html.unescape(text)
-    unescaped = re.sub(
+    return re.sub(
         r"\\u([0-9a-fA-F]{4})", lambda m: chr(int(m.group(1), 16)), unescaped
     )
-    # Разметку снимаем в двух вариантах: со склейкой (адрес, разорванный
-    # тегами, собирается обратно) и с пробелом (соседние слова не слипаются).
-    joined = re.sub(r"<[^>]{1,200}>", "", unescaped)
-    spaced = re.sub(r"<[^>]{1,200}>", " ", unescaped)
-    return joined if joined == spaced else joined + "\n" + spaced
+
+
+def normalized_views(text: str) -> tuple[str, ...]:
+    """Дополнительные представления текста для сканирования.
+
+    Разметку снимаем в двух вариантах: со склейкой (адрес, разорванный тегами,
+    собирается обратно) и с пробелом (соседние слова не слипаются).
+    """
+    unescaped = normalize_text(text)
+    joined = re.sub(r"<[^>\n]{1,200}>", "", unescaped)
+    spaced = re.sub(r"<[^>\n]{1,200}>", " ", unescaped)
+    views = [view for view in (unescaped, joined, spaced) if view != text]
+    unique: list[str] = []
+    for view in views:
+        if view not in unique:
+            unique.append(view)
+    return tuple(unique)
 
 
 def _decode(payload: bytes, charset: str) -> str:
@@ -519,7 +553,9 @@ def _walk_part(part, *, stem: str, index: int, chunks: list[str], opaque: list[s
                 source = str(nested_payload).encode("utf-8", errors="replace")
         try:
             if cte == "base64":
-                source = base64.b64decode(source, validate=False)
+                # validate=True: повреждённый base64 не должен молча
+                # превращаться в усечённое «письмо», которое нечего проверять.
+                source = base64.b64decode(re.sub(rb"\s+", b"", source), validate=True)
             elif cte == "quoted-printable":
                 source = quopri.decodestring(source)
         except Exception:
@@ -538,6 +574,12 @@ def _walk_part(part, *, stem: str, index: int, chunks: list[str], opaque: list[s
         payload = part.get_payload(decode=True)
     except Exception:  # pragma: no cover - битый transfer-encoding
         payload = None
+    if _has_decoding_defect(part):
+        # stdlib не бросает исключение на повреждённом base64: он возвращает
+        # усечённые (или пустые) байты и записывает дефект. Прочитанным это
+        # считать нельзя — что было в исходных байтах, мы не знаем.
+        opaque.append(f"{name} ({content_type}, повреждённое кодирование)")
+        return
     if payload is None:
         raw_payload = part.get_payload()
         if isinstance(raw_payload, list):
@@ -555,11 +597,7 @@ def _walk_part(part, *, stem: str, index: int, chunks: list[str], opaque: list[s
         opaque.append(f"{name} ({content_type})")
         return
 
-    text = _decode(payload, part.get_content_charset() or "utf-8")
-    chunks.append(text)
-    normalized = normalize_text(text)
-    if normalized != text:
-        chunks.append(normalized)
+    chunks.append(_decode(payload, part.get_content_charset() or "utf-8"))
 
 
 def eml_to_text(raw: bytes, *, stem: str = "eml") -> tuple[str, list[str]]:
@@ -602,26 +640,35 @@ def read_scannable(path: Path) -> Scannable:
         raw = path.read_bytes()
         decoded, opaque = eml_to_text(raw, stem=path.name)
         envelope = raw.decode("utf-8", errors="replace")
-        return Scannable(envelope + "\n" + decoded, tuple(opaque))
+        # Сырьё письма — основное представление (нумерация строк совпадает с
+        # файлом), развёрнутый MIME и его нормализация — дополнительные.
+        views = (decoded, *normalized_views(decoded))
+        return Scannable(envelope, tuple(opaque), extra_views=views)
 
     if size > MAX_FILE_BYTES:
         raise Unscannable(f"больше {MAX_FILE_BYTES} байт")
     if path.suffix.lower() in BINARY_SUFFIXES:
         raise Unscannable(f"бинарный формат {path.suffix.lower()}")
     raw = path.read_bytes()
-    if b"\x00" in raw:
-        raise Unscannable("содержит нулевые байты")
+    if _looks_binary(raw):
+        # Расширение может врать так же, как MIME-тип внутри письма: `.txt`
+        # с сигнатурой %PDF- или {\rtf — непрозрачный файл, а не текст.
+        raise Unscannable("бинарная сигнатура при текстовом расширении")
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise Unscannable("не UTF-8") from exc
-    return Scannable(text)
+    # Нормализация нужна не только внутри письма: `.json` с `\u0040` и `.html`
+    # с `&#64;` — такие же фикстуры и точно так же прячут адрес.
+    return Scannable(text, extra_views=normalized_views(text))
 
 
 # Запись манифеста: `- \`путь\` — описание` вне блоков кода.
 # Отступ ограничен тремя пробелами: четыре и больше — это indented code block
 # по CommonMark, то есть пример, а не запись.
 PROVENANCE_ENTRY_RE = re.compile(r"^ {0,3}[-*] +`([^`]+)`\s*[—–-]\s*\S")
+# Открывающий/закрывающий fence: не меньше трёх одинаковых символов.
+FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 
 
 def load_provenance(manifest: Path) -> set[str]:
@@ -637,13 +684,21 @@ def load_provenance(manifest: Path) -> set[str]:
     except OSError:  # pragma: no cover
         return set()
     entries: set[str] = set()
-    in_fence = False
+    fence: tuple[str, int] | None = None
     for line in text.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("```") or stripped.startswith("~~~"):
-            in_fence = not in_fence
+        opener = FENCE_RE.match(line)
+        if opener:
+            marker = opener.group(1)
+            char, length = marker[0], len(marker)
+            if fence is None:
+                fence = (char, length)
+                continue
+            # Закрыть блок может только тот же символ той же или большей длины:
+            # строка `~~~` внутри ```-блока — это содержимое, а не конец.
+            if char == fence[0] and length >= fence[1] and not opener.group(2).strip():
+                fence = None
             continue
-        if in_fence:
+        if fence is not None:
             continue
         match = PROVENANCE_ENTRY_RE.match(line)
         if not match:
@@ -752,6 +807,36 @@ def scan_text(
     return findings
 
 
+def scan_scannable(
+    scannable: Scannable,
+    *,
+    path: str,
+    allow: Sequence[AllowEntry] = (),
+    deny: Sequence[re.Pattern[str]] = (),
+) -> list[Finding]:
+    """Просканировать все представления файла и убрать повторы.
+
+    Представления (сырьё, развёрнутое письмо, нормализованный текст)
+    сканируются отдельно, чтобы нумерация строк в каждом была верной; одно и
+    то же значение показывается пользователю один раз — из первого
+    представления, где оно найдено.
+    """
+    findings = scan_text(scannable.text, path=path, allow=allow, deny=deny)
+    for view in scannable.extra_views:
+        findings.extend(scan_text(view, path=path, allow=allow, deny=deny))
+    if not scannable.multi_view:
+        return findings
+    seen: set[tuple[str, str]] = set()
+    deduped: list[Finding] = []
+    for finding in findings:
+        key = (finding.rule, finding.value)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(finding)
+    return deduped
+
+
 def scan_paths(
     roots: Sequence[Path],
     *,
@@ -778,20 +863,7 @@ def scan_paths(
                             exc.reason, rel)
                 )
             continue
-        file_findings = scan_text(scannable.text, path=rel, allow=allow, deny=deny)
-        if file_path.suffix.lower() == ".eml":
-            # .eml сканируется дважды — как сырьё и как развёрнутый текст, —
-            # поэтому одно и то же значение не показывается пользователю дважды.
-            seen: set[tuple[str, str]] = set()
-            deduped: list[Finding] = []
-            for finding in file_findings:
-                key = (finding.rule, finding.value)
-                if key in seen:
-                    continue
-                seen.add(key)
-                deduped.append(finding)
-            file_findings = deduped
-        findings.extend(file_findings)
+        findings.extend(scan_scannable(scannable, path=rel, allow=allow, deny=deny))
         for label in scannable.opaque_parts:
             # Provenance на само письмо не покрывает вложение внутри него:
             # иначе одна бинарная часть прятала бы весь файл от проверки.

@@ -49,7 +49,7 @@ tests/fixtures/
 
 ```bash
 export HERMES_EXTRA_DENY_FILE=~/.config/hermes-cloud/deny-patterns.txt
-python scripts/check_fixtures.py
+python3 scripts/check_fixtures.py --all --require-deny
 ```
 
 Файл — построчные regex; проверка их применяет дополнительно к встроенным правилам.
