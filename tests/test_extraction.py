@@ -48,7 +48,7 @@ class FakeResponse:
         self.stop_reason = stop_reason
         self.stop_details = None if stop_reason != "refusal" else {"category": "cyber"}
         self.usage = FakeUsage()
-        self.model = "claude-opus-5"
+        self.model = "claude-sonnet-5"
 
 
 class FakeMessages:
@@ -110,18 +110,28 @@ def test_original_sender_is_passed_as_trusted_metadata() -> None:
 
 def test_request_shape_matches_the_current_api() -> None:
     client = FakeClient()
-    Extractor(client, model="claude-opus-5", effort="medium").extract_email(
+    Extractor(client, model="claude-sonnet-5", effort="medium").extract_email(
         load("direct_invoice_it.eml")
     )
 
     call = client.messages.calls[0]
-    assert call["model"] == "claude-opus-5"
+    assert call["model"] == "claude-sonnet-5"
     assert call["output_format"] is ExtractionResult
     assert call["output_config"] == {"effort": "medium"}
     # Стабильный системный префикс кэшируется: он одинаков для всех писем.
     assert call["system"][0]["cache_control"] == {"type": "ephemeral"}
     # Параметры сэмплирования на этой модели запрещены.
     assert "temperature" not in call and "top_p" not in call and "top_k" not in call
+
+
+def test_effort_is_omitted_when_the_model_does_not_support_it() -> None:
+    """Haiku 4.5 отвечает 400 на output_config.effort — параметра быть не должно."""
+    client = FakeClient()
+    Extractor(client, model="claude-haiku-4-5", effort=None).extract_email(
+        load("direct_invoice_it.eml")
+    )
+
+    assert "output_config" not in client.messages.calls[0]
 
 
 def test_family_language_reaches_the_prompt() -> None:
@@ -144,7 +154,7 @@ def test_usage_is_reported_for_cost_caps() -> None:
     assert extraction.result.kind == "payment"
     assert extraction.input_tokens == 1200
     assert extraction.cache_read_tokens == 900
-    assert extraction.model == "claude-opus-5"
+    assert extraction.model == "claude-sonnet-5"
 
 
 def test_attachment_metadata_is_listed() -> None:

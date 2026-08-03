@@ -12,17 +12,84 @@ import os
 import sys
 from pathlib import Path
 
+from hermes_cloud.channels.telegram import FakeTransport, TelegramTransport
+from hermes_cloud.core.approvals import ApprovalStore
+from hermes_cloud.core.config import load_config, load_dotenv
 from hermes_cloud.core.db import open_database
 from hermes_cloud.core.events import EventStore
+from hermes_cloud.execute.reminder import ReminderStore
 from hermes_cloud.ingest.inject import ingest_file
+from hermes_cloud.ingest.worker import Worker
+from hermes_cloud.runner.extraction import Extractor
+from hermes_cloud.runner.pipeline import Pipeline
 
 DEFAULT_DB_PATH = "data/hermes.db"
 DB_ENV = "HERMES_DB"
 
 
-def _store(args: argparse.Namespace) -> EventStore:
+def _database(args: argparse.Namespace):
+    load_dotenv()
     path = args.db or os.environ.get(DB_ENV) or DEFAULT_DB_PATH
-    return EventStore(open_database(Path(path)))
+    return open_database(Path(path))
+
+
+def _store(args: argparse.Namespace) -> EventStore:
+    return EventStore(_database(args))
+
+
+def _pipeline(args: argparse.Namespace, database) -> Pipeline:
+    """Собрать конвейер из окружения. Без токена — сухой прогон в консоль."""
+    config = load_config()
+    transport = (
+        TelegramTransport(config.telegram_token) if config.has_telegram else FakeTransport()
+    )
+    if not config.has_telegram:
+        print("TELEGRAM_BOT_TOKEN не задан — работаю всухую, сообщения в консоль")
+    return Pipeline(
+        approvals=ApprovalStore(database),
+        reminders=ReminderStore(database),
+        transport=transport,
+        extractor=Extractor(
+            model=config.model, effort=config.effort, family_language=config.language
+        ),
+        chat=config.require_chat(),
+        thread=config.thread,
+    )
+
+
+def cmd_worker(args: argparse.Namespace) -> int:
+    """Обработать очередь: событие → извлечение → карточка."""
+    database = _database(args)
+    events = EventStore(database)
+    pipeline = _pipeline(args, database)
+    processed = Worker(events, pipeline.handle_event, worker_id="cli").drain(limit=args.limit)
+    for item in processed:
+        state = "ок" if item.ok else f"ошибка: {item.error}"
+        print(f"{item.event.id}  {state}")
+    if not processed:
+        print("очередь пуста")
+    return 0
+
+
+def cmd_tick(args: argparse.Namespace) -> int:
+    """Доставить созревшие напоминания. В Фазе 5 это делает scheduler-loop."""
+    database = _database(args)
+    pipeline = _pipeline(args, database)
+    delivered = 0
+    while True:
+        reminder = pipeline.reminders.claim_due()
+        if reminder is None:
+            break
+        pipeline.transport.send_message(
+            chat=reminder.chat, thread=reminder.thread,
+            text=f"Напоминание: {reminder.text}",
+        )
+        pipeline.reminders.mark_delivered(reminder.id)
+        delivered += 1
+        print(f"{reminder.id}  доставлено")
+    if not delivered:
+        print("созревших напоминаний нет")
+    return 0
 
 
 def cmd_inject_eml(args: argparse.Namespace) -> int:
@@ -95,6 +162,13 @@ def build_parser() -> argparse.ArgumentParser:
     replay = commands.add_parser("replay", help="вернуть событие в очередь")
     replay.add_argument("event_id")
     replay.set_defaults(func=cmd_replay)
+
+    worker = commands.add_parser("worker", help="обработать очередь событий")
+    worker.add_argument("--limit", type=int, default=10)
+    worker.set_defaults(func=cmd_worker)
+
+    tick = commands.add_parser("tick", help="доставить созревшие напоминания")
+    tick.set_defaults(func=cmd_tick)
     return parser
 
 

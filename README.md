@@ -11,6 +11,27 @@ Family operations assistant for households living in a foreign language. Forward
 Status: pilot MVP under construction. **Gate −1 (right-to-build) is open**: the engineering and privacy drafts exist and are under review, and the system runs on synthetic data only. Real data — including the owner's own mailbox — is not connected before Phase 2 and counsel sign-off.
 See `thoughts/shared/plans/2026-08-02-family-ops-assistant-mvp.md` for the implementation plan and `thoughts/shared/implementations/2026-08-02-family-ops-assistant-mvp-validation.md` for the Gate −1 validation report.
 
+## Running the Phase 1 slice (synthetic data only)
+
+```bash
+pip install -r requirements-dev.txt
+export ANTHROPIC_API_KEY=...          # or put it in .env (gitignored)
+export HERMES_CHAT=-100990000101      # Telegram chat the cards go to
+export TELEGRAM_BOT_TOKEN=...         # optional: without it messages print to the console
+
+python3 -m hermes_cloud.cli inject-eml tests/fixtures/email/forwarded_school_de.eml
+python3 -m hermes_cloud.cli worker     # extraction → card with ✅ / ✏️ / ❌
+python3 -m hermes_cloud.cli status     # queue counters
+python3 -m hermes_cloud.cli tick       # deliver reminders that came due
+python3 -m hermes_cloud.cli dlq        # events that exhausted their attempts
+python3 -m hermes_cloud.cli replay <event_id>
+```
+
+Nothing leaves the machine without a human pressing ✅: the worker only stages a
+proposal, and execution happens after `claim` (see [`docs/SECURITY.md`](docs/SECURITY.md)).
+
+Model benchmark and the extraction-model decision: [`bench/README.md`](bench/README.md).
+
 ## Documentation
 
 - [`docs/SECURITY.md`](docs/SECURITY.md) — threat model, trust boundaries, vulnerability reporting

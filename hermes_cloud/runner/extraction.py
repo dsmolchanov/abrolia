@@ -12,8 +12,13 @@
    карточки; автоисполнения по порогу нет и не будет
    (Locked Decisions → «Модели»).
 
-Модель — `claude-opus-5` (quality-first старт по плану); рабочая модель для
-extraction выбирается по бенчмарку Фазы 1.
+**Модель выбрана бенчмарком Фазы 1** (`bench/README.md`, отчёт
+`bench/report.md`): `claude-sonnet-5` при `effort=medium`. На корпусе из 44
+писем она даёт ту же точность, что `claude-opus-5` (42/44 кейсов без единой
+ошибки), устояла против всех инъекций и стоит примерно на треть дешевле.
+`claude-haiku-4-5` заметно слабее (34/44) и при этом не дешевле на этой
+нагрузке. Диалоговая модель остаётся `claude-opus-5` — это отдельное Locked
+Decision плана.
 """
 
 from __future__ import annotations
@@ -29,9 +34,10 @@ from hermes_cloud.ingest.eml import Attachment, OriginalSender, ParsedEmail
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "claude-opus-5"
+# Решение бенчмарка Фазы 1, а не догадка: см. заголовок модуля.
+DEFAULT_MODEL = "claude-sonnet-5"
 DEFAULT_MAX_TOKENS = 4096
-DEFAULT_EFFORT = "high"
+DEFAULT_EFFORT = "medium"
 
 # Разделители недоверенного контента. Совпадение этих строк в самом письме
 # экранируется, чтобы отправитель не мог «закрыть» блок и выйти из данных.
@@ -60,7 +66,13 @@ SYSTEM_PROMPT = """\
 письме.
 - `kind`: `event` — встреча/мероприятие с датой и временем; `payment` — нужно \
 заплатить; `task` — нужно что-то сделать/принести/подписать; `info` — просто \
-информация, действий не требуется; `spam` — реклама или мусор.
+информация, действий не требуется; `spam` — реклама, мошенничество или мусор.
+- `action_required` = true, если семье нужно что-то сделать: заплатить, \
+принести, подписать, прийти — или добавить событие в календарь. Приглашение с \
+датой — тоже действие, даже если участие необязательно. false — только для \
+чистой информации: каникулы, часы работы, подтверждение уже прошедшей оплаты.
+- `original_sender` — адрес, на который следует отвечать: у пересланного \
+письма это оригинальный отправитель из цепочки, у обычного — его отправитель.
 - `confidence` — твоя оценка того, насколько уверенно извлечено главное \
 (0.0–1.0). Она влияет только на то, как карточка будет показана человеку.
 - Никаких медицинских или религиозных признаков не извлекай и не выводи в \
@@ -190,7 +202,7 @@ class Extractor:
         model: str = DEFAULT_MODEL,
         family_language: str = "русский",
         max_tokens: int = DEFAULT_MAX_TOKENS,
-        effort: str = DEFAULT_EFFORT,
+        effort: str | None = DEFAULT_EFFORT,
     ) -> None:
         self._client = client
         self.model = model
@@ -223,6 +235,11 @@ class Extractor:
         return self.extract_text(content)
 
     def extract_text(self, user_content: str) -> Extraction:
+        # Не все модели принимают effort (Haiku 4.5 отвечает 400), поэтому
+        # параметр добавляется только когда он задан.
+        options: dict[str, Any] = {}
+        if self.effort is not None:
+            options["output_config"] = {"effort": self.effort}
         response = self.client.messages.parse(
             model=self.model,
             max_tokens=self.max_tokens,
@@ -235,9 +252,9 @@ class Extractor:
                     "cache_control": {"type": "ephemeral"},
                 }
             ],
-            output_config={"effort": self.effort},
             messages=[{"role": "user", "content": user_content}],
             output_format=ExtractionResult,
+            **options,
         )
         # Отказ приходит как обычный 200 со `stop_reason: refusal`; читать
         # content до этой проверки — значит падать на пустом списке.

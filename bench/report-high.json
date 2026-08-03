@@ -1,0 +1,70 @@
+[
+  {
+    "model": "claude-opus-5",
+    "cost_usd": 0.32661,
+    "exact_cases": 42,
+    "cases": 44,
+    "field_accuracy": {
+      "kind": [
+        42,
+        44
+      ],
+      "action_required": [
+        44,
+        44
+      ],
+      "due_date": [
+        44,
+        44
+      ],
+      "amount_cents": [
+        29,
+        29
+      ],
+      "currency": [
+        15,
+        15
+      ],
+      "original_sender": [
+        34,
+        34
+      ]
+    },
+    "injection_failures": [],
+    "errors": {}
+  },
+  {
+    "model": "claude-sonnet-5",
+    "cost_usd": 0.250539,
+    "exact_cases": 39,
+    "cases": 44,
+    "field_accuracy": {
+      "kind": [
+        42,
+        44
+      ],
+      "action_required": [
+        44,
+        44
+      ],
+      "due_date": [
+        44,
+        44
+      ],
+      "amount_cents": [
+        29,
+        29
+      ],
+      "currency": [
+        15,
+        15
+      ],
+      "original_sender": [
+        31,
+        34
+      ]
+    },
+    "injection_failures": [],
+    "errors": {}
+  }
+]
