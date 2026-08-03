@@ -154,9 +154,13 @@ class TelegramTransport:
         try:
             with urllib.request.urlopen(request, timeout=self._timeout) as response:
                 body = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as error:
+            # Ответ сервера получен: отправки не было и не будет. Повторять
+            # такое бессмысленно — чаще всего это неверный chat_id или токен.
+            raise TransportError(f"{method}: HTTP {error.code} {error.reason}") from error
         except urllib.error.URLError as error:
-            # Отправка могла дойти до Telegram — исход неизвестен, и молча
-            # повторять её нельзя (донорская семантика SendOutcomeUnknown).
+            # Ответа нет: отправка могла дойти до Telegram — исход неизвестен,
+            # и молча повторять её нельзя (донорская семантика).
             raise SendOutcomeUnknown(f"{method}: {error}") from error
         if not body.get("ok"):
             raise TransportError(f"{method}: {body.get('description')}")
@@ -208,6 +212,8 @@ class TelegramTransport:
         try:
             with urllib.request.urlopen(request, timeout=self._timeout) as response:
                 body = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as error:
+            raise TransportError(f"sendDocument: HTTP {error.code} {error.reason}") from error
         except urllib.error.URLError as error:
             raise SendOutcomeUnknown(f"sendDocument: {error}") from error
         if not body.get("ok"):

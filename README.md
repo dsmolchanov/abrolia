@@ -28,6 +28,16 @@ python3 -m hermes_cloud.cli dlq        # events that exhausted their attempts
 python3 -m hermes_cloud.cli replay <event_id>
 ```
 
+Without a bot (or with `--console`) the cards are printed to the terminal and
+confirmed from there — same approval gate, different transport:
+
+```bash
+python3 -m hermes_cloud.cli --console worker
+python3 -m hermes_cloud.cli --console pending
+python3 -m hermes_cloud.cli --console confirm <approval_id>
+python3 -m hermes_cloud.cli --console tick
+```
+
 Nothing leaves the machine without a human pressing ✅: the worker only stages a
 proposal, and execution happens after `claim` (see [`docs/SECURITY.md`](docs/SECURITY.md)).
 

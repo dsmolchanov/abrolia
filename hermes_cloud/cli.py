@@ -12,7 +12,8 @@ import os
 import sys
 from pathlib import Path
 
-from hermes_cloud.channels.telegram import FakeTransport, TelegramTransport
+from hermes_cloud.channels.console import ConsoleTransport
+from hermes_cloud.channels.telegram import TelegramTransport
 from hermes_cloud.core.approvals import ApprovalStore
 from hermes_cloud.core.config import load_config, load_dotenv
 from hermes_cloud.core.db import open_database
@@ -38,13 +39,14 @@ def _store(args: argparse.Namespace) -> EventStore:
 
 
 def _pipeline(args: argparse.Namespace, database) -> Pipeline:
-    """Собрать конвейер из окружения. Без токена — сухой прогон в консоль."""
+    """Собрать конвейер из окружения. Без токена (или с --console) — в консоль."""
     config = load_config()
+    use_telegram = config.has_telegram and not getattr(args, "console", False)
     transport = (
-        TelegramTransport(config.telegram_token) if config.has_telegram else FakeTransport()
+        TelegramTransport(config.telegram_token) if use_telegram else ConsoleTransport()
     )
-    if not config.has_telegram:
-        print("TELEGRAM_BOT_TOKEN не задан — работаю всухую, сообщения в консоль")
+    if not use_telegram:
+        print("карточки печатаю в консоль; подтверждать командой `confirm <id>`")
     return Pipeline(
         approvals=ApprovalStore(database),
         reminders=ReminderStore(database),
@@ -123,6 +125,51 @@ def cmd_listen(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_confirm(args: argparse.Namespace) -> int:
+    """Подтвердить предложение из консоли — то же, что нажать ✅ в чате.
+
+    Проходит через тот же `claim`: чат, тред и актор проверяются, код
+    одноразовый. Отличается только транспорт, а не граница доверия.
+    """
+    from hermes_cloud.channels.telegram import HouseholdChannels
+    from hermes_cloud.runner.card import ACTION_CONFIRM, ACTION_REJECT
+
+    database = _database(args)
+    pipeline = _pipeline(args, database)
+    config = load_config()
+    channels = HouseholdChannels(
+        allowed_chats=frozenset({config.require_chat()}),
+        family_actors=config.family_actors,
+    )
+    approval = pipeline.approvals.get(args.approval_id)
+    if approval is None:
+        print(f"предложение {args.approval_id} не найдено", file=sys.stderr)
+        return 1
+    actor = args.actor or (next(iter(config.family_actors), None) or approval.chat)
+    handled = pipeline.handle_callback(
+        action=ACTION_REJECT if args.reject else ACTION_CONFIRM,
+        approval_id=approval.id,
+        origin=channels.origin_for(approval.chat, approval.thread, actor),
+    )
+    print(handled.message or "готово")
+    return 0
+
+
+def cmd_pending(args: argparse.Namespace) -> int:
+    """Показать предложения, ждущие подтверждения."""
+    database = _database(args)
+    pipeline = _pipeline(args, database)
+    config = load_config()
+    items = pipeline.approvals.pending_for(config.require_chat(), config.thread)
+    if not items:
+        print("нечего подтверждать")
+        return 0
+    for approval in items:
+        label = approval.payload.get("text") or approval.payload.get("title") or "—"
+        print(f"{approval.id}  {approval.kind}  {label}")
+    return 0
+
+
 def cmd_tick(args: argparse.Namespace) -> int:
     """Доставить созревшие напоминания. В Фазе 5 это делает scheduler-loop."""
     database = _database(args)
@@ -198,6 +245,10 @@ def cmd_replay(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="hermes-cloud", description=__doc__)
     parser.add_argument("--db", help=f"путь к базе (иначе ${DB_ENV} или {DEFAULT_DB_PATH})")
+    parser.add_argument(
+        "--console", action="store_true",
+        help="печатать карточки в консоль даже при заданном токене Telegram",
+    )
     commands = parser.add_subparsers(dest="command", required=True)
 
     inject = commands.add_parser("inject-eml", help="принять письмо из файла .eml")
@@ -221,6 +272,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     tick = commands.add_parser("tick", help="доставить созревшие напоминания")
     tick.set_defaults(func=cmd_tick)
+
+    pending = commands.add_parser("pending", help="предложения, ждущие подтверждения")
+    pending.set_defaults(func=cmd_pending)
+
+    confirm = commands.add_parser("confirm", help="подтвердить предложение из консоли")
+    confirm.add_argument("approval_id")
+    confirm.add_argument("--actor", help="от чьего имени (по умолчанию — первый family-актор)")
+    confirm.add_argument("--reject", action="store_true", help="отклонить вместо подтверждения")
+    confirm.set_defaults(func=cmd_confirm)
 
     listen = commands.add_parser("listen", help="обрабатывать нажатия кнопок в канале")
     listen.add_argument("--rounds", type=int, default=0, help="0 — бесконечно")

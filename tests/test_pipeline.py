@@ -333,3 +333,25 @@ def test_update_loop_refuses_a_stranger(world) -> None:
 def test_update_loop_ignores_uninteresting_updates(world) -> None:
     events, pipeline, transport = world
     assert pipeline.handle_update({"update_id": 3, "poll": {}}, CHANNELS) is None
+
+
+def test_http_error_is_definitive_not_unknown() -> None:
+    """400 от Telegram — отправки не было; повторять нечего."""
+    import urllib.error
+    from unittest.mock import patch
+
+    from hermes_cloud.channels.telegram import (
+        SendOutcomeUnknown,
+        TelegramTransport,
+        TransportError,
+    )
+
+    transport = TelegramTransport("12345:fake")
+    with patch("urllib.request.urlopen", side_effect=urllib.error.HTTPError(
+        "url", 400, "Bad Request", {}, None
+    )), pytest.raises(TransportError):
+        transport.send_message(chat="990000001", text="x")
+
+    with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("сеть упала")), \
+            pytest.raises(SendOutcomeUnknown):
+        transport.send_message(chat="990000001", text="x")
