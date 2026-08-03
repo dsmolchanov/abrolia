@@ -17,8 +17,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install tooling
-        run: pip install --disable-pip-version-check ruff pytest
+      - name: Install dependencies
+        run: pip install --disable-pip-version-check -r requirements-dev.txt
       - name: Materialise private deny patterns
         # Реальные имена и ID донора нельзя держать в публичном репозитории даже
         # как правило, поэтому они приходят из секрета. Секрет не настроен =>
