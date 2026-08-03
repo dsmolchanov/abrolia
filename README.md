@@ -27,6 +27,7 @@ python3 -m hermes_cloud.cli worker     # extraction → card with ✅ / ✏️ /
 python3 -m hermes_cloud.cli listen     # long-poll the channel, handle button presses
 python3 -m hermes_cloud.cli status     # queue counters
 python3 -m hermes_cloud.cli tick       # deliver reminders that came due
+python3 -m hermes_cloud.cli reconcile  # settle effects left hanging by a crash
 python3 -m hermes_cloud.cli dlq        # events that exhausted their attempts
 python3 -m hermes_cloud.cli replay <event_id>
 ```

@@ -74,11 +74,34 @@ def _pipeline(args: argparse.Namespace, database) -> Pipeline:
     )
 
 
+def _reconcile(pipeline: Pipeline) -> None:
+    """Разобрать эффекты, повисшие после прошлого падения.
+
+    Делается до приёма новой работы: сначала честно закрываем прошлое, потом
+    беремся за настоящее.
+    """
+    for handled in pipeline.reconcile():
+        print(f"после падения: {handled.approval_id} — {(handled.message or '')[:60]}")
+
+
+def cmd_reconcile(args: argparse.Namespace) -> int:
+    """Разобрать повисшие эффекты вручную (то же делают worker и listen)."""
+    pipeline = _pipeline(args, _database(args))
+    handled = pipeline.reconcile()
+    if not handled:
+        print("повисших эффектов нет")
+        return 0
+    for item in handled:
+        print(f"{item.approval_id}  {(item.message or '')[:80]}")
+    return 0
+
+
 def cmd_worker(args: argparse.Namespace) -> int:
     """Обработать очередь: событие → извлечение → карточка."""
     database = _database(args)
     events = EventStore(database)
     pipeline = _pipeline(args, database)
+    _reconcile(pipeline)
     processed = Worker(events, pipeline.handle_event, worker_id="cli").drain(limit=args.limit)
     for item in processed:
         state = "ок" if item.ok else f"ошибка: {item.error}"
@@ -123,6 +146,9 @@ def cmd_listen(args: argparse.Namespace) -> int:
     rounds = 0
     while args.rounds == 0 or rounds < args.rounds:
         rounds += 1
+        # Разбор каждый круг, а не только на старте: аренда упавшего процесса
+        # истекает уже после запуска, и на старте видеть ещё нечего.
+        _reconcile(pipeline)
         updates = pipeline.transport.get_updates(offset=offset, timeout=args.timeout)
         for update in updates:
             offset = int(update.get("update_id", 0)) + 1
@@ -277,6 +303,9 @@ def build_parser() -> argparse.ArgumentParser:
     worker = commands.add_parser("worker", help="обработать очередь событий")
     worker.add_argument("--limit", type=int, default=10)
     worker.set_defaults(func=cmd_worker)
+
+    reconcile = commands.add_parser("reconcile", help="разобрать эффекты, повисшие после падения")
+    reconcile.set_defaults(func=cmd_reconcile)
 
     tick = commands.add_parser("tick", help="доставить созревшие напоминания")
     tick.set_defaults(func=cmd_tick)

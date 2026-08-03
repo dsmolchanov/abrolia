@@ -137,6 +137,19 @@ class ReminderStore:
         row = self.db.query_one("SELECT * FROM reminders WHERE id = ?", (reminder_id,))
         return Reminder.from_row(row) if row else None
 
+    def for_approval(self, approval_id: str) -> Reminder | None:
+        """Напоминание, порождённое этим подтверждением.
+
+        Ключ идемпотентности при доделке после падения: подтверждение порождает
+        ровно одно напоминание, и повтор обязан найти прежнее, а не создать
+        второе.
+        """
+        row = self.db.query_one(
+            "SELECT * FROM reminders WHERE approval_id = ? ORDER BY created_at LIMIT 1",
+            (approval_id,),
+        )
+        return Reminder.from_row(row) if row else None
+
     def pending(self, *, limit: int = 50) -> list[Reminder]:
         rows = self.db.query(
             "SELECT * FROM reminders WHERE status = ? ORDER BY due_at LIMIT ?",

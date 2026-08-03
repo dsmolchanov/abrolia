@@ -12,13 +12,14 @@ import logging
 from dataclasses import dataclass
 from datetime import date, datetime
 
-from hermes_cloud.channels.telegram import Transport
+from hermes_cloud.channels.telegram import SendOutcomeUnknown, Transport
 from hermes_cloud.core.approvals import (
     STATUS_DONE,
     STATUS_FAILED,
     ApprovalStore,
     RateLimited,
 )
+from hermes_cloud.core.effects import APPROVAL_TOOL_USE_ID, EffectJournal
 from hermes_cloud.core.events import Event
 from hermes_cloud.core.runcontext import (
     WRITE_CALENDAR,
@@ -54,6 +55,10 @@ TEXT_RATE_LIMITED = "Слишком много неверных кодов. По
 TEXT_NO_RIGHT = (
     "Это подтверждает кто-то из взрослых в семье — у вас нет такого права."
 )
+TEXT_OUTCOME_UNKNOWN = (
+    "Связь оборвалась на полпути, и я не знаю, дошло ли отправленное. "
+    "Проверьте, пожалуйста, — повторять сам не буду, чтобы не сделать дважды."
+)
 
 # Право, необходимое для подтверждения предложения этого вида. Подтверждение —
 # это разрешение на эффект, поэтому спрашивается mutate-cap, а не «знакомость».
@@ -61,6 +66,11 @@ CAPABILITY_FOR_KIND = {
     KIND_REMINDER: WRITE_REMINDER,
     KIND_ICS: WRITE_CALENDAR,
 }
+
+# Виды эффектов, которые можно доделать после падения: локальные и
+# идемпотентные по id подтверждения. Всё остальное — наружу, и повтору не
+# подлежит (`Locked Decisions` → «Идемпотентность», `docs/SECURITY.md`, T9).
+REPLAYABLE_KINDS = frozenset({KIND_REMINDER})
 
 
 @dataclass(frozen=True)
@@ -83,6 +93,7 @@ class Pipeline:
         chat: str,
         thread: int | None = None,
         actor: str = "system",
+        effects: EffectJournal | None = None,
     ) -> None:
         self.approvals = approvals
         self.reminders = reminders
@@ -91,6 +102,9 @@ class Pipeline:
         self.chat = chat
         self.thread = thread
         self.actor = actor
+        # Журнал живёт в той же базе: запись попытки обязана коммититься вместе
+        # с claim'ом, а через две базы это невозможно.
+        self.effects = effects or EffectJournal(approvals.db)
 
     # --- входящее событие ---------------------------------------------------
 
@@ -210,8 +224,27 @@ class Pipeline:
     # --- исполнение ---------------------------------------------------------
 
     def execute(self, approval, *, now: float | None = None) -> Handled:
-        """Исполнить подтверждённое предложение. Вызывается только после claim."""
+        """Исполнить подтверждённое предложение. Вызывается только после claim.
+
+        Запись в журнале эффектов к этому моменту уже есть — её сделал `claim`
+        в своей транзакции. Если её нет (прямой вызов мимо claim), заводим
+        сейчас: эффект без записи невозможен по построению.
+        """
         payload = approval.payload
+        effect = self.effects.find(
+            run_id=approval.id, tool_use_id=APPROVAL_TOOL_USE_ID
+        )
+        if effect is None:
+            effect, _ = self.effects.begin(
+                run_id=approval.id, tool_use_id=APPROVAL_TOOL_USE_ID,
+                kind=payload["kind"], approval_id=approval.id, now=now,
+            )
+        elif effect.settled:
+            # Исход уже известен: повторное исполнение того же подтверждения
+            # не создаёт второй эффект (`effects_run_tool` гарантирует одну
+            # строку, эта ветка — что мы не вызовем исполнителя дважды).
+            return Handled(approval_id=approval.id, message=effect.result or TEXT_GONE)
+
         try:
             if payload["kind"] == KIND_REMINDER:
                 text = self._execute_reminder(approval, payload, now=now)
@@ -219,7 +252,19 @@ class Pipeline:
                 text = self._execute_ics(approval, payload)
             else:
                 raise ValueError(f"неизвестный вид предложения: {payload['kind']!r}")
+        except SendOutcomeUnknown as error:
+            # Отправка могла дойти. Повторять нельзя, молчать — тем более.
+            self.effects.outcome_unknown(effect.id, f"{type(error).__name__}: {error}", now=now)
+            self.approvals.mark(
+                approval.id, STATUS_FAILED, error=f"outcome_unknown: {error}", now=now
+            )
+            self.transport.send_message(
+                chat=approval.chat, text=TEXT_OUTCOME_UNKNOWN, thread=approval.thread
+            )
+            logger.warning("approval %s outcome unknown", approval.id)
+            return Handled(approval_id=approval.id, message=TEXT_OUTCOME_UNKNOWN)
         except Exception as error:
+            self.effects.fail(effect.id, f"{type(error).__name__}: {error}", now=now)
             self.approvals.mark(
                 approval.id, STATUS_FAILED, error=f"{type(error).__name__}: {error}", now=now
             )
@@ -230,12 +275,17 @@ class Pipeline:
             logger.warning("approval %s failed: %s", approval.id, type(error).__name__)
             return Handled(approval_id=approval.id, message=message)
 
+        self.effects.complete(effect.id, text, now=now)
         self.approvals.mark(approval.id, STATUS_DONE, receipt=text, now=now)
         self.transport.send_message(chat=approval.chat, text=text, thread=approval.thread)
         return Handled(approval_id=approval.id, executed=payload["kind"], message=text)
 
     def _execute_reminder(self, approval, payload: dict, *, now: float | None) -> str:
         due = date.fromisoformat(payload["due_date"])
+        existing = self.reminders.for_approval(approval.id)
+        if existing is not None:
+            # Доделка после падения: напоминание уже создано, второго не будет.
+            return f"Готово: напомню {due.strftime('%d.%m.%Y')} — {existing.text}."
         reminder = self.reminders.create(
             chat=approval.chat,
             thread=approval.thread,
@@ -266,3 +316,39 @@ class Pipeline:
             caption="Откройте файл, чтобы добавить событие в календарь.",
         )
         return f"Готово: файл события «{payload['title']}» отправлен."
+
+    # --- разбор после падения -----------------------------------------------
+
+    def reconcile(self, *, now: float | None = None) -> list[Handled]:
+        """Разобрать эффекты, повисшие после падения. Вызывается при старте.
+
+        Стратегия — по виду эффекта, и это не деталь реализации, а суть:
+        локальный и идемпотентный по ключу подтверждения (напоминание) можно
+        доделать; наружный (файл в чат, письмо, календарь чужого сервиса) —
+        нельзя, потому что «аренда истекла» не означает «не дошло». Такой
+        эффект закрывается как `outcome_unknown`, и человеку говорят правду.
+        """
+        handled: list[Handled] = []
+        for effect in self.effects.stale(now=now):
+            approval = (
+                self.approvals.get(effect.approval_id) if effect.approval_id else None
+            )
+            if approval is None:
+                self.effects.outcome_unknown(
+                    effect.id, "подтверждение не найдено", now=now
+                )
+                continue
+            if effect.kind in REPLAYABLE_KINDS:
+                logger.info("reconcile: доделываю %s (%s)", effect.id, effect.kind)
+                handled.append(self.execute(approval, now=now))
+                continue
+            logger.warning("reconcile: исход %s (%s) неизвестен", effect.id, effect.kind)
+            self.effects.outcome_unknown(effect.id, "процесс упал во время отправки", now=now)
+            self.approvals.mark(
+                approval.id, STATUS_FAILED, error="outcome_unknown: рестарт", now=now
+            )
+            self.transport.send_message(
+                chat=approval.chat, text=TEXT_OUTCOME_UNKNOWN, thread=approval.thread
+            )
+            handled.append(Handled(approval_id=approval.id, message=TEXT_OUTCOME_UNKNOWN))
+        return handled

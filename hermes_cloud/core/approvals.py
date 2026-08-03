@@ -14,6 +14,10 @@
 * **`payload_sha` проверяется при подтверждении.** Человек подтверждает
   конкретный payload; подменённый после показа карточки — не исполняется.
 * **TTL.** Забытое предложение истекает, а не ждёт вечно.
+
+К донорским добавлен один инвариант Фазы 2: **claim и запись попытки в журнал
+эффектов — одна транзакция**. Подтверждение без записи о нём означало бы, что
+после падения нельзя понять, начинали ли исполнять.
 """
 
 from __future__ import annotations
@@ -27,6 +31,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from hermes_cloud.core.db import Database, new_id
+from hermes_cloud.core.effects import APPROVAL_TOOL_USE_ID, record_attempt
 
 CODE_BYTES = 8  # 16 hex-символов = 64 бита
 CODE_RE = re.compile(r"^[0-9a-f]{16}$")
@@ -237,6 +242,18 @@ class ApprovalStore:
                 "UPDATE approvals SET status = ?, claimed_by = ?, updated_at = ?"
                 " WHERE id = ?",
                 (STATUS_CLAIMED, str(actor), now, row["id"]),
+            )
+            # Попытка записывается здесь же, а не перед вызовом исполнителя:
+            # подтверждение и запись о нём — один атомарный факт. Падение сразу
+            # после коммита оставит `pending`, который разберёт реконсиляция.
+            record_attempt(
+                connection,
+                run_id=row["id"],
+                tool_use_id=APPROVAL_TOOL_USE_ID,
+                kind=row["kind"],
+                approval_id=row["id"],
+                payload_sha=row["payload_sha"],
+                now=now,
             )
         claimed = self.get(row["id"])
         assert claimed is not None
