@@ -21,6 +21,7 @@ export TELEGRAM_BOT_TOKEN=...         # optional: without it messages print to t
 
 python3 -m hermes_cloud.cli inject-eml tests/fixtures/email/forwarded_school_de.eml
 python3 -m hermes_cloud.cli worker     # extraction → card with ✅ / ✏️ / ❌
+python3 -m hermes_cloud.cli listen     # long-poll the channel, handle button presses
 python3 -m hermes_cloud.cli status     # queue counters
 python3 -m hermes_cloud.cli tick       # deliver reminders that came due
 python3 -m hermes_cloud.cli dlq        # events that exhausted their attempts

@@ -71,6 +71,58 @@ def cmd_worker(args: argparse.Namespace) -> int:
     return 0
 
 
+OFFSET_KEY = "telegram_update_offset"
+
+
+def _read_offset(database) -> int | None:
+    row = database.query_one("SELECT value FROM channel_state WHERE key = ?", (OFFSET_KEY,))
+    return int(row["value"]) if row else None
+
+
+def _write_offset(database, offset: int) -> None:
+    import time as _time
+
+    with database.write() as connection:
+        connection.execute(
+            "INSERT INTO channel_state (key, value, updated_at) VALUES (?, ?, ?)"
+            " ON CONFLICT (key) DO UPDATE SET value = excluded.value,"
+            " updated_at = excluded.updated_at",
+            (OFFSET_KEY, str(offset), _time.time()),
+        )
+
+
+def cmd_listen(args: argparse.Namespace) -> int:
+    """Слушать канал и обрабатывать нажатия ✅/✏️/❌.
+
+    Long-polling, а не webhook: webhook требует публичного адреса и приезжает
+    в Фазе 4 вместе с nerve-webhook. Смещение хранится в базе — перезапуск не
+    переигрывает уже обработанные нажатия.
+    """
+    from hermes_cloud.channels.telegram import HouseholdChannels
+
+    database = _database(args)
+    pipeline = _pipeline(args, database)
+    config = load_config()
+    channels = HouseholdChannels(
+        allowed_chats=frozenset({config.require_chat()}),
+        family_actors=config.family_actors,
+    )
+    offset = _read_offset(database)
+    print("слушаю канал; Ctrl+C чтобы остановить")
+    rounds = 0
+    while args.rounds == 0 or rounds < args.rounds:
+        rounds += 1
+        updates = pipeline.transport.get_updates(offset=offset, timeout=args.timeout)
+        for update in updates:
+            offset = int(update.get("update_id", 0)) + 1
+            handled = pipeline.handle_update(update, channels)
+            if handled is not None:
+                print(f"{handled.executed or 'обработано'}: {(handled.message or '')[:80]}")
+        if offset is not None and updates:
+            _write_offset(database, offset)
+    return 0
+
+
 def cmd_tick(args: argparse.Namespace) -> int:
     """Доставить созревшие напоминания. В Фазе 5 это делает scheduler-loop."""
     database = _database(args)
@@ -169,6 +221,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     tick = commands.add_parser("tick", help="доставить созревшие напоминания")
     tick.set_defaults(func=cmd_tick)
+
+    listen = commands.add_parser("listen", help="обрабатывать нажатия кнопок в канале")
+    listen.add_argument("--rounds", type=int, default=0, help="0 — бесконечно")
+    listen.add_argument("--timeout", type=int, default=25)
+    listen.set_defaults(func=cmd_listen)
     return parser
 
 

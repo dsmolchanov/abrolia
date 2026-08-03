@@ -151,6 +151,31 @@ class Pipeline:
 
         return self.execute(approval, now=now)
 
+    def handle_update(self, update: dict, channels) -> Handled | None:
+        """Апдейт из канала → действие. None — апдейт нам не интересен.
+
+        Сообщения в Фазе 1 только подсказывают человеку, что делать: диалог с
+        моделью — Фаза 2, и до RunContext-авторизации его тут быть не должно.
+        """
+        from hermes_cloud.channels.telegram import IncomingCallback, parse_update
+
+        parsed = parse_update(update, channels)
+        if parsed is None:
+            return None
+        if isinstance(parsed, IncomingCallback):
+            handled = self.handle_callback(
+                action=parsed.action, approval_id=parsed.approval_id, origin=parsed.origin
+            )
+            if parsed.callback_id:
+                self.transport.answer_callback(parsed.callback_id)
+            return handled
+        if not parsed.origin.is_known:
+            self.transport.send_message(
+                chat=parsed.origin.chat, text=TEXT_UNKNOWN_ACTOR, thread=parsed.origin.thread
+            )
+            return Handled(message=TEXT_UNKNOWN_ACTOR)
+        return None
+
     # --- исполнение ---------------------------------------------------------
 
     def execute(self, approval, *, now: float | None = None) -> Handled:

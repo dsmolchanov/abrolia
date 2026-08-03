@@ -128,3 +128,47 @@ def test_config_is_immutable() -> None:
     except Exception:
         return
     raise AssertionError("конфиг должен быть неизменяемым")
+
+
+def test_listen_processes_updates_and_remembers_the_offset(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """Перезапуск не переигрывает уже обработанные нажатия."""
+    from hermes_cloud.core.events import EventStore
+    from hermes_cloud.ingest.inject import ingest_file
+    from hermes_cloud.runner.card import ACTION_REJECT
+
+    database = open_database(tmp_path / "hermes.db")
+    events = EventStore(database)
+    ingest_file(events, Path(__file__).resolve().parent / "fixtures" / "email"
+                / "direct_invoice_it.eml")
+    transport = FakeTransport()
+    approvals = ApprovalStore(database)
+    pipeline = Pipeline(
+        approvals=approvals,
+        reminders=ReminderStore(database),
+        transport=transport,
+        extractor=object(),
+        chat="990000001",
+    )
+    staged = approvals.stage(
+        kind="reminder", payload={"kind": "reminder", "text": "x", "due_date": "2026-09-08"},
+        chat="990000001", actor="990000001",
+    )
+    transport.updates = [{
+        "update_id": 42,
+        "callback_query": {
+            "id": "cb", "from": {"id": 990000001},
+            "data": f"{ACTION_REJECT}:{staged.id}",
+            "message": {"message_id": 1, "chat": {"id": 990000001}},
+        },
+    }]
+    monkeypatch.setenv("HERMES_CHAT", "990000001")
+    monkeypatch.setenv("HERMES_FAMILY_ACTORS", "990000001")
+    monkeypatch.setattr(cli, "_pipeline", lambda args, db: pipeline)
+    monkeypatch.setattr(cli, "_database", lambda args: database)
+
+    assert cli.main(["listen", "--rounds", "1", "--timeout", "0"]) == 0
+
+    assert approvals.get(staged.id).status == "cancelled"
+    assert cli._read_offset(database) == 43, "смещение сохранено для следующего запуска"

@@ -16,6 +16,7 @@ import json
 import logging
 import urllib.error
 import urllib.request
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -82,6 +83,8 @@ class Transport(Protocol):
 
     def answer_callback(self, callback_id: str, text: str = "") -> None: ...
 
+    def get_updates(self, *, offset: int | None = None, timeout: int = 25) -> list[dict]: ...
+
 
 @dataclass
 class SentMessage:
@@ -107,6 +110,7 @@ class FakeTransport:
     messages: list[SentMessage] = field(default_factory=list)
     documents: list[SentDocument] = field(default_factory=list)
     answered: list[tuple[str, str]] = field(default_factory=list)
+    updates: list[dict[str, Any]] = field(default_factory=list)
 
     def send_message(
         self, *, chat: str, text: str, thread: int | None = None,
@@ -124,6 +128,10 @@ class FakeTransport:
 
     def answer_callback(self, callback_id: str, text: str = "") -> None:
         self.answered.append((callback_id, text))
+
+    def get_updates(self, *, offset: int | None = None, timeout: int = 25) -> list[dict]:
+        pending, self.updates = self.updates, []
+        return pending
 
 
 class TelegramTransport:
@@ -172,13 +180,49 @@ class TelegramTransport:
     def send_document(
         self, *, chat: str, filename: str, content: bytes, caption: str = "",
         thread: int | None = None,
-    ) -> str:  # pragma: no cover - требует multipart и живого бота
-        raise NotImplementedError(
-            "отправка файла в Telegram подключается вместе с ботом (ручная проверка Фазы 1)"
+    ) -> str:
+        """multipart/form-data вручную: ради одного вызова тянуть зависимость незачем."""
+        boundary = "hermes" + uuid.uuid4().hex
+        fields: list[tuple[str, str]] = [("chat_id", chat)]
+        if thread is not None:
+            fields.append(("message_thread_id", str(thread)))
+        if caption:
+            fields.append(("caption", caption))
+        parts: list[bytes] = []
+        for name, value in fields:
+            parts.append(
+                f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n"
+                f"{value}\r\n".encode()
+            )
+        parts.append(
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"document\";"
+            f" filename=\"{filename}\"\r\nContent-Type: text/calendar\r\n\r\n".encode()
         )
+        parts.append(content)
+        parts.append(f"\r\n--{boundary}--\r\n".encode())
+        request = urllib.request.Request(
+            f"{self._api_root}/bot{self._token}/sendDocument",
+            data=b"".join(parts),
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self._timeout) as response:
+                body = json.loads(response.read().decode("utf-8"))
+        except urllib.error.URLError as error:
+            raise SendOutcomeUnknown(f"sendDocument: {error}") from error
+        if not body.get("ok"):
+            raise TransportError(f"sendDocument: {body.get('description')}")
+        return str(body["result"]["message_id"])
 
     def answer_callback(self, callback_id: str, text: str = "") -> None:
         self._call("answerCallbackQuery", {"callback_query_id": callback_id, "text": text})
+
+    def get_updates(self, *, offset: int | None = None, timeout: int = 25) -> list[dict]:
+        """Long-polling. Webhook — Фаза 4; здесь достаточно опроса."""
+        payload: dict[str, Any] = {"timeout": timeout}
+        if offset is not None:
+            payload["offset"] = offset
+        return list(self._call("getUpdates", payload))
 
 
 class TransportError(RuntimeError):

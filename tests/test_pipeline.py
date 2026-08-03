@@ -285,3 +285,51 @@ def test_update_from_a_foreign_chat_is_not_known() -> None:
 def test_irrelevant_updates_are_ignored() -> None:
     assert parse_update({"poll": {}}, CHANNELS) is None
     assert parse_update({"callback_query": {"id": "x", "from": {"id": 1}}}, CHANNELS) is None
+
+
+# --- цикл прослушивания канала ---------------------------------------------
+
+
+def test_update_loop_confirms_through_the_same_gate(world) -> None:
+    """Кнопка из канала проходит ровно тот же claim, что и прямой вызов."""
+    events, pipeline, transport = world
+    approval_id = inject_and_process(events, pipeline)
+    update = {
+        "update_id": 1,
+        "callback_query": {
+            "id": "cb1",
+            "from": {"id": int(PARENT)},
+            "data": f"{ACTION_CONFIRM}:{approval_id}",
+            "message": {"message_id": 5, "chat": {"id": int(FAMILY_CHAT)}},
+        },
+    }
+
+    handled = pipeline.handle_update(update, CHANNELS)
+
+    assert handled.executed == "reminder"
+    assert len(pipeline.reminders.pending()) == 1
+    assert transport.answered == [("cb1", "")], "спиннер кнопки обязан гаситься"
+
+
+def test_update_loop_refuses_a_stranger(world) -> None:
+    events, pipeline, transport = world
+    approval_id = inject_and_process(events, pipeline)
+    update = {
+        "update_id": 2,
+        "callback_query": {
+            "id": "cb2",
+            "from": {"id": int(STRANGER)},
+            "data": f"{ACTION_CONFIRM}:{approval_id}",
+            "message": {"message_id": 5, "chat": {"id": int(FAMILY_CHAT)}},
+        },
+    }
+
+    handled = pipeline.handle_update(update, CHANNELS)
+
+    assert handled.executed is None
+    assert pipeline.reminders.pending() == []
+
+
+def test_update_loop_ignores_uninteresting_updates(world) -> None:
+    events, pipeline, transport = world
+    assert pipeline.handle_update({"update_id": 3, "poll": {}}, CHANNELS) is None
