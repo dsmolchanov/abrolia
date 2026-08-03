@@ -27,6 +27,7 @@ from hermes_cloud.core.dsar import EXTERNAL_SURFACES, export_bytes, wipe_househo
 from hermes_cloud.core.effects import APPROVAL_TOOL_USE_ID, EffectJournal
 from hermes_cloud.core.events import Event
 from hermes_cloud.core.evidence import EvidenceStore, content_sha
+from hermes_cloud.core.matching import find_match
 from hermes_cloud.core.memory import MemoryStore
 from hermes_cloud.core.runcontext import (
     DATA_DELETE,
@@ -49,8 +50,10 @@ from hermes_cloud.runner.bundle import (
     item_line,
     items_for,
     items_of,
+    reconcile_items,
     render_bundle,
     toggled,
+    update_lines,
 )
 from hermes_cloud.runner.card import (
     ACTION_CONFIRM,
@@ -108,6 +111,27 @@ CAPABILITY_FOR_KIND = {
 # Календарь здесь не по недосмотру: у события есть заданный нами id, поэтому
 # повтор находит его и обновляет, а не создаёт второе (`execute/gcal.py`).
 REPLAYABLE_KINDS = frozenset({KIND_REMINDER, KIND_MEMORY, KIND_CALENDAR})
+
+
+def fact_payload(result) -> dict:
+    """Факт письма — то, во что семья поверит, а не то, что мы сделаем.
+
+    В `commitments` едет именно он, а не карточка: обязательство отвечает на
+    «что мы знаем», действия — на «что с этим делать». Смешав их, мы получили бы
+    факт, у которого нельзя спросить срок, потому что там лежит список кнопок.
+    """
+    return {
+        "kind": result.kind,
+        "title": result.title,
+        "summary": result.summary,
+        "start": result.event_start.isoformat() if result.event_start else None,
+        "end": result.event_end.isoformat() if result.event_end else None,
+        "due_date": result.due_date.isoformat() if result.due_date else None,
+        "amount_cents": result.amount.amount_cents if result.amount else None,
+        "currency": result.amount.currency if result.amount else None,
+        "location": result.location,
+        "responsible": result.responsible,
+    }
 
 
 def evidence_needles(result) -> list[str]:
@@ -232,14 +256,39 @@ class Pipeline:
             )
             return Handled(message=info.text)
         header = "\n".join(header_lines(result, source=source))
+
+        # Не про то же ли самое, что мы уже знаем? «Экскурсия перенесена» —
+        # это новая версия факта, а не второй факт.
+        match = find_match(
+            self.commitments,
+            self.evidence,
+            kind=result.kind,
+            title=result.title,
+            sender_domain=ref.sender_domain,
+        )
+        previous = match.commitment if match and match.sure else None
+        fact = fact_payload(result)
+        if previous is not None:
+            items = reconcile_items(items, previous)
+            header = "\n".join([header, "", *update_lines(previous.payload, fact)])
+        elif match and match.maybe:
+            # Похоже, но не наверняка: показываем оба и говорим прямо.
+            header = "\n".join([
+                header, "",
+                f"⚠️ Возможно, это про то же, что и «{match.commitment.payload.get('title')}»"
+                " — если да, отклоните одно из двух.",
+            ])
+        # Карточка собирается после сопоставления: до него ещё не известно,
+        # предлагаем мы сделать или поправить.
         preview = render_bundle(result, items, header=header)
 
         # Кандидат — единственный статус, который может появиться из модели.
         commitment = self.commitments.propose(
             kind=result.kind,
-            payload=preview.proposal,
+            payload=fact,
             extraction_run_id=run.id,
             confidence=result.confidence,
+            supersedes=previous.id if previous is not None else None,
             observed_at=(
                 result.event_start.timestamp() if result.event_start is not None else None
             ),
@@ -451,8 +500,24 @@ class Pipeline:
         self.transport.send_message(chat=approval.chat, text=text, thread=approval.thread)
         return Handled(approval_id=approval.id, executed=payload["kind"], message=text)
 
+    def _fact_root(self, commitment_id: str | None) -> str | None:
+        """Корень цепочки версий: id события в календаре не меняется с версией.
+
+        Иначе «экскурсия перенесена» создала бы второе событие вместо переноса
+        первого — ровно то, ради чего вся суперсессия и затевалась.
+        """
+        if not commitment_id:
+            return None
+        chain = self.commitments.chain(commitment_id)
+        return chain[0].id if chain else commitment_id
+
     def _execute_reminder(self, approval, payload: dict, *, now: float | None) -> str:
         due = date.fromisoformat(payload["due_date"])
+        replaced = payload.get("supersedes_reminder_id")
+        if replaced:
+            # Новая версия факта отменяет напоминание прежней: два напоминания
+            # об одном и том же с разными датами — худшее из возможного.
+            self.reminders.cancel(replaced, now=now)
         existing = self.reminders.for_approval(approval.id)
         if existing is not None:
             # Доделка после падения: напоминание уже создано, второго не будет.
@@ -529,6 +594,9 @@ class Pipeline:
         reminder = self.reminders.for_approval(approval.id)
         if reminder is not None:
             self.commitments.link(commitment_id, reminder_id=reminder.id, now=now)
+        event_id = payload.get("calendar_event_id")
+        if event_id:
+            self.commitments.link(commitment_id, calendar_event_id=event_id, now=now)
 
     def _execute_bundle(self, approval, payload: dict, *, now: float | None) -> str:
         """Исполнить связку по-пунктно: у каждого пункта свой эффект.
@@ -646,7 +714,7 @@ class Pipeline:
         start = datetime.fromisoformat(payload["start"])
         event = build_calendar_event(
             approval_id=approval.id,
-            commitment_id=payload.get("commitment_id"),
+            commitment_id=self._fact_root(payload.get("commitment_id")),
             title=payload["title"],
             start=start,
             end=datetime.fromisoformat(payload["end"]) if payload.get("end") else None,

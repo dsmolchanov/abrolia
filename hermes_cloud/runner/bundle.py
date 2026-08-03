@@ -152,6 +152,49 @@ def toggled(payload: dict[str, Any], index: int) -> dict[str, Any]:
     return {**payload, "items": [item.to_json() for item in items]}
 
 
+def reconcile_items(items: list[Item], previous: Any) -> list[Item]:
+    """Превратить связку в reconcile: не «сделать заново», а «поправить».
+
+    Календарное событие правится по тому же id (его корень — первая версия
+    факта), а напоминание прежней версии отменяется при создании новой. Иначе
+    у семьи останутся два напоминания об одном взносе с разными датами.
+    """
+    updated: list[Item] = []
+    for item in items:
+        payload = dict(item.payload)
+        if item.kind in {KIND_CALENDAR, KIND_ICS}:
+            payload["update"] = True
+        elif item.kind == KIND_REMINDER and previous.reminder_id:
+            payload["supersedes_reminder_id"] = previous.reminder_id
+        updated.append(Item(payload=payload, enabled=item.enabled))
+    return updated
+
+
+def update_lines(previous: dict[str, Any], current: dict[str, Any]) -> list[str]:
+    """Строки «что изменилось» — то, ради чего человек читает второе письмо."""
+    from hermes_cloud.core.matching import LABELS, changes
+
+    delta = changes(previous, current)
+    if not delta:
+        return ["Это уточнение к тому, что уже подтверждено — по сути ничего не меняется."]
+    lines = ["Это обновление того, что уже подтверждено. Что изменилось:"]
+    for field, (was, now) in delta.items():
+        lines.append(f"— {LABELS.get(field, field)}: {_readable(field, was)} → {_readable(field, now)}")
+    return lines
+
+
+def _readable(field: str, value: Any) -> str:
+    if value is None:
+        return "—"
+    if field == "amount_cents":
+        return format_money(int(value), "")
+    if field in {"start", "end"}:
+        return format_date(datetime.fromisoformat(str(value))) or str(value)
+    if field == "due_date":
+        return format_date(date.fromisoformat(str(value))) or str(value)
+    return str(value)
+
+
 def item_line(item: Item) -> str:
     """Строка пункта в карточке: что именно произойдёт после ✅."""
     payload = item.payload
@@ -159,11 +202,15 @@ def item_line(item: Item) -> str:
     if kind in {KIND_CALENDAR, KIND_ICS}:
         when = format_date(datetime.fromisoformat(payload["start"]))
         where = f", {payload['location']}" if payload.get("location") else ""
-        verb = "В календарь" if kind == KIND_CALENDAR else "Файл события"
+        if payload.get("update"):
+            verb = "Обновить в календаре" if kind == KIND_CALENDAR else "Новый файл события"
+        else:
+            verb = "В календарь" if kind == KIND_CALENDAR else "Файл события"
         return f"{verb}: {payload['title']} — {when}{where}"
     if kind == KIND_REMINDER:
         when = format_date(date.fromisoformat(payload["due_date"]))
-        return f"Напомнить {when}: {payload['text']}"
+        verb = "Перенести напоминание на" if payload.get("supersedes_reminder_id") else "Напомнить"
+        return f"{verb} {when}: {payload['text']}"
     return f"{kind}: {payload.get('title') or payload.get('text') or ''}"
 
 
