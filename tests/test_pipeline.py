@@ -15,13 +15,13 @@ import pytest
 
 from hermes_cloud.channels.telegram import (
     FakeTransport,
-    HouseholdChannels,
     IncomingCallback,
     parse_update,
 )
 from hermes_cloud.core.approvals import ApprovalStore, payload_sha
 from hermes_cloud.core.db import open_database
 from hermes_cloud.core.events import EventStore
+from hermes_cloud.core.runcontext import Household, build_run_context
 from hermes_cloud.execute.reminder import ReminderStore
 from hermes_cloud.ingest.inject import ingest_file
 from hermes_cloud.ingest.worker import Worker
@@ -33,10 +33,14 @@ FIXTURES = Path(__file__).resolve().parent / "fixtures" / "email"
 
 FAMILY_CHAT = "-100990000101"
 PARENT = "990000001"
+NANNY = "990000003"
 STRANGER = "990000009"
 
-CHANNELS = HouseholdChannels(
-    allowed_chats=frozenset({FAMILY_CHAT}), family_actors=frozenset({PARENT})
+HOUSEHOLD = Household(
+    owner=PARENT,
+    family=frozenset({PARENT}),
+    guests=frozenset({NANNY}),
+    allowed_chats=frozenset({FAMILY_CHAT}),
 )
 
 PAYMENT = ExtractionResult(
@@ -97,8 +101,10 @@ def world(tmp_path: Path):
     return events, pipeline, transport
 
 
-def origin(actor: str = PARENT, chat: str = FAMILY_CHAT, thread: int | None = None):
-    return CHANNELS.origin_for(chat, thread, actor)
+def context(actor: str = PARENT, chat: str = FAMILY_CHAT, thread: int | None = None):
+    return build_run_context(
+        household=HOUSEHOLD, actor_id=actor, chat_id=chat, thread_id=thread
+    )
 
 
 def inject_and_process(events: EventStore, pipeline: Pipeline) -> str:
@@ -127,7 +133,7 @@ def test_confirmation_creates_the_reminder_once(world) -> None:
     approval_id = inject_and_process(events, pipeline)
 
     handled = pipeline.handle_callback(
-        action=ACTION_CONFIRM, approval_id=approval_id, origin=origin()
+        action=ACTION_CONFIRM, approval_id=approval_id, context=context()
     )
 
     assert handled.executed == "reminder"
@@ -137,7 +143,7 @@ def test_confirmation_creates_the_reminder_once(world) -> None:
 
     # Повторное нажатие той же кнопки не создаёт второе напоминание.
     again = pipeline.handle_callback(
-        action=ACTION_CONFIRM, approval_id=approval_id, origin=origin()
+        action=ACTION_CONFIRM, approval_id=approval_id, context=context()
     )
     assert again.executed is None
     assert len(pipeline.reminders.pending()) == 1
@@ -149,12 +155,31 @@ def test_stranger_cannot_confirm(world) -> None:
     approval_id = inject_and_process(events, pipeline)
 
     handled = pipeline.handle_callback(
-        action=ACTION_CONFIRM, approval_id=approval_id, origin=origin(actor=STRANGER)
+        action=ACTION_CONFIRM, approval_id=approval_id, context=context(actor=STRANGER)
     )
 
     assert handled.executed is None
     assert "не знаю" in transport.messages[-1].text
     assert pipeline.reminders.pending() == []
+
+
+def test_guest_is_known_but_may_not_confirm(world) -> None:
+    """Няню семья знает — но подтверждать расходы и события ей не дано."""
+    events, pipeline, transport = world
+    approval_id = inject_and_process(events, pipeline)
+
+    handled = pipeline.handle_callback(
+        action=ACTION_CONFIRM, approval_id=approval_id, context=context(actor=NANNY)
+    )
+
+    assert handled.executed is None
+    assert "нет такого права" in transport.messages[-1].text
+    assert pipeline.reminders.pending() == []
+    # Код не сгорел: предложение по-прежнему ждёт того, кто вправе.
+    assert pipeline.approvals.get(approval_id).status == "staged"
+    assert pipeline.handle_callback(
+        action=ACTION_CONFIRM, approval_id=approval_id, context=context()
+    ).executed == "reminder"
 
 
 def test_confirmation_from_another_chat_is_refused(world) -> None:
@@ -164,7 +189,7 @@ def test_confirmation_from_another_chat_is_refused(world) -> None:
     handled = pipeline.handle_callback(
         action=ACTION_CONFIRM,
         approval_id=approval_id,
-        origin=CHANNELS.origin_for(FAMILY_CHAT, 42, PARENT),  # другой тред
+        context=context(thread=42),  # другой тред
     )
 
     assert handled.executed is None
@@ -176,9 +201,9 @@ def test_reject_and_edit_invalidate_the_proposal(world, action: str) -> None:
     events, pipeline, transport = world
     approval_id = inject_and_process(events, pipeline)
 
-    pipeline.handle_callback(action=action, approval_id=approval_id, origin=origin())
+    pipeline.handle_callback(action=action, approval_id=approval_id, context=context())
     later = pipeline.handle_callback(
-        action=ACTION_CONFIRM, approval_id=approval_id, origin=origin()
+        action=ACTION_CONFIRM, approval_id=approval_id, context=context()
     )
 
     assert later.executed is None, "после отмены код не действует"
@@ -191,7 +216,7 @@ def test_event_letter_produces_an_ics_file(world) -> None:
     approval_id = inject_and_process(events, pipeline)
 
     pipeline.handle_callback(
-        action=ACTION_CONFIRM, approval_id=approval_id, origin=origin()
+        action=ACTION_CONFIRM, approval_id=approval_id, context=context()
     )
 
     assert len(transport.documents) == 1
@@ -224,7 +249,7 @@ def test_failed_execution_is_reported_and_recorded(world) -> None:
         )
 
     handled = pipeline.handle_callback(
-        action=ACTION_CONFIRM, approval_id=approval_id, origin=origin()
+        action=ACTION_CONFIRM, approval_id=approval_id, context=context()
     )
 
     assert handled.executed is None
@@ -245,11 +270,11 @@ def test_callback_update_is_parsed_with_verified_origin() -> None:
         }
     }
 
-    parsed = parse_update(update, CHANNELS)
+    parsed = parse_update(update, HOUSEHOLD)
 
     assert isinstance(parsed, IncomingCallback)
     assert parsed.action == "confirm" and parsed.approval_id == "approval-42"
-    assert parsed.origin.actor == PARENT and parsed.origin.is_known is True
+    assert parsed.context.actor_id == PARENT and parsed.context.is_known is True
 
 
 def test_actor_is_taken_from_the_update_not_from_the_text() -> None:
@@ -263,10 +288,10 @@ def test_actor_is_taken_from_the_update_not_from_the_text() -> None:
         }
     }
 
-    parsed = parse_update(update, CHANNELS)
+    parsed = parse_update(update, HOUSEHOLD)
 
-    assert parsed.origin.actor == STRANGER
-    assert parsed.origin.is_known is False
+    assert parsed.context.actor_id == STRANGER
+    assert parsed.context.is_known is False
 
 
 def test_update_from_a_foreign_chat_is_not_known() -> None:
@@ -279,12 +304,12 @@ def test_update_from_a_foreign_chat_is_not_known() -> None:
         }
     }
 
-    assert parse_update(update, CHANNELS).origin.is_known is False
+    assert parse_update(update, HOUSEHOLD).context.is_known is False
 
 
 def test_irrelevant_updates_are_ignored() -> None:
-    assert parse_update({"poll": {}}, CHANNELS) is None
-    assert parse_update({"callback_query": {"id": "x", "from": {"id": 1}}}, CHANNELS) is None
+    assert parse_update({"poll": {}}, HOUSEHOLD) is None
+    assert parse_update({"callback_query": {"id": "x", "from": {"id": 1}}}, HOUSEHOLD) is None
 
 
 # --- цикл прослушивания канала ---------------------------------------------
@@ -304,7 +329,7 @@ def test_update_loop_confirms_through_the_same_gate(world) -> None:
         },
     }
 
-    handled = pipeline.handle_update(update, CHANNELS)
+    handled = pipeline.handle_update(update, HOUSEHOLD)
 
     assert handled.executed == "reminder"
     assert len(pipeline.reminders.pending()) == 1
@@ -324,7 +349,7 @@ def test_update_loop_refuses_a_stranger(world) -> None:
         },
     }
 
-    handled = pipeline.handle_update(update, CHANNELS)
+    handled = pipeline.handle_update(update, HOUSEHOLD)
 
     assert handled.executed is None
     assert pipeline.reminders.pending() == []
@@ -332,7 +357,7 @@ def test_update_loop_refuses_a_stranger(world) -> None:
 
 def test_update_loop_ignores_uninteresting_updates(world) -> None:
     events, pipeline, transport = world
-    assert pipeline.handle_update({"update_id": 3, "poll": {}}, CHANNELS) is None
+    assert pipeline.handle_update({"update_id": 3, "poll": {}}, HOUSEHOLD) is None
 
 
 def test_http_error_is_definitive_not_unknown() -> None:

@@ -5,8 +5,9 @@
 без неё каждый тест карточки требовал бы живого бота.
 
 Разбор апдейта — часть границы доверия (`docs/SECURITY.md`, T4): актор,
-чат и тред берутся **из проверенного апдейта**, а не из текста сообщения, и
-чат сверяется с allowlist household'а. Неизвестный участник группы не получает
+чат и тред берутся **из проверенного апдейта**, а не из текста сообщения. На
+этой же границе собирается `RunContext` — права хода; ниже по конвейеру их
+никто не пересчитывает и не расширяет. Неизвестный участник группы не получает
 ни tools, ни возможности подтвердить чужое предложение.
 """
 
@@ -20,6 +21,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+from hermes_cloud.core.runcontext import Household, RunContext, build_run_context
+
 logger = logging.getLogger(__name__)
 
 API_ROOT = "https://api.telegram.org"
@@ -27,18 +30,8 @@ DEFAULT_TIMEOUT = 20.0
 
 
 @dataclass(frozen=True)
-class Origin:
-    """Откуда пришёл ход: проверенные транспортом чат, тред и актор."""
-
-    chat: str
-    thread: int | None
-    actor: str
-    is_known: bool
-
-
-@dataclass(frozen=True)
 class IncomingMessage:
-    origin: Origin
+    context: RunContext
     text: str
     message_id: int
 
@@ -47,25 +40,11 @@ class IncomingMessage:
 class IncomingCallback:
     """Нажатие кнопки: несёт действие и id предложения, но не код."""
 
-    origin: Origin
+    context: RunContext
     action: str
     approval_id: str
     callback_id: str
     message_id: int | None = None
-
-
-@dataclass(frozen=True)
-class HouseholdChannels:
-    """Кому и где разрешено действовать. В Фазе 5 приедет из household.toml."""
-
-    allowed_chats: frozenset[str] = frozenset()
-    family_actors: frozenset[str] = frozenset()
-
-    def origin_for(self, chat: str, thread: int | None, actor: str) -> Origin:
-        known = (not self.allowed_chats or str(chat) in self.allowed_chats) and (
-            not self.family_actors or str(actor) in self.family_actors
-        )
-        return Origin(chat=str(chat), thread=thread, actor=str(actor), is_known=known)
 
 
 class Transport(Protocol):
@@ -249,7 +228,7 @@ class SendOutcomeUnknown(RuntimeError):
 
 
 def parse_update(
-    update: dict[str, Any], channels: HouseholdChannels
+    update: dict[str, Any], household: Household
 ) -> IncomingMessage | IncomingCallback | None:
     """Разобрать апдейт Bot API. None — апдейт нам не интересен.
 
@@ -266,7 +245,10 @@ def parse_update(
             return None
         action, _, approval_id = data.partition(":")
         return IncomingCallback(
-            origin=channels.origin_for(chat, message.get("message_thread_id"), actor),
+            context=build_run_context(
+                household=household, actor_id=actor, chat_id=chat,
+                thread_id=message.get("message_thread_id"),
+            ),
             action=action,
             approval_id=approval_id,
             callback_id=str(callback.get("id", "")),
@@ -280,7 +262,10 @@ def parse_update(
         if not chat or not actor:
             return None
         return IncomingMessage(
-            origin=channels.origin_for(chat, message.get("message_thread_id"), actor),
+            context=build_run_context(
+                household=household, actor_id=actor, chat_id=chat,
+                thread_id=message.get("message_thread_id"),
+            ),
             text=str(message.get("text") or message.get("caption") or ""),
             message_id=int(message.get("message_id", 0)),
         )

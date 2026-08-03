@@ -38,6 +38,21 @@ def _store(args: argparse.Namespace) -> EventStore:
     return EventStore(_database(args))
 
 
+def _household():
+    """Кто есть кто в household'е. Пусто — значит никто: контур fail-closed."""
+    from hermes_cloud.core.runcontext import load_household
+
+    load_dotenv()
+    household = load_household()
+    if not household.allowed_chats:
+        print(
+            "внимание: HERMES_CHAT не задан — ни один чат не доверен,"
+            " подтверждения будут отклоняться",
+            file=sys.stderr,
+        )
+    return household
+
+
 def _pipeline(args: argparse.Namespace, database) -> Pipeline:
     """Собрать конвейер из окружения. Без токена (или с --console) — в консоль."""
     config = load_config()
@@ -100,15 +115,9 @@ def cmd_listen(args: argparse.Namespace) -> int:
     в Фазе 4 вместе с nerve-webhook. Смещение хранится в базе — перезапуск не
     переигрывает уже обработанные нажатия.
     """
-    from hermes_cloud.channels.telegram import HouseholdChannels
-
     database = _database(args)
     pipeline = _pipeline(args, database)
-    config = load_config()
-    channels = HouseholdChannels(
-        allowed_chats=frozenset({config.require_chat()}),
-        family_actors=config.family_actors,
-    )
+    household = _household()
     offset = _read_offset(database)
     print("слушаю канал; Ctrl+C чтобы остановить")
     rounds = 0
@@ -117,7 +126,7 @@ def cmd_listen(args: argparse.Namespace) -> int:
         updates = pipeline.transport.get_updates(offset=offset, timeout=args.timeout)
         for update in updates:
             offset = int(update.get("update_id", 0)) + 1
-            handled = pipeline.handle_update(update, channels)
+            handled = pipeline.handle_update(update, household)
             if handled is not None:
                 print(f"{handled.executed or 'обработано'}: {(handled.message or '')[:80]}")
         if offset is not None and updates:
@@ -131,25 +140,24 @@ def cmd_confirm(args: argparse.Namespace) -> int:
     Проходит через тот же `claim`: чат, тред и актор проверяются, код
     одноразовый. Отличается только транспорт, а не граница доверия.
     """
-    from hermes_cloud.channels.telegram import HouseholdChannels
+    from hermes_cloud.core.runcontext import build_run_context
     from hermes_cloud.runner.card import ACTION_CONFIRM, ACTION_REJECT
 
     database = _database(args)
     pipeline = _pipeline(args, database)
-    config = load_config()
-    channels = HouseholdChannels(
-        allowed_chats=frozenset({config.require_chat()}),
-        family_actors=config.family_actors,
-    )
+    household = _household()
     approval = pipeline.approvals.get(args.approval_id)
     if approval is None:
         print(f"предложение {args.approval_id} не найдено", file=sys.stderr)
         return 1
-    actor = args.actor or (next(iter(config.family_actors), None) or approval.chat)
+    actor = args.actor or household.owner or next(iter(household.family), approval.chat)
     handled = pipeline.handle_callback(
         action=ACTION_REJECT if args.reject else ACTION_CONFIRM,
         approval_id=approval.id,
-        origin=channels.origin_for(approval.chat, approval.thread, actor),
+        context=build_run_context(
+            household=household, actor_id=actor,
+            chat_id=approval.chat, thread_id=approval.thread,
+        ),
     )
     print(handled.message or "готово")
     return 0

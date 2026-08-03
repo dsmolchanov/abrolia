@@ -12,7 +12,7 @@ import logging
 from dataclasses import dataclass
 from datetime import date, datetime
 
-from hermes_cloud.channels.telegram import Origin, Transport
+from hermes_cloud.channels.telegram import Transport
 from hermes_cloud.core.approvals import (
     STATUS_DONE,
     STATUS_FAILED,
@@ -20,6 +20,11 @@ from hermes_cloud.core.approvals import (
     RateLimited,
 )
 from hermes_cloud.core.events import Event
+from hermes_cloud.core.runcontext import (
+    WRITE_CALENDAR,
+    WRITE_REMINDER,
+    RunContext,
+)
 from hermes_cloud.execute.ics import build_event, filename_for, render_ics
 from hermes_cloud.execute.reminder import ReminderStore, due_timestamp
 from hermes_cloud.ingest.eml import parse_eml
@@ -46,6 +51,16 @@ TEXT_UNKNOWN_ACTOR = (
 )
 TEXT_GONE = "Это предложение уже неактуально — код истёк или его отменили."
 TEXT_RATE_LIMITED = "Слишком много неверных кодов. Попробуйте позже."
+TEXT_NO_RIGHT = (
+    "Это подтверждает кто-то из взрослых в семье — у вас нет такого права."
+)
+
+# Право, необходимое для подтверждения предложения этого вида. Подтверждение —
+# это разрешение на эффект, поэтому спрашивается mutate-cap, а не «знакомость».
+CAPABILITY_FOR_KIND = {
+    KIND_REMINDER: WRITE_REMINDER,
+    KIND_ICS: WRITE_CALENDAR,
+}
 
 
 @dataclass(frozen=True)
@@ -115,43 +130,58 @@ class Pipeline:
     # --- подтверждение ------------------------------------------------------
 
     def handle_callback(
-        self, *, action: str, approval_id: str, origin: Origin, now: float | None = None
+        self, *, action: str, approval_id: str, context: RunContext, now: float | None = None
     ) -> Handled:
         """Нажатие кнопки. Неизвестный актор не подтверждает ничего."""
-        if not origin.is_known:
+        if not context.is_known:
             self.transport.send_message(
-                chat=origin.chat, text=TEXT_UNKNOWN_ACTOR, thread=origin.thread
+                chat=context.chat_id, text=TEXT_UNKNOWN_ACTOR, thread=context.thread_id
             )
             return Handled(message=TEXT_UNKNOWN_ACTOR)
 
         if action in {ACTION_REJECT, ACTION_EDIT}:
+            # Отмена — не эффект: отменить чужое предложение вправе любой, кого
+            # семья знает. Ошибка в эту сторону безопасна.
             self.approvals.cancel(approval_id, now=now)
             text = TEXT_REJECTED if action == ACTION_REJECT else TEXT_EDIT
-            self.transport.send_message(chat=origin.chat, text=text, thread=origin.thread)
+            self.transport.send_message(
+                chat=context.chat_id, text=text, thread=context.thread_id
+            )
             return Handled(approval_id=approval_id, message=text)
 
         if action != ACTION_CONFIRM:
             return Handled(message=None)
 
+        staged = self.approvals.get(approval_id)
+        if staged is not None and not context.can(
+            CAPABILITY_FOR_KIND.get(staged.kind, "")
+        ):
+            # Права проверяются до claim: иначе одноразовый код сгорел бы на
+            # том, кому и так нельзя.
+            self.transport.send_message(
+                chat=context.chat_id, text=TEXT_NO_RIGHT, thread=context.thread_id
+            )
+            return Handled(approval_id=approval_id, message=TEXT_NO_RIGHT)
+
         try:
             approval = self.approvals.claim_by_id(
-                approval_id=approval_id, chat=origin.chat,
-                thread=origin.thread, actor=origin.actor, now=now,
+                approval_id=approval_id, chat=context.chat_id,
+                thread=context.thread_id, actor=context.actor_id, now=now,
             )
         except RateLimited:
             self.transport.send_message(
-                chat=origin.chat, text=TEXT_RATE_LIMITED, thread=origin.thread
+                chat=context.chat_id, text=TEXT_RATE_LIMITED, thread=context.thread_id
             )
             return Handled(approval_id=approval_id, message=TEXT_RATE_LIMITED)
         if approval is None:
             self.transport.send_message(
-                chat=origin.chat, text=TEXT_GONE, thread=origin.thread
+                chat=context.chat_id, text=TEXT_GONE, thread=context.thread_id
             )
             return Handled(approval_id=approval_id, message=TEXT_GONE)
 
         return self.execute(approval, now=now)
 
-    def handle_update(self, update: dict, channels) -> Handled | None:
+    def handle_update(self, update: dict, household) -> Handled | None:
         """Апдейт из канала → действие. None — апдейт нам не интересен.
 
         Сообщения в Фазе 1 только подсказывают человеку, что делать: диалог с
@@ -159,19 +189,20 @@ class Pipeline:
         """
         from hermes_cloud.channels.telegram import IncomingCallback, parse_update
 
-        parsed = parse_update(update, channels)
+        parsed = parse_update(update, household)
         if parsed is None:
             return None
         if isinstance(parsed, IncomingCallback):
             handled = self.handle_callback(
-                action=parsed.action, approval_id=parsed.approval_id, origin=parsed.origin
+                action=parsed.action, approval_id=parsed.approval_id, context=parsed.context
             )
             if parsed.callback_id:
                 self.transport.answer_callback(parsed.callback_id)
             return handled
-        if not parsed.origin.is_known:
+        if not parsed.context.is_known:
             self.transport.send_message(
-                chat=parsed.origin.chat, text=TEXT_UNKNOWN_ACTOR, thread=parsed.origin.thread
+                chat=parsed.context.chat_id, text=TEXT_UNKNOWN_ACTOR,
+                thread=parsed.context.thread_id,
             )
             return Handled(message=TEXT_UNKNOWN_ACTOR)
         return None

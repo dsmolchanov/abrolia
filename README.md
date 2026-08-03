@@ -17,6 +17,9 @@ See `thoughts/shared/plans/2026-08-02-family-ops-assistant-mvp.md` for the imple
 pip install -r requirements-dev.txt
 export ANTHROPIC_API_KEY=...          # or put it in .env (gitignored)
 export HERMES_CHAT=-100990000101      # Telegram chat the cards go to
+export HERMES_OWNER=990000001         # who may export/delete household data
+export HERMES_FAMILY_ACTORS=990000002 # who may confirm actions (comma-separated)
+export HERMES_GUEST_ACTORS=990000003  # optional: read-only actors (nanny, grandparent)
 export TELEGRAM_BOT_TOKEN=...         # optional: without it messages print to the console
 
 python3 -m hermes_cloud.cli inject-eml tests/fixtures/email/forwarded_school_de.eml
@@ -40,6 +43,11 @@ python3 -m hermes_cloud.cli --console tick
 
 Nothing leaves the machine without a human pressing ✅: the worker only stages a
 proposal, and execution happens after `claim` (see [`docs/SECURITY.md`](docs/SECURITY.md)).
+
+Actor roles decide who may press it. The mapping comes from `household.toml`
+when the file exists and from the variables above otherwise; anyone not listed —
+and anyone writing from a chat outside `HERMES_CHAT` — gets zero capabilities,
+not reduced ones.
 
 Model benchmark and the extraction-model decision: [`bench/README.md`](bench/README.md).
 

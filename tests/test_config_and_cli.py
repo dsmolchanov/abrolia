@@ -18,7 +18,6 @@ def test_config_defaults_are_safe() -> None:
 
     assert config.database_path == Path("data/hermes.db")
     assert config.thread is None
-    assert config.family_actors == frozenset()
     assert config.has_telegram is False
     assert config.model == "claude-sonnet-5", "решение бенчмарка Фазы 1"
     assert config.effort == "medium"
@@ -38,7 +37,6 @@ def test_config_reads_the_environment() -> None:
 
     assert config.database_path == Path("/tmp/h.db")
     assert config.thread == 7
-    assert config.family_actors == frozenset({"990000001", "990000002"})
     assert config.language == "español"
     assert config.model == "claude-sonnet-5"
     assert config.effort == "medium"
