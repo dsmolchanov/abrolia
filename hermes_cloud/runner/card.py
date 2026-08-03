@@ -23,6 +23,8 @@ LOW_CONFIDENCE = 0.7
 ACTION_CONFIRM = "confirm"
 ACTION_EDIT = "edit"
 ACTION_REJECT = "reject"
+# Переключение пункта в связке. Несёт номер пункта третьим полем callback'а.
+ACTION_TOGGLE = "toggle"
 
 KIND_REMINDER = "reminder"
 # Событие уезжает в календарь семьи, если он подключён, и файлом — если нет.
@@ -36,6 +38,8 @@ KIND_MEMORY = "memory"
 # и то и другое необратимо (`core/dsar.py`).
 KIND_EXPORT = "export"
 KIND_DELETE = "delete"
+# Связка: одно письмо породило несколько действий, подтверждение одно.
+KIND_BUNDLE = "bundle"
 
 
 @dataclass(frozen=True)
@@ -43,11 +47,17 @@ class Button:
     label: str
     action: str
     approval_id: str
+    argument: str | None = None
 
     @property
     def callback_data(self) -> str:
-        """Данные кнопки: действие и id, но никогда не код подтверждения."""
-        return f"{self.action}:{self.approval_id}"
+        """Данные кнопки: действие, id и (для связки) номер пункта.
+
+        Кода подтверждения здесь нет и быть не может: callback виден всем, кто
+        может прочитать разметку сообщения.
+        """
+        data = f"{self.action}:{self.approval_id}"
+        return f"{data}:{self.argument}" if self.argument is not None else data
 
 
 @dataclass(frozen=True)
@@ -61,11 +71,11 @@ class Card:
         return bool(self.buttons)
 
 
-def _format_money(amount_cents: int, currency: str) -> str:
+def format_money(amount_cents: int, currency: str) -> str:
     return f"{amount_cents / 100:.2f} {currency.upper()}".replace(".", ",")
 
 
-def _format_date(value: date | datetime | None) -> str | None:
+def format_date(value: date | datetime | None) -> str | None:
     if value is None:
         return None
     if isinstance(value, datetime):
@@ -73,53 +83,11 @@ def _format_date(value: date | datetime | None) -> str | None:
     return value.strftime("%d.%m.%Y")
 
 
-def proposal_for(
-    result: ExtractionResult, *, calendar: bool = False
-) -> dict[str, Any] | None:
-    """Что именно предлагается сделать. None — предлагать нечего.
+def header_lines(result: ExtractionResult, *, source: str | None = None) -> list[str]:
+    """Шапка карточки: заголовок, пересказ и факты, которые человек проверяет.
 
-    Событие с известным началом уезжает в календарь семьи, если он подключён, и
-    файлом `.ics` — если нет. Всё остальное, что требует действия, становится
-    напоминанием к дедлайну.
-    """
-    if result.kind in {"info", "spam"} or not result.action_required:
-        return None
-    if result.kind == "event" and result.event_start is not None:
-        return {
-            "kind": KIND_CALENDAR if calendar else KIND_ICS,
-            "title": result.title,
-            "start": result.event_start.isoformat(),
-            "end": result.event_end.isoformat() if result.event_end else None,
-            "location": result.location,
-            "description": result.summary,
-        }
-    due = result.due_date or (result.event_start.date() if result.event_start else None)
-    if due is None:
-        return None
-    return {
-        "kind": KIND_REMINDER,
-        "text": result.title,
-        "due_date": due.isoformat(),
-        "amount_cents": result.amount.amount_cents if result.amount else None,
-        "currency": result.amount.currency if result.amount else None,
-        # Ответственный едет в payload не для карточки, а для вопросов вида
-        # «какие платежи на этой неделе и кто их закрывает» (`core/queries.py`).
-        "responsible": result.responsible,
-    }
-
-
-def render_card(
-    result: ExtractionResult,
-    *,
-    approval_id: str | None = None,
-    code: str | None = None,
-    source: str | None = None,
-    calendar: bool = False,
-) -> Card:
-    """Собрать карточку. Без `approval_id` карточка получается без кнопок.
-
-    `source` — строка происхождения из `core/evidence.py`: цитата из живого
-    письма, а после его удаления по сроку хранения — честный след без контента.
+    Вынесена отдельно, потому что связка из нескольких действий (`runner/bundle.py`)
+    показывает ту же шапку — письмо-то одно.
     """
     lines: list[str] = [result.title]
     if result.summary:
@@ -128,11 +96,11 @@ def render_card(
 
     facts: list[str] = []
     if result.amount is not None:
-        facts.append(f"Сумма: {_format_money(result.amount.amount_cents, result.amount.currency)}")
-    when = _format_date(result.event_start)
+        facts.append(f"Сумма: {format_money(result.amount.amount_cents, result.amount.currency)}")
+    when = format_date(result.event_start)
     if when:
         facts.append(f"Когда: {when}")
-    deadline = _format_date(result.due_date)
+    deadline = format_date(result.due_date)
     if deadline:
         facts.append(f"Срок: {deadline}")
     if result.location:
@@ -140,8 +108,8 @@ def render_card(
     if result.responsible:
         facts.append(f"Кто: {result.responsible}")
     if result.original_sender is not None:
-        # Отправитель показывается отдельной строкой намеренно: в Фазе 4
-        # именно он станет получателем исходящего письма.
+        # Отправитель показывается отдельной строкой намеренно: именно он
+        # станет получателем исходящего письма.
         sender = result.original_sender.email
         if result.original_sender.name:
             sender = f"{result.original_sender.name} <{sender}>"
@@ -151,34 +119,21 @@ def render_card(
     if facts:
         lines.append("")
         lines.extend(facts)
+    return lines
 
-    proposal = proposal_for(result, calendar=calendar)
-    if proposal is None:
-        if result.kind == "spam":
-            lines.append("")
-            lines.append("Похоже на рекламу — ничего делать не нужно.")
-        elif not result.action_required:
-            lines.append("")
-            lines.append("Действий не требуется — это к сведению.")
-        return Card(text="\n".join(lines))
 
-    if result.confidence < LOW_CONFIDENCE:
+def render_info(result: ExtractionResult, *, source: str | None = None) -> Card:
+    """Карточка письма, не требующего действий: без кнопок и без предложения.
+
+    Всё, что действия требует, рендерит `runner/bundle.py`: даже одно действие —
+    вырожденная связка, и отдельного пути для него нет специально, иначе два
+    пути начнут расходиться в поведении.
+    """
+    lines = header_lines(result, source=source)
+    if result.kind == "spam":
         lines.append("")
-        lines.append("⚠️ Проверьте дату и сумму: письмо распознано не уверенно.")
-
-    lines.append("")
-    lines.append(
-        "Создать напоминание?" if proposal["kind"] == KIND_REMINDER
-        else "Добавить в календарь?"
-    )
-    if code:
-        lines.append(f"Код подтверждения: {code}")
-
-    buttons: tuple[Button, ...] = ()
-    if approval_id:
-        buttons = (
-            Button("✅ Да", ACTION_CONFIRM, approval_id),
-            Button("✏️ Исправить", ACTION_EDIT, approval_id),
-            Button("❌ Нет", ACTION_REJECT, approval_id),
-        )
-    return Card(text="\n".join(lines), buttons=buttons, proposal=proposal)
+        lines.append("Похоже на рекламу — ничего делать не нужно.")
+    elif not result.action_required:
+        lines.append("")
+        lines.append("Действий не требуется — это к сведению.")
+    return Card(text="\n".join(lines))

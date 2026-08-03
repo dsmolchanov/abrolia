@@ -45,6 +45,8 @@ class IncomingCallback:
     approval_id: str
     callback_id: str
     message_id: int | None = None
+    # Третье поле callback'а: номер пункта связки. Для остальных кнопок пусто.
+    argument: str | None = None
 
 
 class Transport(Protocol):
@@ -243,7 +245,8 @@ def parse_update(
         data = str(callback.get("data") or "")
         if not chat or not actor or ":" not in data:
             return None
-        action, _, approval_id = data.partition(":")
+        action, _, rest = data.partition(":")
+        approval_id, _, argument = rest.partition(":")
         return IncomingCallback(
             context=build_run_context(
                 household=household, actor_id=actor, chat_id=chat,
@@ -253,6 +256,7 @@ def parse_update(
             approval_id=approval_id,
             callback_id=str(callback.get("id", "")),
             message_id=message.get("message_id"),
+            argument=argument or None,
         )
 
     message = update.get("message") or update.get("edited_message")

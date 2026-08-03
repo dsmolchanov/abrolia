@@ -16,6 +16,7 @@ from hermes_cloud.channels.telegram import SendOutcomeUnknown, Transport
 from hermes_cloud.core.approvals import (
     STATUS_DONE,
     STATUS_FAILED,
+    STATUS_STAGED,
     ApprovalStore,
     RateLimited,
 )
@@ -43,17 +44,28 @@ from hermes_cloud.execute.gcal import (
 from hermes_cloud.execute.ics import build_event, filename_for, render_ics
 from hermes_cloud.execute.reminder import ReminderStore, due_timestamp
 from hermes_cloud.ingest.eml import parse_eml
+from hermes_cloud.runner.bundle import (
+    enabled_items,
+    item_line,
+    items_for,
+    items_of,
+    render_bundle,
+    toggled,
+)
 from hermes_cloud.runner.card import (
     ACTION_CONFIRM,
     ACTION_EDIT,
     ACTION_REJECT,
+    ACTION_TOGGLE,
+    KIND_BUNDLE,
     KIND_CALENDAR,
     KIND_DELETE,
     KIND_EXPORT,
     KIND_ICS,
     KIND_MEMORY,
     KIND_REMINDER,
-    render_card,
+    header_lines,
+    render_info,
 )
 from hermes_cloud.runner.extraction import Extractor
 from hermes_cloud.runner.model import ToolLoop
@@ -119,6 +131,26 @@ def evidence_needles(result) -> list[str]:
     if result.location:
         needles.append(result.location)
     return needles
+
+
+class BundlePartiallyFailed(RuntimeError):
+    """Часть пунктов связки не прошла. Текст исключения — то, что видит семья."""
+
+
+def may_confirm(context: RunContext, payload: dict) -> bool:
+    """Хватает ли прав подтвердить это предложение.
+
+    У связки прав ровно столько, сколько нужно её включённым пунктам: право
+    подтвердить целое не может быть слабее права подтвердить любую его часть.
+    Неизвестный вид — отказ: список видов закрытый, и «не знаю, что это» не
+    повод разрешать.
+    """
+    if payload.get("kind") == KIND_BUNDLE:
+        items = enabled_items(payload)
+        return bool(items) and all(
+            context.can(CAPABILITY_FOR_KIND.get(item.kind, "")) for item in items
+        )
+    return context.can(CAPABILITY_FOR_KIND.get(payload.get("kind", ""), ""))
 
 
 @dataclass(frozen=True)
@@ -191,13 +223,16 @@ class Pipeline:
         )
         source = self.evidence.render_source(ref)
 
-        preview = render_card(result, source=source, calendar=self.calendar is not None)
-        if preview.proposal is None:
+        items = items_for(result, calendar=self.calendar is not None)
+        if not items:
             # Информационное письмо: сообщение без кнопок, подтверждать нечего.
+            info = render_info(result, source=source)
             self.transport.send_message(
-                chat=self.chat, text=preview.text, thread=self.thread
+                chat=self.chat, text=info.text, thread=self.thread
             )
-            return Handled(message=preview.text)
+            return Handled(message=info.text)
+        header = "\n".join(header_lines(result, source=source))
+        preview = render_bundle(result, items, header=header)
 
         # Кандидат — единственный статус, который может появиться из модели.
         commitment = self.commitments.propose(
@@ -218,9 +253,8 @@ class Pipeline:
             context_key=event.context_key,
             event_id=event.id,
         )
-        card = render_card(
-            result, approval_id=staged.id, code=staged.code, source=source,
-            calendar=self.calendar is not None,
+        card = render_bundle(
+            result, items, approval_id=staged.id, code=staged.code, header=header
         )
         self.transport.send_message(
             chat=self.chat,
@@ -234,7 +268,13 @@ class Pipeline:
     # --- подтверждение ------------------------------------------------------
 
     def handle_callback(
-        self, *, action: str, approval_id: str, context: RunContext, now: float | None = None
+        self,
+        *,
+        action: str,
+        approval_id: str,
+        context: RunContext,
+        argument: str | None = None,
+        now: float | None = None,
     ) -> Handled:
         """Нажатие кнопки. Неизвестный актор не подтверждает ничего."""
         if not context.is_known:
@@ -242,6 +282,11 @@ class Pipeline:
                 chat=context.chat_id, text=TEXT_UNKNOWN_ACTOR, thread=context.thread_id
             )
             return Handled(message=TEXT_UNKNOWN_ACTOR)
+
+        if action == ACTION_TOGGLE:
+            return self._toggle_item(
+                approval_id=approval_id, index=argument, context=context, now=now
+            )
 
         if action in {ACTION_REJECT, ACTION_EDIT}:
             # Отмена — не эффект: отменить чужое предложение вправе любой, кого
@@ -258,9 +303,7 @@ class Pipeline:
             return Handled(message=None)
 
         staged = self.approvals.get(approval_id)
-        if staged is not None and not context.can(
-            CAPABILITY_FOR_KIND.get(staged.kind, "")
-        ):
+        if staged is not None and not may_confirm(context, staged.payload):
             # Права проверяются до claim: иначе одноразовый код сгорел бы на
             # том, кому и так нельзя.
             self.transport.send_message(
@@ -300,7 +343,8 @@ class Pipeline:
             return None
         if isinstance(parsed, IncomingCallback):
             handled = self.handle_callback(
-                action=parsed.action, approval_id=parsed.approval_id, context=parsed.context
+                action=parsed.action, approval_id=parsed.approval_id,
+                context=parsed.context, argument=parsed.argument,
             )
             if parsed.callback_id:
                 self.transport.answer_callback(parsed.callback_id)
@@ -362,8 +406,22 @@ class Pipeline:
                 text = self._execute_export(approval)
             elif payload["kind"] == KIND_DELETE:
                 text = self._execute_delete(approval, now=now)
+            elif payload["kind"] == KIND_BUNDLE:
+                text = self._execute_bundle(approval, payload, now=now)
             else:
                 raise ValueError(f"неизвестный вид предложения: {payload['kind']!r}")
+        except BundlePartiallyFailed as partial:
+            # Удавшиеся пункты остаются сделанными: их эффекты уже закрыты в
+            # журнале. Подтверждение помечается неудавшимся, потому что
+            # выполнено не всё, о чём договорились.
+            self.effects.fail(effect.id, "часть пунктов связки не прошла", now=now)
+            self.approvals.mark(
+                approval.id, STATUS_FAILED, error="bundle: частичный отказ", now=now
+            )
+            self.transport.send_message(
+                chat=approval.chat, text=str(partial), thread=approval.thread
+            )
+            return Handled(approval_id=approval.id, message=str(partial))
         except (SendOutcomeUnknown, CalendarOutcomeUnknown) as error:
             # Отправка могла дойти. Повторять нельзя, молчать — тем более.
             self.effects.outcome_unknown(effect.id, f"{type(error).__name__}: {error}", now=now)
@@ -472,6 +530,115 @@ class Pipeline:
         if reminder is not None:
             self.commitments.link(commitment_id, reminder_id=reminder.id, now=now)
 
+    def _execute_bundle(self, approval, payload: dict, *, now: float | None) -> str:
+        """Исполнить связку по-пунктно: у каждого пункта свой эффект.
+
+        Упавший пункт не отменяет удавшиеся и не откатывает их: две трети
+        сделанного лучше, чем ничего, — при условии, что человеку честно
+        сказано, какая треть не сделана.
+        """
+        lines: list[str] = []
+        failures = 0
+        for index, item in enumerate(items_of(payload)):
+            if not item.enabled:
+                continue
+            effect, fresh = self.effects.begin(
+                run_id=approval.id,
+                tool_use_id=f"item-{index}",
+                kind=item.kind,
+                approval_id=approval.id,
+                now=now,
+            )
+            if not fresh and effect.settled:
+                # Доделка после падения: этот пункт уже исполнен.
+                lines.append(f"✓ {effect.result or item.kind}")
+                continue
+            try:
+                # Пункт наследует ссылку на обязательство: от неё зависит id
+                # события в календаре, а он обязан пережить версии факта.
+                text = self._execute_item(
+                    approval,
+                    {**item.payload, "commitment_id": payload.get("commitment_id")},
+                    now=now,
+                )
+            except Exception as error:
+                failures += 1
+                self.effects.fail(effect.id, f"{type(error).__name__}: {error}", now=now)
+                logger.warning(
+                    "пункт %s связки %s не сработал: %s",
+                    index, approval.id, type(error).__name__,
+                )
+                lines.append(f"✗ {item_line(item)} — не получилось")
+                continue
+            self.effects.complete(effect.id, text, now=now)
+            lines.append(f"✓ {text}")
+
+        if failures:
+            lines.append("")
+            lines.append("Что не получилось — попробуйте ещё раз или напишите мне.")
+            raise BundlePartiallyFailed("\n".join(lines))
+        return "\n".join(lines)
+
+    def _execute_item(self, approval, payload: dict, *, now: float | None) -> str:
+        """Один пункт связки. Те же исполнители, что и у одиночного действия."""
+        kind = payload["kind"]
+        if kind == KIND_REMINDER:
+            return self._execute_reminder(approval, payload, now=now)
+        if kind == KIND_CALENDAR:
+            return self._execute_calendar(approval, payload, now=now)
+        if kind == KIND_ICS:
+            return self._execute_ics(approval, payload)
+        raise ValueError(f"неизвестный вид пункта: {kind!r}")
+
+    def _toggle_item(
+        self, *, approval_id: str, index: str | None, context: RunContext, now: float | None
+    ) -> Handled:
+        """Включить или выключить пункт связки.
+
+        Пересобирает предложение целиком: старый код перестаёт действовать, а
+        новая карточка приходит с новым. Подтверждать теперь предлагается
+        другое — значит и код должен быть другим (та же логика, что у ✏️).
+        """
+        approval = self.approvals.get(approval_id)
+        if approval is None or approval.status != STATUS_STAGED:
+            self.transport.send_message(
+                chat=context.chat_id, text=TEXT_GONE, thread=context.thread_id
+            )
+            return Handled(approval_id=approval_id, message=TEXT_GONE)
+        try:
+            position = int(index or "")
+        except ValueError:
+            return Handled(approval_id=approval_id)
+
+        payload = toggled(approval.payload, position)
+        if payload == approval.payload:
+            # Последний включённый пункт выключить нельзя: для «ничего не делать»
+            # есть ❌.
+            return Handled(approval_id=approval_id)
+
+        self.approvals.cancel(approval_id, now=now)
+        staged = self.approvals.stage(
+            kind=KIND_BUNDLE,
+            payload=payload,
+            chat=approval.chat,
+            thread=approval.thread,
+            actor=approval.actor,
+            context_key=approval.context_key,
+            event_id=approval.event_id,
+            now=now,
+        )
+        card = render_bundle(
+            None, items_of(payload), approval_id=staged.id, code=staged.code,
+            header=payload.get("header", ""),
+        )
+        self.transport.send_message(
+            chat=approval.chat,
+            text=card.text,
+            thread=approval.thread,
+            buttons=tuple((button.label, button.callback_data) for button in card.buttons),
+        )
+        return Handled(approval_id=staged.id, message=card.text)
+
     def _execute_calendar(self, approval, payload: dict, *, now: float | None) -> str:
         """Событие в календарь семьи. Повтор находит его по id и обновляет."""
         if self.calendar is None:  # pragma: no cover — карточка бы не появилась
@@ -479,6 +646,7 @@ class Pipeline:
         start = datetime.fromisoformat(payload["start"])
         event = build_calendar_event(
             approval_id=approval.id,
+            commitment_id=payload.get("commitment_id"),
             title=payload["title"],
             start=start,
             end=datetime.fromisoformat(payload["end"]) if payload.get("end") else None,

@@ -45,14 +45,20 @@ class CalendarOutcomeUnknown(RuntimeError):
     """Связь оборвалась. Для календаря это поправимо: id детерминированный."""
 
 
-def event_id_for(approval_id: str) -> str:
-    """Детерминированный id события Google из id подтверждения.
+def event_id_for(seed: str) -> str:
+    """Детерминированный id события Google.
+
+    Seed — **id обязательства**, если оно есть, и id подтверждения иначе.
+    Разница принципиальная: обязательство переживает версии («экскурсия
+    перенесена»), а подтверждение у каждой версии своё. Выводя id из факта, мы
+    получаем обновление того же события; выводя из кнопки — второе событие
+    рядом с первым.
 
     base32hex без паддинга: алфавит `0-9a-v` — ровно то, что принимает Google.
-    Base64 или hex-с-дефисами он отвергает, а UUID подтверждения содержит
-    символы вне разрешённого набора.
+    Base64 или hex-с-дефисами он отвергает, а UUID содержит символы вне
+    разрешённого набора.
     """
-    digest = hashlib.sha256(approval_id.encode("utf-8")).digest()
+    digest = hashlib.sha256(seed.encode("utf-8")).digest()
     encoded = base64.b32hexencode(digest).decode("ascii").rstrip("=").lower()
     return (ID_PREFIX + encoded)[:ID_LENGTH]
 
@@ -96,6 +102,7 @@ class CalendarEvent:
 def build_calendar_event(
     *,
     approval_id: str,
+    commitment_id: str | None = None,
     title: str,
     start: datetime,
     end: datetime | None = None,
@@ -104,7 +111,7 @@ def build_calendar_event(
     timezone: str = "UTC",
 ) -> CalendarEvent:
     return CalendarEvent(
-        id=event_id_for(approval_id),
+        id=event_id_for(commitment_id or approval_id),
         title=title,
         start=start,
         end=end or start + DEFAULT_DURATION,
@@ -187,9 +194,9 @@ class Calendar:
         logger.info("calendar event %s создан", event.id)
         return Written(event=created, created=True, updated=False)
 
-    def cancel(self, approval_id: str) -> bool:
-        """Отменить событие, порождённое этим подтверждением."""
-        event_id = event_id_for(approval_id)
+    def cancel(self, seed: str) -> bool:
+        """Отменить событие, порождённое этим обязательством (или подтверждением)."""
+        event_id = event_id_for(seed)
         if self.backend.get_event(self.calendar_id, event_id) is None:
             return False
         self.backend.delete_event(self.calendar_id, event_id)

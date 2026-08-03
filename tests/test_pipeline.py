@@ -140,7 +140,7 @@ def test_confirmation_creates_the_reminder_once(world) -> None:
         action=ACTION_CONFIRM, approval_id=approval_id, context=context()
     )
 
-    assert handled.executed == "reminder"
+    assert handled.executed == "bundle"
     pending = pipeline.reminders.pending()
     assert len(pending) == 1 and "Экскурсия" in pending[0].text
     assert "Готово" in transport.messages[-1].text
@@ -183,7 +183,7 @@ def test_guest_is_known_but_may_not_confirm(world) -> None:
     assert pipeline.approvals.get(approval_id).status == "staged"
     assert pipeline.handle_callback(
         action=ACTION_CONFIRM, approval_id=approval_id, context=context()
-    ).executed == "reminder"
+    ).executed == "bundle"
 
 
 def test_confirmation_from_another_chat_is_refused(world) -> None:
@@ -404,7 +404,7 @@ def test_update_loop_confirms_through_the_same_gate(world) -> None:
 
     handled = pipeline.handle_update(update, HOUSEHOLD)
 
-    assert handled.executed == "reminder"
+    assert handled.executed == "bundle"
     assert len(pipeline.reminders.pending()) == 1
     assert transport.answered == [("cb1", "")], "спиннер кнопки обязан гаситься"
 

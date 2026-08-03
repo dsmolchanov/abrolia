@@ -15,13 +15,14 @@ from hermes_cloud.execute.ics import (
     render_ics,
 )
 from hermes_cloud.execute.reminder import ReminderStore, due_timestamp
+from hermes_cloud.runner.bundle import items_for, render_bundle
 from hermes_cloud.runner.card import (
     ACTION_CONFIRM,
     ACTION_EDIT,
     ACTION_REJECT,
     KIND_ICS,
     KIND_REMINDER,
-    render_card,
+    render_info,
 )
 from hermes_cloud.runner.extraction import (
     ExtractionResult,
@@ -48,18 +49,29 @@ def result(**overrides) -> ExtractionResult:
 # --- карточка ---------------------------------------------------------------
 
 
+def card_for(extraction, *, approval_id="a1", code=None, calendar=False):
+    """Карточка так, как её собирает конвейер: даже одно действие — связка."""
+    return render_bundle(
+        extraction,
+        items_for(extraction, calendar=calendar),
+        approval_id=approval_id,
+        code=code,
+    )
+
+
 def test_payment_card_shows_amount_and_deadline_verbatim() -> None:
-    card = render_card(result(), approval_id="a1", code="0123456789abcdef")
+    card = card_for(result(), code="0123456789abcdef")
 
     assert "15,00 EUR" in card.text
     assert "08.09.2026" in card.text
     assert "0123456789abcdef" in card.text
-    assert card.proposal["kind"] == KIND_REMINDER
-    assert card.proposal["amount_cents"] == 1500
+    items = card.proposal["items"]
+    assert [item["kind"] for item in items] == [KIND_REMINDER]
+    assert items[0]["amount_cents"] == 1500
 
 
 def test_event_with_start_becomes_a_calendar_proposal() -> None:
-    card = render_card(
+    card = card_for(
         result(
             kind="event",
             event_start=datetime(2026, 9, 12, 7, 45, tzinfo=UTC),
@@ -68,28 +80,45 @@ def test_event_with_start_becomes_a_calendar_proposal() -> None:
         approval_id="a2",
     )
 
-    assert card.proposal["kind"] == KIND_ICS
+    assert card.proposal["items"][0]["kind"] == KIND_ICS
     assert "12.09.2026 07:45" in card.text
     assert "Haupteingang" in card.text
 
 
+def test_a_school_letter_becomes_two_items() -> None:
+    """Прийти 12-го и заплатить до 8-го — два дела с разными сроками."""
+    card = card_for(
+        result(
+            kind="event",
+            event_start=datetime(2026, 9, 12, 7, 45, tzinfo=UTC),
+            due_date=date(2026, 9, 8),
+        ),
+        approval_id="a2b",
+    )
+
+    kinds = [item["kind"] for item in card.proposal["items"]]
+    assert kinds == [KIND_ICS, KIND_REMINDER]
+    assert "12.09.2026" in card.text and "08.09.2026" in card.text
+
+
 def test_info_card_has_no_buttons() -> None:
-    card = render_card(result(kind="info", action_required=False), approval_id="a3")
+    card = render_info(result(kind="info", action_required=False))
 
     assert card.actionable is False
     assert card.proposal is None
     assert "Действий не требуется" in card.text
+    assert items_for(result(kind="info", action_required=False)) == []
 
 
 def test_spam_card_says_nothing_to_do() -> None:
-    card = render_card(result(kind="spam", action_required=False), approval_id="a4")
+    card = render_info(result(kind="spam", action_required=False))
 
     assert card.actionable is False
     assert "рекламу" in card.text
 
 
 def test_buttons_carry_the_id_and_never_the_code() -> None:
-    card = render_card(result(), approval_id="a5", code="0123456789abcdef")
+    card = card_for(result(), approval_id="a5", code="0123456789abcdef")
 
     assert [button.action for button in card.buttons] == [
         ACTION_CONFIRM, ACTION_EDIT, ACTION_REJECT
@@ -100,18 +129,18 @@ def test_buttons_carry_the_id_and_never_the_code() -> None:
 
 
 def test_low_confidence_only_changes_the_rendering() -> None:
-    low = render_card(result(confidence=0.4), approval_id="a6")
-    high = render_card(result(confidence=0.95), approval_id="a6")
+    low = card_for(result(confidence=0.4), approval_id="a6")
+    high = card_for(result(confidence=0.95), approval_id="a6")
 
     assert "Проверьте дату и сумму" in low.text
     assert "Проверьте дату и сумму" not in high.text
     # Предложение и кнопки не зависят от уверенности: автоисполнения нет.
-    assert low.proposal == high.proposal
+    assert low.proposal["items"] == high.proposal["items"]
     assert len(low.buttons) == len(high.buttons) == 3
 
 
 def test_original_sender_is_a_separate_line() -> None:
-    card = render_card(
+    card = card_for(
         result(original_sender=OriginalSenderHint(
             email="sekretariat@grundschule.example", name="Sekretariat"
         )),
@@ -122,9 +151,7 @@ def test_original_sender_is_a_separate_line() -> None:
 
 
 def test_actionable_letter_without_any_date_gets_no_proposal() -> None:
-    card = render_card(result(kind="task", due_date=None, amount=None), approval_id="a8")
-
-    assert card.proposal is None and card.actionable is False
+    assert items_for(result(kind="task", due_date=None, amount=None)) == []
 
 
 # --- напоминания ------------------------------------------------------------

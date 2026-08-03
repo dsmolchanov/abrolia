@@ -217,7 +217,7 @@ def test_the_card_goes_to_the_calendar_when_one_is_connected(world) -> None:
 
 def test_without_a_calendar_the_event_still_reaches_the_family(tmp_path: Path) -> None:
     """Нет календаря — нет и потери: событие уезжает файлом, как в Фазе 1."""
-    from hermes_cloud.runner.card import proposal_for
+    from hermes_cloud.runner.bundle import items_for
     from hermes_cloud.runner.extraction import ExtractionResult
 
     result = ExtractionResult(
@@ -225,8 +225,8 @@ def test_without_a_calendar_the_event_still_reaches_the_family(tmp_path: Path) -
         action_required=True, event_start=START, confidence=0.9,
     )
 
-    assert proposal_for(result, calendar=False)["kind"] == KIND_ICS
-    assert proposal_for(result, calendar=True)["kind"] == KIND_CALENDAR
+    assert items_for(result, calendar=False)[0].kind == KIND_ICS
+    assert items_for(result, calendar=True)[0].kind == KIND_CALENDAR
 
 
 def test_a_lost_connection_is_outcome_unknown_not_a_second_event(world) -> None:
