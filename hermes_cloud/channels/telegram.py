@@ -145,14 +145,16 @@ class TelegramTransport:
         self._api_root = api_root
         self._timeout = timeout
 
-    def _call(self, method: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def _call(
+        self, method: str, payload: dict[str, Any], *, timeout: float | None = None
+    ) -> dict[str, Any]:
         request = urllib.request.Request(
             f"{self._api_root}/bot{self._token}/{method}",
             data=json.dumps(payload).encode("utf-8"),
             headers={"Content-Type": "application/json"},
         )
         try:
-            with urllib.request.urlopen(request, timeout=self._timeout) as response:
+            with urllib.request.urlopen(request, timeout=timeout or self._timeout) as response:
                 body = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as error:
             # Ответ сервера получен: отправки не было и не будет. Повторять
@@ -224,11 +226,18 @@ class TelegramTransport:
         self._call("answerCallbackQuery", {"callback_query_id": callback_id, "text": text})
 
     def get_updates(self, *, offset: int | None = None, timeout: int = 25) -> list[dict]:
-        """Long-polling. Webhook — Фаза 4; здесь достаточно опроса."""
+        """Long-polling. Webhook — Фаза 4; здесь достаточно опроса.
+
+        Таймаут сокета обязан быть больше запрошенного времени ожидания:
+        при long-poll Telegram молчит до `timeout` секунд, и клиент с меньшим
+        таймаутом обрывает соединение раньше ответа.
+        """
         payload: dict[str, Any] = {"timeout": timeout}
         if offset is not None:
             payload["offset"] = offset
-        return list(self._call("getUpdates", payload))
+        return list(
+            self._call("getUpdates", payload, timeout=timeout + self._timeout)
+        )
 
 
 class TransportError(RuntimeError):

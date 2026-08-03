@@ -355,3 +355,27 @@ def test_http_error_is_definitive_not_unknown() -> None:
     with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("сеть упала")), \
             pytest.raises(SendOutcomeUnknown):
         transport.send_message(chat="990000001", text="x")
+
+
+def test_long_poll_waits_longer_than_it_asks_telegram_to_wait() -> None:
+    """Иначе сокет отваливается раньше, чем Telegram успевает ответить."""
+    from unittest.mock import patch
+
+    from hermes_cloud.channels.telegram import TelegramTransport
+
+    transport = TelegramTransport("12345:fake", timeout=20.0)
+
+    class _Response:
+        def read(self):
+            return b'{"ok": true, "result": []}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    with patch("urllib.request.urlopen", return_value=_Response()) as urlopen:
+        transport.get_updates(offset=None, timeout=25)
+
+    assert urlopen.call_args.kwargs["timeout"] > 25
