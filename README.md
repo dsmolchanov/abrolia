@@ -23,6 +23,8 @@ export HERMES_GUEST_ACTORS=990000003  # optional: read-only actors (nanny, grand
 export TELEGRAM_BOT_TOKEN=...         # optional: without it messages print to the console
 
 python3 -m hermes_cloud.cli inject-eml tests/fixtures/email/forwarded_school_de.eml
+python3 -m hermes_cloud.cli gmail-poll --baseline  # first run: mark existing mail as seen
+python3 -m hermes_cloud.cli gmail-poll   # fetch mail labelled Hermes (email option c)
 python3 -m hermes_cloud.cli worker     # extraction → card with ✅ / ✏️ / ❌
 python3 -m hermes_cloud.cli listen     # long-poll the channel, handle button presses
 python3 -m hermes_cloud.cli status     # queue counters

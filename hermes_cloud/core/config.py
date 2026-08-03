@@ -24,6 +24,9 @@ ENV_EFFORT = "HERMES_EXTRACTION_EFFORT"
 ENV_TELEGRAM = "TELEGRAM_BOT_TOKEN"
 ENV_GOOGLE_TOKEN = "HERMES_GOOGLE_TOKEN"
 ENV_CALENDAR = "HERMES_CALENDAR_ID"
+ENV_GMAIL_ADDRESS = "HERMES_GMAIL_ADDRESS"
+ENV_GMAIL_PASSWORD = "HERMES_GMAIL_APP_PASSWORD"
+ENV_GMAIL_LABEL = "HERMES_GMAIL_LABEL"
 
 DEFAULT_DB_PATH = "data/hermes.db"
 DEFAULT_LANGUAGE = "русский"
@@ -31,6 +34,8 @@ DEFAULT_LANGUAGE = "русский"
 DEFAULT_MODEL = "claude-sonnet-5"
 DEFAULT_EFFORT = "medium"
 DEFAULT_CALENDAR = "primary"
+# Ярлык — вся граница доступа к ящику: письмо без него мы не запрашиваем.
+DEFAULT_GMAIL_LABEL = "Hermes"
 
 
 def load_dotenv(path: Path | str = ".env") -> None:
@@ -56,11 +61,18 @@ class Config:
     effort: str | None
     google_token_path: Path | None
     calendar_id: str
+    gmail_address: str
+    gmail_app_password: str | None
+    gmail_label: str
     telegram_token: str | None
 
     @property
     def has_telegram(self) -> bool:
         return bool(self.telegram_token)
+
+    @property
+    def has_gmail(self) -> bool:
+        return bool(self.gmail_address and self.gmail_app_password)
 
     @property
     def has_calendar(self) -> bool:
@@ -95,4 +107,7 @@ def load_config(*, env: dict[str, str] | None = None) -> Config:
             Path(source[ENV_GOOGLE_TOKEN]) if source.get(ENV_GOOGLE_TOKEN) else None
         ),
         calendar_id=source.get(ENV_CALENDAR) or DEFAULT_CALENDAR,
+        gmail_address=(source.get(ENV_GMAIL_ADDRESS) or "").strip(),
+        gmail_app_password=source.get(ENV_GMAIL_PASSWORD) or None,
+        gmail_label=source.get(ENV_GMAIL_LABEL) or DEFAULT_GMAIL_LABEL,
     )

@@ -213,6 +213,48 @@ def cmd_confirm(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_gmail_poll(args: argparse.Namespace) -> int:
+    """Забрать письма с ярлыком `Hermes` из ящика семьи (email-опция c)."""
+    from hermes_cloud.ingest.gmail_poll import (
+        GmailPoller,
+        MailError,
+        UidValidityChanged,
+    )
+
+    database = _database(args)
+    config = load_config()
+    if not config.has_gmail:
+        print(
+            "не заданы HERMES_GMAIL_ADDRESS / HERMES_GMAIL_APP_PASSWORD",
+            file=sys.stderr,
+        )
+        return 1
+    poller = GmailPoller(
+        EventStore(database),
+        address=config.gmail_address,
+        app_password=config.gmail_app_password,
+        label=config.gmail_label,
+    )
+    try:
+        if args.baseline:
+            result = poller.baseline()
+            print(f"базис снят: {len(result.cursor.seen)} писем помечены виденными")
+            return 0
+        if args.rebaseline:
+            result = poller.rebaseline()
+            print(f"перебазирование: {len(result.cursor.seen)} писем помечены виденными")
+            return 0
+        result = poller.poll()
+    except UidValidityChanged as error:
+        print(f"{error}\nсделайте `gmail-poll --rebaseline` осознанно", file=sys.stderr)
+        return 2
+    except MailError as error:
+        print(f"почта недоступна: {error}", file=sys.stderr)
+        return 1
+    print(f"принято: {result.accepted}, уже видели: {result.skipped}")
+    return 0
+
+
 def cmd_retention(args: argparse.Namespace) -> int:
     """Стереть то, чему вышел срок. Матрица — в `docs/privacy/data-map.md`."""
     from hermes_cloud.core.retention import RetentionJob
@@ -447,6 +489,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     reconcile = commands.add_parser("reconcile", help="разобрать эффекты, повисшие после падения")
     reconcile.set_defaults(func=cmd_reconcile)
+
+    gmail = commands.add_parser("gmail-poll", help="забрать письма с ярлыком Hermes")
+    gmail.add_argument(
+        "--baseline", action="store_true",
+        help="первый запуск: пометить уже существующие письма виденными",
+    )
+    gmail.add_argument(
+        "--rebaseline", action="store_true",
+        help="после смены UIDVALIDITY: сбросить курсор осознанно",
+    )
+    gmail.set_defaults(func=cmd_gmail_poll)
 
     retention = commands.add_parser("retention", help="стереть то, чему вышел срок хранения")
     retention.set_defaults(func=cmd_retention)
