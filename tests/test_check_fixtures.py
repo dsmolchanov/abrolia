@@ -756,6 +756,36 @@ def test_require_deny_passes_with_private_patterns(monkeypatch, tmp_path: Path) 
 # --- гейт репозитория --------------------------------------------------------
 
 
+def test_env_files_are_not_scanned(tmp_path: Path) -> None:
+    """Секреты по конвенции живут в .env — ругаться на него нельзя."""
+    fixtures = tmp_path / "tests" / "fixtures"
+    fixtures.mkdir(parents=True)
+    (fixtures / ".env.local").write_text(
+        f"KEY={joined('sk-', 'ant-', 'api03-', '01234', '56789abcdefghij')}\n",
+        encoding="utf-8",
+    )
+    assert checker.scan_paths([tmp_path / "tests"], repo_root=tmp_path) == []
+
+
+def test_git_ignored_files_are_skipped(tmp_path: Path) -> None:
+    """Игнорируемый файл в историю не попадёт; попытка его закоммитить — попадёт."""
+    import subprocess
+
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    (tmp_path / ".gitignore").write_text("secrets/\n", encoding="utf-8")
+    secrets_dir = tmp_path / "tests" / "fixtures"
+    secrets_dir.mkdir(parents=True)
+    ignored = tmp_path / "secrets"
+    ignored.mkdir()
+    leak = f"to = '{GMAIL}'\n"
+    (ignored / "notes.txt").write_text(leak, encoding="utf-8")
+    (secrets_dir / "tracked.txt").write_text(leak, encoding="utf-8")
+
+    findings = checker.scan_paths([tmp_path], repo_root=tmp_path)
+
+    assert [f.path for f in findings] == ["tests/fixtures/tracked.txt"]
+
+
 def test_repo_is_clean_including_prose() -> None:
     """CI гоняет --all: код, фикстуры, docs/ и thoughts/."""
     allow = checker.load_allow(REPO_ROOT / checker.ALLOW_FILE)

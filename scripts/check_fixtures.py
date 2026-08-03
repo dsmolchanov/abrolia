@@ -24,6 +24,10 @@
                    которое не описано в PROVENANCE.md ближайшего родительского
                    каталога. Заголовки и текстовые части письма проверяются в
                    любом случае — непрозрачное вложение не прячет письмо.
+Файлы, игнорируемые git (и любые `.env*`), не проверяются: попасть в историю
+они не могут, а секреты по конвенции живут именно там. Историю независимо
+сканирует gitleaks.
+
 * ``custom``     — паттерны из приватного файла (env ``HERMES_EXTRA_DENY_FILE``):
                    реальные имена/ID донора, которые нельзя коммитить даже в
                    виде правила. **Исключениями не подавляется никогда.**
@@ -54,6 +58,7 @@ import json
 import os
 import quopri
 import re
+import subprocess
 import sys
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
@@ -805,10 +810,35 @@ def provenance_covers(file_path: Path, repo_root: Path, *, part: str | None = No
     return False
 
 
-def iter_files(roots: Sequence[Path]) -> Iterator[Path]:
+def git_ignored(paths: Sequence[Path], repo_root: Path) -> set[Path]:
+    """Файлы, которые git игнорирует: они физически не могут попасть в историю.
+
+    Секреты по нашей же конвенции живут в `.env` и в Fly secrets
+    (CONTRIBUTING, р. 2). Ругаться на `.env` — значит требовать нарушить
+    собственное правило; при этом попытка закоммитить такой файл сразу станет
+    видимой (файл перестанет быть игнорируемым) и будет поймана. Историю
+    независимо проверяет gitleaks.
+    """
+    if not paths or not (repo_root / ".git").exists():
+        return set()
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "check-ignore", "--stdin", "-z"],
+            input="\0".join(str(p) for p in paths),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):  # pragma: no cover - нет git
+        return set()
+    return {Path(item) for item in result.stdout.split("\0") if item}
+
+
+def iter_files(roots: Sequence[Path], *, repo_root: Path | None = None) -> Iterator[Path]:
+    candidates: list[Path] = []
     for root in roots:
         if root.is_file():
-            yield root
+            candidates.append(root)
             continue
         if not root.is_dir():
             continue
@@ -817,7 +847,15 @@ def iter_files(roots: Sequence[Path]) -> Iterator[Path]:
                 continue
             if any(part in SKIP_DIRS for part in path.parts):
                 continue
-            yield path
+            candidates.append(path)
+    ignored = git_ignored(candidates, repo_root or REPO_ROOT)
+    for path in candidates:
+        # `.env` пропускается и без git: там секреты живут по конвенции.
+        if path.name.startswith(".env"):
+            continue
+        if path in ignored:
+            continue
+        yield path
 
 
 # --- сканирование ------------------------------------------------------------
@@ -918,7 +956,7 @@ def scan_paths(
     deny: Sequence[re.Pattern[str]] = (),
 ) -> list[Finding]:
     findings: list[Finding] = []
-    for file_path in iter_files(roots):
+    for file_path in iter_files(roots, repo_root=repo_root):
         try:
             rel = str(file_path.relative_to(repo_root))
         except ValueError:
