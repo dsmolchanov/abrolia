@@ -536,6 +536,95 @@ def test_tilde_line_inside_backtick_fence_does_not_open_entries(tmp_path: Path) 
     assert [f.rule for f in findings] == ["unscannable"]
 
 
+def test_escaped_address_in_mime_preamble_is_caught(tmp_path: Path) -> None:
+    """Преамбула multipart — обычный текст письма, а не «ничьё» место."""
+    local, domain = GMAIL.split("@")
+    eml = (
+        "From: Anna Beispiel <anna@example.com>\n"
+        "MIME-Version: 1.0\n"
+        'Content-Type: multipart/mixed; boundary="b1"\n\n'
+        f"Kontakt: {local}&#64;{domain}\n\n"
+        "--b1\n"
+        'Content-Type: text/plain; charset="utf-8"\n\n'
+        "Nichts.\n"
+        "--b1--\n"
+        f"Epilog: {local}&#64;{domain}\n"
+    )
+    assert "email" in _scan_fixture_file(tmp_path, "preamble.eml", eml)
+
+
+def test_multiline_html_tag_does_not_hide_the_address(tmp_path: Path) -> None:
+    """Тег переносится через строки и бывает длиннее любого лимита регулярки."""
+    local, domain = GMAIL.split("@")
+    filler = "x" * 300
+    page = (
+        f"<p>Kontakt: {local}<span\n"
+        f'   class="{filler}"\n'
+        f"   data-role=obfuscation></span>&#64;{domain}</p>\n"
+    )
+    assert "email" in _scan_fixture_file(tmp_path, "multiline.html", page)
+
+
+def test_ascii_pdf_with_leading_junk_is_opaque(tmp_path: Path) -> None:
+    """Читалки прощают мусор перед %PDF-; значит, и мы обязаны его увидеть."""
+    body = (
+        b"\xef\xbb\xbf\n\n%PDF-1.4\n1 0 obj\n<< /Filter /ASCIIHexDecode >>\nstream\n"
+        b"706172656e74406764696c2e636f6d\nendstream\nendobj\n%%EOF\n"
+    )
+    assert _scan_fixture_file(tmp_path, "sneaky.txt", body) == ["unscannable"]
+
+
+def test_source_file_merely_mentioning_pdf_magic_stays_scannable(tmp_path: Path) -> None:
+    """Одной сигнатуры мало: упоминание %PDF- в исходнике — не PDF."""
+    source = 'MAGIC = b"%PDF-1.4"  # сигнатура для теста\n'
+    assert _scan_fixture_file(tmp_path, "probe.py", source) == []
+
+
+def test_rtf_file_is_opaque_by_extension(tmp_path: Path) -> None:
+    assert _scan_fixture_file(tmp_path, "brief2.rtf", "plain ascii, no rtf magic\n") == [
+        "unscannable"
+    ]
+
+
+def test_entity_newline_does_not_shift_line_numbers(tmp_path: Path) -> None:
+    """`&#10;` не должен уводить номер строки за конец файла."""
+    local, domain = GMAIL.split("@")
+    page = "first line\n" + f"&#10;&#10;&#10;{local}&#64;{domain}\n" + "third line\n"
+    fixtures = tmp_path / "tests" / "fixtures"
+    fixtures.mkdir(parents=True)
+    (fixtures / "shift.html").write_text(page, encoding="utf-8")
+    findings = checker.scan_paths([tmp_path / "tests"], repo_root=tmp_path)
+    assert [(f.rule, f.line_no) for f in findings] == [("email", 2)]
+
+
+def test_fence_opened_inside_a_list_is_respected(tmp_path: Path) -> None:
+    """«- ```» открывает блок кода: пример внутри него записью не является."""
+    fixtures = tmp_path / "tests" / "fixtures" / "media"
+    fixtures.mkdir(parents=True)
+    (fixtures / "notice.png").write_bytes(b"\x89PNG\r\n\x1a\n\x00binary")
+    (tmp_path / "tests" / "fixtures" / "PROVENANCE.md").write_text(
+        "Пример:\n\n"
+        "- ```\n"
+        "  - `media/notice.png` — пример внутри блока кода\n"
+        "  ```\n",
+        encoding="utf-8",
+    )
+    findings = checker.scan_paths([tmp_path / "tests"], repo_root=tmp_path)
+    assert [f.rule for f in findings] == ["unscannable"]
+
+
+def test_indented_entry_is_not_a_record(tmp_path: Path) -> None:
+    fixtures = tmp_path / "tests" / "fixtures" / "media"
+    fixtures.mkdir(parents=True)
+    (fixtures / "notice.png").write_bytes(b"\x89PNG\r\n\x1a\n\x00binary")
+    (tmp_path / "tests" / "fixtures" / "PROVENANCE.md").write_text(
+        "- пример вложенного списка:\n  - `media/notice.png` — вложенная строка\n",
+        encoding="utf-8",
+    )
+    findings = checker.scan_paths([tmp_path / "tests"], repo_root=tmp_path)
+    assert [f.rule for f in findings] == ["unscannable"]
+
+
 def test_provenance_needs_a_structured_entry(tmp_path: Path) -> None:
     """Упоминание имени в прозе или в примере не является записью о файле."""
     fixtures = tmp_path / "tests" / "fixtures" / "media"

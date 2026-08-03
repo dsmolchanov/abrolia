@@ -58,6 +58,7 @@ import sys
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from fnmatch import fnmatch
+from html.parser import HTMLParser
 from pathlib import Path, PurePosixPath
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -78,6 +79,9 @@ SKIP_DIRS = {
     "node_modules", ".mypy_cache", "dist", "build",
 }
 BINARY_SUFFIXES = {
+    # .rtf здесь потому, что парсера RTF у нас нет: hex-escape вида \'40 прячет
+    # содержимое, а «прочитали байты» — не то же самое, что «проверили».
+    ".rtf", ".doc", ".docx", ".xls", ".xlsx", ".odt",
     ".png", ".jpg", ".jpeg", ".gif", ".pdf", ".zip", ".gz", ".tgz", ".ico",
     ".ogg", ".oga", ".mp3", ".mp4", ".wav", ".m4a", ".sqlite", ".db", ".woff",
     ".woff2", ".ttf", ".pyc", ".so", ".dylib",
@@ -455,44 +459,103 @@ def _has_decoding_defect(part) -> bool:
 
 
 def _looks_binary(payload: bytes) -> bool:
-    """Похоже ли содержимое на бинарь вопреки объявленному типу.
+    """Похоже ли содержимое на бинарь вопреки объявленному типу или расширению.
 
-    PDF, объявленный `text/plain`, декодируется как ASCII и молча проходил бы
-    проверку, ничего при этом не значив.
+    Сигнатура ищется не строго с нулевого байта: перед ней допустимы BOM,
+    пробелы и переводы строк — читалки форматов их прощают, значит и мы должны.
+    Для форматов, которые бывают полностью ASCII (PDF, RTF), одной сигнатуры
+    мало: нужен второй маркер, иначе упоминание `%PDF-` в исходнике теста
+    объявляло бы сам тест непрозрачным.
     """
     if b"\x00" in payload[:4096]:
         return True
-    return any(payload.startswith(magic) for magic in BINARY_MAGIC)
+    head = payload[:1024].lstrip(b"\xef\xbb\xbf\xff\xfe\xfe\xff \t\r\n\x0c")
+    if any(head.startswith(magic) for magic in BINARY_MAGIC):
+        return True
+    # PDF допускает мусор перед заголовком; подтверждаем структурой документа.
+    has_header = payload.find(b"%PDF-", 0, 1024) >= 0
+    return has_header and any(
+        token in payload for token in (b"%%EOF", b"endobj", b"stream")
+    )
+
+
+def _decode_escapes(line: str) -> str:
+    """Раскрыть HTML-сущности и `\\uXXXX` в пределах одной строки.
+
+    Материализованные переводы строк заменяются пробелом: `&#10;` не должен
+    сдвигать нумерацию — иначе отчёт указывает на строку, которой нет в файле.
+    """
+    unescaped = html.unescape(line)
+    unescaped = re.sub(
+        r"\\u([0-9a-fA-F]{4})", lambda m: chr(int(m.group(1), 16)), unescaped
+    )
+    return unescaped.replace("\r", " ").replace("\n", " ")
 
 
 def normalize_text(text: str) -> str:
-    """Снять экранирование, за которым прячется значение.
+    """Построчно снять экранирование, за которым прячется значение.
 
-    `anna&#64;example.com` в HTML, `\\u0040` в JSON и разметка вокруг адреса —
-    всё это проходит мимо правил, если сканировать байты как есть. Обработка
-    построчная: нумерация строк в отчёте остаётся верной.
+    `anna&#64;example.com` в HTML и `\\u0040` в JSON проходят мимо правил, если
+    сканировать байты как есть. Число строк не меняется — номера в отчёте
+    остаются верными.
     """
-    unescaped = html.unescape(text)
-    return re.sub(
-        r"\\u([0-9a-fA-F]{4})", lambda m: chr(int(m.group(1), 16)), unescaped
-    )
+    return "\n".join(_decode_escapes(line) for line in text.split("\n"))
+
+
+class _MarkupStripper(HTMLParser):
+    """Собрать текст HTML, сохранив нумерацию строк.
+
+    Регуляркой это не делается: валидный тег переносится через строки и бывает
+    длиннее любого разумного лимита, а `parent<span\n class=x></span>&#64;…`
+    рендерится как цельный адрес. Номер строки в этом представлении — строка,
+    на которой начался видимый фрагмент: разорванное многострочным тегом
+    склеивается обратно, а переводы строк в самом тексте нумерацию сохраняют.
+    """
+
+    def __init__(self, line_count: int) -> None:
+        super().__init__(convert_charrefs=True)
+        self.lines = [""] * max(line_count, 1)
+        self.cursor = 0
+
+    def handle_data(self, data: str) -> None:
+        # Курсор двигают только переводы строк внутри самого текста. Перенос
+        # внутри тега строку не начинает: `parent<span\n …></span>@…` человек
+        # видит одной строкой — значит и мы обязаны увидеть её целиком.
+        parts = data.split("\n")
+        self.lines[self.cursor] += parts[0]
+        for chunk in parts[1:]:
+            self.cursor = min(self.cursor + 1, len(self.lines) - 1)
+            self.lines[self.cursor] += chunk
+
+    def error(self, message: str) -> None:  # pragma: no cover - Python <3.10 API
+        return
+
+
+def markup_view(text: str) -> str | None:
+    """Текст без разметки, строка в строку. None — если это не разметка."""
+    if "<" not in text or ">" not in text:
+        return None
+    stripper = _MarkupStripper(text.count("\n") + 1)
+    try:
+        stripper.feed(text)
+        stripper.close()
+    except Exception:  # pragma: no cover - парсер очень терпим
+        return None
+    return "\n".join(stripper.lines)
 
 
 def normalized_views(text: str) -> tuple[str, ...]:
     """Дополнительные представления текста для сканирования.
 
-    Разметку снимаем в двух вариантах: со склейкой (адрес, разорванный тегами,
-    собирается обратно) и с пробелом (соседние слова не слипаются).
+    Каждое — построчно выровнено с исходником, поэтому номер строки в находке
+    указывает на реальное место в файле.
     """
-    unescaped = normalize_text(text)
-    joined = re.sub(r"<[^>\n]{1,200}>", "", unescaped)
-    spaced = re.sub(r"<[^>\n]{1,200}>", " ", unescaped)
-    views = [view for view in (unescaped, joined, spaced) if view != text]
-    unique: list[str] = []
-    for view in views:
-        if view not in unique:
-            unique.append(view)
-    return tuple(unique)
+    views: list[str] = []
+    for candidate in (normalize_text(text), markup_view(text)):
+        if candidate is None or candidate == text or candidate in views:
+            continue
+        views.append(candidate)
+    return tuple(views)
 
 
 def _decode(payload: bytes, charset: str) -> str:
@@ -522,6 +585,11 @@ def _walk_part(part, *, stem: str, index: int, chunks: list[str], opaque: list[s
         return
 
     if content_type.startswith("multipart/"):
+        # Преамбула и эпилог не являются частями и в walk не попадают, но это
+        # обычный текст письма — адрес там виден человеку и должен быть виден нам.
+        for extra in (getattr(part, "preamble", None), getattr(part, "epilogue", None)):
+            if isinstance(extra, str) and extra.strip():
+                chunks.append(extra)
         payload = part.get_payload()
         if isinstance(payload, list):
             for sub_index, sub in enumerate(payload):
@@ -641,8 +709,9 @@ def read_scannable(path: Path) -> Scannable:
         decoded, opaque = eml_to_text(raw, stem=path.name)
         envelope = raw.decode("utf-8", errors="replace")
         # Сырьё письма — основное представление (нумерация строк совпадает с
-        # файлом), развёрнутый MIME и его нормализация — дополнительные.
-        views = (decoded, *normalized_views(decoded))
+        # файлом); дополнительные — его же нормализация (экранирование внутри
+        # преамбулы и заголовков), развёрнутый MIME и нормализация развёрнутого.
+        views = (*normalized_views(envelope), decoded, *normalized_views(decoded))
         return Scannable(envelope, tuple(opaque), extra_views=views)
 
     if size > MAX_FILE_BYTES:
@@ -666,9 +735,13 @@ def read_scannable(path: Path) -> Scannable:
 # Запись манифеста: `- \`путь\` — описание` вне блоков кода.
 # Отступ ограничен тремя пробелами: четыре и больше — это indented code block
 # по CommonMark, то есть пример, а не запись.
-PROVENANCE_ENTRY_RE = re.compile(r"^ {0,3}[-*] +`([^`]+)`\s*[—–-]\s*\S")
-# Открывающий/закрывающий fence: не меньше трёх одинаковых символов.
-FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+# Запись — только с нулевой колонки: любой отступ означает вложенность (в
+# список, в цитату, в блок кода), а вложенная строка примером быть может, а
+# записью — нет.
+PROVENANCE_ENTRY_RE = re.compile(r"^[-*] +`([^`]+)`\s*[—–-]\s*\S")
+# Fence: не меньше трёх одинаковых символов; допускается маркер списка или
+# отступ перед ним — иначе «- ```» открывает блок незаметно для парсера.
+FENCE_RE = re.compile(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)?(`{3,}|~{3,})(.*)$")
 
 
 def load_provenance(manifest: Path) -> set[str]:
