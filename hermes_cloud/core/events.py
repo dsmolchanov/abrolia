@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from hermes_cloud.core.db import Database, new_id
+from hermes_cloud.core.dsar import is_deleted
 
 STATUS_RECEIVED = "received"
 STATUS_PROCESSING = "processing"
@@ -72,6 +73,10 @@ class Accepted:
     created: bool
 
 
+class HouseholdDeleted(RuntimeError):
+    """Household стёрт: приём новых событий закрыт навсегда."""
+
+
 class EventStore:
     def __init__(self, database: Database, *, clock=time.time) -> None:
         self.db = database
@@ -94,6 +99,12 @@ class EventStore:
         `synchronous=FULL`, поэтому вызывающий может отвечать «принято»
         каналу, не рискуя потерять письмо при падении процесса.
         """
+        if is_deleted(self.db):
+            # Household стёрт по запросу владельца. Отложенный вебхук не должен
+            # воскресить его молчаливой вставкой нового письма.
+            raise HouseholdDeleted(
+                "household стёрт по запросу владельца: новые события не принимаются"
+            )
         now = self.clock() if received_at is None else received_at
         event_id = new_id()
         with self.db.write() as connection:

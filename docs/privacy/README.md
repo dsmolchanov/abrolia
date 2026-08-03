@@ -27,6 +27,7 @@
 | [`processors.md`](processors.md) | Реестр процессоров и международных передач: DPA / SCC / TIA по каждому |
 | [`minors.md`](minors.md) | Политика данных несовершеннолетних |
 | [`incident-response.md`](incident-response.md) | Реакция на инцидент, сроки уведомлений (ст. 33/34), runbook |
+| [`delete-runbook.md`](delete-runbook.md) | Порядок стирания household'а: что удаляется автоматически, что вручную, что остаётся и почему |
 | [`privacy-notice-ru.md`](privacy-notice-ru.md) / [`privacy-notice-en.md`](privacy-notice-en.md) | Уведомление для семей (RU/EN) |
 
 Смежное: [`../SECURITY.md`](../SECURITY.md) (threat model), [`../source-pins.md`](../source-pins.md).

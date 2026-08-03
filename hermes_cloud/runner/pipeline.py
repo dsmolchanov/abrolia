@@ -22,11 +22,14 @@ from hermes_cloud.core.approvals import (
 from hermes_cloud.core.commitments import STATUS_CANDIDATE as COMMITMENT_CANDIDATE
 from hermes_cloud.core.commitments import STATUS_CONFIRMED as MEMORY_CONFIRMED
 from hermes_cloud.core.commitments import CommitmentStore
+from hermes_cloud.core.dsar import EXTERNAL_SURFACES, export_bytes, wipe_household
 from hermes_cloud.core.effects import APPROVAL_TOOL_USE_ID, EffectJournal
 from hermes_cloud.core.events import Event
 from hermes_cloud.core.evidence import EvidenceStore, content_sha
 from hermes_cloud.core.memory import MemoryStore
 from hermes_cloud.core.runcontext import (
+    DATA_DELETE,
+    DATA_EXPORT,
     WRITE_CALENDAR,
     WRITE_MEMORY,
     WRITE_REMINDER,
@@ -39,6 +42,8 @@ from hermes_cloud.runner.card import (
     ACTION_CONFIRM,
     ACTION_EDIT,
     ACTION_REJECT,
+    KIND_DELETE,
+    KIND_EXPORT,
     KIND_ICS,
     KIND_MEMORY,
     KIND_REMINDER,
@@ -74,6 +79,8 @@ CAPABILITY_FOR_KIND = {
     KIND_REMINDER: WRITE_REMINDER,
     KIND_ICS: WRITE_CALENDAR,
     KIND_MEMORY: WRITE_MEMORY,
+    KIND_EXPORT: DATA_EXPORT,
+    KIND_DELETE: DATA_DELETE,
 }
 
 # Виды эффектов, которые можно доделать после падения: локальные и
@@ -333,6 +340,10 @@ class Pipeline:
                 text = self._execute_ics(approval, payload)
             elif payload["kind"] == KIND_MEMORY:
                 text = self._execute_memory(approval, payload, now=now)
+            elif payload["kind"] == KIND_EXPORT:
+                text = self._execute_export(approval)
+            elif payload["kind"] == KIND_DELETE:
+                text = self._execute_delete(approval, now=now)
             else:
                 raise ValueError(f"неизвестный вид предложения: {payload['kind']!r}")
         except SendOutcomeUnknown as error:
@@ -402,6 +413,29 @@ class Pipeline:
             self.commitments.reject(commitment_id, now=now)
         if statement_id:
             self.memory.reject(statement_id, now=now)
+
+    def _execute_export(self, approval) -> str:
+        """Выгрузка уходит файлом, а не текстом в чат: её сохраняют, а не читают."""
+        content = export_bytes(self.approvals.db)
+        self.transport.send_document(
+            chat=approval.chat,
+            thread=approval.thread,
+            filename="hermes-export.json",
+            content=content,
+            caption="Полная выгрузка данных household'а.",
+        )
+        logger.info("export delivered: %s байт", len(content))
+        return f"Готово: выгрузка отправлена ({len(content)} байт)."
+
+    def _execute_delete(self, approval, *, now: float | None) -> str:
+        """Стирание. После него отмечать в журнале уже нечего — журнала нет."""
+        removed = wipe_household(self.approvals.db, now=now)
+        logger.warning("household wiped: %s строк", sum(removed.values()))
+        surfaces = "\n".join(f"— {item}" for item in EXTERNAL_SURFACES)
+        return (
+            f"Данные household'а стёрты ({sum(removed.values())} записей).\n"
+            "Вне нашего контроля осталось:\n" + surfaces
+        )
 
     def _confirm_commitment(self, approval, payload: dict, *, now: float | None) -> None:
         """Подтверждение действия подтверждает и сам факт — но только его версию.

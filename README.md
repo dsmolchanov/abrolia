@@ -28,6 +28,9 @@ python3 -m hermes_cloud.cli listen     # long-poll the channel, handle button pr
 python3 -m hermes_cloud.cli status     # queue counters
 python3 -m hermes_cloud.cli tick       # deliver reminders that came due
 python3 -m hermes_cloud.cli reconcile  # settle effects left hanging by a crash
+python3 -m hermes_cloud.cli retention  # delete what the retention matrix says is due
+python3 -m hermes_cloud.cli export     # owner-only: stage a full data export
+python3 -m hermes_cloud.cli delete     # owner-only: stage an irreversible wipe
 python3 -m hermes_cloud.cli dlq        # events that exhausted their attempts
 python3 -m hermes_cloud.cli replay <event_id>
 ```

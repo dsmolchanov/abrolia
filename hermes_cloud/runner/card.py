@@ -29,6 +29,10 @@ KIND_ICS = "ics"
 # Запись в память — тоже предложение с кнопками: попасть в память иначе как
 # через человека нельзя (`core/memory.py`).
 KIND_MEMORY = "memory"
+# Права субъекта: выгрузка и стирание. Тот же контур подтверждения — потому что
+# и то и другое необратимо (`core/dsar.py`).
+KIND_EXPORT = "export"
+KIND_DELETE = "delete"
 
 
 @dataclass(frozen=True)

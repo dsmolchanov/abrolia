@@ -199,6 +199,90 @@ def cmd_confirm(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_retention(args: argparse.Namespace) -> int:
+    """Стереть то, чему вышел срок. Матрица — в `docs/privacy/data-map.md`."""
+    from hermes_cloud.core.retention import RetentionJob
+
+    report = RetentionJob(_database(args)).run()
+    print(f"стёрто записей: {report.total_deleted}")
+    print(f"  содержимое писем обезличено: {report.raw_blanked}")
+    print(f"  события: {report.events_deleted}, напоминания: {report.reminders_deleted}")
+    print(
+        f"  подтверждения: {report.approvals_deleted}, эффекты: {report.effects_deleted},"
+        f" прогоны: {report.extraction_runs_deleted}"
+    )
+    print(
+        f"  неподтверждённые гипотезы: {report.candidates_deleted},"
+        f" памяти: {report.memory_candidates_deleted}"
+    )
+    if report.memory_due_for_review:
+        print(
+            f"  память на пересмотр ({len(report.memory_due_for_review)} записей) — "
+            "удаляет человек, не джоба"
+        )
+    return 0
+
+
+def _owner_request(args: argparse.Namespace, kind: str, question: str) -> int:
+    """Поставить owner-операцию на подтверждение кодом.
+
+    Экспорт и удаление необратимы каждый по-своему, поэтому идут тем же путём,
+    что и действия: предложение → код → ✅. Права проверяются здесь, второй раз —
+    при подтверждении (`CAPABILITY_FOR_KIND`).
+    """
+    from hermes_cloud.core.runcontext import CapabilityDenied, build_run_context
+    from hermes_cloud.runner.pipeline import CAPABILITY_FOR_KIND
+
+    database = _database(args)
+    pipeline = _pipeline(args, database)
+    household = _household()
+    actor = args.actor or household.owner
+    if not actor:
+        print("не задан владелец: HERMES_OWNER или --actor", file=sys.stderr)
+        return 1
+    context = build_run_context(
+        household=household, actor_id=actor,
+        chat_id=pipeline.chat, thread_id=pipeline.thread,
+    )
+    try:
+        context.require(CAPABILITY_FOR_KIND[kind])
+    except CapabilityDenied as denied:
+        print(f"отказано: {denied}", file=sys.stderr)
+        return 1
+    staged = pipeline.approvals.stage(
+        kind=kind,
+        payload={"kind": kind, "requested_by": actor},
+        chat=pipeline.chat,
+        thread=pipeline.thread,
+        actor=actor,
+    )
+    pipeline.transport.send_message(
+        chat=pipeline.chat,
+        thread=pipeline.thread,
+        text=f"{question}\nКод подтверждения: {staged.code}",
+        buttons=(("✅ Да", f"confirm:{staged.id}"), ("❌ Нет", f"reject:{staged.id}")),
+    )
+    print(f"{staged.id}  ждёт подтверждения владельцем")
+    return 0
+
+
+def cmd_export(args: argparse.Namespace) -> int:
+    """Запросить полную выгрузку данных household'а."""
+    return _owner_request(
+        args, "export", "Выгрузить все данные household'а одним файлом?"
+    )
+
+
+def cmd_delete(args: argparse.Namespace) -> int:
+    """Запросить стирание household'а. Необратимо."""
+    return _owner_request(
+        args,
+        "delete",
+        "Стереть все данные household'а? Это необратимо — "
+        "внешние поверхности закрываются отдельно по delete-runbook.",
+    )
+
+
 def cmd_pending(args: argparse.Namespace) -> int:
     """Показать предложения, ждущие подтверждения."""
     database = _database(args)
@@ -316,6 +400,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     reconcile = commands.add_parser("reconcile", help="разобрать эффекты, повисшие после падения")
     reconcile.set_defaults(func=cmd_reconcile)
+
+    retention = commands.add_parser("retention", help="стереть то, чему вышел срок хранения")
+    retention.set_defaults(func=cmd_retention)
+
+    export = commands.add_parser("export", help="запросить полную выгрузку данных (владелец)")
+    export.add_argument("--actor", help="от чьего имени (по умолчанию — HERMES_OWNER)")
+    export.set_defaults(func=cmd_export)
+
+    delete = commands.add_parser("delete", help="запросить стирание household'а (владелец)")
+    delete.add_argument("--actor", help="от чьего имени (по умолчанию — HERMES_OWNER)")
+    delete.set_defaults(func=cmd_delete)
 
     tick = commands.add_parser("tick", help="доставить созревшие напоминания")
     tick.set_defaults(func=cmd_tick)
