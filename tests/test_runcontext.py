@@ -27,6 +27,7 @@ from hermes_cloud.core.runcontext import (
     ROLE_UNKNOWN,
     SCOPE_PERSONAL,
     SCOPE_SHARED,
+    WRITE_EMAIL,
     WRITE_MEMORY,
     WRITE_REMINDER,
     CapabilityDenied,
@@ -152,6 +153,7 @@ EXPECTED_CAPABILITY = {
     "calendar_list_events": READ_CALENDAR,
     "propose_reminder": WRITE_REMINDER,
     "memory_append": WRITE_MEMORY,
+    "propose_email": WRITE_EMAIL,
 }
 
 VALID_ARGUMENTS = {
@@ -161,6 +163,11 @@ VALID_ARGUMENTS = {
     "calendar_list_events": {"days": 14},
     "propose_reminder": {"text": "оплатить взнос 15 EUR", "due_date": "2026-09-08"},
     "memory_append": {"text": "Лиза ходит на плавание по вторникам", "kind": "routine"},
+    "propose_email": {
+        "to": "sekretariat@grundschule.example",
+        "subject": "Klassenfahrt 3b",
+        "body": "Guten Tag, wir nehmen teil.",
+    },
 }
 
 ROLES = {

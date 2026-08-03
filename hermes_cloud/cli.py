@@ -78,11 +78,29 @@ def _pipeline(args: argparse.Namespace, database) -> Pipeline:
         chat=config.require_chat(),
         thread=config.thread,
         calendar=calendar,
+        mail=_mail(config),
         loop=ToolLoop(
             journal=EffectJournal(database),
             services=Services.on(database, calendar=calendar),
             family_language=config.language,
         ),
+    )
+
+
+def _mail(config):
+    """Исходящая почта. Нет учётных данных — нет и отправки, но предложить можно."""
+    if not config.has_gmail:
+        return None
+    from hermes_cloud.execute.email_send import EmailSender, SmtpSsl
+
+    return EmailSender(
+        SmtpSsl(
+            address=config.gmail_address,
+            password=config.gmail_app_password,
+            host=config.smtp_host,
+            port=config.smtp_port,
+        ),
+        sender=config.gmail_address,
     )
 
 

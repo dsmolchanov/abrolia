@@ -33,6 +33,7 @@ from hermes_cloud.runner.card import (
     ACTION_TOGGLE,
     KIND_BUNDLE,
     KIND_CALENDAR,
+    KIND_EMAIL,
     KIND_ICS,
     KIND_REMINDER,
     LOW_CONFIDENCE,
@@ -211,6 +212,10 @@ def item_line(item: Item) -> str:
         when = format_date(date.fromisoformat(payload["due_date"]))
         verb = "Перенести напоминание на" if payload.get("supersedes_reminder_id") else "Напомнить"
         return f"{verb} {when}: {payload['text']}"
+    if kind == KIND_EMAIL:
+        # Получатель — отдельной строкой и всегда: подтверждают не «письмо
+        # вообще», а письмо этому адресу.
+        return f"Письмо\n   Кому: {payload['to']}\n   Тема: {payload['subject']}"
     return f"{kind}: {payload.get('title') or payload.get('text') or ''}"
 
 

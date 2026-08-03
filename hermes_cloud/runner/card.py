@@ -40,6 +40,8 @@ KIND_EXPORT = "export"
 KIND_DELETE = "delete"
 # Связка: одно письмо породило несколько действий, подтверждение одно.
 KIND_BUNDLE = "bundle"
+# Исходящее письмо — единственное действие, которое нельзя отозвать.
+KIND_EMAIL = "email"
 
 
 @dataclass(frozen=True)

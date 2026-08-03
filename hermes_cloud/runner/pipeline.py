@@ -33,9 +33,15 @@ from hermes_cloud.core.runcontext import (
     DATA_DELETE,
     DATA_EXPORT,
     WRITE_CALENDAR,
+    WRITE_EMAIL,
     WRITE_MEMORY,
     WRITE_REMINDER,
     RunContext,
+)
+from hermes_cloud.execute.email_send import (
+    EmailOutcomeUnknown,
+    EmailSender,
+    Outgoing,
 )
 from hermes_cloud.execute.gcal import (
     Calendar,
@@ -63,6 +69,7 @@ from hermes_cloud.runner.card import (
     KIND_BUNDLE,
     KIND_CALENDAR,
     KIND_DELETE,
+    KIND_EMAIL,
     KIND_EXPORT,
     KIND_ICS,
     KIND_MEMORY,
@@ -101,6 +108,7 @@ CAPABILITY_FOR_KIND = {
     KIND_CALENDAR: WRITE_CALENDAR,
     KIND_ICS: WRITE_CALENDAR,
     KIND_MEMORY: WRITE_MEMORY,
+    KIND_EMAIL: WRITE_EMAIL,
     KIND_EXPORT: DATA_EXPORT,
     KIND_DELETE: DATA_DELETE,
 }
@@ -200,6 +208,7 @@ class Pipeline:
         effects: EffectJournal | None = None,
         loop: ToolLoop | None = None,
         calendar: Calendar | None = None,
+        mail: EmailSender | None = None,
     ) -> None:
         self.approvals = approvals
         self.reminders = reminders
@@ -216,6 +225,9 @@ class Pipeline:
         # Календарь household'а. Без него событие уезжает файлом .ics — тот же
         # результат для семьи, просто мы не можем писать сами.
         self.calendar = calendar
+        # Исходящая почта. Её отсутствие — не деградация, а выключенный тракт:
+        # предложить письмо можно, отправить — нет.
+        self.mail = mail
         # Онтологический слой: провенанс, обязательства, память. Живёт в той же
         # базе — иначе «откуда эта сумма» пришлось бы собирать из двух мест.
         self.evidence = EvidenceStore(approvals.db)
@@ -471,7 +483,7 @@ class Pipeline:
                 chat=approval.chat, text=str(partial), thread=approval.thread
             )
             return Handled(approval_id=approval.id, message=str(partial))
-        except (SendOutcomeUnknown, CalendarOutcomeUnknown) as error:
+        except (SendOutcomeUnknown, CalendarOutcomeUnknown, EmailOutcomeUnknown) as error:
             # Отправка могла дойти. Повторять нельзя, молчать — тем более.
             self.effects.outcome_unknown(effect.id, f"{type(error).__name__}: {error}", now=now)
             self.approvals.mark(
@@ -629,6 +641,15 @@ class Pipeline:
                     {**item.payload, "commitment_id": payload.get("commitment_id")},
                     now=now,
                 )
+            except (SendOutcomeUnknown, CalendarOutcomeUnknown, EmailOutcomeUnknown) as error:
+                # «Не получилось» здесь было бы враньём: письмо могло уйти.
+                failures += 1
+                self.effects.outcome_unknown(
+                    effect.id, f"{type(error).__name__}: {error}", now=now
+                )
+                logger.warning("исход пункта %s связки %s неизвестен", index, approval.id)
+                lines.append(f"⚠️ {item_line(item)} — не знаю, дошло ли; повторять не буду")
+                continue
             except Exception as error:
                 failures += 1
                 self.effects.fail(effect.id, f"{type(error).__name__}: {error}", now=now)
@@ -656,6 +677,8 @@ class Pipeline:
             return self._execute_calendar(approval, payload, now=now)
         if kind == KIND_ICS:
             return self._execute_ics(approval, payload)
+        if kind == KIND_EMAIL:
+            return self._execute_email(approval, payload)
         raise ValueError(f"неизвестный вид пункта: {kind!r}")
 
     def _toggle_item(
@@ -728,6 +751,15 @@ class Pipeline:
         verb = "обновил" if written.updated else "добавил"
         link = f"\n{written.link}" if written.link else ""
         return f"Готово: {verb} в календаре «{payload['title']}».{link}"
+
+    def _execute_email(self, approval, payload: dict) -> str:
+        """Отправить подтверждённое письмо. Отозвать его будет уже нельзя."""
+        if self.mail is None:
+            raise ValueError("исходящая почта не настроена")
+        letter = Outgoing.from_payload(payload)
+        message_id = self.mail.send(letter, approval_id=approval.id)
+        logger.info("письмо %s отправлено по подтверждению %s", message_id, approval.id)
+        return f"Готово: письмо для {letter.to} отправлено."
 
     def _execute_ics(self, approval, payload: dict) -> str:
         start = datetime.fromisoformat(payload["start"])

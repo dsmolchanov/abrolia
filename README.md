@@ -57,6 +57,11 @@ tools the sender's role allows, every tool call is journalled before it happens,
 and a tool that changes anything only stages a proposal — the confirmation is
 still a human pressing ✅.
 
+Outgoing email is the one action with no way back, so it carries three locks:
+the recipient is shown on its own line and bound to the confirmation by
+payload_sha, `HERMES_EMAIL_SEND=1` is re-read immediately before transport, and
+a dropped connection is reported as an unknown outcome rather than retried.
+
 Actor roles decide who may press it. The mapping comes from `household.toml`
 when the file exists and from the variables above otherwise; anyone not listed —
 and anyone writing from a chat outside `HERMES_CHAT` — gets zero capabilities,

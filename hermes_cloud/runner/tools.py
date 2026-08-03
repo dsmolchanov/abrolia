@@ -27,13 +27,15 @@ from hermes_cloud.core.runcontext import (
     READ_CALENDAR,
     READ_MEMORY,
     READ_TASKS,
+    WRITE_EMAIL,
     WRITE_MEMORY,
     WRITE_REMINDER,
     RunContext,
 )
 from hermes_cloud.execute.gcal import Calendar
 from hermes_cloud.execute.reminder import ReminderStore, due_timestamp
-from hermes_cloud.runner.card import KIND_MEMORY
+from hermes_cloud.runner.bundle import Item, bundle_payload
+from hermes_cloud.runner.card import KIND_BUNDLE, KIND_EMAIL, KIND_MEMORY
 
 
 class UnknownTool(LookupError):
@@ -416,6 +418,73 @@ def memory_append(
     )
     return {"proposal_id": staged.id, "statement_id": statement.id,
             "status": "ожидает подтверждения"}
+
+
+@REGISTRY.tool(
+    name="propose_email",
+    capability=WRITE_EMAIL,
+    description=(
+        "Предложить отправить письмо. Ничего не отправляет: семья увидит "
+        "карточку с получателем и текстом и подтвердит сама. Для ответа в "
+        "существующую переписку укажи `in_reply_to` — Message-ID письма, "
+        "на которое отвечаем."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "to": {"type": "string", "description": "Адрес получателя."},
+            "subject": {"type": "string", "description": "Тема письма."},
+            "body": {"type": "string", "description": "Текст письма целиком."},
+            "in_reply_to": {
+                "type": "string",
+                "description": "Message-ID письма, на которое это ответ, если это ответ.",
+            },
+        },
+        "required": ["to", "subject", "body"],
+    },
+)
+def propose_email(
+    context: RunContext, services: Services, arguments: dict[str, Any]
+) -> dict[str, Any]:
+    """Письмо — предложение, и получатель в нём подтверждается наравне с текстом.
+
+    Проверка адреса и заголовков делается уже здесь, а не только перед
+    отправкой: показать семье карточку с негодным адресом — значит попросить
+    подтвердить то, что всё равно не уйдёт.
+    """
+    context.require(WRITE_EMAIL)
+    from hermes_cloud.execute.email_send import EmailRejected, Outgoing, validate
+
+    letter = Outgoing(
+        to=str(arguments.get("to") or ""),
+        subject=str(arguments.get("subject") or ""),
+        body=str(arguments.get("body") or ""),
+        in_reply_to=arguments.get("in_reply_to") or None,
+    )
+    try:
+        validate(letter)
+    except EmailRejected as error:
+        raise ToolInputError(str(error)) from error
+
+    payload = bundle_payload(
+        [Item(payload={
+            "kind": KIND_EMAIL,
+            "to": letter.to,
+            "subject": letter.subject,
+            "body": letter.body,
+            "in_reply_to": letter.in_reply_to,
+        })],
+        header=f"Письмо для {letter.to}",
+    )
+    staged = services.approvals.stage(
+        kind=KIND_BUNDLE,
+        payload=payload,
+        chat=context.chat_id,
+        thread=context.thread_id,
+        actor=context.actor_id,
+        context_key=f"chat:{context.chat_id}",
+    )
+    return {"proposal_id": staged.id, "status": "ожидает подтверждения"}
 
 
 # --- разбор аргументов --------------------------------------------------------

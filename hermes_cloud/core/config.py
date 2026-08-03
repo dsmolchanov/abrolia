@@ -27,6 +27,8 @@ ENV_CALENDAR = "HERMES_CALENDAR_ID"
 ENV_GMAIL_ADDRESS = "HERMES_GMAIL_ADDRESS"
 ENV_GMAIL_PASSWORD = "HERMES_GMAIL_APP_PASSWORD"
 ENV_GMAIL_LABEL = "HERMES_GMAIL_LABEL"
+ENV_SMTP_HOST = "HERMES_SMTP_HOST"
+ENV_SMTP_PORT = "HERMES_SMTP_PORT"
 
 DEFAULT_DB_PATH = "data/hermes.db"
 DEFAULT_LANGUAGE = "русский"
@@ -36,6 +38,9 @@ DEFAULT_EFFORT = "medium"
 DEFAULT_CALENDAR = "primary"
 # Ярлык — вся граница доступа к ящику: письмо без него мы не запрашиваем.
 DEFAULT_GMAIL_LABEL = "Hermes"
+# Хост берётся из конфига, а не зашивается: у семьи может быть не Gmail.
+DEFAULT_SMTP_HOST = "smtp.gmail.com"
+DEFAULT_SMTP_PORT = 465
 
 
 def load_dotenv(path: Path | str = ".env") -> None:
@@ -64,6 +69,8 @@ class Config:
     gmail_address: str
     gmail_app_password: str | None
     gmail_label: str
+    smtp_host: str
+    smtp_port: int
     telegram_token: str | None
 
     @property
@@ -110,4 +117,6 @@ def load_config(*, env: dict[str, str] | None = None) -> Config:
         gmail_address=(source.get(ENV_GMAIL_ADDRESS) or "").strip(),
         gmail_app_password=source.get(ENV_GMAIL_PASSWORD) or None,
         gmail_label=source.get(ENV_GMAIL_LABEL) or DEFAULT_GMAIL_LABEL,
+        smtp_host=source.get(ENV_SMTP_HOST) or DEFAULT_SMTP_HOST,
+        smtp_port=int(source.get(ENV_SMTP_PORT) or DEFAULT_SMTP_PORT),
     )
