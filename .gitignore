@@ -6,3 +6,4 @@ data/
 *.egg-info/
 .pytest_cache/
 household.toml
+backups/

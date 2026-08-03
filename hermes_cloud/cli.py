@@ -223,6 +223,36 @@ def cmd_retention(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_backup(args: argparse.Namespace) -> int:
+    """Сделать зашифрованный снимок базы и убрать просроченные архивы."""
+    from hermes_cloud.core.backup import BackupError, make_backup, prune_backups
+
+    try:
+        archive = make_backup(_database(args), args.directory)
+    except BackupError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    print(f"{archive.path}  {archive.size} байт")
+    for removed in prune_backups(args.directory):
+        print(f"{removed}  удалён по сроку хранения")
+    return 0
+
+
+def cmd_restore(args: argparse.Namespace) -> int:
+    """Восстановить базу из архива. Существующий файл не перезаписывается без `--force`."""
+    from hermes_cloud.core.backup import BackupError, restore_backup
+
+    target = Path(args.target or os.environ.get(DB_ENV) or DEFAULT_DB_PATH)
+    try:
+        restored = restore_backup(args.archive, target, overwrite=args.force)
+    except BackupError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    print(f"восстановлено в {restored}")
+    print("проверьте: hermes-cloud status && hermes-cloud pending")
+    return 0
+
+
 def _owner_request(args: argparse.Namespace, kind: str, question: str) -> int:
     """Поставить owner-операцию на подтверждение кодом.
 
@@ -403,6 +433,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     retention = commands.add_parser("retention", help="стереть то, чему вышел срок хранения")
     retention.set_defaults(func=cmd_retention)
+
+    backup = commands.add_parser("backup", help="зашифрованный снимок базы")
+    backup.add_argument("--directory", default="backups", help="куда класть архивы")
+    backup.set_defaults(func=cmd_backup)
+
+    restore = commands.add_parser("restore", help="восстановить базу из архива")
+    restore.add_argument("archive", type=Path)
+    restore.add_argument("--target", help="куда восстанавливать (иначе — рабочая база)")
+    restore.add_argument("--force", action="store_true", help="перезаписать существующий файл")
+    restore.set_defaults(func=cmd_restore)
 
     export = commands.add_parser("export", help="запросить полную выгрузку данных (владелец)")
     export.add_argument("--actor", help="от чьего имени (по умолчанию — HERMES_OWNER)")

@@ -31,6 +31,8 @@ python3 -m hermes_cloud.cli reconcile  # settle effects left hanging by a crash
 python3 -m hermes_cloud.cli retention  # delete what the retention matrix says is due
 python3 -m hermes_cloud.cli export     # owner-only: stage a full data export
 python3 -m hermes_cloud.cli delete     # owner-only: stage an irreversible wipe
+python3 -m hermes_cloud.cli backup     # encrypted snapshot (HERMES_BACKUP_KEY)
+python3 -m hermes_cloud.cli restore <archive> --target /data/restored.db
 python3 -m hermes_cloud.cli dlq        # events that exhausted their attempts
 python3 -m hermes_cloud.cli replay <event_id>
 ```
@@ -65,6 +67,7 @@ Model benchmark and the extraction-model decision: [`bench/README.md`](bench/REA
 - [`docs/SECURITY.md`](docs/SECURITY.md) — threat model, trust boundaries, vulnerability reporting
 - [`docs/privacy/`](docs/privacy/README.md) — data map and retention, lawful bases, DPIA, processor register, privacy notice (RU/EN), minors policy, incident response
 - [`docs/ontology.md`](docs/ontology.md) — the operational vocabulary: journals vs. statements, status model, competency questions
+- [`docs/restore.md`](docs/restore.md) — backup format, restore procedure, what a restore cannot bring back
 - [`docs/source-pins.md`](docs/source-pins.md) — pinned donor revisions
 - [`docs/roadmap-channels.md`](docs/roadmap-channels.md) — post-MVP channels and voice
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — fixture sanitisation rules, secrets policy, working order
