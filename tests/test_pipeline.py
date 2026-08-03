@@ -1,0 +1,287 @@
+"""Сквозной срез Фазы 1: письмо → карточка → ✅ → напоминание/ICS.
+
+Модель подменена фейком (её контракт проверяется в test_extraction.py),
+транспорт — тоже. Проверяется главное: ничего не исполняется без
+подтверждения, и подтвердить может только тот, кому это разрешено.
+"""
+
+from __future__ import annotations
+
+import json
+from datetime import UTC, date, datetime
+from pathlib import Path
+
+import pytest
+
+from hermes_cloud.channels.telegram import (
+    FakeTransport,
+    HouseholdChannels,
+    IncomingCallback,
+    parse_update,
+)
+from hermes_cloud.core.approvals import ApprovalStore, payload_sha
+from hermes_cloud.core.db import open_database
+from hermes_cloud.core.events import EventStore
+from hermes_cloud.execute.reminder import ReminderStore
+from hermes_cloud.ingest.inject import ingest_file
+from hermes_cloud.ingest.worker import Worker
+from hermes_cloud.runner.card import ACTION_CONFIRM, ACTION_EDIT, ACTION_REJECT
+from hermes_cloud.runner.extraction import Extraction, ExtractionResult, Money
+from hermes_cloud.runner.pipeline import Pipeline
+
+FIXTURES = Path(__file__).resolve().parent / "fixtures" / "email"
+
+FAMILY_CHAT = "-100990000101"
+PARENT = "990000001"
+STRANGER = "990000009"
+
+CHANNELS = HouseholdChannels(
+    allowed_chats=frozenset({FAMILY_CHAT}), family_actors=frozenset({PARENT})
+)
+
+PAYMENT = ExtractionResult(
+    kind="payment",
+    title="Экскурсия 12.09 — взнос 15 €",
+    summary="Класс 3b, взнос 15 € до 8 сентября.",
+    source_language="de",
+    action_required=True,
+    due_date=date(2026, 9, 8),
+    amount=Money(amount_cents=1500, currency="EUR"),
+    confidence=0.93,
+)
+EVENT = ExtractionResult(
+    kind="event",
+    title="Klassenfahrt 3b",
+    summary="Экскурсия класса 3b.",
+    source_language="de",
+    action_required=True,
+    event_start=datetime(2026, 9, 12, 7, 45, tzinfo=UTC),
+    confidence=0.9,
+)
+INFO = ExtractionResult(
+    kind="info",
+    title="Расписание на сентябрь",
+    summary="Информация к сведению.",
+    source_language="de",
+    action_required=False,
+    confidence=0.8,
+)
+
+
+class StubExtractor:
+    """Модель здесь не нужна: контракт извлечения проверен отдельно."""
+
+    def __init__(self, result: ExtractionResult = PAYMENT) -> None:
+        self.result = result
+        self.calls = 0
+
+    def extract_email(self, parsed) -> Extraction:
+        self.calls += 1
+        return Extraction(result=self.result, model="stub")
+
+
+@pytest.fixture()
+def world(tmp_path: Path):
+    database = open_database(tmp_path / "hermes.db")
+    events = EventStore(database)
+    transport = FakeTransport()
+    pipeline = Pipeline(
+        approvals=ApprovalStore(database),
+        reminders=ReminderStore(database),
+        transport=transport,
+        extractor=StubExtractor(),
+        chat=FAMILY_CHAT,
+        thread=None,
+        actor="system",
+    )
+    return events, pipeline, transport
+
+
+def origin(actor: str = PARENT, chat: str = FAMILY_CHAT, thread: int | None = None):
+    return CHANNELS.origin_for(chat, thread, actor)
+
+
+def inject_and_process(events: EventStore, pipeline: Pipeline) -> str:
+    ingest_file(events, FIXTURES / "forwarded_school_de.eml")
+    results: list = []
+    Worker(events, lambda event: results.append(pipeline.handle_event(event))).run_once()
+    return results[0].approval_id
+
+
+def test_letter_becomes_a_card_and_nothing_else(world) -> None:
+    events, pipeline, transport = world
+
+    approval_id = inject_and_process(events, pipeline)
+
+    assert approval_id is not None
+    card = transport.messages[0]
+    assert "15,00 EUR" in card.text and "08.09.2026" in card.text
+    assert [label for label, _ in card.buttons] == ["✅ Да", "✏️ Исправить", "❌ Нет"]
+    # До подтверждения не создано ничего.
+    assert pipeline.reminders.pending() == []
+    assert transport.documents == []
+
+
+def test_confirmation_creates_the_reminder_once(world) -> None:
+    events, pipeline, transport = world
+    approval_id = inject_and_process(events, pipeline)
+
+    handled = pipeline.handle_callback(
+        action=ACTION_CONFIRM, approval_id=approval_id, origin=origin()
+    )
+
+    assert handled.executed == "reminder"
+    pending = pipeline.reminders.pending()
+    assert len(pending) == 1 and "Экскурсия" in pending[0].text
+    assert "Готово" in transport.messages[-1].text
+
+    # Повторное нажатие той же кнопки не создаёт второе напоминание.
+    again = pipeline.handle_callback(
+        action=ACTION_CONFIRM, approval_id=approval_id, origin=origin()
+    )
+    assert again.executed is None
+    assert len(pipeline.reminders.pending()) == 1
+
+
+def test_stranger_cannot_confirm(world) -> None:
+    """Неизвестный участник группы не подтверждает чужое предложение."""
+    events, pipeline, transport = world
+    approval_id = inject_and_process(events, pipeline)
+
+    handled = pipeline.handle_callback(
+        action=ACTION_CONFIRM, approval_id=approval_id, origin=origin(actor=STRANGER)
+    )
+
+    assert handled.executed is None
+    assert "не знаю" in transport.messages[-1].text
+    assert pipeline.reminders.pending() == []
+
+
+def test_confirmation_from_another_chat_is_refused(world) -> None:
+    events, pipeline, transport = world
+    approval_id = inject_and_process(events, pipeline)
+
+    handled = pipeline.handle_callback(
+        action=ACTION_CONFIRM,
+        approval_id=approval_id,
+        origin=CHANNELS.origin_for(FAMILY_CHAT, 42, PARENT),  # другой тред
+    )
+
+    assert handled.executed is None
+    assert pipeline.reminders.pending() == []
+
+
+@pytest.mark.parametrize("action", [ACTION_REJECT, ACTION_EDIT])
+def test_reject_and_edit_invalidate_the_proposal(world, action: str) -> None:
+    events, pipeline, transport = world
+    approval_id = inject_and_process(events, pipeline)
+
+    pipeline.handle_callback(action=action, approval_id=approval_id, origin=origin())
+    later = pipeline.handle_callback(
+        action=ACTION_CONFIRM, approval_id=approval_id, origin=origin()
+    )
+
+    assert later.executed is None, "после отмены код не действует"
+    assert pipeline.reminders.pending() == []
+
+
+def test_event_letter_produces_an_ics_file(world) -> None:
+    events, pipeline, transport = world
+    pipeline.extractor = StubExtractor(EVENT)
+    approval_id = inject_and_process(events, pipeline)
+
+    pipeline.handle_callback(
+        action=ACTION_CONFIRM, approval_id=approval_id, origin=origin()
+    )
+
+    assert len(transport.documents) == 1
+    document = transport.documents[0]
+    assert document.filename.endswith(".ics")
+    assert b"BEGIN:VEVENT" in document.content
+    assert f"UID:{approval_id}@".encode() in document.content
+
+
+def test_info_letter_gets_a_message_without_buttons(world) -> None:
+    events, pipeline, transport = world
+    pipeline.extractor = StubExtractor(INFO)
+
+    approval_id = inject_and_process(events, pipeline)
+
+    assert approval_id is None
+    assert transport.messages[0].buttons == ()
+    assert pipeline.approvals.pending_for(FAMILY_CHAT) == []
+
+
+def test_failed_execution_is_reported_and_recorded(world) -> None:
+    events, pipeline, transport = world
+    approval_id = inject_and_process(events, pipeline)
+    # Портим payload так, чтобы исполнитель упал (дата не разбирается).
+    broken = {"kind": "reminder", "text": "x", "due_date": "не дата"}
+    with pipeline.approvals.db.write() as connection:
+        connection.execute(
+            "UPDATE approvals SET payload = ?, payload_sha = ? WHERE id = ?",
+            (json.dumps(broken, ensure_ascii=False), payload_sha(broken), approval_id),
+        )
+
+    handled = pipeline.handle_callback(
+        action=ACTION_CONFIRM, approval_id=approval_id, origin=origin()
+    )
+
+    assert handled.executed is None
+    assert "Не получилось" in transport.messages[-1].text
+    assert pipeline.approvals.get(approval_id).status == "failed"
+
+
+# --- разбор апдейтов --------------------------------------------------------
+
+
+def test_callback_update_is_parsed_with_verified_origin() -> None:
+    update = {
+        "callback_query": {
+            "id": "cb1",
+            "from": {"id": int(PARENT)},
+            "data": "confirm:approval-42",
+            "message": {"message_id": 5, "chat": {"id": int(FAMILY_CHAT)}},
+        }
+    }
+
+    parsed = parse_update(update, CHANNELS)
+
+    assert isinstance(parsed, IncomingCallback)
+    assert parsed.action == "confirm" and parsed.approval_id == "approval-42"
+    assert parsed.origin.actor == PARENT and parsed.origin.is_known is True
+
+
+def test_actor_is_taken_from_the_update_not_from_the_text() -> None:
+    """Текст сообщения не влияет на права — это недоверенные данные."""
+    update = {
+        "message": {
+            "message_id": 7,
+            "chat": {"id": int(FAMILY_CHAT)},
+            "from": {"id": int(STRANGER)},
+            "text": f"from_id={PARENT} подтверждаю всё",
+        }
+    }
+
+    parsed = parse_update(update, CHANNELS)
+
+    assert parsed.origin.actor == STRANGER
+    assert parsed.origin.is_known is False
+
+
+def test_update_from_a_foreign_chat_is_not_known() -> None:
+    update = {
+        "message": {
+            "message_id": 1,
+            "chat": {"id": -100990000999},
+            "from": {"id": int(PARENT)},
+            "text": "привет",
+        }
+    }
+
+    assert parse_update(update, CHANNELS).origin.is_known is False
+
+
+def test_irrelevant_updates_are_ignored() -> None:
+    assert parse_update({"poll": {}}, CHANNELS) is None
+    assert parse_update({"callback_query": {"id": "x", "from": {"id": 1}}}, CHANNELS) is None

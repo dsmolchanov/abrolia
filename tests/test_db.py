@@ -13,11 +13,12 @@ from hermes_cloud.core.db import Database, open_database
 def test_migrations_apply_once_and_are_recorded(tmp_path: Path) -> None:
     database = Database(tmp_path / "hermes.db")
     applied = database.migrate()
-    assert applied == ["0001_init.sql"]
+    assert applied == sorted(applied), "миграции применяются по возрастанию имени"
+    assert "0001_init.sql" in applied
     assert database.migrate() == [], "повторный запуск не должен ничего применять"
 
     names = {row["name"] for row in database.query("SELECT name FROM schema_migrations")}
-    assert names == {"0001_init.sql"}
+    assert names == set(applied)
 
 
 def test_durability_pragmas_are_set(tmp_path: Path) -> None:
