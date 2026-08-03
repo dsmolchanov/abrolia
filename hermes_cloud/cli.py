@@ -242,6 +242,9 @@ def cmd_restore(args: argparse.Namespace) -> int:
     """Восстановить базу из архива. Существующий файл не перезаписывается без `--force`."""
     from hermes_cloud.core.backup import BackupError, restore_backup
 
+    # Восстановление — единственная команда, которая не открывает базу и потому
+    # не проходит через `_database`: ключ бэкапа надо подтянуть самим.
+    load_dotenv()
     target = Path(args.target or os.environ.get(DB_ENV) or DEFAULT_DB_PATH)
     try:
         restored = restore_backup(args.archive, target, overwrite=args.force)
