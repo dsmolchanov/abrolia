@@ -83,6 +83,10 @@ class StubExtractor:
         self.calls += 1
         return Extraction(result=self.result, model="stub")
 
+    def system_prompt(self) -> str:
+        """Хэш промпта попадает в `extraction_runs` — прогоны должны быть сравнимы."""
+        return "stub-prompt"
+
 
 @pytest.fixture()
 def world(tmp_path: Path):
@@ -255,6 +259,75 @@ def test_failed_execution_is_reported_and_recorded(world) -> None:
     assert handled.executed is None
     assert "Не получилось" in transport.messages[-1].text
     assert pipeline.approvals.get(approval_id).status == "failed"
+
+
+# --- обязательства и память ---------------------------------------------------
+
+
+def test_the_card_shows_where_the_number_came_from(world) -> None:
+    """Человек подтверждает не пересказ, а то, что видно в письме."""
+    events, pipeline, transport = world
+
+    inject_and_process(events, pipeline)
+
+    assert "Источник: grundschule.example" in transport.messages[0].text
+    assert "15,00 EUR" in transport.messages[0].text
+
+
+def test_extraction_is_recorded_as_a_candidate_until_confirmed(world) -> None:
+    events, pipeline, transport = world
+    approval_id = inject_and_process(events, pipeline)
+
+    candidates = pipeline.commitments.candidates()
+    assert len(candidates) == 1, "извлечение породило ровно одну гипотезу"
+    assert pipeline.commitments.confirmed() == [], "до ✅ это не факт семьи"
+    assert candidates[0].extraction_run_id is not None, "гипотеза знает свой прогон"
+
+    pipeline.handle_callback(
+        action=ACTION_CONFIRM, approval_id=approval_id, context=context()
+    )
+
+    confirmed = pipeline.commitments.confirmed()
+    assert [item.id for item in confirmed] == [candidates[0].id]
+    assert confirmed[0].reminder_id == pipeline.reminders.pending()[0].id
+
+
+@pytest.mark.parametrize("action", [ACTION_REJECT, ACTION_EDIT])
+def test_no_closes_the_hypothesis_too(world, action: str) -> None:
+    events, pipeline, transport = world
+    approval_id = inject_and_process(events, pipeline)
+
+    pipeline.handle_callback(action=action, approval_id=approval_id, context=context())
+
+    assert pipeline.commitments.candidates() == []
+    assert pipeline.commitments.confirmed() == []
+
+
+def test_memory_append_goes_through_the_same_gate(world) -> None:
+    """Запись в память — предложение с кнопками, а не побочный эффект хода."""
+    from hermes_cloud.core.runcontext import Household, build_run_context
+    from hermes_cloud.runner.tools import REGISTRY, Services
+
+    events, pipeline, transport = world
+    services = Services.on(pipeline.approvals.db)
+    household = Household(
+        owner=PARENT, family=frozenset({PARENT}), allowed_chats=frozenset({FAMILY_CHAT})
+    )
+    run_context = build_run_context(household=household, actor_id=PARENT, chat_id=FAMILY_CHAT)
+
+    proposed = REGISTRY.invoke(
+        run_context, "memory_append",
+        {"text": "Лиза не ест орехи", "kind": "fact"}, services=services,
+    )
+
+    assert services.memory.recall() == [], "до подтверждения память пуста"
+
+    pipeline.handle_callback(
+        action=ACTION_CONFIRM, approval_id=proposed["proposal_id"], context=context()
+    )
+
+    assert [item.text for item in services.memory.recall()] == ["Лиза не ест орехи"]
+    assert "Запомнил" in transport.messages[-1].text
 
 
 # --- разбор апдейтов --------------------------------------------------------

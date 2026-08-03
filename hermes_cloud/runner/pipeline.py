@@ -19,10 +19,16 @@ from hermes_cloud.core.approvals import (
     ApprovalStore,
     RateLimited,
 )
+from hermes_cloud.core.commitments import STATUS_CANDIDATE as COMMITMENT_CANDIDATE
+from hermes_cloud.core.commitments import STATUS_CONFIRMED as MEMORY_CONFIRMED
+from hermes_cloud.core.commitments import CommitmentStore
 from hermes_cloud.core.effects import APPROVAL_TOOL_USE_ID, EffectJournal
 from hermes_cloud.core.events import Event
+from hermes_cloud.core.evidence import EvidenceStore, content_sha
+from hermes_cloud.core.memory import MemoryStore
 from hermes_cloud.core.runcontext import (
     WRITE_CALENDAR,
+    WRITE_MEMORY,
     WRITE_REMINDER,
     RunContext,
 )
@@ -34,6 +40,7 @@ from hermes_cloud.runner.card import (
     ACTION_EDIT,
     ACTION_REJECT,
     KIND_ICS,
+    KIND_MEMORY,
     KIND_REMINDER,
     render_card,
 )
@@ -66,12 +73,36 @@ TEXT_OUTCOME_UNKNOWN = (
 CAPABILITY_FOR_KIND = {
     KIND_REMINDER: WRITE_REMINDER,
     KIND_ICS: WRITE_CALENDAR,
+    KIND_MEMORY: WRITE_MEMORY,
 }
 
 # Виды эффектов, которые можно доделать после падения: локальные и
 # идемпотентные по id подтверждения. Всё остальное — наружу, и повтору не
 # подлежит (`Locked Decisions` → «Идемпотентность», `docs/SECURITY.md`, T9).
-REPLAYABLE_KINDS = frozenset({KIND_REMINDER})
+REPLAYABLE_KINDS = frozenset({KIND_REMINDER, KIND_MEMORY})
+
+
+def evidence_needles(result) -> list[str]:
+    """Опоры для поиска цитаты: то, что человек и так будет проверять глазами.
+
+    Ищем именно так, как это написано в письме (сумма «15,00», дата
+    «08.09.2026»), а не так, как мы её нормализовали, — иначе цитата не найдётся
+    там, где она есть.
+    """
+    needles: list[str] = []
+    if result.amount is not None:
+        major, minor = divmod(result.amount.amount_cents, 100)
+        needles += [f"{major},{minor:02d}", f"{major}.{minor:02d}", str(major)]
+    for value in (result.due_date, result.event_start):
+        if value is None:
+            continue
+        moment = value.date() if hasattr(value, "date") else value
+        needles += [
+            moment.strftime("%d.%m.%Y"), moment.strftime("%d.%m."), moment.isoformat()
+        ]
+    if result.location:
+        needles.append(result.location)
+    return needles
 
 
 @dataclass(frozen=True)
@@ -109,6 +140,11 @@ class Pipeline:
         self.effects = effects or EffectJournal(approvals.db)
         # Диалог необязателен: воркер и tick обходятся без него.
         self.loop = loop
+        # Онтологический слой: провенанс, обязательства, память. Живёт в той же
+        # базе — иначе «откуда эта сумма» пришлось бы собирать из двух мест.
+        self.evidence = EvidenceStore(approvals.db)
+        self.commitments = CommitmentStore(approvals.db)
+        self.memory = MemoryStore(approvals.db)
 
     # --- входящее событие ---------------------------------------------------
 
@@ -118,7 +154,24 @@ class Pipeline:
         extraction = self.extractor.extract_email(parsed)
         result = extraction.result
 
-        preview = render_card(result)
+        run = self.evidence.record_run(
+            event_id=event.id,
+            model=extraction.model,
+            prompt_sha=content_sha(self.extractor.system_prompt()),
+            input_tokens=extraction.input_tokens,
+            output_tokens=extraction.output_tokens,
+        )
+        ref = self.evidence.add_ref(
+            extraction_run_id=run.id,
+            event_id=event.id,
+            text=parsed.text,
+            sender=parsed.original_sender.email if parsed.original_sender else parsed.from_email,
+            message_date=parsed.date,
+            needles=evidence_needles(result),
+        )
+        source = self.evidence.render_source(ref)
+
+        preview = render_card(result, source=source)
         if preview.proposal is None:
             # Информационное письмо: сообщение без кнопок, подтверждать нечего.
             self.transport.send_message(
@@ -126,16 +179,26 @@ class Pipeline:
             )
             return Handled(message=preview.text)
 
+        # Кандидат — единственный статус, который может появиться из модели.
+        commitment = self.commitments.propose(
+            kind=result.kind,
+            payload=preview.proposal,
+            extraction_run_id=run.id,
+            confidence=result.confidence,
+            observed_at=(
+                result.event_start.timestamp() if result.event_start is not None else None
+            ),
+        )
         staged = self.approvals.stage(
             kind=preview.proposal["kind"],
-            payload=preview.proposal,
+            payload={**preview.proposal, "commitment_id": commitment.id},
             chat=self.chat,
             thread=self.thread,
             actor=self.actor,
             context_key=event.context_key,
             event_id=event.id,
         )
-        card = render_card(result, approval_id=staged.id, code=staged.code)
+        card = render_card(result, approval_id=staged.id, code=staged.code, source=source)
         self.transport.send_message(
             chat=self.chat,
             text=card.text,
@@ -161,6 +224,7 @@ class Pipeline:
             # Отмена — не эффект: отменить чужое предложение вправе любой, кого
             # семья знает. Ошибка в эту сторону безопасна.
             self.approvals.cancel(approval_id, now=now)
+            self._reject_commitment(approval_id, now=now)
             text = TEXT_REJECTED if action == ACTION_REJECT else TEXT_EDIT
             self.transport.send_message(
                 chat=context.chat_id, text=text, thread=context.thread_id
@@ -267,6 +331,8 @@ class Pipeline:
                 text = self._execute_reminder(approval, payload, now=now)
             elif payload["kind"] == KIND_ICS:
                 text = self._execute_ics(approval, payload)
+            elif payload["kind"] == KIND_MEMORY:
+                text = self._execute_memory(approval, payload, now=now)
             else:
                 raise ValueError(f"неизвестный вид предложения: {payload['kind']!r}")
         except SendOutcomeUnknown as error:
@@ -293,6 +359,7 @@ class Pipeline:
             return Handled(approval_id=approval.id, message=message)
 
         self.effects.complete(effect.id, text, now=now)
+        self._confirm_commitment(approval, payload, now=now)
         self.approvals.mark(approval.id, STATUS_DONE, receipt=text, now=now)
         self.transport.send_message(chat=approval.chat, text=text, thread=approval.thread)
         return Handled(approval_id=approval.id, executed=payload["kind"], message=text)
@@ -313,6 +380,45 @@ class Pipeline:
         )
         logger.info("reminder %s created from approval %s", reminder.id, approval.id)
         return f"Готово: напомню {due.strftime('%d.%m.%Y')} — {payload['text']}."
+
+    def _execute_memory(self, approval, payload: dict, *, now: float | None) -> str:
+        """Подтверждённая запись в память. До этого момента её там не было."""
+        statement = self.memory.get(payload["statement_id"])
+        if statement is not None and statement.status == MEMORY_CONFIRMED:
+            # Доделка после падения: запись уже подтверждена, второй раз нечего.
+            return f"Запомнил: {statement.text}"
+        statement = self.memory.confirm(payload["statement_id"], approval, now=now)
+        logger.info("memory statement %s confirmed", statement.id)
+        return f"Запомнил: {statement.text}"
+
+    def _reject_commitment(self, approval_id: str, *, now: float | None) -> None:
+        """«Нет» человека закрывает и гипотезу модели, а не только кнопку."""
+        approval = self.approvals.get(approval_id)
+        if approval is None:
+            return
+        commitment_id = approval.payload.get("commitment_id")
+        statement_id = approval.payload.get("statement_id")
+        if commitment_id:
+            self.commitments.reject(commitment_id, now=now)
+        if statement_id:
+            self.memory.reject(statement_id, now=now)
+
+    def _confirm_commitment(self, approval, payload: dict, *, now: float | None) -> None:
+        """Подтверждение действия подтверждает и сам факт — но только его версию.
+
+        Обязательство переходит в `confirmed` здесь, а не в момент извлечения:
+        до нажатия ✅ это была гипотеза модели.
+        """
+        commitment_id = payload.get("commitment_id")
+        if not commitment_id:
+            return
+        commitment = self.commitments.get(commitment_id)
+        if commitment is None or commitment.status != COMMITMENT_CANDIDATE:
+            return
+        self.commitments.confirm(commitment_id, approval, now=now)
+        reminder = self.reminders.for_approval(approval.id)
+        if reminder is not None:
+            self.commitments.link(commitment_id, reminder_id=reminder.id, now=now)
 
     def _execute_ics(self, approval, payload: dict) -> str:
         start = datetime.fromisoformat(payload["start"])

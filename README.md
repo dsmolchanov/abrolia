@@ -61,6 +61,7 @@ Model benchmark and the extraction-model decision: [`bench/README.md`](bench/REA
 
 - [`docs/SECURITY.md`](docs/SECURITY.md) — threat model, trust boundaries, vulnerability reporting
 - [`docs/privacy/`](docs/privacy/README.md) — data map and retention, lawful bases, DPIA, processor register, privacy notice (RU/EN), minors policy, incident response
+- [`docs/ontology.md`](docs/ontology.md) — the operational vocabulary: journals vs. statements, status model, competency questions
 - [`docs/source-pins.md`](docs/source-pins.md) — pinned donor revisions
 - [`docs/roadmap-channels.md`](docs/roadmap-channels.md) — post-MVP channels and voice
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — fixture sanitisation rules, secrets policy, working order

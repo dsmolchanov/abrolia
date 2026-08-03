@@ -11,7 +11,6 @@ from pathlib import Path
 
 import pytest
 
-from hermes_cloud.core.approvals import ApprovalStore
 from hermes_cloud.core.db import open_database
 from hermes_cloud.core.runcontext import (
     ALL_READ,
@@ -35,7 +34,6 @@ from hermes_cloud.core.runcontext import (
     build_run_context,
     load_household,
 )
-from hermes_cloud.execute.reminder import ReminderStore
 from hermes_cloud.runner.tools import REGISTRY, Services, UnknownTool
 
 OWNER = "990000001"
@@ -61,8 +59,7 @@ def context_for(actor: str, *, chat: str = CHAT, thread: int | None = None):
 
 @pytest.fixture
 def services(tmp_path: Path) -> Services:
-    database = open_database(tmp_path / "hermes.db")
-    return Services(approvals=ApprovalStore(database), reminders=ReminderStore(database))
+    return Services.on(open_database(tmp_path / "hermes.db"))
 
 
 # --- роли ---------------------------------------------------------------------
@@ -147,13 +144,17 @@ def test_run_ids_are_unique_per_turn() -> None:
 EXPECTED_CAPABILITY = {
     "list_reminders": READ_TASKS,
     "list_pending_proposals": READ_TASKS,
+    "memory_search": READ_MEMORY,
     "propose_reminder": WRITE_REMINDER,
+    "memory_append": WRITE_MEMORY,
 }
 
 VALID_ARGUMENTS = {
     "list_reminders": {"limit": 5},
     "list_pending_proposals": {},
+    "memory_search": {"query": "плавание"},
     "propose_reminder": {"text": "оплатить взнос 15 EUR", "due_date": "2026-09-08"},
+    "memory_append": {"text": "Лиза ходит на плавание по вторникам", "kind": "routine"},
 }
 
 ROLES = {

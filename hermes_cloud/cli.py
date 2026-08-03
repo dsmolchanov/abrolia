@@ -78,7 +78,7 @@ def _pipeline(args: argparse.Namespace, database) -> Pipeline:
         thread=config.thread,
         loop=ToolLoop(
             journal=EffectJournal(database),
-            services=Services(approvals=approvals, reminders=reminders),
+            services=Services.on(database),
             family_language=config.language,
         ),
     )

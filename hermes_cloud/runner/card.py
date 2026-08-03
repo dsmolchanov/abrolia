@@ -26,6 +26,9 @@ ACTION_REJECT = "reject"
 
 KIND_REMINDER = "reminder"
 KIND_ICS = "ics"
+# Запись в память — тоже предложение с кнопками: попасть в память иначе как
+# через человека нельзя (`core/memory.py`).
+KIND_MEMORY = "memory"
 
 
 @dataclass(frozen=True)
@@ -90,6 +93,9 @@ def proposal_for(result: ExtractionResult) -> dict[str, Any] | None:
         "due_date": due.isoformat(),
         "amount_cents": result.amount.amount_cents if result.amount else None,
         "currency": result.amount.currency if result.amount else None,
+        # Ответственный едет в payload не для карточки, а для вопросов вида
+        # «какие платежи на этой неделе и кто их закрывает» (`core/queries.py`).
+        "responsible": result.responsible,
     }
 
 
@@ -98,8 +104,13 @@ def render_card(
     *,
     approval_id: str | None = None,
     code: str | None = None,
+    source: str | None = None,
 ) -> Card:
-    """Собрать карточку. Без `approval_id` карточка получается без кнопок."""
+    """Собрать карточку. Без `approval_id` карточка получается без кнопок.
+
+    `source` — строка происхождения из `core/evidence.py`: цитата из живого
+    письма, а после его удаления по сроку хранения — честный след без контента.
+    """
     lines: list[str] = [result.title]
     if result.summary:
         lines.append("")
@@ -125,6 +136,8 @@ def render_card(
         if result.original_sender.name:
             sender = f"{result.original_sender.name} <{sender}>"
         facts.append(f"Отправитель: {sender}")
+    if source:
+        facts.append(source)
     if facts:
         lines.append("")
         lines.extend(facts)

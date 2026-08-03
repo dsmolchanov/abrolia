@@ -20,13 +20,18 @@ from datetime import date
 from typing import Any
 
 from hermes_cloud.core.approvals import ApprovalStore
+from hermes_cloud.core.commitments import CommitmentStore
+from hermes_cloud.core.memory import KIND_FACT, KINDS, MemoryStore
 from hermes_cloud.core.runcontext import (
     ALL_WRITE,
+    READ_MEMORY,
     READ_TASKS,
+    WRITE_MEMORY,
     WRITE_REMINDER,
     RunContext,
 )
 from hermes_cloud.execute.reminder import ReminderStore, due_timestamp
+from hermes_cloud.runner.card import KIND_MEMORY
 
 
 class UnknownTool(LookupError):
@@ -43,6 +48,18 @@ class Services:
 
     approvals: ApprovalStore
     reminders: ReminderStore
+    memory: MemoryStore | None = None
+    commitments: CommitmentStore | None = None
+
+    @classmethod
+    def on(cls, database) -> Services:
+        """Собрать полный набор сторов над одной базой."""
+        return cls(
+            approvals=ApprovalStore(database),
+            reminders=ReminderStore(database),
+            memory=MemoryStore(database),
+            commitments=CommitmentStore(database),
+        )
 
 
 Handler = Callable[[RunContext, "Services", dict[str, Any]], Any]
@@ -245,6 +262,114 @@ def propose_reminder(
     # Код одноразовый и показывается человеку в карточке — модели он не нужен
     # и в её контекст не попадает.
     return {"proposal_id": staged.id, "status": "ожидает подтверждения"}
+
+
+@REGISTRY.tool(
+    name="memory_search",
+    capability=READ_MEMORY,
+    description=(
+        "Найти в памяти семьи подтверждённые записи: факты, распорядок, "
+        "предпочтения. Показывает только действующее — заменённое и "
+        "просроченное не возвращается."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Что искать, одним-двумя словами."},
+            "kind": {
+                "type": "string",
+                "description": "Вид записи: fact, routine или preference.",
+                "enum": sorted(KINDS),
+            },
+        },
+        "required": [],
+    },
+)
+def memory_search(
+    context: RunContext, services: Services, arguments: dict[str, Any]
+) -> dict[str, Any]:
+    context.require(READ_MEMORY)
+    if services.memory is None:
+        raise ToolInputError("память не подключена")
+    kind = arguments.get("kind")
+    if kind is not None and kind not in KINDS:
+        raise ToolInputError(f"неизвестный вид записи: {kind!r}")
+    found = services.memory.recall(query=arguments.get("query"), kind=kind)
+    return {
+        "statements": [
+            {"id": item.id, "kind": item.kind, "subject": item.subject, "text": item.text}
+            for item in found
+        ]
+    }
+
+
+@REGISTRY.tool(
+    name="memory_append",
+    capability=WRITE_MEMORY,
+    description=(
+        "Предложить запомнить что-то о семье надолго. Ничего не запоминает "
+        "сразу: семья увидит карточку и подтвердит. Указывай `supersedes`, "
+        "если новая запись заменяет прежнюю."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "text": {"type": "string", "description": "Что запомнить, одной фразой."},
+            "kind": {
+                "type": "string",
+                "description": "fact — факт, routine — распорядок, preference — предпочтение.",
+                "enum": sorted(KINDS),
+            },
+            "subject": {"type": "string", "description": "О ком или о чём запись."},
+            "supersedes": {
+                "type": "string",
+                "description": "id записи, которую эта заменяет, если такая есть.",
+            },
+        },
+        "required": ["text"],
+    },
+)
+def memory_append(
+    context: RunContext, services: Services, arguments: dict[str, Any]
+) -> dict[str, Any]:
+    """Запись в память — всегда предложение.
+
+    Память переживает и письмо, и разговор: попадание в неё напрямую означало
+    бы, что письмо, притворившееся инструкцией, влияет на все будущие ходы
+    (`docs/SECURITY.md`, T1). Поэтому здесь только кандидат и карточка.
+    """
+    context.require(WRITE_MEMORY)
+    if services.memory is None:
+        raise ToolInputError("память не подключена")
+    text = _text(arguments.get("text"), "text", limit=500)
+    kind = arguments.get("kind") or KIND_FACT
+    if kind not in KINDS:
+        raise ToolInputError(f"неизвестный вид записи: {kind!r}")
+    try:
+        statement = services.memory.propose(
+            text=text,
+            kind=kind,
+            subject=arguments.get("subject"),
+            actor=context.actor_id,
+            supersedes=arguments.get("supersedes") or None,
+        )
+    except Exception as error:  # ошибки инвариантов памяти — ошибки аргументов
+        raise ToolInputError(str(error)) from error
+    staged = services.approvals.stage(
+        kind=KIND_MEMORY,
+        payload={
+            "kind": KIND_MEMORY,
+            "statement_id": statement.id,
+            "text": statement.text,
+            "memory_kind": statement.kind,
+        },
+        chat=context.chat_id,
+        thread=context.thread_id,
+        actor=context.actor_id,
+        context_key=f"chat:{context.chat_id}",
+    )
+    return {"proposal_id": staged.id, "statement_id": statement.id,
+            "status": "ожидает подтверждения"}
 
 
 # --- разбор аргументов --------------------------------------------------------
