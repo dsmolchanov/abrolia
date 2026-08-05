@@ -583,6 +583,121 @@ def test_inspect_and_deprovision_do_not_claim_unknown_cleanup_complete() -> None
     assert result.error_code == "fly_delete_unknown"
 
 
+@pytest.mark.parametrize(
+    ("exit_event", "expected"),
+    [
+        (
+            {"exit_code": 0, "oom_killed": False, "requested_stop": False},
+            InspectState.ABSENT,
+        ),
+        (
+            {"exit_code": 1, "oom_killed": False, "requested_stop": False},
+            InspectState.FAILED,
+        ),
+    ],
+)
+def test_ephemeral_google_revoker_proves_exit_before_cleanup(
+    exit_event: dict[str, Any], expected: InspectState
+) -> None:
+    transaction_id = "a" * 32
+    app = FlyRuntimeProvisioner.stable_app_name(_spec().household_id)
+    machine: dict[str, Any] | None = None
+    calls: list[tuple[str, str, dict[str, Any] | None]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal machine
+        body = json.loads(request.content) if request.content else None
+        calls.append((request.method, request.url.path, body))
+        path = request.url.path
+        if path.endswith("/machines") and request.method == "GET":
+            return httpx.Response(200, json=[] if machine is None else [machine], request=request)
+        if path.endswith("/machines") and request.method == "POST":
+            machine = {
+                "id": "revoker-machine-id",
+                "instance_id": "01JREVOCATION",
+                "state": "started",
+                **body,
+            }
+            return httpx.Response(201, json=machine, request=request)
+        if path.endswith("/wait"):
+            assert dict(request.url.params) == {
+                "state": "stopped",
+                "instance_id": "01JREVOCATION",
+                "timeout": "30",
+            }
+            return httpx.Response(200, json={"ok": True}, request=request)
+        if path.endswith("/revoker-machine-id") and request.method == "GET":
+            assert machine is not None
+            observed = {
+                **machine,
+                "state": "stopped",
+                "events": [{"type": "exit", "request": {"exit_event": exit_event}}],
+            }
+            return httpx.Response(200, json=observed, request=request)
+        if path.endswith("/revoker-machine-id") and request.method == "DELETE":
+            assert dict(request.url.params) == {"force": "true"}
+            machine = None
+            return httpx.Response(204, request=request)
+        raise AssertionError(f"unexpected Fly call: {request.method} {request.url}")
+
+    state = _provisioner(handler).revoke_google_secret(app, transaction_id)
+
+    assert state is expected
+    payload = next(
+        body
+        for method, path, body in calls
+        if method == "POST" and path.endswith("/machines")
+    )
+    assert payload == {
+        "name": f"abrolia-google-revoker-{transaction_id[:12]}",
+        "region": "ams",
+        "skip_service_registration": True,
+        "config": {
+            "image": IMAGE,
+            "init": {"exec": ["hermes-cloud", "revoke-google-grant"]},
+            "auto_destroy": False,
+            "metadata": {
+                "abrolia_managed": "true",
+                "abrolia_google_revoke": transaction_id,
+                "fly_platform_version": "v2",
+                "fly_process_group": "google-revoker",
+            },
+            "guest": {"cpu_kind": "shared", "cpus": 1, "memory_mb": 256},
+            "restart": {"policy": "no"},
+        },
+    }
+    encoded = json.dumps(payload)
+    assert "ABROLIA_GMAIL_OAUTH_GRANT" not in encoded
+    assert "refresh" not in encoded
+    assert "mounts" not in encoded
+    deleted = any(method == "DELETE" for method, _path, _body in calls)
+    assert deleted is (expected is InspectState.ABSENT)
+
+
+def test_ephemeral_google_revoker_wait_timeout_is_unknown() -> None:
+    transaction_id = "b" * 32
+    app = FlyRuntimeProvisioner.stable_app_name(_spec().household_id)
+    desired = _provisioner(lambda request: httpx.Response(500, request=request))
+    machine = {
+        "id": "revoker-machine-id",
+        "instance_id": "01JREVOCATION",
+        "state": "started",
+        **desired._google_revoker_payload(transaction_id),
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/machines"):
+            return httpx.Response(200, json=[machine], request=request)
+        if request.url.path.endswith("/wait"):
+            return httpx.Response(408, json={}, request=request)
+        raise AssertionError(f"unexpected Fly call: {request.method} {request.url}")
+
+    assert (
+        _provisioner(handler).revoke_google_secret(app, transaction_id)
+        is InspectState.UNKNOWN
+    )
+
+
 def test_fly_secret_sink_uses_stdin_only_and_redacts_failures() -> None:
     calls: list[dict[str, Any]] = []
 

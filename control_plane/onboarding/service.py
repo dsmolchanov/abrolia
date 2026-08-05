@@ -43,6 +43,7 @@ class OnboardingService:
         *,
         runtime_provider: str = "dry-run-runtime",
         email_provider: str = "fake-email",
+        gmail_provider: str | None = None,
         byo_domain_provider: str | None = None,
         allow_real_email_domains: bool = False,
         email_identities: EmailIdentityService | None = None,
@@ -52,6 +53,7 @@ class OnboardingService:
         self.jobs = jobs
         self.runtime_provider = runtime_provider
         self.email_provider = email_provider
+        self.gmail_provider = gmail_provider or email_provider
         self.byo_domain_provider = byo_domain_provider or email_provider
         self.allow_real_email_domains = allow_real_email_domains
         self.email_identities = email_identities
@@ -244,6 +246,8 @@ class OnboardingService:
     def _provider_for(self, kind: StepKind, selection_kind: str) -> str:
         if kind is StepKind.EMAIL and selection_kind == "family_domain":
             return self.byo_domain_provider
+        if kind is StepKind.EMAIL and selection_kind == "gmail_agent":
+            return self.gmail_provider
         return {
             StepKind.EMAIL: self.email_provider,
             StepKind.WHATSAPP: "fake-whatsapp",

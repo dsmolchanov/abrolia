@@ -29,6 +29,11 @@ from control_plane.privacy.export import (
 )
 from control_plane.privacy.retention import RetentionService
 from control_plane.privacy.runtime import PrivateRuntimeDsarClient
+from control_plane.providers.email.google_oauth import (
+    GoogleOAuthClient,
+    GoogleOAuthProvisioner,
+    GoogleOAuthService,
+)
 from control_plane.provisioning.bootstrap import BootstrapService
 from control_plane.provisioning.fakes import synthetic_provider_registry
 from control_plane.provisioning.planner import DesiredSpecPlanner
@@ -61,6 +66,7 @@ class ControlPlaneContainer:
     configs: ConfigRepository
     email_identities: EmailIdentityRepository
     email_identity_service: EmailIdentityService
+    google_oauth: GoogleOAuthService
     sessions: SessionService
     magic_links: MagicLinkService
     account_service: AccountService
@@ -106,22 +112,44 @@ class ControlPlaneContainer:
         magic_links = MagicLinkService(auth, mailer or MemoryMailer(), config.public_origin)
         account_service = AccountService(auth, accounts, households, sessions)
         household_service = HouseholdService(households)
+        rate_limiter = RateLimiter(database, lookup)
+        providers = synthetic_provider_registry()
+        fly_provider = None
+        if config.runtime_provider == "fly-runtime":
+            from control_plane.provisioning.fly import FlyRuntimeProvisioner
+
+            fly_provider = FlyRuntimeProvisioner.from_config(config)
+            providers.register("fly-runtime", fly_provider)
+            secret_sink = FlySecretSink()
+        else:
+            secret_sink = InMemorySecretSink()
+        google_client = (
+            GoogleOAuthClient(
+                client_id=config.google_oauth_client_id,
+                client_secret=config.google_oauth_client_secret,
+            )
+            if config.google_oauth_client_id and config.google_oauth_client_secret
+            else None
+        )
+        google_oauth = GoogleOAuthService(
+            config=config,
+            client=google_client,
+            identities=email_identities,
+            accounts=accounts,
+            jobs=jobs,
+            secret_sink=secret_sink,
+            token_hasher=token_hasher,
+        )
+        google_provider = GoogleOAuthProvisioner(google_oauth)
+        providers.register("google-oauth", google_provider)
         onboarding = OnboardingService(
             households,
             onboarding_repository,
             jobs,
             runtime_provider=config.runtime_provider,
+            gmail_provider="google-oauth",
             email_identities=email_identity_service,
         )
-        rate_limiter = RateLimiter(database, lookup)
-        providers = synthetic_provider_registry()
-        if config.runtime_provider == "fly-runtime":
-            from control_plane.provisioning.fly import FlyRuntimeProvisioner
-
-            providers.register("fly-runtime", FlyRuntimeProvisioner.from_config(config))
-            secret_sink = FlySecretSink()
-        else:
-            secret_sink = InMemorySecretSink()
         planner = DesiredSpecPlanner(accounts, households, onboarding_repository, configs)
         worker = ProvisioningWorker(
             jobs=jobs,
@@ -138,10 +166,11 @@ class ControlPlaneContainer:
         )
         bootstrap = BootstrapService(configs, onboarding_repository, jobs)
         runtime_boundary = (
-            PrivateRuntimeDsarClient(token_hasher)
-            if config.runtime_provider == "fly-runtime"
-            else None
+            PrivateRuntimeDsarClient(token_hasher) if config.runtime_provider == "fly-runtime" else None
         )
+        if runtime_boundary is not None:
+            google_provider.revoker = runtime_boundary
+            google_provider.namespace_revoker = fly_provider
         if runtime_exporter is None:
             runtime_exporter = (
                 SyntheticRuntimeExporter()
@@ -185,6 +214,7 @@ class ControlPlaneContainer:
             configs,
             email_identities,
             email_identity_service,
+            google_oauth,
             sessions,
             magic_links,
             account_service,

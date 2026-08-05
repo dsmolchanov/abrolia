@@ -92,6 +92,11 @@ if (page === "onboarding") {
     const dnsRecords = document.querySelector("#dns-records");
     const dnsStatusPanel = document.querySelector("#dns-status-panel");
     const dnsRecordStatus = document.querySelector("#dns-record-status");
+    const googlePanel = document.querySelector("#google-oauth-panel");
+    const googleConnect = document.querySelector("#google-connect");
+    const googleConfirm = document.querySelector("#google-confirm");
+    const googleConfirmLabel = document.querySelector("#google-confirm-label");
+    const googleConnected = document.querySelector("#google-connected");
     const labels = {
       available: ["Ready", "Choose an option to continue."],
       selected: ["Selection saved", "The durable worker will begin this setup."],
@@ -131,6 +136,16 @@ if (page === "onboarding") {
       return item;
     }));
     dnsStatusPanel.hidden = Object.keys(recordStatus).length === 0;
+    const googleState = current?.public_status?.state;
+    const callbackConfirmed = new URLSearchParams(window.location.search).get("google") === "confirm";
+    googlePanel.hidden = !["oauth_required", "dedicated_account_confirmation"].includes(googleState)
+      && !callbackConfirmed;
+    googleConnect.hidden = googleState !== "oauth_required" || callbackConfirmed;
+    googleConfirm.hidden = googleState !== "dedicated_account_confirmation" && !callbackConfirmed;
+    googleConfirmLabel.hidden = googleConfirm.hidden;
+    const maskedAddress = current?.public_status?.connected_address_masked;
+    googleConnected.hidden = !maskedAddress;
+    if (maskedAddress) googleConnected.querySelector("strong").textContent = maskedAddress;
     retry.hidden = workflowOwnsView || current?.status !== "failed";
     retry.dataset.kind = current?.kind || "";
     check.hidden = workflowOwnsView || current?.status !== "waiting_user";
@@ -246,6 +261,31 @@ if (page === "onboarding") {
     event.preventDefault();
     command(`/api/v1/onboarding/reset/${button.dataset.reset}`);
   }));
+  document.querySelector("#google-connect")?.addEventListener("click", async () => {
+    const status = document.querySelector("#google-status");
+    status.textContent = "Opening Google's secure authorization page…";
+    try {
+      const response = await fetch("/api/v1/email/google/start", {
+        method: "POST",
+        headers: commandHeaders(state.version),
+      });
+      if (!response.ok) throw new Error("unavailable");
+      const result = await response.json();
+      window.location.assign(result.authorization_url);
+    } catch (_error) {
+      status.textContent = "Google connection is unavailable for this account.";
+    }
+  });
+  document.querySelector("#google-confirm")?.addEventListener("click", async () => {
+    const checkbox = document.querySelector("#google-dedicated");
+    const status = document.querySelector("#google-status");
+    if (!checkbox.checked) {
+      status.textContent = "Confirm that this is a separate agent mailbox.";
+      return;
+    }
+    await command("/api/v1/email/google/confirm", {dedicated_mailbox: true});
+    history.replaceState(null, "", "/onboarding");
+  });
   refreshDomainGuidance();
   refresh();
   window.setInterval(() => {

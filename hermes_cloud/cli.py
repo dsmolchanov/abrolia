@@ -13,6 +13,8 @@ import os
 import sys
 from pathlib import Path
 
+import httpx
+
 from hermes_cloud.channels.console import ConsoleTransport
 from hermes_cloud.channels.telegram import TelegramTransport
 from hermes_cloud.core.approvals import ApprovalStore
@@ -617,6 +619,33 @@ def cmd_bootstrap(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_revoke_google_grant(_args: argparse.Namespace) -> int:
+    """Revoke the staged Gmail refresh grant without exposing secret material."""
+
+    raw = os.environ.get("ABROLIA_GMAIL_OAUTH_GRANT", "")
+    try:
+        payload = json.loads(raw)
+        credential = payload["refresh_credential"]
+        if not isinstance(payload, dict) or not isinstance(credential, str) or not credential:
+            raise ValueError
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        print("Google revoke failed (configuration)", file=sys.stderr)
+        return 2
+    try:
+        response = httpx.post(
+            "https://oauth2.googleapis.com/revoke",
+            params={"token": credential},
+            timeout=20.0,
+        )
+    except (httpx.TimeoutException, httpx.TransportError):
+        print("Google revoke failed (network)", file=sys.stderr)
+        return 3
+    if response.status_code in {200, 400}:
+        return 0
+    print("Google revoke failed (provider)", file=sys.stderr)
+    return 4
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="hermes-cloud", description=__doc__)
     parser.add_argument("--db", help=f"путь к базе (иначе ${DB_ENV} или {DEFAULT_DB_PATH})")
@@ -714,6 +743,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     bootstrap.add_argument("--timeout", type=float, default=20.0)
     bootstrap.set_defaults(func=cmd_bootstrap)
+
+    revoke_google = commands.add_parser(
+        "revoke-google-grant", help="отозвать staged Gmail OAuth grant"
+    )
+    revoke_google.set_defaults(func=cmd_revoke_google_grant)
     return parser
 
 

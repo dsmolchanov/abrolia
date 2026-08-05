@@ -669,6 +669,14 @@ flags остаются false до provider-specific gates.
 
 ### Phase 2.7 — Google OAuth control-plane flow
 
+#### Status — automated implementation complete (2026-08-05)
+
+- PKCE/state/session/household/workflow binding, exact scopes, dedicated mailbox
+  confirmation, immediate SecretSink handoff, replay rejection and allowlisted
+  policy gates are implemented.
+- Runtime-first revoke and late-callback rejection are implemented; live Google
+  test-user connect/revoke remains the manual staging gate.
+
 #### Files
 
 - Add `control_plane/providers/email/google_oauth.py`.
@@ -702,6 +710,13 @@ flags остаются false до provider-specific gates.
 
 ### Phase 2.8 — Gmail History ingest and Gmail API send
 
+#### Status — automated implementation complete (2026-08-05)
+
+- Encrypted grant rotation, initial History baseline, INBOX-only ingestion,
+  append-before-cursor acknowledgement, bounded resync, health taxonomy and
+  exact Sent Message-ID reconciliation are implemented and hermetically tested.
+- Real Gmail quota/cursor/restart smoke remains manual and opt-in.
+
 #### Files
 
 - Add `hermes_cloud/ingest/gmail_api.py`.
@@ -731,6 +746,19 @@ flags остаются false до provider-specific gates.
 - Refresh/access tokens never reach volume plaintext, logs or exception text.
 
 ### Phase 2.9 — UI activation, lifecycle, observability and rollout
+
+#### Status — automated implementation complete (2026-08-05)
+
+- Contextual OAuth UI, dual-check activation receipts, runtime Gmail health,
+  reconnect/reset cleanup, runtime-first revoke/delete, DSAR classification and
+  independent rollout gates/runbook are implemented.
+- Disconnect before the household runtime Machine exists uses a deterministic
+  one-shot Fly revoker Machine: the pinned runtime image inherits the app secret,
+  mounts no volume or service, and cleanup proceeds only after a trusted exit-0
+  event proves Google revoke (HTTP 400 is treated as already revoked). Timeout,
+  config drift, non-zero exit and unverifiable cleanup remain fail-closed.
+- Cross-provider staging, backup/restore and policy evidence checks remain manual
+  release gates and are not claimed by the automated suite.
 
 #### Files
 
