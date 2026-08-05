@@ -118,6 +118,29 @@ prefix scans.
 
 ## Bootstrap and readiness
 
+Managed Nerve email has a separate attachment-readiness gate. Provisioning
+creates the household org, domain grant, inbox, runtime key and signed webhook,
+then probes `GET /internal/feature-flags/attachments` with that household key.
+The email step remains `waiting_user` with
+`readiness=attachments_flag_pending` until the effective response is exactly
+`enabled=true` for the expected Nerve org. A timeout, 5xx, malformed response,
+wrong org, or disabled value never marks the household ready.
+
+The operator takes `nerve_org_id` from the redacted step status and runs the
+existing audited writer inside the Nerve control-plane Machine:
+
+```bash
+flyctl ssh console --app nerve-control-plane --command \
+  'env NERVE_FLAGS_ACTOR=<operator-id> /app/nerve-flags set attachments --org <nerve-org-uuid> --enabled=true'
+```
+
+Record the returned `replay_id`. Wait at least 65 seconds (`2 x 30s` cache TTL
+plus margin), then use the onboarding **Check** action. Check recovers the
+one-time household credentials, repeats the effective-state probe as the
+household principal, and completes the step only after convergence. Do not use
+the bootstrap admin credential to bypass this probe, and do not enable the
+global default.
+
 The control plane stages `HERMES_BOOTSTRAP_TOKEN` into the expected runtime
 namespace. The runtime uses it as a bearer credential for two calls:
 

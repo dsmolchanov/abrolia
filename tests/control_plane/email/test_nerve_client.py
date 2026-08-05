@@ -81,3 +81,63 @@ def test_client_preserves_bounded_rate_limit_hint() -> None:
         client.ensure_org(household_id="household-1")
 
     assert raised.value.retry_after == 7
+
+
+@pytest.mark.parametrize("enabled", (False, True))
+def test_client_probes_exact_household_attachment_contract(enabled: bool) -> None:
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(
+            method=request.method,
+            path=request.url.path,
+            runtime_key=request.headers.get("X-Nerve-Cloud-Key"),
+            admin_key=request.headers.get("X-API-Key"),
+        )
+        return httpx.Response(
+            200,
+            json={
+                "flag": "attachments",
+                "org_id": "household-org",
+                "enabled": enabled,
+                "cache_ttl_seconds": 30,
+            },
+        )
+
+    assert (
+        _client(handler).attachment_feature_enabled(
+            api_key="synthetic-runtime-key", expected_org_id="household-org"
+        )
+        is enabled
+    )
+    assert captured == {
+        "method": "GET",
+        "path": "/internal/feature-flags/attachments",
+        "runtime_key": "synthetic-runtime-key",
+        "admin_key": None,
+    }
+
+
+@pytest.mark.parametrize(
+    "response",
+    (
+        httpx.Response(503),
+        httpx.Response(
+            200,
+            json={
+                "flag": "attachments",
+                "org_id": "another-org",
+                "enabled": True,
+                "cache_ttl_seconds": 30,
+            },
+        ),
+        httpx.Response(200, content=b"not-json"),
+    ),
+)
+def test_client_attachment_probe_failures_never_report_ready(response) -> None:
+    client = _client(lambda request: response)
+
+    with pytest.raises(OutcomeUnknown):
+        client.attachment_feature_enabled(
+            api_key="synthetic-runtime-key", expected_org_id="household-org"
+        )

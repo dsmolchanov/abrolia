@@ -12,11 +12,16 @@ from control_plane.provisioning.contracts import (
     InspectState,
     OutcomeUnknown,
     ProviderRejected,
+    ProviderWaiting,
     ProvisionResult,
 )
 
 NERVE_SECRET_BINDING = "ABROLIA_NERVE_EMAIL_CREDENTIALS"
 NERVE_SCOPES = ("nerve:email.read", "nerve:email.send")
+
+
+class AttachmentFlagPending(ProviderWaiting):
+    code = "nerve_attachment_flag_pending"
 
 
 @dataclass(frozen=True)
@@ -56,6 +61,42 @@ class NerveManagedEmailProvisioner:
         if len(matches) > 1:
             raise ProviderRejected("Nerve returned duplicate managed resources")
         return matches[0] if matches else None
+
+    @staticmethod
+    def _identity_id(stable_ref: str) -> str | None:
+        parts = stable_ref.split(":")
+        if len(parts) != 5 or parts[1] != "email_identity":
+            return None
+        return parts[2]
+
+    @staticmethod
+    def _pending(refs: _Refs) -> AttachmentFlagPending:
+        return AttachmentFlagPending(
+            "Nerve attachments must be activated for this household",
+            external_ref=refs.encode(),
+            public_result={
+                "readiness": "attachments_flag_pending",
+                "nerve_org_id": refs.org_id,
+                "operator_action": {
+                    "tool": "nerve-flags",
+                    "arguments": [
+                        "set",
+                        "attachments",
+                        "--org",
+                        refs.org_id,
+                        "--enabled=true",
+                    ],
+                    "audit_actor_required": True,
+                },
+                "next_action": "enable the flag, wait for convergence, then check again",
+            },
+        )
+
+    def _probe_or_wait(self, refs: _Refs, api_key: str) -> None:
+        if not self.client.attachment_feature_enabled(
+            api_key=api_key, expected_org_id=refs.org_id
+        ):
+            raise self._pending(refs)
 
     def ensure(self, intent: dict[str, Any], idempotency_key: str) -> ProvisionResult:
         parsed = EmailProvisionIntent.model_validate(intent)
@@ -110,6 +151,7 @@ class NerveManagedEmailProvisioner:
         )
         if not all((refs.grant_id, refs.inbox_id, refs.key_id, refs.webhook_id)):
             raise OutcomeUnknown("Nerve resource identity is incomplete")
+        self._probe_or_wait(refs, str(key["key"]))
         bundle = json.dumps(
             {"api_key": key["key"], "webhook_signing_key": webhook["secret"]},
             sort_keys=True,
@@ -152,15 +194,16 @@ class NerveManagedEmailProvisioner:
         if stable_ref.startswith("{"):
             refs = _Refs.decode(stable_ref)
             org = self.client.get_org(household_id=refs.household_id)
-            return (
-                InspectResult(InspectState.READY, self._result(refs))
-                if org.get("org_id") == refs.org_id
-                else InspectResult(InspectState.ABSENT)
-            )
-        parts = stable_ref.split(":")
-        if len(parts) != 5 or parts[1] != "email_identity":
+            if org.get("org_id") != refs.org_id:
+                return InspectResult(InspectState.ABSENT)
+            identity_id = self._identity_id(refs.stable_ref)
+            if identity_id is None:
+                return InspectResult(InspectState.UNKNOWN)
+            return self._recover_and_probe(refs, identity_id)
+        identity_id = self._identity_id(stable_ref)
+        if identity_id is None:
             return InspectResult(InspectState.UNKNOWN)
-        household_id, _, identity_id, _, _ = parts
+        household_id = stable_ref.split(":", 1)[0]
         org = self.client.get_org(household_id=household_id)
         org_id = str(org.get("org_id", ""))
         if not org_id:
@@ -186,28 +229,58 @@ class NerveManagedEmailProvisioner:
         )
         if not all((grant, inbox, key, webhook)):
             return InspectResult(InspectState.UNKNOWN)
-        self.client.delete(f"/v1/keys/{key['id']}", org_id=org_id)
-        recovered_key = self.client.issue_key(
-            org_id=org_id,
-            external_ref=f"{self._resource_ref(identity_id, 'key')}:recovery",
-        )
-        rotated = self.client.rotate_webhook(
-            org_id=org_id, webhook_id=str(webhook["id"])
-        )
-        if not recovered_key.get("key") or not rotated.get("secret"):
-            return InspectResult(
-                InspectState.UNKNOWN, error_code="credential_recovery_unknown"
-            )
         refs = _Refs(
             household_id=household_id,
             stable_ref=stable_ref,
             org_id=org_id,
             grant_id=str(grant["id"]),
             inbox_id=str(inbox["id"]),
-            key_id=str(recovered_key["id"]),
+            key_id=str(key["id"]),
             webhook_id=str(webhook["id"]),
             address=str(inbox["address"]),
         )
+        return self._recover_and_probe(refs, identity_id)
+
+    def _recover_and_probe(self, refs: _Refs, identity_id: str) -> InspectResult:
+        key_ref = self._resource_ref(identity_id, "key")
+        keys = self.client.list_keys(org_id=refs.org_id)
+        key = self._one(keys, key_ref) or self._one(keys, f"{key_ref}:recovery")
+        webhook = self._one(
+            self.client.list_webhooks(org_id=refs.org_id),
+            self._resource_ref(identity_id, "webhook"),
+        )
+        if key is None or webhook is None:
+            return InspectResult(InspectState.UNKNOWN)
+        self.client.delete(f"/v1/keys/{key['id']}", org_id=refs.org_id)
+        recovered_key = self.client.issue_key(
+            org_id=refs.org_id, external_ref=f"{key_ref}:recovery",
+        )
+        rotated = self.client.rotate_webhook(
+            org_id=refs.org_id, webhook_id=str(webhook["id"])
+        )
+        if not recovered_key.get("key") or not rotated.get("secret"):
+            return InspectResult(
+                InspectState.UNKNOWN, error_code="credential_recovery_unknown"
+            )
+        recovered_refs = _Refs(
+            household_id=refs.household_id,
+            stable_ref=refs.stable_ref,
+            org_id=refs.org_id,
+            grant_id=refs.grant_id,
+            inbox_id=refs.inbox_id,
+            key_id=str(recovered_key["id"]),
+            webhook_id=str(webhook["id"]),
+            address=refs.address,
+        )
+        if not self.client.attachment_feature_enabled(
+            api_key=str(recovered_key["key"]), expected_org_id=refs.org_id
+        ):
+            pending = self._pending(recovered_refs)
+            return InspectResult(
+                InspectState.PENDING,
+                error_code=pending.code,
+                public_result=pending.public_result,
+            )
         bundle = json.dumps(
             {
                 "api_key": recovered_key["key"],
@@ -216,12 +289,24 @@ class NerveManagedEmailProvisioner:
             sort_keys=True,
             separators=(",", ":"),
         )
-        return InspectResult(InspectState.READY, self._result(refs, secret=bundle))
+        return InspectResult(
+            InspectState.READY, self._result(recovered_refs, secret=bundle)
+        )
 
     def deprovision(self, external_ref: str) -> InspectResult:
         refs = _Refs.decode(external_ref)
+        identity_id = self._identity_id(refs.stable_ref)
         self.client.delete(f"/v1/webhooks/{refs.webhook_id}", org_id=refs.org_id)
-        self.client.delete(f"/v1/keys/{refs.key_id}", org_id=refs.org_id)
+        key_ids = {refs.key_id}
+        if identity_id is not None:
+            key_ref = self._resource_ref(identity_id, "key")
+            key_ids.update(
+                str(item["id"])
+                for item in self.client.list_keys(org_id=refs.org_id)
+                if item.get("external_ref") in {key_ref, f"{key_ref}:recovery"}
+            )
+        for key_id in sorted(key_ids):
+            self.client.delete(f"/v1/keys/{key_id}", org_id=refs.org_id)
         self.client.delete(f"/v1/inboxes/{refs.inbox_id}", org_id=refs.org_id)
         self.client.delete(f"/v1/domain-grants/{refs.grant_id}")
         self.client.delete(f"/v1/orgs/{refs.org_id}")
