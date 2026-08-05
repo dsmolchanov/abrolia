@@ -78,10 +78,16 @@ DNS acceptance matrix.
   the complete Go suite. Main `99092688c3213af3cf7dc8e72cc28bd89983f6a1`
   is deployed as production release 69 on image digest
   `sha256:7406baea1ea524f0b9de43ff4e5d40ae9d407f3e316f70f10dafa44851229d08`.
+- PR #22 makes runtime cleanup ignore Fly's historical `destroyed` Machine
+  records so exact volume deletion can proceed. Current main
+  `168d25c20c27b80bcda031210c40f41751a2c7b4` is deployed as production
+  release 16 on image digest
+  `sha256:2aa6100eda56f3cce124e4cf928519b3ca1fee74d6b8a66d317b71868604c92f`.
 - Post-deploy `/healthz` and the Fly service check pass. Generation B remains
   `verified`. `/readyz` remains 503 solely because the previously documented
   cleanup job `6a0d040d-bfb9-4671-b2c5-e6ee681bdc6b` is still
-  `outcome_unknown`; this predates and is independent of the email release.
+  `outcome_unknown`; the fix is deployed, but this quarantined job requires an
+  explicit operator reconcile and predates the email release.
 - No authoritative DNS credential is present in the local environment,
   repository secrets, Abrolia Fly secrets, or the available Route 53 account.
   The visible operator-owned domains use third-party authoritative name
@@ -315,7 +321,7 @@ not a reason to weaken the current reserved set.
 | Nerve production release 68 | **pass** — digest-pinned image, service check healthy |
 | Nerve PR #67 and production release 69 | **pass** — cross-org service-token request denied, own-org request preserved; immutable digest healthy |
 | Abrolia PR #21 CI | **pass** — complete non-live suite, lint, fixtures, contracts and secret scan |
-| Abrolia production release 15 | **pass** — immutable digest deployed, Fly service check and `/healthz` healthy; generation B remains verified |
+| Abrolia production release 16 | **pass** — current main including PRs #21–#23 is deployed on an immutable digest; Fly service check and `/healthz` are healthy; generation B remains verified |
 | Managed generation A cleanup and old replay | **pass** — empty diagnostic orphan tombstoned; delayed generation-A ensure returned 409 |
 | Managed generation B reconnect | **pass** — fresh identity/org/inbox verified at workflow version 17 |
 | Logout/login/two reloads/logout | **pass** — 200, stable verified state, 204, then 401 |
