@@ -874,7 +874,14 @@ class FlyRuntimeProvisioner:
         try:
             if self._get_app(target.app_ref) is None:
                 return InspectResult(InspectState.ABSENT)
-            machines = self._machines(target.app_ref)
+            # Fly retains destroyed Machines in the list API as historical
+            # records. They no longer own runtime state and must not block the
+            # following volume deletion forever.
+            machines = [
+                item
+                for item in self._machines(target.app_ref)
+                if str(item.get("state", "")).lower() != "destroyed"
+            ]
             owned_machines = [
                 item
                 for item in machines
@@ -901,7 +908,11 @@ class FlyRuntimeProvisioner:
                 )
             if self._get_app(target.app_ref) is None:
                 return InspectResult(InspectState.ABSENT)
-            remaining_machines = self._machines(target.app_ref)
+            remaining_machines = [
+                item
+                for item in self._machines(target.app_ref)
+                if str(item.get("state", "")).lower() != "destroyed"
+            ]
             if owned_machines and any(
                 item.get("id") in {owned.get("id") for owned in owned_machines}
                 for item in remaining_machines

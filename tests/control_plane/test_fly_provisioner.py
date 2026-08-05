@@ -559,6 +559,67 @@ def test_runtime_deprovision_preserves_app_secret_namespace() -> None:
     ]
 
 
+def test_runtime_deprovision_ignores_historical_destroyed_machine() -> None:
+    app_ref = FlyRuntimeProvisioner.stable_app_name(_spec().household_id)
+    volume_present = True
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal volume_present
+        seen.append(request)
+        path = request.url.path
+        if path.endswith("/machines"):
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": "machine-synthetic",
+                        "name": "abrolia-runtime",
+                        "state": "destroyed",
+                    }
+                ],
+                request=request,
+            )
+        if path.endswith("/volumes"):
+            payload = (
+                [
+                    {
+                        "id": "vol-synthetic",
+                        "name": "abrolia_data",
+                        "region": "ams",
+                        "encrypted": True,
+                    }
+                ]
+                if volume_present
+                else []
+            )
+            return httpx.Response(200, json=payload, request=request)
+        if path.endswith("/volumes/vol-synthetic") and request.method == "DELETE":
+            volume_present = False
+            return httpx.Response(204, request=request)
+        if path == f"/v1/apps/{app_ref}":
+            return httpx.Response(200, json={"name": app_ref}, request=request)
+        raise AssertionError(f"unexpected Fly call: {request.method} {path}")
+
+    result = _provisioner(handler).deprovision_runtime(
+        {
+            "app_ref": app_ref,
+            "machine_ref": "machine-synthetic",
+            "volume_ref": "vol-synthetic",
+        }
+    )
+
+    assert result.state is InspectState.ABSENT
+    assert not any(
+        request.method == "DELETE" and "/machines/" in request.url.path
+        for request in seen
+    )
+    assert any(
+        request.method == "DELETE" and request.url.path.endswith("/volumes/vol-synthetic")
+        for request in seen
+    )
+
+
 def test_inspect_and_deprovision_do_not_claim_unknown_cleanup_complete() -> None:
     spec = _spec()
     fly = StatefulFly()
