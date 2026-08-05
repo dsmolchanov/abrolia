@@ -11,7 +11,10 @@ from control_plane.email.models import (
     EmailOption,
     EmailProvisionIntent,
 )
-from control_plane.providers.email.nerve_client import NerveAdminClient
+from control_plane.providers.email.nerve_client import (
+    NerveAdminClient,
+    email_org_external_ref,
+)
 from control_plane.providers.email.nerve_managed import (
     NERVE_SCOPES,
     NERVE_SECRET_BINDING,
@@ -37,6 +40,7 @@ class _ByoRefs:
     key_id: str = ""
     webhook_id: str = ""
     address: str = ""
+    org_external_ref: str = ""
 
     def encode(self) -> str:
         return json.dumps(self.__dict__, sort_keys=True, separators=(",", ":"))
@@ -98,7 +102,13 @@ class NerveByoDomainProvisioner:
             str(parsed.selection.get("domain", "")),
             str(parsed.selection.get("local_part", "")),
         )
-        org = self.client.ensure_org(household_id=parsed.household_id)
+        org_external_ref = email_org_external_ref(
+            parsed.household_id, parsed.identity_id
+        )
+        org = self.client.ensure_org(
+            household_id=parsed.household_id,
+            identity_id=parsed.identity_id,
+        )
         org_id = str(org.get("org_id", ""))
         if not org_id:
             raise OutcomeUnknown("Nerve org identity is missing")
@@ -119,6 +129,7 @@ class NerveByoDomainProvisioner:
             domain_id=domain_id,
             domain=domain,
             address=f"{local_part}@{domain}",
+            org_external_ref=org_external_ref,
         )
         return refs, domain_result, dns
 
@@ -249,7 +260,9 @@ class NerveByoDomainProvisioner:
         if not stable_ref.startswith("{"):
             return InspectResult(InspectState.UNKNOWN)
         refs = _ByoRefs.decode(stable_ref)
-        org = self.client.get_org(household_id=refs.household_id)
+        if not refs.org_external_ref:
+            return InspectResult(InspectState.UNKNOWN)
+        org = self.client.get_org(external_ref=refs.org_external_ref)
         return (
             InspectResult(InspectState.READY)
             if org.get("org_id") == refs.org_id

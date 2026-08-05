@@ -37,7 +37,6 @@ def test_production_defaults_are_visibly_synthetic_and_real_providers_off() -> N
     [
         ("ABROLIA_SYNTHETIC_ONLY", "0"),
         ("REAL_FAMILY_DATA_ENABLED", "1"),
-        ("ABROLIA_REAL_EMAIL_ENABLED", "1"),
         ("ABROLIA_REAL_WHATSAPP_ENABLED", "1"),
         ("ABROLIA_REAL_CHANNEL_ENABLED", "1"),
     ],
@@ -47,6 +46,65 @@ def test_phase_one_real_data_and_provider_flags_fail_closed(
 ) -> None:
     with pytest.raises(ConfigurationError, match="Phase 1|real provider"):
         ControlPlaneConfig.from_env(_production_env(**{name: value}))
+
+
+def test_real_email_requires_complete_https_nerve_config_and_allowlist() -> None:
+    with pytest.raises(ConfigurationError, match="complete Nerve"):
+        ControlPlaneConfig.from_env(
+            _production_env(ABROLIA_REAL_EMAIL_ENABLED="1")
+        )
+    with pytest.raises(ConfigurationError, match="HTTPS"):
+        ControlPlaneConfig.from_env(
+            _production_env(
+                ABROLIA_REAL_EMAIL_ENABLED="1",
+                ABROLIA_REAL_EMAIL_HOUSEHOLD_ALLOWLIST=(
+                    "10000000-0000-4000-8000-000000000001"
+                ),
+                ABROLIA_NERVE_BASE_URL="http://nerve.example.test",
+                ABROLIA_NERVE_ADMIN_KEY="synthetic-admin-key",
+                ABROLIA_NERVE_PLATFORM_ORG_ID="20000000-0000-4000-8000-000000000001",
+                ABROLIA_NERVE_PLATFORM_DOMAIN_ID="30000000-0000-4000-8000-000000000001",
+            )
+        )
+    with pytest.raises(ConfigurationError, match="allowlist"):
+        ControlPlaneConfig.from_env(
+            _production_env(
+                ABROLIA_REAL_EMAIL_ENABLED="1",
+                ABROLIA_NERVE_BASE_URL="https://nerve.example.test",
+                ABROLIA_NERVE_ADMIN_KEY="synthetic-admin-key",
+                ABROLIA_NERVE_PLATFORM_ORG_ID="20000000-0000-4000-8000-000000000001",
+                ABROLIA_NERVE_PLATFORM_DOMAIN_ID="30000000-0000-4000-8000-000000000001",
+            )
+        )
+
+
+def test_real_email_config_is_independent_from_real_family_data_gate() -> None:
+    household_id = "10000000-0000-4000-8000-000000000001"
+    config = ControlPlaneConfig.from_env(
+        _production_env(
+            ABROLIA_REAL_EMAIL_ENABLED="1",
+            ABROLIA_REAL_EMAIL_HOUSEHOLD_ALLOWLIST=household_id,
+            ABROLIA_NERVE_BASE_URL="https://nerve.example.test",
+            ABROLIA_NERVE_ADMIN_KEY="synthetic-admin-key",
+            ABROLIA_NERVE_PLATFORM_ORG_ID="20000000-0000-4000-8000-000000000001",
+            ABROLIA_NERVE_PLATFORM_DOMAIN_ID="30000000-0000-4000-8000-000000000001",
+        )
+    )
+
+    assert config.synthetic_only
+    assert not config.real_family_data_enabled
+    assert config.real_email_enabled
+    assert config.real_email_household_allowlist == frozenset({household_id})
+    assert "synthetic-admin-key" not in repr(config)
+
+
+def test_real_email_allowlist_rejects_non_uuid_entries() -> None:
+    with pytest.raises(ConfigurationError, match="comma-separated UUIDs"):
+        ControlPlaneConfig.from_env(
+            _production_env(
+                ABROLIA_REAL_EMAIL_HOUSEHOLD_ALLOWLIST="not-a-household-id"
+            )
+        )
 
 
 def test_fly_runtime_requires_all_private_pinned_inputs() -> None:

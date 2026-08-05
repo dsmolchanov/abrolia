@@ -14,6 +14,7 @@ from control_plane.provisioning.contracts import (
     InspectState,
     OutcomeUnknown,
     ProviderRegistry,
+    ProviderRejected,
     ProviderWaiting,
     ProvisionResult,
 )
@@ -41,6 +42,7 @@ class FakeNerveAdmin:
         self.attachment_probe_calls: list[tuple[str, str]] = []
         self.key_calls = 0
         self.deleted: list[tuple[str, str | None]] = []
+        self.org_external_refs: list[str] = []
         self.grants = [
             {"id": GRANT_ID, "external_ref": "arbolia:email:identity-1:grant"}
         ]
@@ -62,10 +64,14 @@ class FakeNerveAdmin:
         items[:] = [item for item in items if item["external_ref"] != value["external_ref"]]
         items.append(value)
 
-    def ensure_org(self, *, household_id):
+    def ensure_org(self, *, household_id, identity_id):
+        self.org_external_refs.append(
+            f"arbolia:household:{household_id}:email:{identity_id}"
+        )
         return {"org_id": ORG_ID}
 
-    def get_org(self, *, household_id):
+    def get_org(self, *, external_ref):
+        self.org_external_refs.append(external_ref)
         return {"org_id": ORG_ID}
 
     def ensure_grant(self, *, org_id, external_ref):
@@ -157,14 +163,87 @@ class LostInboxResponseNerveAdmin(FakeNerveAdmin):
         )
 
 
-def _intent() -> dict:
+class LifecycleNerveAdmin(FakeNerveAdmin):
+    def __init__(self) -> None:
+        super().__init__()
+        self.orgs: dict[str, str] = {}
+        self.tombstoned: set[str] = set()
+
+    def ensure_org(self, *, household_id, identity_id):
+        external_ref = f"arbolia:household:{household_id}:email:{identity_id}"
+        self.org_external_refs.append(external_ref)
+        if external_ref in self.tombstoned:
+            raise ProviderRejected("tombstoned org external ref")
+        if external_ref not in self.orgs:
+            suffix = len(self.orgs) + 1
+            self.orgs[external_ref] = (
+                f"20000000-0000-4000-8000-{suffix:012d}"
+            )
+        return {"org_id": self.orgs[external_ref]}
+
+    def get_org(self, *, external_ref):
+        if external_ref in self.tombstoned or external_ref not in self.orgs:
+            return {}
+        return {"org_id": self.orgs[external_ref]}
+
+    def delete(self, path, *, org_id=None):
+        super().delete(path, org_id=org_id)
+        if path.startswith("/v1/orgs/"):
+            deleted_org_id = path.rsplit("/", 1)[-1]
+            self.tombstoned.update(
+                ref for ref, candidate in self.orgs.items()
+                if candidate == deleted_org_id
+            )
+
+
+def _intent(*, identity_id: str = "identity-1") -> dict:
     return EmailProvisionIntent(
-        identity_id="identity-1",
+        identity_id=identity_id,
         household_id="household-1",
         option=EmailOption.MANAGED_ABROLIA,
         selection={"kind": "abrolia_managed", "local_part": "family-agent"},
         secret_namespace_ref="abrolia-hh-synthetic",
     ).model_dump(mode="json")
+
+
+def test_reconnect_uses_fresh_org_without_resurrecting_tombstone() -> None:
+    client = LifecycleNerveAdmin()
+    provider = NerveManagedEmailProvisioner(client)
+    first_key = "household-1:email_identity:identity-1:abrolia_managed:1"
+    first = provider.ensure(_intent(), first_key)
+
+    assert provider.deprovision(first.external_ref).state is InspectState.ABSENT
+    with pytest.raises(ProviderRejected, match="tombstoned"):
+        provider.ensure(_intent(), first_key)
+
+    second = provider.ensure(
+        _intent(identity_id="identity-2"),
+        "household-1:email_identity:identity-2:abrolia_managed:1",
+    )
+
+    assert second.public_result["provider_subject"] != first.public_result[
+        "provider_subject"
+    ]
+    assert set(client.orgs) == {
+        "arbolia:household:household-1:email:identity-1",
+        "arbolia:household:household-1:email:identity-2",
+    }
+
+
+def test_pre_generation_reference_fails_closed_during_inspection() -> None:
+    client = FakeNerveAdmin()
+    provider = NerveManagedEmailProvisioner(client)
+    result = provider.ensure(
+        _intent(), "household-1:email_identity:identity-1:abrolia_managed:1"
+    )
+    legacy = json.loads(result.external_ref)
+    legacy.pop("org_external_ref")
+
+    inspected = provider.inspect(
+        json.dumps(legacy, sort_keys=True, separators=(",", ":"))
+    )
+
+    assert inspected.state is InspectState.UNKNOWN
 
 
 def test_managed_provider_builds_isolated_resources_and_one_secret_bundle() -> None:
@@ -173,6 +252,9 @@ def test_managed_provider_builds_isolated_resources_and_one_secret_bundle() -> N
         _intent(), "household-1:email_identity:identity-1:abrolia_managed:1"
     )
 
+    assert client.org_external_refs == [
+        "arbolia:household:household-1:email:identity-1"
+    ]
     assert result.public_result["agent_inbox"] == "family-agent@" + "abrolia.com"
     assert result.public_result["granted_scopes"] == [
         "nerve:email.read",

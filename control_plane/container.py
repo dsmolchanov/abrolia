@@ -142,12 +142,45 @@ class ControlPlaneContainer:
         )
         google_provider = GoogleOAuthProvisioner(google_oauth)
         providers.register("google-oauth", google_provider)
+        if config.real_email_enabled:
+            from control_plane.providers.email.nerve_byo_domain import (
+                NerveByoDomainProvisioner,
+            )
+            from control_plane.providers.email.nerve_client import (
+                NerveAdminClient,
+                NerveAdminSettings,
+            )
+            from control_plane.providers.email.nerve_managed import (
+                NerveManagedEmailProvisioner,
+            )
+
+            nerve_client = NerveAdminClient(NerveAdminSettings(
+                base_url=config.nerve_base_url or "",
+                admin_key=config.nerve_admin_key or "",
+                platform_org_id=config.nerve_platform_org_id or "",
+                platform_domain_id=config.nerve_platform_domain_id or "",
+            ))
+            providers.register(
+                "nerve-managed", NerveManagedEmailProvisioner(nerve_client)
+            )
+            providers.register(
+                "nerve-byo-domain", NerveByoDomainProvisioner(nerve_client)
+            )
+        email_provider = "nerve-managed" if config.real_email_enabled else "fake-email"
+        byo_domain_provider = (
+            "nerve-byo-domain" if config.real_email_enabled else "fake-email"
+        )
         onboarding = OnboardingService(
             households,
             onboarding_repository,
             jobs,
             runtime_provider=config.runtime_provider,
             gmail_provider="google-oauth",
+            email_provider=email_provider,
+            byo_domain_provider=byo_domain_provider,
+            allow_real_email_domains=config.real_email_enabled,
+            real_email_enabled=config.real_email_enabled,
+            real_email_household_allowlist=config.real_email_household_allowlist,
             email_identities=email_identity_service,
         )
         planner = DesiredSpecPlanner(accounts, households, onboarding_repository, configs)

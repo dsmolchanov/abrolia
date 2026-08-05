@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import httpx
 import pytest
 
@@ -24,6 +26,12 @@ def _client(handler) -> NerveAdminClient:
         ),
         client=httpx.Client(transport=httpx.MockTransport(handler)),
     )
+
+
+def test_admin_settings_repr_never_contains_bootstrap_secret() -> None:
+    client = _client(lambda request: httpx.Response(200, json={}, request=request))
+
+    assert "synthetic-admin-key" not in repr(client.settings)
 
 
 def test_client_uses_bootstrap_admin_and_exact_platform_grant_contract() -> None:
@@ -53,6 +61,24 @@ def test_client_uses_bootstrap_admin_and_exact_platform_grant_contract() -> None
     }
 
 
+def test_client_scopes_org_identity_to_email_lifecycle() -> None:
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"org_id": "org-1"})
+
+    result = _client(handler).ensure_org(
+        household_id="household-1", identity_id="identity-2"
+    )
+
+    assert result["org_id"] == "org-1"
+    assert captured["body"] == {
+        "name": "Abrolia household household-1",
+        "external_ref": "arbolia:household:household-1:email:identity-2",
+    }
+
+
 @pytest.mark.parametrize(
     ("status", "error"),
     ((403, ProviderRejected), (409, ProviderRejected), (503, OutcomeUnknown)),
@@ -65,7 +91,7 @@ def test_client_maps_provider_failures_without_response_body_leak(status, error)
     )
 
     with pytest.raises(error) as raised:
-        client.ensure_org(household_id="household-1")
+        client.ensure_org(household_id="household-1", identity_id="identity-1")
 
     assert "private-provider-response" not in str(raised.value)
 
@@ -78,7 +104,7 @@ def test_client_preserves_bounded_rate_limit_hint() -> None:
     )
 
     with pytest.raises(ProviderRateLimited) as raised:
-        client.ensure_org(household_id="household-1")
+        client.ensure_org(household_id="household-1", identity_id="identity-1")
 
     assert raised.value.retry_after == 7
 

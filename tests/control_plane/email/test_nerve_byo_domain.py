@@ -31,6 +31,7 @@ class FakeByoNerveAdmin:
         self.deleted: list[str] = []
         self.inbox_calls = 0
         self.fail_domain_delete_once = False
+        self.org_external_refs: list[str] = []
         self.dns_records = [{
             "type": "TXT",
             "host": "_nerve.family.example.test",
@@ -43,10 +44,14 @@ class FakeByoNerveAdmin:
             "required": True,
         }]
 
-    def ensure_org(self, *, household_id):
+    def ensure_org(self, *, household_id, identity_id):
+        self.org_external_refs.append(
+            f"arbolia:household:{household_id}:email:{identity_id}"
+        )
         return {"org_id": ORG_ID}
 
-    def get_org(self, *, household_id):
+    def get_org(self, *, external_ref):
+        self.org_external_refs.append(external_ref)
         return {} if f"/v1/orgs/{ORG_ID}" in self.deleted else {"org_id": ORG_ID}
 
     def ensure_domain(self, *, org_id, domain, external_ref):

@@ -1,8 +1,10 @@
-# Synthetic onboarding control plane runbook
+# Onboarding control plane runbook
 
 Phase 1 is an invite-only, synthetic-only staging contour. It is not permission
 to process real family content, connect a personal mailbox, or enable a real
-email, WhatsApp, or channel adapter.
+email, WhatsApp, or channel adapter. The real Nerve email exception described
+below is restricted to explicitly allowlisted operator-owned synthetic staging
+households; it does not enable real family data.
 
 ## Topology and locked flags
 
@@ -31,7 +33,8 @@ ABROLIA_RUNTIME_IMAGE=registry.example.invalid/abrolia/runtime@sha256:<published
 The following values are Fly secrets, never config-file values or command-line
 arguments: `ABROLIA_ENCRYPTION_KEY`, `ABROLIA_LOOKUP_HMAC_KEY`,
 `ABROLIA_TOKEN_HMAC_KEY`, `FLY_API_TOKEN`, and the separately controlled
-`ABROLIA_CONTROL_PLANE_BACKUP_KEY`. The three application keys are independent
+`ABROLIA_CONTROL_PLANE_BACKUP_KEY`. `ABROLIA_NERVE_ADMIN_KEY` is also a Fly
+secret whenever the Nerve gate is configured. The three application keys are independent
 32-byte urlsafe-base64 values. Record the active encryption version in
 `ABROLIA_ENCRYPTION_KEY_VERSION`; retain an old field key until its rows have
 been re-encrypted.
@@ -50,6 +53,31 @@ is a stable HMAC bound to the exact managed runtime ref; its value is not stored
 in control-plane SQLite. Do not substitute similarly named `ABROLIA_*`
 variables: the runtime rejects an incomplete or mismatched `HERMES_*` binding.
 
+### Operator-only Nerve email gate
+
+Keep `ABROLIA_REAL_EMAIL_ENABLED=0` for the normal synthetic contour. A Phase
+2.4 live rehearsal may set it to `1` only after all of these values are present:
+
+```text
+ABROLIA_REAL_EMAIL_HOUSEHOLD_ALLOWLIST=<operator-household-uuid>[,<uuid>...]
+ABROLIA_NERVE_BASE_URL=https://<nerve-control-plane-origin>
+ABROLIA_NERVE_PLATFORM_ORG_ID=<platform-org-uuid>
+ABROLIA_NERVE_PLATFORM_DOMAIN_ID=<platform-domain-uuid>
+```
+
+Install `ABROLIA_NERVE_ADMIN_KEY` through the secret store. Missing values, an
+empty/invalid UUID allowlist, or a non-HTTPS Nerve origin abort startup. The
+container then registers `nerve-managed` and `nerve-byo-domain`; a household
+outside the allowlist is rejected before a provisioning job is created. Gmail,
+WhatsApp and primary-channel real adapters remain disabled.
+
+Each email connection uses a lifecycle-scoped Nerve org reconciliation key:
+`arbolia:household:<household_id>:email:<email_identity_id>`. Cleanup tombstones
+that org permanently. Retrying the deleted identity must continue to conflict;
+reconnecting the same household creates a new email identity and a fresh org.
+Never clear `deleted_at` or reuse the old org, because retained history belongs
+to the old credential boundary.
+
 Use a dedicated staging organization when one is available. If the pilot is
 temporarily hosted in a shared personal organization, dedicate the app names,
 Machines, volumes, secrets and org token to the synthetic contour, record that
@@ -65,7 +93,8 @@ provider.
 4. Set secret values through `fly secrets import` or the Fly secret store. Avoid
    `fly secrets set NAME=value` in shared shell history.
 5. Confirm `/healthz` and `/readyz`, then inspect the effective environment and
-   verify every real-provider flag is `0`. The probes report DB and volume
+   verify every real-provider flag is `0`, unless executing the documented
+   operator-only Nerve rehearsal. The probes report DB and volume
    availability, worker pause/backlog/stale leases, unknown outcomes, expired
    bootstrap records, provider adapter status, and backup age without paths or
    credentials. `/readyz` is non-200 for an operational blocker; a normal

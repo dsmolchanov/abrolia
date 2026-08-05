@@ -24,6 +24,7 @@ from control_plane.email.repository import EmailIdentityRepository
 from control_plane.models import StepKind, StepStatus
 from control_plane.observability import StructuredLogger
 from control_plane.onboarding.state import VERIFY_RESULT, next_status
+from control_plane.providers.email.nerve_client import email_org_external_ref
 from control_plane.provisioning.contracts import (
     InspectState,
     OutcomeUnknown,
@@ -683,6 +684,7 @@ class ProvisioningWorker:
                 "key_id",
                 "webhook_id",
                 "address",
+                "org_external_ref",
             }
         elif option == EmailOption.OWN_DOMAIN.value:
             resource_key = "domain_id"
@@ -696,6 +698,7 @@ class ProvisioningWorker:
                 "key_id",
                 "webhook_id",
                 "address",
+                "org_external_ref",
             }
         else:
             raise ProviderRejected("Nerve provider does not match the selected option")
@@ -710,6 +713,9 @@ class ProvisioningWorker:
             "key_id": provider_refs.get("key_id"),
             "webhook_id": provider_refs.get("webhook_id"),
             "address": public_result["agent_inbox"],
+            "org_external_ref": email_org_external_ref(
+                job.household_id, str(request.get("email_identity_id", ""))
+            ),
         }
         if option == EmailOption.OWN_DOMAIN.value:
             expected["domain"] = canonicalize_domain(
@@ -767,6 +773,7 @@ class ProvisioningWorker:
                 "key_id",
                 "webhook_id",
                 "address",
+                "org_external_ref",
             }
             expected_address = normalize_email(
                 f"{request.get('selection', {}).get('local_part', '')}@abrolia.com"
@@ -777,6 +784,9 @@ class ProvisioningWorker:
                 or reference["household_id"] != job.household_id
                 or reference["stable_ref"] != request.get("stable_ref", job.intent_key)
                 or reference["org_id"] != typed_readiness.nerve_org_id
+                or reference["org_external_ref"] != email_org_external_ref(
+                    job.household_id, str(request.get("email_identity_id", ""))
+                )
                 or normalize_email(str(reference["address"])) != expected_address
                 or not all(
                     self._canonical_uuid(reference[key])
@@ -822,6 +832,7 @@ class ProvisioningWorker:
                 "key_id",
                 "webhook_id",
                 "address",
+                "org_external_ref",
             }
             if not isinstance(reference, dict) or set(reference) != exact_keys:
                 raise ValueError("unexpected pending Nerve reference")
@@ -834,6 +845,9 @@ class ProvisioningWorker:
                 reference["household_id"] != job.household_id
                 or reference["stable_ref"] != request.get("stable_ref", job.intent_key)
                 or reference["domain"] != expected_domain
+                or reference["org_external_ref"] != email_org_external_ref(
+                    job.household_id, str(request.get("email_identity_id", ""))
+                )
                 or normalize_email(reference["address"]) != expected_address
                 or not self._canonical_uuid(reference["org_id"])
                 or not self._canonical_uuid(reference["domain_id"])
