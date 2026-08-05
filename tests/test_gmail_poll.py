@@ -106,8 +106,8 @@ def test_only_labelled_mail_is_ever_fetched(world) -> None:
 
     assert result.accepted == 1
     assert mailbox.fetched == ["1"], "второе письмо не скачивалось"
-    assert world.by_external_id("eml:<school@example>") is not None
-    assert world.by_external_id("eml:<private@example>") is None
+    assert world.by_external_id("eml:school@example") is not None
+    assert world.by_external_id("eml:private@example") is None
 
 
 def test_the_search_asks_gmail_for_the_label_itself(world) -> None:
@@ -142,7 +142,7 @@ def test_a_new_letter_after_a_poll_is_picked_up(world) -> None:
     result = poll.poll()
 
     assert result.accepted == 1
-    assert world.by_external_id("eml:<b@example>") is not None
+    assert world.by_external_id("eml:b@example") is not None
 
 
 def test_the_cursor_is_bounded(world) -> None:
@@ -280,7 +280,28 @@ def test_the_same_letter_gives_the_same_result_whichever_door_it_came_through(
     raw = fixture.read_bytes()
 
     def run(door: str) -> tuple[str, dict]:
-        from test_pipeline import StubExtractor
+        from datetime import date
+
+        from hermes_cloud.runner.extraction import Extraction, ExtractionResult, Money
+
+        class StubExtractor:
+            def extract_email(self, _parsed):
+                return Extraction(
+                    result=ExtractionResult(
+                        kind="payment",
+                        title="Экскурсия 12.09 — взнос 15 €",
+                        summary="Класс 3b, взнос 15 € до 8 сентября.",
+                        source_language="de",
+                        action_required=True,
+                        due_date=date(2026, 9, 8),
+                        amount=Money(amount_cents=1500, currency="EUR"),
+                        confidence=0.93,
+                    ),
+                    model="stub",
+                )
+
+            def system_prompt(self):
+                return "stub-prompt"
 
         database = open_database(tmp_path / f"{door}.db")
         events = EventStore(database)

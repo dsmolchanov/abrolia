@@ -32,6 +32,7 @@ from hermes_cloud.core.runcontext import (
     WRITE_REMINDER,
     RunContext,
 )
+from hermes_cloud.email.contracts import EmailBinding
 from hermes_cloud.execute.gcal import Calendar
 from hermes_cloud.execute.reminder import ReminderStore, due_timestamp
 from hermes_cloud.runner.bundle import Item, bundle_payload
@@ -55,9 +56,16 @@ class Services:
     memory: MemoryStore | None = None
     commitments: CommitmentStore | None = None
     calendar: Calendar | None = None
+    email_binding: EmailBinding | None = None
 
     @classmethod
-    def on(cls, database, *, calendar: Calendar | None = None) -> Services:
+    def on(
+        cls,
+        database,
+        *,
+        calendar: Calendar | None = None,
+        email_binding: EmailBinding | None = None,
+    ) -> Services:
         """Собрать полный набор сторов над одной базой."""
         return cls(
             approvals=ApprovalStore(database),
@@ -65,6 +73,7 @@ class Services:
             memory=MemoryStore(database),
             commitments=CommitmentStore(database),
             calendar=calendar,
+            email_binding=email_binding,
         )
 
 
@@ -466,14 +475,21 @@ def propose_email(
     except EmailRejected as error:
         raise ToolInputError(str(error)) from error
 
-    payload = bundle_payload(
-        [Item(payload={
+    email_payload = {
             "kind": KIND_EMAIL,
             "to": letter.to,
             "subject": letter.subject,
             "body": letter.body,
             "in_reply_to": letter.in_reply_to,
-        })],
+    }
+    if services.email_binding is not None:
+        email_payload.update({
+            "from_identity_id": services.email_binding.identity_id,
+            "binding_revision": services.email_binding.revision,
+            "from_address": services.email_binding.address,
+        })
+    payload = bundle_payload(
+        [Item(payload=email_payload)],
         header=f"Письмо для {letter.to}",
     )
     staged = services.approvals.stage(

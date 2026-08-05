@@ -43,6 +43,9 @@ verified = true
 [email]
 agent_inbox = "agent@abrolia.test"
 fallback = "owner@example.test"
+provider_kind = "nerve-managed"
+provider_binding_ref = "email-identity-1"
+secret_binding_ref = "HERMES_EMAIL_BINDING"
 '''
     digest = compute_config_sha256(body)
     return body.replace("schema_version = 1\n", f'schema_version = 1\nconfig_sha256 = "{digest}"\n')
@@ -187,6 +190,12 @@ def test_versioned_manifest_wins_over_legacy_runtime_environment(tmp_path: Path)
     assert config.country_code == "CZ"
     assert config.config_revision == 3
     assert config.primary_channel == "telegram"
+    assert config.email_provider == "nerve-managed"
+    assert config.email_address == "agent@abrolia.test"
+    assert config.email_identity_id == "email-identity-1"
+    assert config.email_binding_revision == 3
+    assert config.email_secret_names == ("HERMES_EMAIL_BINDING",)
+    assert config.has_email_identity
 
 
 def test_legacy_imap_requires_explicit_test_only_gate() -> None:
@@ -207,6 +216,20 @@ def test_legacy_imap_requires_explicit_test_only_gate() -> None:
     assert disabled.gmail_app_password is None
     assert not disabled.has_gmail
     assert enabled.has_gmail
+
+
+def test_config_repr_never_contains_provider_secrets() -> None:
+    canary = "provider-secret-canary"
+    config = load_config(
+        env={
+            "TELEGRAM_BOT_TOKEN": canary,
+            "HERMES_GMAIL_ADDRESS": "fixture@example.test",
+            "HERMES_GMAIL_APP_PASSWORD": canary,
+            "HERMES_LEGACY_IMAP_TEST_ONLY": "1",
+        }
+    )
+
+    assert canary not in repr(config)
 
 
 def test_eu_strict_manifest_fails_without_explicit_provider(tmp_path: Path) -> None:

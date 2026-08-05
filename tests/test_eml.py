@@ -108,7 +108,7 @@ def test_html_only_letter_is_readable() -> None:
 def test_external_id_prefers_message_id_and_falls_back_to_hash() -> None:
     parsed = load("direct_invoice_it.eml")
     raw = (FIXTURES / "direct_invoice_it.eml").read_bytes()
-    assert external_id(parsed, raw) == "eml:DIR0006synthetic@mail.example.com"
+    assert external_id(parsed, raw) == "eml:dir0006synthetic@mail.example.com"
 
     headerless = b"Subject: kein Message-ID\n\nText\n"
     generated = external_id(parse_eml(headerless), headerless)

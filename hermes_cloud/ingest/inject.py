@@ -7,43 +7,25 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import hashlib
 from pathlib import Path
 
-from hermes_cloud.core.events import Accepted, EventStore
-from hermes_cloud.ingest.eml import ParsedEmail, external_id, parse_eml
+from hermes_cloud.core.events import EventStore
+from hermes_cloud.ingest.rfc822 import Ingested, ingest_rfc822
 
 SOURCE_INJECT = "inject"
-
-
-@dataclass(frozen=True)
-class Ingested:
-    accepted: Accepted
-    parsed: ParsedEmail
-
-    @property
-    def created(self) -> bool:
-        return self.accepted.created
-
-    @property
-    def event_id(self) -> str:
-        return self.accepted.event.id
 
 
 def ingest_bytes(
     store: EventStore, raw: bytes, *, source: str = SOURCE_INJECT
 ) -> Ingested:
     """Разобрать письмо и зафиксировать событие (повтор — no-op)."""
-    parsed = parse_eml(raw)
-    accepted = store.append(
+    return ingest_rfc822(
+        store,
         source=source,
-        external_id=external_id(parsed, raw),
-        raw=raw,
-        # Ключ цепочки, а не отправитель: два письма одного треда должны
-        # обрабатываться по порядку, письма разных семейных тем — параллельно.
-        context_key=parsed.thread_key,
+        provider_event_id=f"inject:{hashlib.sha256(raw).hexdigest()}",
+        raw_bytes=raw,
     )
-    return Ingested(accepted=accepted, parsed=parsed)
 
 
 def ingest_file(store: EventStore, path: Path | str, *, source: str = SOURCE_INJECT) -> Ingested:

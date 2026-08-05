@@ -215,7 +215,11 @@ def item_line(item: Item) -> str:
     if kind == KIND_EMAIL:
         # Получатель — отдельной строкой и всегда: подтверждают не «письмо
         # вообще», а письмо этому адресу.
-        return f"Письмо\n   Кому: {payload['to']}\n   Тема: {payload['subject']}"
+        sender = payload.get("from_address") or "не настроен"
+        return (
+            f"Письмо\n   От: {sender}\n   Кому: {payload['to']}\n"
+            f"   Тема: {payload['subject']}"
+        )
     return f"{kind}: {payload.get('title') or payload.get('text') or ''}"
 
 

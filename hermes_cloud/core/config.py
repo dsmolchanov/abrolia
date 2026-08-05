@@ -12,7 +12,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from hermes_cloud.core.runtime_manifest import maybe_load_runtime_manifest
@@ -30,6 +30,11 @@ ENV_GMAIL_ADDRESS = "HERMES_GMAIL_ADDRESS"
 ENV_GMAIL_PASSWORD = "HERMES_GMAIL_APP_PASSWORD"
 ENV_GMAIL_LABEL = "HERMES_GMAIL_LABEL"
 ENV_LEGACY_IMAP_TEST_ONLY = "HERMES_LEGACY_IMAP_TEST_ONLY"
+ENV_EMAIL_PROVIDER = "HERMES_EMAIL_PROVIDER"
+ENV_EMAIL_ADDRESS = "HERMES_EMAIL_ADDRESS"
+ENV_EMAIL_IDENTITY = "HERMES_EMAIL_IDENTITY_ID"
+ENV_EMAIL_BINDING_REVISION = "HERMES_EMAIL_BINDING_REVISION"
+ENV_EMAIL_SECRET_NAMES = "HERMES_EMAIL_SECRET_NAMES"
 ENV_SMTP_HOST = "HERMES_SMTP_HOST"
 ENV_SMTP_PORT = "HERMES_SMTP_PORT"
 ENV_VERTEX_EU_ENABLED = "HERMES_VERTEX_EU_ENABLED"
@@ -71,12 +76,17 @@ class Config:
     google_token_path: Path | None
     calendar_id: str
     gmail_address: str
-    gmail_app_password: str | None
+    gmail_app_password: str | None = field(repr=False)
     gmail_label: str
     legacy_imap_test_only: bool
     smtp_host: str
     smtp_port: int
-    telegram_token: str | None
+    telegram_token: str | None = field(repr=False)
+    email_provider: str = "synthetic"
+    email_address: str = ""
+    email_identity_id: str | None = None
+    email_binding_revision: int | None = None
+    email_secret_names: tuple[str, ...] = ()
     timezone: str | None = None
     country_code: str | None = None
     residency_mode: str | None = None
@@ -91,11 +101,21 @@ class Config:
 
     @property
     def has_gmail(self) -> bool:
+        """Deprecated compatibility flag for the test-only IMAP adapter."""
         return bool(
             self.legacy_imap_test_only
             and self.manifest_path is None
             and self.gmail_address
             and self.gmail_app_password
+        )
+
+    @property
+    def has_email_identity(self) -> bool:
+        return bool(
+            self.manifest_path is not None
+            and self.email_address
+            and self.email_identity_id
+            and self.email_binding_revision
         )
 
     @property
@@ -134,6 +154,25 @@ def load_config(
     legacy_imap_test_only = (
         source.get(ENV_LEGACY_IMAP_TEST_ONLY) or ""
     ).strip().casefold() in {"1", "true", "yes", "on"}
+    raw_email_revision = (source.get(ENV_EMAIL_BINDING_REVISION) or "").strip()
+    manifest_email = manifest.email if manifest else None
+    email_address = (
+        manifest_email.agent_inbox
+        if manifest_email is not None
+        else (source.get(ENV_EMAIL_ADDRESS) or "").strip()
+    )
+    email_identity_id = (
+        manifest_email.provider_binding_ref
+        if manifest_email is not None
+        else (source.get(ENV_EMAIL_IDENTITY) or "").strip() or None
+    )
+    secret_names = tuple(
+        item.strip()
+        for item in (source.get(ENV_EMAIL_SECRET_NAMES) or "").split(",")
+        if item.strip()
+    )
+    if manifest_email is not None and manifest_email.secret_binding_ref:
+        secret_names = (manifest_email.secret_binding_ref,)
     return Config(
         database_path=Path(source.get(ENV_DB) or DEFAULT_DB_PATH),
         chat=manifest.primary_chat_id if manifest else source.get(ENV_CHAT, "").strip(),
@@ -166,4 +205,17 @@ def load_config(
         config_sha256=manifest.config_sha256 if manifest else None,
         manifest_path=Path(manifest.source) if manifest else None,
         primary_channel=manifest.primary_channel if manifest else None,
+        email_provider=(
+            manifest_email.provider_kind
+            if manifest_email is not None
+            else (source.get(ENV_EMAIL_PROVIDER) or "synthetic").strip()
+        ),
+        email_address=email_address,
+        email_identity_id=email_identity_id,
+        email_binding_revision=(
+            manifest.config_revision
+            if manifest is not None
+            else int(raw_email_revision) if raw_email_revision else None
+        ),
+        email_secret_names=secret_names,
     )

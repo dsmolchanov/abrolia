@@ -115,7 +115,7 @@ def test_cli_inject_replay_and_status(tmp_path: Path, capsys) -> None:
 
     store = EventStore(open_database(database))
     event_id = store.by_external_id(
-        "eml:CAF1synthetic0001@mail.example.com"
+        "eml:caf1synthetic0001@mail.example.com"
     ).id
     store.mark_failed(event_id, "boom", max_attempts=1)
 
