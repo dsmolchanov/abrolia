@@ -1090,7 +1090,7 @@ Phase 1 is complete only when all are true:
       matching revision/hash.
 - [x] Existing runtime authorization remains fail-closed.
 - [x] Export/delete covers both control plane and dedicated runtime boundary.
-- [ ] Full automated suite, chaos matrix, live synthetic smoke and restore test
+- [x] Full automated suite, chaos matrix, live synthetic smoke and restore test
       are green.
 - [x] Production real-provider flags remain false and synthetic-only gate is
       visibly enforced.

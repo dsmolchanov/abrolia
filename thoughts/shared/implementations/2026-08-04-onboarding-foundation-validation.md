@@ -2,9 +2,9 @@
 
 **Plan:** `thoughts/shared/plans/2026-08-04-abrolia-phase-1-onboarding-foundation.md`
 **Base commit:** `781f122b2ab562c83d886da4631e5600d2fff8bc`
-**Validated:** 2026-08-04
+**Validated:** 2026-08-04; final chaos/restore gates closed 2026-08-05
 **Scope:** Phase 1 / construction unit 1, synthetic data only
-**Status:** automated validation and live synthetic activation passed; chaos and restore rehearsal pending
+**Status:** complete for the synthetic-only Phase 1 boundary
 
 ## Verdict
 
@@ -14,10 +14,11 @@ plane, resumable three-step onboarding, durable provisioning, a fail-closed
 dedicated runtime handoff, privacy operations, deployment artifacts and operator
 documentation.
 
-Phase 1 is **not yet declared fully complete**. A dedicated synthetic Fly runtime
-was provisioned and activated successfully, but the complete process-kill chaos
-matrix and isolated staging restore rehearsal remain manual/live gates. The final
-combined success criterion therefore remains unchecked in the plan.
+Phase 1 is complete for its synthetic-only boundary. A dedicated synthetic Fly
+runtime was provisioned and activated successfully, the complete eight-window
+process-kill matrix passes with real subprocess `SIGKILL`, and an isolated Fly
+restore rehearsal completed with workers paused before explicit operator resume.
+This does not enable real family data or any real provider.
 
 ## Implemented scope
 
@@ -42,8 +43,8 @@ combined success criterion therefore remains unchecked in the plan.
 
 | Check | Result |
 |---|---|
-| `PYTHONDONTWRITEBYTECODE=1 pytest -p no:cacheprovider -m "not live"` | **623 passed, 1 deselected, 1 warning** |
-| `PYTHONDONTWRITEBYTECODE=1 pytest -p no:cacheprovider tests/control_plane` | **212 passed, 1 warning** |
+| `PYTHONDONTWRITEBYTECODE=1 pytest -p no:cacheprovider -m "not live"` | **626 passed, 1 deselected, 1 warning** |
+| `PYTHONDONTWRITEBYTECODE=1 pytest -p no:cacheprovider tests/control_plane` | **215 passed, 1 warning** |
 | `RUFF_CACHE_DIR=/private/tmp/arbolia-ruff-release ruff check .` | pass |
 | `HERMES_EXTRA_DENY_FILE=/private/tmp/arbolia-private-deny.txt python3 scripts/check_fixtures.py --all --require-deny` | pass; no fixture/secret findings |
 | `gitleaks detect --source . --config .gitleaks.toml --log-opts="--all" --redact --verbose` | pass; 39 commits scanned, no leaks |
@@ -94,6 +95,55 @@ platform-enriched mount fields caused a false mismatch; and `/readyz` routing co
 hide the only reconciliation surface. The deployed contour now uses `/healthz` for
 Fly routing and keeps `/readyz` as the operator/release signal.
 
+## Process-kill chaos evidence
+
+Revalidated on 2026-08-05 with real child processes terminated by `SIGKILL`.
+`tests/control_plane/test_phase1_chaos_matrix.py` and the existing parametrized
+lease test cover all required windows:
+
+- transition committed before lease: one pending job survives and settles once;
+- lease before provider call: expiry causes inspect-before-ensure;
+- provider accepted before response persistence: inspect observes the accepted
+  intent and no second ensure occurs;
+- result projection before commit: step/result updates share one SQLite
+  transaction, so a kill rolls both back and recovery produces one resource;
+- config issued before claim: the same revision and staged token remain usable;
+- claim before runtime rename: exact claim replay returns the same manifest/hash;
+- runtime write before activate: mode-`0600` manifest and activating receipt
+  resume against the same revision;
+- activate before cleanup: the durable active state replays, the local receipt is
+  fsynced, acknowledgement creates exactly one cleanup job, and cleanup settles.
+
+The focused provisioning/bootstrap/backup/Fly contract set passed 80 tests before
+the matrix was added; the final full and control-plane suite totals are recorded
+above.
+
+## Isolated restore rehearsal
+
+Completed on Fly `ams` on 2026-08-05 using a temporary app, one encrypted 1 GiB
+volume and one no-service Machine pinned to the deployed control-plane image.
+
+- source application backup: 270370 bytes, SHA-256
+  `0a6d92a6e030687d29b896f34e5f208d9327a8015ca4872afe0d9a08e4476b5a`;
+- the four application/backup keys were streamed directly from the source
+  Machine to the isolated app secret namespace; no value entered a command
+  argument, local file, database or log;
+- restore reported workers paused; `integrity_check=ok`, zero foreign-key
+  violations, mode-`0600` pause marker, and expected account/household/job/config
+  row counts;
+- with workers paused, `/me` and onboarding returned 200, export returned its
+  honest partial boundary, `/healthz` returned 200, `/readyz` returned 503 with
+  `workers_paused`, job leasing remained blocked, and no issued session token
+  appeared in export;
+- wrong key, one-byte archive tamper and existing target were all rejected without
+  a partial restored database;
+- after explicit `resume-jobs`, no old pending job was leased; a new synthetic
+  onboarding completed through active runtime revision 1 and bootstrap cleanup;
+- exact temporary Machine, volume and app were destroyed and verified absent.
+
+The source control plane now reports `backup=fresh`; its encrypted application
+backup remains under the documented retention policy.
+
 ## Success criteria status
 
 Automated evidence supports these completed criteria:
@@ -108,10 +158,8 @@ Automated evidence supports these completed criteria:
 - control-plane plus runtime export/delete boundary;
 - disabled real-provider flags and visible synthetic-only gate.
 
-This criterion remains open:
-
-- the combined full process-kill chaos matrix and isolated staging restore
-  rehearsal (the automated suite and live synthetic happy-path smoke are green).
+The final combined automated-suite, process-kill, live synthetic and restore
+criterion is now complete.
 
 ## Manual/live handoff
 
@@ -122,7 +170,7 @@ Use only synthetic identities and dedicated staging resources.
       that state is preserved.
 - [ ] Complete all three fake/default steps and verify exactly one Fly app, volume
       and Machine exist in `ams`.
-- [ ] Kill the worker in every crash window listed in the plan; resume it and
+- [x] Kill the worker in every crash window listed in the plan; resume it and
       verify resource counts remain one.
 - [ ] Inspect the Fly app: secret names may exist, but values must be absent from
       control-plane DB/log/API output; bootstrap material must disappear only
@@ -136,8 +184,8 @@ Use only synthetic identities and dedicated staging resources.
       session hashes are absent.
 - [ ] Delete the household and verify runtime deprovisioning, session revocation
       and tombstone rejection of delayed callbacks/jobs/bootstrap traffic.
-- [ ] Restore a control-plane backup in isolated staging with workers paused, run
+- [x] Restore a control-plane backup in isolated staging with workers paused, run
       smoke checks, and resume workers only after operator approval.
 
-After these checks pass, mark the final combined plan criterion complete and add
-the chaos/restore evidence without secret values.
+The chaos and restore gates are complete. Remaining unchecked items are retained
+as operator regression drills; they do not broaden Phase 1 beyond synthetic data.
