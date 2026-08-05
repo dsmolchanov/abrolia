@@ -7,7 +7,7 @@ repository: abrolia
 topic: Phase 2.4 Production Wiring and Reconnect Implementation Strategy
 tags: [phase-2-4, nerve, email, production, cleanup, reconnect, tombstone]
 status: complete
-last_updated: 2026-08-05
+last_updated: 2026-08-06
 last_updated_by: Codex
 type: implementation_strategy
 ---
@@ -27,8 +27,13 @@ type: implementation_strategy
   identity, org, inbox, key and webhook and reached `verified`.
 - **Complete — persistence rehearsal.** Logout, maintenance login, two reloads,
   logout and post-logout denial all passed without printing tokens.
-- **Open, separate Phase 2.4 gate — BYO DNS.** Bounded automatic polling and the
-  live operator-owned DNS matrix were not implemented or exercised here.
+- **Complete — bounded BYO polling.** The durable inspection job now polls at
+  bounded backoff intervals and stops after five total attempts.
+- **Complete — Nerve V-01.** Cross-org service-token issuance is denied and the
+  fix is deployed in production release 69.
+- **Open, external Phase 2.4 gate — live BYO DNS.** The operator-owned DNS
+  matrix cannot run until a disposable authoritative zone and mutation access
+  are supplied.
 
 ## Critical References
 
@@ -50,6 +55,11 @@ type: implementation_strategy
   from `internal/store/store_orgs.go`.
 - The complete live evidence and remaining gates are recorded in
   `thoughts/shared/implementations/2026-08-05-abrolia-phase-2-email-identity-validation.md`.
+- Bounded polling is implemented in `control_plane/repositories/jobs.py` and
+  `control_plane/provisioning/worker.py`; the automatic and bounded-stop
+  regressions live in `tests/control_plane/email/test_nerve_byo_domain.py`.
+- Nerve tenant isolation is enforced in `internal/cloudapi/handler_keys.go` and
+  covered by the cross-org tests in `internal/cloudapi/email_tenancy_test.go`.
 
 ## Learnings
 
@@ -77,10 +87,16 @@ type: implementation_strategy
 - Abrolia PR #18, merge `47c8013`
 - Nerve PR #64, merge `8945d3bf43589c51995c6a68ae9e34e62ca37e67`
 - Nerve PR #66, merge `56826658a69423136b45f3bd575744e7e1511699`
+- Nerve PR #67, merge `99092688c3213af3cf7dc8e72cc28bd89983f6a1`
+- Abrolia PR #21, merge `261a35f0d71b66159aea2036501d6cad9381e104`
 - Abrolia release 12 image digest
   `sha256:d2762fdba1e272257966adfb71b9813e8ebb8a768feb4dc1ffa0003d041394cc`
 - Nerve release 68 image digest
   `sha256:693aefba5d6fa319523bf2d8215b9c568f0054cc1fb5da9d706493edd46ea6a4`
+- Nerve release 69 image digest
+  `sha256:7406baea1ea524f0b9de43ff4e5d40ae9d407f3e316f70f10dafa44851229d08`
+- Abrolia release 15 image digest
+  `sha256:82134117d06cbd53841850e7511c08385b97d872e55fed2874fb59f7b9cc699c`
 - Generation A identity/org:
   `a51cb145-63fb-4277-96eb-ef2e28e4907f` /
   `70d15c36-3ab4-40d6-9c58-ae35744d8db5`
@@ -95,17 +111,14 @@ type: implementation_strategy
 
 ## Action Items & Next Steps
 
-1. Implement bounded automatic polling/backoff for Nerve BYO-domain DNS jobs;
-   current `waiting_user` progression still depends on explicit `CHECK`.
-2. Obtain an operator-owned disposable domain and run the live BYO matrix:
+1. Obtain an operator-owned disposable domain and authoritative DNS mutation
+   access, then run the live BYO matrix:
    wrong/partial DNS, record-level persistence across login/reload, one-time
    verification advance, cleanup with DNS still present, and reconnect.
-3. Fix the Nerve cross-org `/v1/tokens/service` authorization issue documented
-   as V-01 before accepting the complete real-provider surface.
-4. Wire a production mailer if login must be verified through public delivery;
+2. Wire a production mailer if login must be verified through public delivery;
    this rehearsal used the documented maintenance operator path and immediately
    revoked the test session.
-5. Review the older runtime cleanup job
+3. Review the older runtime cleanup job
    `6a0d040d-bfb9-4671-b2c5-e6ee681bdc6b` separately if it remains
    `outcome_unknown`; its Machine and volume are already absent and it did not
    block the email lifecycle.
@@ -117,5 +130,8 @@ type: implementation_strategy
   onto the production Nerve email path.
 - Generation B remains active as the canary. Its org-scoped attachment flag is
   enabled; generation A and the diagnostic orphan are tombstoned.
+- Abrolia release 15 passed its Fly service check and `/healthz`; generation B
+  remained `verified` after deployment. `/readyz` remains 503 only because the
+  older cleanup job above is still `outcome_unknown`.
 - Resume with:
   `/resume_handoff thoughts/shared/handoffs/general/2026-08-05_23-38-46_general_phase-2-4-production-reconnect.md`

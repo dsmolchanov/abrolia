@@ -5,14 +5,14 @@
 **Original Abrolia baseline:** `a5dd303c6a2170d09bb5baa9c1e570e27fbd967f`
 **Phase 2.4 baseline:** `bc1b3cf`
 **Original Nerve baseline:** `2b8608f486f8117ded53f49e0551a058e4ebe0d4`
-**Latest deployed Nerve main:** `56826658a69423136b45f3bd575744e7e1511699`
+**Latest deployed Nerve main:** `99092688c3213af3cf7dc8e72cc28bd89983f6a1`
 **Original remediation worktree base:** `ff93f31`
 **PR integration base:** `f3d8c8f` (`origin/main` after Nerve attachment readiness)
 **Scope:** Phase 2.0–2.4; Phase 2.5 runtime-email work is explicitly excluded
-**Current status:** the production wiring and generation-safe cleanup/reconnect
-gate is **accepted**, and bounded BYO-domain polling is implemented and green
-locally. Full Phase 2.4 remains **partial / not accepted** until the live-DNS
-matrix runs and the unrelated V-01 tenant token fix is deployed.
+**Current status:** the production wiring, generation-safe cleanup/reconnect,
+bounded BYO-domain polling, and V-01 tenant isolation gates are **accepted and
+deployed**. Full Phase 2.4 remains **partial / not accepted** only until the
+operator-owned live-DNS matrix runs.
 
 > The path in the original request used `Programs/arbolia`; the active repository
 > is `Programs/abrolia`. Phase 2.5 advanced the shared checkout while this work
@@ -64,11 +64,35 @@ This closes the production composition and same-household reconnect blockers.
 It does not substitute a managed-domain rehearsal for the Phase 2.4 BYO-domain
 DNS acceptance matrix.
 
+## Bounded polling and tenant-isolation closure — 2026-08-05
+
+- Abrolia PR #21 turns the original durable BYO provisioning job into the
+  inspection job, leases it only when `not_before` is due, polls at
+  30/60/120/240-second intervals, and stops after five total attempts while
+  retaining manual `CHECK`. Main `261a35f0d71b66159aea2036501d6cad9381e104`
+  passed the complete non-live CI matrix and is deployed as production release
+  15 on image digest
+  `sha256:82134117d06cbd53841850e7511c08385b97d872e55fed2874fb59f7b9cc699c`.
+- Nerve PR #67 resolves `/v1/tokens/service` through the authenticated tenant
+  before issuance. Its negative cross-org and positive own-org tests passed in
+  the complete Go suite. Main `99092688c3213af3cf7dc8e72cc28bd89983f6a1`
+  is deployed as production release 69 on image digest
+  `sha256:7406baea1ea524f0b9de43ff4e5d40ae9d407f3e316f70f10dafa44851229d08`.
+- Post-deploy `/healthz` and the Fly service check pass. Generation B remains
+  `verified`. `/readyz` remains 503 solely because the previously documented
+  cleanup job `6a0d040d-bfb9-4671-b2c5-e6ee681bdc6b` is still
+  `outcome_unknown`; this predates and is independent of the email release.
+- No authoritative DNS credential is present in the local environment,
+  repository secrets, Abrolia Fly secrets, or the available Route 53 account.
+  The visible operator-owned domains use third-party authoritative name
+  servers. A domain must therefore be nominated and DNS access supplied before
+  the live mutation matrix can be run safely.
+
 ## Executive verdict
 
 | Item | Current result | Release meaning |
 |---|---|---|
-| V-01 — cross-org Nerve service-token issuance | **Open upstream / P0** | Blocks real-provider rollout; no affected Abrolia call site was found |
+| V-01 — cross-org Nerve service-token issuance | **Fixed, tested and deployed** | Nerve PR #67 binds requested org IDs to the authenticated tenant; production release 69 is healthy |
 | V-02 — false verification after one-time-secret loss | **Safety fixed / convergence partial** | False verification is eliminated; crash-after-install still needs a durable non-secret receipt/inspection contract |
 | V-03 — provider secret in allowed values | **Fixed locally for durable/public email paths** | Provider outputs are typed, credential-shaped values are rejected, and external error codes are normalized |
 | V-04 — expired hold reported claimable while identity is live | **Fixed fail-closed locally** | Availability stays false until the owning identity is terminal; automatic TTL ownership transfer remains deferred |
@@ -79,20 +103,13 @@ boundary. They do not make the full BYO-domain or Gmail rollout ready.
 
 ## Remediation applied
 
-### V-01 — still open in `nerve-cloud`
+### V-01 — fixed and deployed in `nerve-cloud`
 
-The finding remains present on deployed Nerve main `5682665`:
-
-- `internal/cloudapi/handler_keys.go` passes the requested `org_id` to service
-  token issuance without resolving it against the authenticated tenant;
-- `nerve:admin.billing` remains delegable by a tenant billing principal;
-- the isolated A-to-B request still requires an upstream negative HTTP test and
-  authorization fix.
-
-Abrolia currently creates tenant keys through `/v1/keys` and does not call
-`/v1/service-tokens`, so there is no safe local patch for this upstream defect.
-It remains a real-provider release blocker rather than an Abrolia runtime
-regression.
+Nerve PR #67 routes `/v1/tokens/service` through the same authenticated-tenant
+organization resolver as the other tenant-scoped handlers. The regression
+matrix proves that organization A receives a denial for organization B and can
+still issue for its own organization. The full Go suite passed and production
+release 69 is healthy on the immutable digest recorded above.
 
 ### V-02 — false success is fixed; receipt recovery remains open
 
@@ -265,14 +282,12 @@ not a reason to weaken the current reserved set.
 
 ### Remaining Phase 2.4 blockers
 
-1. Merge and deploy the bounded BYO-domain DNS polling change.
-2. Run the live BYO-domain DNS matrix with an operator-owned test domain,
+1. Run the live BYO-domain DNS matrix with an operator-owned test domain,
    including wrong/partial records, verified advance, persisted DNS state,
    cleanup while DNS remains present, and reconnect. The managed-domain live
-   rehearsal above does not exercise DNS mutation.
-3. Fix and negatively test the unrelated cross-org service-token issue V-01 in
-   Nerve before declaring the whole real-provider release surface accepted.
-4. Wire a production mailer if repeated login must be validated through public
+   rehearsal above does not exercise DNS mutation. This is externally blocked
+   until an authoritative DNS zone and mutation access are supplied.
+2. Wire a production mailer if repeated login must be validated through public
    delivery rather than the documented maintenance-window operator link.
 
 ## Automated verification
@@ -298,6 +313,9 @@ not a reason to weaken the current reserved set.
 |---|---|
 | Nerve PR #66 CI | **pass** — cloud-e2e, go-checks, unit, integration, lint, coverage, SDK, dashboard, exact mirror and vulnerability checks |
 | Nerve production release 68 | **pass** — digest-pinned image, service check healthy |
+| Nerve PR #67 and production release 69 | **pass** — cross-org service-token request denied, own-org request preserved; immutable digest healthy |
+| Abrolia PR #21 CI | **pass** — complete non-live suite, lint, fixtures, contracts and secret scan |
+| Abrolia production release 15 | **pass** — immutable digest deployed, Fly service check and `/healthz` healthy; generation B remains verified |
 | Managed generation A cleanup and old replay | **pass** — empty diagnostic orphan tombstoned; delayed generation-A ensure returned 409 |
 | Managed generation B reconnect | **pass** — fresh identity/org/inbox verified at workflow version 17 |
 | Logout/login/two reloads/logout | **pass** — 200, stable verified state, 204, then 401 |
@@ -335,18 +353,15 @@ The normal-path baseline suites were green, which is why the new negative,
 hard-process-loss, cross-household, malformed-provider, and cancellation tests
 are part of the remediation rather than relying on the previous suite alone.
 
-## Upstream and manual release gate
+## Remaining manual release gate
 
-Before Phase 2.4 or any real email provider is accepted:
+Before Phase 2.4 is fully accepted:
 
-1. fix V-01 and add the A-to-B service-token negative test in `nerve-cloud`;
-2. make verified inbox/domain/org cleanup convergent in Nerve;
-3. implement bounded DNS polling/backoff and lost-recovery-response handling;
-4. rerun both repositories' integration and chaos suites;
-5. run the staged manual/live matrix with synthetic households and no real
+1. nominate an operator-owned disposable domain and provide authoritative DNS
+   mutation access;
+2. run the staged manual/live matrix with synthetic households and no real
    family data;
-6. keep `ABROLIA_REAL_EMAIL_ENABLED` and the broader real-family-data gates off
-   until all items above pass.
+3. keep broader real-family-data gates off until that matrix passes.
 
 Phase 2.5 may continue independently, but it must not be used as evidence that
 Phase 2.4 is accepted.
