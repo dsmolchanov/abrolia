@@ -814,6 +814,79 @@ def test_late_success_with_unknown_compensation_creates_recoverable_cleanup(
     assert not fake.resources
 
 
+def test_email_reset_strips_runtime_manifest_digest_from_cleanup_reference(
+    cp_stack,
+) -> None:
+    cp_stack.complete_profile(provision_namespace=False)
+    registry = ProviderRegistry()
+    registry.register("dry-run-runtime", DryRunRuntimeProvisioner())
+    registry.register("fake-email", DeterministicFakeProvisioner("email"))
+    registry.register("fake-whatsapp", DeterministicFakeProvisioner("whatsapp"))
+    registry.register("fake-channel", DeterministicFakeProvisioner("channel"))
+    worker = cp_stack.make_worker(providers=registry, now=BASE_TIME + 20)
+
+    assert worker.run_once().status == "succeeded"
+    for kind, selection in (
+        (StepKind.EMAIL, EMAIL_SELECTION),
+        (StepKind.WHATSAPP, WHATSAPP_SELECTION),
+        (StepKind.PRIMARY_CHANNEL, CHANNEL_SELECTION),
+    ):
+        cp_stack.service.select(
+            cp_stack.household.id,
+            kind,
+            selection,
+            context=cp_stack.context(),
+            now=BASE_TIME + 21,
+        )
+        assert worker.run_once().status == "succeeded"
+    assert worker.run_once().status == "succeeded"
+
+    runtime = cp_stack.database.query_one(
+        "SELECT id, external_id_ciphertext, encryption_key_version"
+        " FROM external_resources WHERE resource_type = 'runtime'"
+    )
+    original_ref = cp_stack.jobs.decrypt_json(
+        "external_resources",
+        runtime["id"],
+        "external_id",
+        runtime["external_id_ciphertext"],
+        runtime["encryption_key_version"],
+    )
+    exact_ref = {
+        "app_ref": original_ref,
+        "machine_ref": "machine-phase24",
+        "volume_ref": "volume-phase24",
+        "config_sha256": "a" * 64,
+    }
+    encrypted = cp_stack.jobs.encrypt_json(
+        "external_resources", runtime["id"], "external_id", exact_ref
+    )
+    with cp_stack.database.write() as connection:
+        connection.execute(
+            "UPDATE external_resources SET external_id_ciphertext = ?,"
+            " encryption_key_version = ? WHERE id = ?",
+            (encrypted.ciphertext, encrypted.key_version, runtime["id"]),
+        )
+
+    cp_stack.service.reset_from(
+        cp_stack.household.id,
+        StepKind.EMAIL,
+        context=cp_stack.context(),
+        now=BASE_TIME + 30,
+    )
+
+    cleanup = cp_stack.database.query_one(
+        "SELECT id FROM provisioning_jobs WHERE kind = 'cleanup'"
+        " AND provider = 'dry-run-runtime'"
+    )
+    request = cp_stack.jobs.request(cleanup["id"])
+    assert request["external_ref"] == {
+        "app_ref": original_ref,
+        "machine_ref": "machine-phase24",
+        "volume_ref": "volume-phase24",
+    }
+
+
 def test_email_reset_runtime_cleanup_preserves_namespace_for_reconnect(
     cp_stack,
 ) -> None:
