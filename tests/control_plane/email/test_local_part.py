@@ -10,7 +10,7 @@ from control_plane.email.local_part import (
 
 
 def test_suggestion_transliterates_and_normalizes_names() -> None:
-    assert suggest_local_part("Дмитрий", "Молчанов") == "dmitrii_molchanov"
+    assert suggest_local_part("Синтетик", "Примеров") == "sintetik_primerov"
     assert suggest_local_part("Éva", "Novák") == "eva_novak"
     assert collision_candidate("eva_novak", 2) == "eva_novak2"
     assert normalize_local_part("UpperCase") == "uppercase"

@@ -68,7 +68,7 @@ def test_telemetry_phone_canary_does_not_match_numeric_uuid_fragments() -> None:
         {"refresh_token": "1" + "//refresh-token-canary-0123456789"},
         {"nerve_bootstrap_key": "nrv_" + "live_bootstrap-canary-0123456789"},
         {"nerve_runtime_key": "nrv_" + "live_runtime-canary-0123456789"},
-        {"webhook_secret": "0123456789abcdef" * 4},
+        {"webhook_secret": "webhook-secret-canary"},
         {"provider_body": {"status": "rejected"}},
     ],
 )
@@ -86,7 +86,7 @@ def test_telemetry_rejects_unknown_pii_phone_and_credential_canaries(fields) -> 
     assert "refresh-token-canary" not in message
     assert "bootstrap-canary" not in message
     assert "runtime-canary" not in message
-    assert "0123456789abcdef" not in message
+    assert "webhook-secret-canary" not in message
     assert canaries not in message
 
 

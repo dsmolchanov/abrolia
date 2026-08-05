@@ -41,7 +41,7 @@ def test_schema_constraints_reject_impossible_states(cp_stack) -> None:
         ("refresh_token", "1" + "//refresh-token-canary-0123456789"),
         ("nerve_bootstrap_key", "nrv_" + "live_bootstrap-canary-0123456789"),
         ("nerve_runtime_key", "nrv_" + "live_runtime-canary-0123456789"),
-        ("webhook_secret", "0123456789abcdef" * 4),
+        ("webhook_secret", "webhook-secret-canary"),
     ),
 )
 def test_secret_shaped_job_payload_is_rejected_before_insert(
