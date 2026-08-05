@@ -581,11 +581,22 @@ flags остаются false до provider-specific gates.
 
 #### Acceptance
 
-- Reload/login resumes the same DNS records and state.
-- Wrong/partial DNS stays waiting; verified DNS advances once.
-- Domain cannot be claimed by two households through race or normalization trick.
-- Delete/reconnect tests cover DNS still present, provider unavailable and lost
+- [x] Reload/login resumes the same DNS records and state.
+- [x] Wrong/partial DNS stays waiting; verified DNS advances once.
+- [x] Domain cannot be claimed by two households through race or normalization trick.
+- [x] Delete/reconnect tests cover DNS still present, provider unavailable and lost
   response.
+
+#### Status — automated implementation complete (2026-08-05)
+
+- DNS inspection uses persisted bounded backoff (30s, 60s, 120s, 300s,
+  600s), preserves `waiting_user` UX, and falls back to the manual check action.
+- BYO key recovery removes inspectable orphan generations before issuing a new
+  one-time credential; double response loss converges without false verification.
+- A two-connection writer race proves canonical domain ownership is unique.
+- Nerve bootstrap cleanup now has a separate tested hard-delete path for the
+  inbox while tenant-facing deletion remains recoverable disable/reactivate.
+- Real DNS/provider and logout/login staging smoke remains a manual release gate.
 
 ### Phase 2.5 — Provider-neutral runtime email core
 

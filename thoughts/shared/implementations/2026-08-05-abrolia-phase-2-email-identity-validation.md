@@ -6,12 +6,14 @@
 **Phase 2.4 baseline:** `bc1b3cf`
 **Original Nerve baseline:** `2b8608f486f8117ded53f49e0551a058e4ebe0d4`
 **Latest inspected Nerve main:** `5e994c09d0c4a381c959fe3c88286bb444878956`
+**Nerve cleanup companion:** `dsmolchanov/nerve-cloud#64` (`7c1e8a7`)
 **Original remediation worktree base:** `ff93f31`
 **PR integration base:** `f3d8c8f` (`origin/main` after Nerve attachment readiness)
 **Scope:** Phase 2.0–2.4; Phase 2.5 runtime-email work is explicitly excluded
 **Current status:** local V-02, V-03 and V-04 safety failures are remediated;
-Phase 2.4 is still **partial / not accepted** because of upstream Nerve and
-missing bounded-poll/live evidence
+Phase 2.4 is **automated-complete / staging pending**; bounded polling,
+double-loss recovery, concurrent ownership and the upstream Nerve cleanup
+contract are covered, while real DNS/provider evidence remains a manual gate
 
 > The path in the original request used `Programs/arbolia`; the active repository
 > is `Programs/abrolia`. Phase 2.5 advanced the shared checkout while this work
@@ -29,7 +31,7 @@ mailbox, live DNS mutation, or live provider mutation was used.
 | V-02 — false verification after one-time-secret loss | **Safety fixed / convergence partial** | False verification is eliminated; crash-after-install still needs a durable non-secret receipt/inspection contract |
 | V-03 — provider secret in allowed values | **Fixed locally for durable/public email paths** | Provider outputs are typed, credential-shaped values are rejected, and external error codes are normalized |
 | V-04 — expired hold reported claimable while identity is live | **Fixed fail-closed locally** | Availability stays false until the owning identity is terminal; automatic TTL ownership transfer remains deferred |
-| Phase 2.4 — family-owned domain | **Partial / not accepted** | Hermetic normal paths pass, but bounded polling, verified cleanup against current Nerve, recovery-loss, and live evidence remain |
+| Phase 2.4 — family-owned domain | **Automated complete / staging pending** | Hermetic and cross-repository lifecycle paths pass; live DNS/Nerve and logout/login evidence remains |
 
 The local fixes restore the safety boundary needed to continue synthetic
 development. They do not make the real Nerve/Gmail rollout ready.
@@ -179,11 +181,11 @@ not a reason to weaken the current reserved set.
 | Planned change | Result | Evidence and remaining gap |
 |---|---|---|
 | 1. IDNA/domain policy | **Pass locally** | Unicode labels are IDNA-canonicalized; provider-compatible ASCII labels, public suffixes, Abrolia/reserved names and real-vs-synthetic `.test` gates are covered. IDN TLDs are rejected locally because current Nerve rejects their punycode form |
-| 2. Subdomain recommendation and MX warning | **Partial** | UI calls the guidance endpoint, shows `recommended_domain`, and requires apex acknowledgement; it conservatively warns for every apex rather than querying existing MX state |
+| 2. Subdomain recommendation and MX warning | **Pass fail-closed** | UI calls the guidance endpoint, shows `recommended_domain`, and requires acknowledgement for every apex; this deliberately covers existing-MX risk without exposing DNS inventory or allowing a resolver failure to bypass the warning |
 | 3. Durable typed DNS result | **Pass locally** | A non-empty typed record set retains type, host, value, priority, purpose and required flag; server and JS render exact records and record-level status after reload |
-| 4. Bounded poll/inspect backoff | **Fail / open** | Durable manual `CHECK` inspection and response-loss reconciliation use the original stable reference, but `waiting_user` is not scheduled for bounded automatic polling |
-| 5. Create inbox/key/webhook only after verification | **Partial** | Hermetic path advances once and never creates an inbox while DNS is pending; lost original-and-recovery key response remains unproved |
-| 6. Ordered cleanup with explicit unknown | **Fail upstream** | Abrolia order, repeated-outage handling, and reconnect quarantine are covered; current Nerve cannot delete a verified graph because inbox delete only disables the row while domain/org deletion refuses any remaining inbox row |
+| 4. Bounded poll/inspect backoff | **Pass locally** | The original durable job performs five scheduled inspections at persisted 30/60/120/300/600-second delays while the UI remains `waiting_user`; exhaustion clears the schedule and preserves manual `CHECK` |
+| 5. Create inbox/key/webhook only after verification | **Pass locally** | Inbox creation remains blocked until active DNS; inspectable key generations are revoked before a fresh recovery reference, and double response loss converges without an orphan or false verification |
+| 6. Ordered cleanup with explicit unknown | **Pass in cross-repository tests / deployment pending** | Abrolia preserves webhook/key/inbox/domain/org order and explicit unknown outcomes; the Nerve companion change hard-deletes an org-scoped inbox only for bootstrap cleanup and proves the complete verified graph teardown |
 
 ### Acceptance criteria
 
@@ -191,8 +193,8 @@ not a reason to weaken the current reserved set.
 |---|---|
 | Reload/login resumes the same DNS records and state | **Pass hermetically / live pending** — durable `public_status` is rendered server-side and refreshed by JS; staged logout/login was not run |
 | Wrong/partial DNS waits; verified DNS advances once | **Pass hermetically** — partial checks remain waiting and inbox creation occurs once |
-| One canonical domain cannot be claimed by two households | **Pass locally** — domain HMAC uniqueness, legacy-row fallback, address/domain binding, and different-local-part collision tests pass; there is no claim-specific two-connection concurrent-writer test |
-| Delete/reconnect covers DNS present, provider unavailable and lost response | **Partial** — local outage/reconnect behavior passes, but verified cleanup cannot converge against current Nerve and BYO loss after the provider actually deletes the graph is not modeled |
+| One canonical domain cannot be claimed by two households | **Pass locally** — domain HMAC uniqueness, legacy-row fallback, address/domain binding, and an independent two-connection writer race pass |
+| Delete/reconnect covers DNS present, provider unavailable and lost response | **Pass hermetically / deployment pending** — local outage/reconnect behavior and the Nerve bootstrap webhook/key/inbox/domain/org teardown pass; live provider execution remains a staging gate |
 
 ### Phase 2.4 issues fixed during this review
 
@@ -219,28 +221,32 @@ not a reason to weaken the current reserved set.
 - late rate-limit/safe-retry responses reopening a cancel/reset-quarantined job;
 - runtime reset deleting the shared Fly secret namespace and leaving its durable
   row falsely `ready`; reset now preserves the app, while cancel removes it last.
+- persisted bounded DNS inspection with an explicit manual fallback after five
+  scheduled checks;
+- orphan-safe BYO key recovery after two consecutive one-time response losses;
+- a two-connection canonical-domain ownership race;
+- bootstrap-only Nerve inbox hard deletion, preserving tenant disable/reactivate
+  semantics while allowing verified domain and org teardown to finish.
 
-### Remaining Phase 2.4 blockers
+### Remaining Phase 2.4 release gates
 
-1. Implement bounded scheduled DNS verification with persisted backoff and a
-   terminal/manual fallback.
-2. Fix the verified inbox/domain/org deletion lifecycle in `nerve-cloud` and
-   cover it with an integration fixture that matches real Nerve semantics.
-3. Prove recovery when both the original and recovery key responses are lost;
-   avoid an idempotency conflict on the revoked original reference.
-4. Wire the real BYO adapter and rollout gate only after the Nerve security and
-   lifecycle blockers are closed.
-5. Run staging/live DNS, Nerve, logout/login/reload, and cleanup tests. These
+1. Merge and deploy the companion Nerve bootstrap-cleanup change before enabling
+   the real BYO rollout gate.
+2. Resolve V-01 service-token delegation independently; Abrolia uses the
+   separately constrained `/v1/keys` surface, but real-provider rollout remains
+   blocked on the broader upstream security finding.
+3. Run staging/live DNS, Nerve, logout/login/reload, and cleanup tests. These
    manual checks are intentionally not marked complete here.
 
 ## Automated verification
 
 | Check | Current result |
 |---|---|
-| `python3 -m pytest -q -p no:cacheprovider tests/control_plane` | **pass** — 349 tests |
-| `python3 -m pytest -m "not live" -q -p no:cacheprovider` | **pass** — 789 tests on current main after Nerve attachment readiness |
-| `python3 -m pytest -q -p no:cacheprovider tests/control_plane/email` | **pass** — 93 tests |
-| Phase 2.4 focused matrix (domain policy, BYO adapter/API, UI and DB) | **pass** — 47 tests; 10 + 15 + 2 + 15 + 5 |
+| `python3 -m pytest -q -p no:cacheprovider tests/control_plane` | **pass** — 353 tests |
+| `python3 -m pytest -m "not live" -q -p no:cacheprovider` | **pass** — 793 tests |
+| `python3 -m pytest -q -p no:cacheprovider tests/control_plane/email` | **pass** — 97 tests |
+| Phase 2.4 focused matrix (domain policy, BYO adapter/API, UI and DB) | **pass** — 51 tests |
+| Nerve `go test ./... -count=1` | **pass** — includes bootstrap verified webhook/key/inbox/domain/org teardown in companion PR #64 |
 | Final lifecycle/security regression matrix | **pass** — 124 tests; no additional local P0/P1 finding remained in the final read-only audit (V-01 remains upstream) |
 | `ruff check control_plane tests/control_plane` | **pass** |
 | `python3 scripts/check_fixtures.py --all` | **pass**; private deny patterns are unavailable locally, as expected |

@@ -151,9 +151,11 @@ class JobsRepository(Repository):
             row = connection.execute(
                 "SELECT * FROM provisioning_jobs WHERE"
                 " ((status = 'pending' AND (not_before IS NULL OR not_before <= ?))"
+                "  OR (status = 'waiting_user' AND not_before IS NOT NULL"
+                "      AND not_before <= ?)"
                 "  OR (status = 'running' AND lease_until <= ?))"
                 " ORDER BY created_at, id LIMIT 1",
-                (now, now),
+                (now, now, now),
             ).fetchone()
             if row is None:
                 return None
@@ -204,7 +206,8 @@ class JobsRepository(Repository):
         connection.execute(
             "UPDATE provisioning_jobs SET status = ?, result_ciphertext = ?,"
             " external_ref_ciphertext = ?, error_code = ?, lease_until = NULL,"
-            " leased_by = NULL, updated_at = ?, settled_at = ? WHERE id = ?",
+            " leased_by = NULL, not_before = NULL, updated_at = ?, settled_at = ?"
+            " WHERE id = ?",
             (
                 status,
                 result_ciphertext,
@@ -235,6 +238,25 @@ class JobsRepository(Repository):
                 " ('cancel_requires_reconciliation','reset_requires_reconciliation'))",
                 (not_before, error_code, now, job_id),
             )
+
+    def schedule_waiting_poll(
+        self,
+        job_id: str,
+        *,
+        not_before: float,
+        error_code: str,
+        now: float | None = None,
+    ) -> bool:
+        """Schedule a bounded provider inspection without leaving waiting-user UX."""
+        now = time.time() if now is None else now
+        with self.db.write() as connection:
+            updated = connection.execute(
+                "UPDATE provisioning_jobs SET not_before = ?, error_code = ?,"
+                " lease_until = NULL, leased_by = NULL, settled_at = NULL, updated_at = ?"
+                " WHERE id = ? AND status = 'waiting_user'",
+                (not_before, error_code, now, job_id),
+            )
+        return updated.rowcount == 1
 
     def cancel_household(self, household_id: str, *, now: float | None = None) -> int:
         now = time.time() if now is None else now
