@@ -13,6 +13,7 @@ from control_plane.db import new_id
 from control_plane.email.contracts import EmailFailureKind, EmailProviderError
 from control_plane.email.domain_policy import canonicalize_domain
 from control_plane.email.models import (
+    SYNTHETIC_EMAIL_SECRET_BINDING,
     EmailDnsPublicStatus,
     EmailGoogleOAuthPublicStatus,
     EmailIdentityStatus,
@@ -1164,9 +1165,8 @@ class ProvisioningWorker:
                 email_identity_id = request.get("email_identity_id")
                 if (
                     request.get("resource_type") == "email_identity"
-                    and (
-                        not isinstance(email_identity_id, str)
-                        or not self._delete_email_binding_secret(email_identity_id)
+                    and not self._delete_email_cleanup_secret(
+                        job, request, email_identity_id
                     )
                 ):
                     return WorkResult(
@@ -2118,9 +2118,8 @@ class ProvisioningWorker:
         email_identity_id = request.get("email_identity_id")
         if (
             request.get("resource_type") == "email_identity"
-            and (
-                not isinstance(email_identity_id, str)
-                or not self._delete_email_binding_secret(email_identity_id)
+            and not self._delete_email_cleanup_secret(
+                job, request, email_identity_id
             )
         ):
             self._mark_step_problem(
@@ -2148,6 +2147,36 @@ class ProvisioningWorker:
                 )
         return WorkResult(job.id, "succeeded")
 
+    def _delete_email_cleanup_secret(
+        self, job: JobRecord, request: dict[str, Any], identity_id: Any
+    ) -> bool:
+        if isinstance(identity_id, str):
+            return self._delete_email_binding_secret(identity_id)
+        binding_ref = request.get("legacy_secret_binding_ref")
+        if (
+            job.provider != "fake-email"
+            or binding_ref != SYNTHETIC_EMAIL_SECRET_BINDING
+        ):
+            return False
+        return self._delete_email_binding_secret_for_household(
+            job.household_id, binding_ref
+        )
+
+    def _delete_email_binding_secret_for_household(
+        self, household_id: str, binding_ref: str
+    ) -> bool:
+        namespace_ref = self._secret_namespace_ref(
+            household_id, include_deleting=True
+        )
+        if namespace_ref is None:
+            namespace_state = self._secret_namespace_state(household_id)
+            return namespace_state is not None and namespace_state[0] == "deleted"
+        try:
+            self.secret_sink.delete(namespace_ref, binding_ref)
+        except Exception:
+            return False
+        return True
+
     def _delete_email_binding_secret(self, identity_id: str) -> bool:
         if self.email_identities is None:
             return True
@@ -2160,17 +2189,9 @@ class ProvisioningWorker:
             return False
         if not identity_row["secret_binding_ref"]:
             return True
-        namespace_ref = self._secret_namespace_ref(
-            identity_row["household_id"], include_deleting=True
+        return self._delete_email_binding_secret_for_household(
+            identity_row["household_id"], identity_row["secret_binding_ref"]
         )
-        if namespace_ref is None:
-            namespace_state = self._secret_namespace_state(identity_row["household_id"])
-            return namespace_state is not None and namespace_state[0] == "deleted"
-        try:
-            self.secret_sink.delete(namespace_ref, identity_row["secret_binding_ref"])
-        except Exception:
-            return False
-        return True
 
     def _cleanup_bootstrap(self, job: JobRecord, request: dict) -> WorkResult:
         if request.get("cleanup_authorization") not in {

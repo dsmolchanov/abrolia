@@ -1312,3 +1312,66 @@ def test_reset_deprovisions_identity_and_removes_staged_secret(cp_stack) -> None
         (identity.id,),
     )
     assert reservation["status"] == "released"
+
+
+def test_reset_deprovisions_pre_identity_synthetic_email_resource(cp_stack) -> None:
+    cp_stack.complete_profile()
+    cp_stack.service.select(
+        cp_stack.household.id,
+        StepKind.EMAIL,
+        EMAIL_SELECTION,
+        context=cp_stack.context(),
+        now=BASE_TIME + 2,
+    )
+    provider = FakeEmailIdentityProvisioner(issue_secret=True)
+    registry = ProviderRegistry()
+    registry.register("fake-email", provider)
+    sink = InMemorySecretSink()
+    worker = cp_stack.make_worker(
+        providers=registry, secret_sink=sink, now=BASE_TIME + 3
+    )
+    assert worker.run_once().status == "succeeded"
+    identity = cp_stack.email_identities.current_for_household(cp_stack.household.id)
+    assert identity is not None
+    namespace = cp_stack.database.query_one(
+        "SELECT * FROM external_resources WHERE resource_type = 'secret_namespace'"
+    )
+    namespace_ref = cp_stack.jobs.decrypt_json(
+        "external_resources",
+        namespace["id"],
+        "external_id",
+        namespace["external_id_ciphertext"],
+        namespace["encryption_key_version"],
+    )
+    assert sink.get(namespace_ref, "ABROLIA_EMAIL_PROVIDER_KEY") == b"synthetic-key"
+
+    # Reproduce the production baseline: the provider resource predates the
+    # durable email identity generation introduced later.
+    with cp_stack.database.write() as connection:
+        connection.execute(
+            "DELETE FROM email_address_reservations WHERE email_identity_id = ?",
+            (identity.id,),
+        )
+        connection.execute("DELETE FROM email_identities WHERE id = ?", (identity.id,))
+
+    cp_stack.service.reset_from(
+        cp_stack.household.id,
+        StepKind.EMAIL,
+        context=cp_stack.context(),
+        now=BASE_TIME + 4,
+    )
+    cleanup = cp_stack.database.query_one(
+        "SELECT id FROM provisioning_jobs WHERE kind = 'cleanup'"
+        " AND provider = 'fake-email'"
+    )
+    assert cp_stack.jobs.request(cleanup["id"])["legacy_secret_binding_ref"] == (
+        "ABROLIA_EMAIL_PROVIDER_KEY"
+    )
+
+    result = worker.run_once()
+    assert result is not None and result.status == "succeeded"
+    assert sink.get(namespace_ref, "ABROLIA_EMAIL_PROVIDER_KEY") is None
+    assert cp_stack.database.query_one(
+        "SELECT status FROM external_resources"
+        " WHERE resource_type = 'email_identity'"
+    )["status"] == "deleted"
