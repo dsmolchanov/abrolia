@@ -16,8 +16,21 @@
 ## API-снапшот Nerve, на который полагаемся
 
 - `POST /v1/orgs`, `POST /v1/domains`, **`GET /v1/domains/dns`**, **`POST /v1/domains/verify`**, `POST /v1/inboxes`, `POST /v1/keys`, `POST /v1/webhooks` (секрет — только в ответе create/rotate)
+- Bootstrap-only domain-grant contract for managed `@abrolia.com`:
+  `POST /v1/domain-grants`, `GET /v1/domain-grants` and
+  `DELETE /v1/domain-grants/{id}`. The platform owner grants the household org
+  access to the verified root domain **before** inbox creation. Abrolia's
+  `NerveManagedEmailProvisioner` already follows this order; the exact request
+  body and bootstrap credential boundary are covered by
+  `test_client_uses_bootstrap_admin_and_exact_platform_grant_contract`.
 - `GET /v1/inboxes/{id}/threads[/{thread_id}]`, `GET /v1/messages/{id}/attachments/{aid}` с `nerve:email.read`; состояния `pending`, `available`, `expired`, `too_large`, `failed` имеют типизированную семантику SDK
 - MCP: `list_threads, get_thread, search_inbox, draft_reply_with_policy, send_reply, compose_email`; `compose_email`/`send_reply` принимают `attachments`, `draft_reply_with_policy` — нет. Инструмента `draft_reply` не существует — в первой редакции документа имя было указано неверно
+- Attachment capability has a separate activation prerequisite: the household
+  org must have effective `attachments=true`, verified with its runtime key at
+  `GET /internal/feature-flags/attachments`. The global default remains off.
+  Until the org flag converges, `tools/list` omits attachment inputs and an
+  attempted attachment send returns `attachment_feature_disabled`; a valid
+  inbox/key alone is not evidence that attachment onboarding is complete.
 - Подпись webhook: `X-Nerve-Signature: t=..,v1=..` HMAC-SHA256 над `ts.body`
 
 ## Nerve Phase 7 release evidence (2026-08-05)
@@ -42,6 +55,13 @@ Abrolia `main` на момент перепина содержит HTTP-contract
 provisioning, но ещё не содержит полный live consumer-suite из Phase 3. Поэтому
 upstream production contract и локальный provisioning suite записываются как
 два разных доказательства; локальные тесты нельзя называть staging/live smoke.
+
+**Открытый activation gate:** managed provisioning создаёт и проверяет domain
+grant, но пока не оркестрирует и не проверяет org-scoped `attachments` flag.
+До закрытия [abrolia#6](https://github.com/dsmolchanov/abrolia/issues/6)
+перепин фиксирует совместимую Nerve release baseline, но не означает, что новый
+household объявляется attachment-ready. Онбординг обязан оставаться
+fail-closed/pending до успешного effective-state probe.
 
 Consumer verification на `abrolia@1596310502f7127de2ef83512e4ffa9ca71ffa42`:
 
