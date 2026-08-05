@@ -168,7 +168,7 @@ def test_manifest_and_provider_public_result_reject_secret_shaped_fields(
 
 
 def test_phase_one_input_contracts_reject_real_provider_facing_identities() -> None:
-    with pytest.raises(ValidationError, match="reserved .test"):
+    with pytest.raises(ValidationError, match="rollout gate"):
         FamilyDomainSelection(domain="family.example.com")
     assert FamilyDomainSelection(domain="family.example.test").domain.endswith(".test")
 

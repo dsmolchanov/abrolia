@@ -179,7 +179,14 @@ class ProvisioningWorker:
                     else request
                 )
             if job.operation == "inspect":
-                return self._inspect_job(job, request, provider, namespace_ref=namespace_ref)
+                inspect_request = (
+                    {**request, "secret_namespace_ref": namespace_ref}
+                    if job.kind == "email_identity"
+                    else request
+                )
+                return self._inspect_job(
+                    job, inspect_request, provider, namespace_ref=namespace_ref
+                )
             split_runtime = job.kind == "runtime" and all(
                 callable(getattr(provider, name, None)) for name in ("prepare", "launch")
             )
@@ -253,7 +260,14 @@ class ProvisioningWorker:
                 error.code,
             )
         except ProviderWaiting as error:
-            return self._mark_step_problem(job, request, "waiting_user", error.code)
+            return self._mark_step_problem(
+                job,
+                request,
+                "waiting_user",
+                error.code,
+                public_result=error.public_result,
+                external_ref=error.external_ref,
+            )
         except ProviderRejected as error:
             return self._mark_step_problem(job, request, "failed", error.code)
         except (OutcomeUnknown, TimeoutError, ConnectionError):
@@ -312,7 +326,12 @@ class ProvisioningWorker:
         *,
         namespace_ref: str | None = None,
     ) -> WorkResult:
-        inspected = provider.inspect(request["stable_ref"])
+        inspect_intent = getattr(provider, "inspect_intent", None)
+        inspected = (
+            inspect_intent(request, request["stable_ref"])
+            if callable(inspect_intent)
+            else provider.inspect(request["stable_ref"])
+        )
         if inspected.state is InspectState.READY and inspected.result is not None:
             if job.kind == "email_identity":
                 if namespace_ref is None or not self._stage_email_secret(
@@ -326,7 +345,11 @@ class ProvisioningWorker:
             return self._finish_step(job, request, inspected.result)
         if inspected.state is InspectState.PENDING:
             return self._mark_step_problem(
-                job, request, "waiting_user", "waiting_user"
+                job,
+                request,
+                "waiting_user",
+                "waiting_user",
+                public_result=inspected.public_result,
             )
         if inspected.state in {InspectState.UNKNOWN, InspectState.READY}:
             return self._mark_step_problem(
@@ -614,7 +637,12 @@ class ProvisioningWorker:
                 return WorkResult(job.id, "pending", error.code)
             except ProviderWaiting as error:
                 return self._mark_step_problem(
-                    job, request, "waiting_user", error.code
+                    job,
+                    request,
+                    "waiting_user",
+                    error.code,
+                    public_result=error.public_result,
+                    external_ref=error.external_ref,
                 )
             except ProviderRejected as error:
                 return self._mark_step_problem(job, request, "failed", error.code)
@@ -662,6 +690,9 @@ class ProvisioningWorker:
         request: dict,
         job_status: str,
         error_code: str,
+        *,
+        public_result: dict[str, Any] | None = None,
+        external_ref: str | None = None,
     ) -> WorkResult:
         now = self.clock()
         with self.jobs.db.write() as connection:
@@ -709,6 +740,13 @@ class ProvisioningWorker:
                 error_code=error_code,
                 now=now,
             )
+            if external_ref and job_status == "waiting_user":
+                self._external_resource(
+                    connection,
+                    job,
+                    external_ref,
+                    status="creating",
+                )
             if (
                 job.kind == "email_identity"
                 and self.email_identities is not None
@@ -747,7 +785,8 @@ class ProvisioningWorker:
                             "state": {
                                 "waiting_user": "waiting_for_you",
                                 "verifying": "needs_reconciliation",
-                            }.get(step_status, "needs_attention")
+                            }.get(step_status, "needs_attention"),
+                            **(public_result or {}),
                         }),
                         now,
                         job.workflow_id,

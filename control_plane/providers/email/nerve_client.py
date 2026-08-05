@@ -116,7 +116,12 @@ class NerveAdminClient:
         return list(payload.get("domain_grants", []))
 
     def ensure_inbox(
-        self, *, org_id: str, address: str, external_ref: str
+        self,
+        *,
+        org_id: str,
+        address: str,
+        external_ref: str,
+        domain_id: str | None = None,
     ) -> dict[str, Any]:
         return self.request(
             "POST",
@@ -124,7 +129,7 @@ class NerveAdminClient:
             json={
                 "org_id": org_id,
                 "address": address,
-                "domain_id": self.settings.platform_domain_id,
+                "domain_id": domain_id or self.settings.platform_domain_id,
                 "external_ref": external_ref,
             },
         )
@@ -132,6 +137,41 @@ class NerveAdminClient:
     def list_inboxes(self, *, org_id: str) -> list[dict[str, Any]]:
         payload = self.request("GET", "/v1/inboxes", params={"org_id": org_id})
         return list(payload.get("inboxes", []))
+
+    def ensure_domain(
+        self, *, org_id: str, domain: str, external_ref: str
+    ) -> dict[str, Any]:
+        return self.request(
+            "POST",
+            "/v1/domains",
+            json={
+                "org_id": org_id,
+                "domain": domain,
+                "dkim_method": "cname",
+                "external_ref": external_ref,
+            },
+        )
+
+    def list_domains(self, *, org_id: str) -> list[dict[str, Any]]:
+        return list(
+            self.request("GET", "/v1/domains", params={"org_id": org_id}).get(
+                "domains", []
+            )
+        )
+
+    def domain_dns(self, *, org_id: str, domain_id: str) -> dict[str, Any]:
+        return self.request(
+            "GET",
+            "/v1/domains/dns",
+            params={"org_id": org_id, "domain_id": domain_id},
+        )
+
+    def verify_domain(self, *, org_id: str, domain_id: str) -> dict[str, Any]:
+        return self.request(
+            "POST",
+            "/v1/domains/verify",
+            json={"org_id": org_id, "domain_id": domain_id},
+        )
 
     def issue_key(self, *, org_id: str, external_ref: str) -> dict[str, Any]:
         return self.request(

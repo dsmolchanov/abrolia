@@ -25,6 +25,10 @@ class EmailIdentityService:
         address = None
         if option is EmailOption.MANAGED_ABROLIA:
             address = f"{normalize_local_part(selection['local_part'])}@abrolia.com"
+        elif option is EmailOption.OWN_DOMAIN:
+            address = (
+                f"{normalize_local_part(selection['local_part'])}@{selection['domain']}"
+            )
         identity = self.repository.create_selected(
             connection,
             household_id=household_id,

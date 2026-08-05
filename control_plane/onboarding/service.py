@@ -43,6 +43,8 @@ class OnboardingService:
         *,
         runtime_provider: str = "dry-run-runtime",
         email_provider: str = "fake-email",
+        byo_domain_provider: str | None = None,
+        allow_real_email_domains: bool = False,
         email_identities: EmailIdentityService | None = None,
     ) -> None:
         self.households = households
@@ -50,6 +52,8 @@ class OnboardingService:
         self.jobs = jobs
         self.runtime_provider = runtime_provider
         self.email_provider = email_provider
+        self.byo_domain_provider = byo_domain_provider or email_provider
+        self.allow_real_email_domains = allow_real_email_domains
         self.email_identities = email_identities
 
     @staticmethod
@@ -232,9 +236,14 @@ class OnboardingService:
         }
         if kind not in adapters:
             raise InvalidTransition(f"{kind.value} is not a selectable user step")
-        return adapters[kind].validate_python(selection).model_dump(mode="json")
+        return adapters[kind].validate_python(
+            selection,
+            context={"allow_real_email_domains": self.allow_real_email_domains},
+        ).model_dump(mode="json")
 
     def _provider_for(self, kind: StepKind, selection_kind: str) -> str:
+        if kind is StepKind.EMAIL and selection_kind == "family_domain":
+            return self.byo_domain_provider
         return {
             StepKind.EMAIL: self.email_provider,
             StepKind.WHATSAPP: "fake-whatsapp",
@@ -507,6 +516,8 @@ class OnboardingService:
                 inspect_request.update({
                     "email_identity_id": identity.id,
                     "household_id": household_id,
+                    "option": identity.option.value,
+                    "selection": self.onboarding.selection(row["id"], kind),
                 })
             inspect_id, _ = self.jobs.create(
                 connection,
@@ -781,8 +792,13 @@ class OnboardingService:
                 "SELECT * FROM onboarding_steps WHERE workflow_id = ? AND kind = ?",
                 (row["id"], kind.value),
             ).fetchone()
-            if target["status"] != "verified":
-                raise InvalidTransition("only a verified choice can be reset explicitly")
+            resettable = target["status"] == "verified" or (
+                kind is StepKind.EMAIL and target["status"] == "waiting_user"
+            )
+            if not resettable:
+                raise InvalidTransition(
+                    "only a verified choice or pending email domain can be reset explicitly"
+                )
             # Cleanup jobs are persisted before any external deprovision call,
             # including a runtime already activated from these choices.
             cleanup_jobs = self._schedule_registered_cleanup(
@@ -861,7 +877,7 @@ class OnboardingService:
                 session_id=context.session_id,
                 request_id=context.request_id,
                 step_kind=kind.value,
-                from_step_status="verified",
+                from_step_status=target["status"],
                 to_step_status="available",
                 related_job_id=cleanup_jobs[0] if cleanup_jobs else None,
                 metadata={"cleanup_jobs": len(cleanup_jobs)},
