@@ -652,10 +652,20 @@ flags остаются false до provider-specific gates.
 
 #### Acceptance
 
-- Invalid/expired/replayed signature never appends or ACKs as success.
-- Crash after append before ACK causes provider retry but one event.
-- Attachment failure is retryable/DLQ without losing parent message.
-- Managed and BYO domain pass the same ingress/send scenario suite.
+- [x] Invalid/expired/replayed signature never appends or ACKs as success.
+- [x] Crash after append before ACK causes provider retry but one event.
+- [x] Attachment failure is retryable/DLQ without losing parent message.
+- [x] Managed and BYO domain pass the same ingress/send scenario suite.
+
+#### Status — automated implementation complete (2026-08-05)
+
+- Runtime migration `0007_nerve_runtime.sql`, signed webhook journal, async
+  body/attachment materializer, Nerve MCP compose adapter and health signals
+  are implemented.
+- Full repository regression, Ruff, fixture scanner and `git diff --check` pass.
+- Real-provider staging smoke (signed inbound PDF through Nerve and approved
+  outbound compose) remains the manual verification gate; no real family data
+  is authorized by these automated results.
 
 ### Phase 2.7 — Google OAuth control-plane flow
 

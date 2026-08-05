@@ -81,6 +81,20 @@ EXPORTED: dict[str, tuple[str, ...]] = {
         "effect_id", "approval_id", "message_id", "provider_ref", "state",
         "accepted_at", "reconciled_at", "created_at", "updated_at",
     ),
+    "nerve_webhook_events": (
+        "id", "binding_identity_id", "binding_revision", "org_id", "inbox_id",
+        "thread_id", "message_id", "attachment_count", "payload", "payload_sha256", "state",
+        "attempts", "canonical_event_id", "last_error_code", "received_at", "updated_at",
+    ),
+    "nerve_attachments": (
+        "id", "nerve_event_id", "message_id", "provider_attachment_id", "filename",
+        "content_type", "actual_size", "content_sha256", "classification", "content",
+        "retention_until", "created_at",
+    ),
+    "nerve_runtime_health": (
+        "binding_identity_id", "binding_revision", "last_webhook_at",
+        "last_materialized_at", "credential_state", "last_error_code", "updated_at",
+    ),
 }
 
 # Таблицы, которых в экспорте нет — и почему. Список существует, чтобы
@@ -92,6 +106,7 @@ NOT_EXPORTED = {
     "oauth_grants": (
         "зашифрованный provider credential; в DSAR не выдаётся и удаляется целиком"
     ),
+    "nerve_webhook_signatures": "служебные replay-дигесты без содержимого письма",
 }
 
 # То, что нельзя удалить у себя, потому что оно не у нас.
@@ -143,7 +158,8 @@ def wipe_household(database: Database, *, now: float | None = None) -> dict[str,
     """
     now = time.time() if now is None else now
     order = (
-        "email_delivery_receipts", "email_sends", "email_ingress_receipts",
+        "nerve_attachments", "nerve_webhook_signatures", "nerve_webhook_events",
+        "nerve_runtime_health", "email_delivery_receipts", "email_sends", "email_ingress_receipts",
         "oauth_grants", "email_sync_state", "email_bindings",
         "evidence_refs", "extraction_runs", "effects", "commitments",
         "memory_statements", "reminders", "approval_attempts", "approvals",

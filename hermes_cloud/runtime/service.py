@@ -25,7 +25,19 @@ from hermes_cloud.core.runtime_manifest import (
     load_runtime_manifest,
 )
 from hermes_cloud.email.contracts import EmailBinding
+from hermes_cloud.email.nerve_client import (
+    DEFAULT_REST_URL,
+    DEFAULT_RUNTIME_URL,
+    NerveEmailClient,
+)
 from hermes_cloud.email.receipts import EmailBindingStore
+from hermes_cloud.ingest.nerve_webhook import (
+    MAX_WEBHOOK_BYTES,
+    NerveAttachmentWorker,
+    NerveWebhookReceiver,
+    NerveWebhookRejected,
+    NerveWebhookStore,
+)
 from hermes_cloud.runtime.bootstrap import (
     DEFAULT_ACTIVATION_STATE,
     DEFAULT_MANIFEST_PATH,
@@ -46,6 +58,9 @@ ENV_RUNTIME_PORT = "HERMES_RUNTIME_PORT"
 ENV_BOOTSTRAP_RETRY_SECONDS = "HERMES_BOOTSTRAP_RETRY_SECONDS"
 ENV_RUNTIME_DSAR_TOKEN = "HERMES_RUNTIME_DSAR_TOKEN"
 ENV_RUNTIME_DELETION_MARKER = "HERMES_RUNTIME_DELETION_MARKER"
+ENV_NERVE_RUNTIME_URL = "ABROLIA_NERVE_RUNTIME_URL"
+ENV_NERVE_REST_URL = "ABROLIA_NERVE_REST_URL"
+ENV_NERVE_WORKER_SECONDS = "ABROLIA_NERVE_WORKER_SECONDS"
 
 
 class RuntimeNotReady(RuntimeError):
@@ -58,6 +73,16 @@ class Probe:
     payload: Mapping[str, Any]
 
 
+@dataclass(frozen=True)
+class NerveRuntimeConfig:
+    org_id: str
+    inbox_id: str
+    api_key: str
+    webhook_signing_key: str
+    runtime_url: str
+    rest_url: str
+
+
 class RuntimeService:
     def __init__(
         self,
@@ -66,6 +91,7 @@ class RuntimeService:
         activation_path: Path | str | None = None,
         runtime_ref: str | None = None,
         env: Mapping[str, str] | None = None,
+        nerve_client_factory: Callable[..., Any] = NerveEmailClient,
     ) -> None:
         self.env = dict(os.environ if env is None else env)
         self.manifest_path = Path(
@@ -77,6 +103,7 @@ class RuntimeService:
             or DEFAULT_ACTIVATION_STATE
         )
         self.runtime_ref = runtime_ref or self.env.get(ENV_RUNTIME_REF) or ""
+        self.nerve_client_factory = nerve_client_factory
         self.database_path = Path(self.env.get(ENV_DB) or DEFAULT_DB_PATH)
         self.deletion_marker = Path(
             self.env.get(ENV_RUNTIME_DELETION_MARKER)
@@ -114,6 +141,14 @@ class RuntimeService:
             binding = self._sync_email_binding(manifest)
         except Exception:
             return Probe(503, {"status": "not_ready", "reason": "email_state_unavailable"})
+        if binding is not None and binding.provider.startswith("nerve"):
+            try:
+                self._nerve_config(manifest)
+            except RuntimeNotReady:
+                return Probe(
+                    503,
+                    {"status": "not_ready", "reason": "email_provider_unavailable"},
+                )
         payload = {
             "status": "ready",
             "household_id": manifest.household_id,
@@ -124,6 +159,14 @@ class RuntimeService:
                 email_provider=binding.provider,
                 email_binding_revision=binding.revision,
             )
+            if binding.provider.startswith("nerve"):
+                try:
+                    with open_database(self.database_path) as database:
+                        payload.update(
+                            email_health=NerveWebhookStore(database).health(binding)
+                        )
+                except Exception:
+                    payload.update(email_health={"status": "unavailable"})
         return Probe(
             200,
             payload,
@@ -138,7 +181,9 @@ class RuntimeService:
         if manifest is None:
             raise RuntimeNotReady(f"runtime is not active ({reason})")
         try:
-            self._sync_email_binding(manifest)
+            binding = self._sync_email_binding(manifest)
+            if binding is not None and binding.provider.startswith("nerve"):
+                self._nerve_config(manifest)
         except Exception as error:
             raise RuntimeNotReady("runtime is not active (email_state_unavailable)") from error
         return manifest
@@ -162,11 +207,72 @@ class RuntimeService:
         with open_database(self.database_path) as database:
             return EmailBindingStore(database).activate(binding)
 
+    def _nerve_config(self, manifest: RuntimeManifest) -> NerveRuntimeConfig:
+        if not manifest.email.provider_kind.startswith("nerve"):
+            raise RuntimeNotReady("runtime email provider is not Nerve")
+        try:
+            refs = json.loads(manifest.email.provider_binding_ref or "")
+        except (TypeError, json.JSONDecodeError) as error:
+            raise RuntimeNotReady("Nerve public binding reference is invalid") from error
+        secret_name = manifest.email.secret_binding_ref or ""
+        try:
+            secrets = json.loads(self.env.get(secret_name, ""))
+        except (TypeError, json.JSONDecodeError) as error:
+            raise RuntimeNotReady("Nerve credential bundle is unavailable") from error
+        if not isinstance(refs, dict) or not isinstance(secrets, dict):
+            raise RuntimeNotReady("Nerve runtime configuration is invalid")
+        values = {
+            "org_id": refs.get("org_id"),
+            "inbox_id": refs.get("inbox_id"),
+            "api_key": secrets.get("api_key"),
+            "webhook_signing_key": secrets.get("webhook_signing_key"),
+        }
+        if any(not isinstance(value, str) or not value for value in values.values()):
+            raise RuntimeNotReady("Nerve runtime configuration is incomplete")
+        return NerveRuntimeConfig(
+            **values,
+            runtime_url=self.env.get(ENV_NERVE_RUNTIME_URL, DEFAULT_RUNTIME_URL),
+            rest_url=self.env.get(ENV_NERVE_REST_URL, DEFAULT_REST_URL),
+        )
+
+    def receive_nerve_webhook(self, payload: bytes, signature: str):
+        manifest = self.require_ready()
+        binding = self._sync_email_binding(manifest)
+        if binding is None:
+            raise RuntimeNotReady("Nerve email binding is unavailable")
+        config = self._nerve_config(manifest)
+        with open_database(self.database_path) as database:
+            return NerveWebhookReceiver(
+                NerveWebhookStore(database),
+                binding=binding,
+                org_id=config.org_id,
+                inbox_id=config.inbox_id,
+                signing_secret=config.webhook_signing_key,
+            ).receive(payload, signature)
+
+    def run_nerve_once(self):
+        manifest = self.require_ready()
+        config = self._nerve_config(manifest)
+        with open_database(self.database_path) as database:
+            client = self.nerve_client_factory(
+                api_key=config.api_key,
+                runtime_url=config.runtime_url,
+                rest_url=config.rest_url,
+            )
+            try:
+                return NerveAttachmentWorker(database, client).run_once()
+            finally:
+                close = getattr(client, "close", None)
+                if close is not None:
+                    close()
+
     def __call__(self, environ: Mapping[str, Any], start_response: Callable) -> list[bytes]:
         """Health probes plus an authenticated private DSAR boundary."""
         path = str(environ.get("PATH_INFO") or "")
         method = str(environ.get("REQUEST_METHOD") or "GET").upper()
-        if path in {"/internal/v1/dsar/export", "/internal/v1/dsar/delete"}:
+        if path == "/v1/email/nerve/webhook" and method == "POST":
+            probe = self._nerve_webhook(environ)
+        elif path in {"/internal/v1/dsar/export", "/internal/v1/dsar/delete"}:
             probe = self._dsar(path, method, str(environ.get("HTTP_AUTHORIZATION") or ""))
         elif method != "GET" or path not in {"/healthz", "/readyz"}:
             probe = Probe(404, {"status": "not_found"})
@@ -175,8 +281,12 @@ class RuntimeService:
         body = json.dumps(probe.payload, sort_keys=True, separators=(",", ":")).encode()
         status_text = {
             200: "200 OK",
+            400: "400 Bad Request",
             401: "401 Unauthorized",
+            403: "403 Forbidden",
             404: "404 Not Found",
+            409: "409 Conflict",
+            413: "413 Content Too Large",
             410: "410 Gone",
             503: "503 Service Unavailable",
         }
@@ -189,6 +299,38 @@ class RuntimeService:
             ],
         )
         return [body]
+
+    def _nerve_webhook(self, environ: Mapping[str, Any]) -> Probe:
+        try:
+            length = int(str(environ.get("CONTENT_LENGTH") or "0"))
+        except ValueError:
+            return Probe(400, {"status": "invalid_request"})
+        if length < 1:
+            return Probe(400, {"status": "invalid_request"})
+        if length > MAX_WEBHOOK_BYTES:
+            return Probe(413, {"status": "payload_too_large"})
+        stream = environ.get("wsgi.input")
+        if stream is None or not hasattr(stream, "read"):
+            return Probe(400, {"status": "invalid_request"})
+        payload = stream.read(length)
+        if not isinstance(payload, bytes) or len(payload) != length:
+            return Probe(400, {"status": "invalid_request"})
+        signature = str(environ.get("HTTP_X_NERVE_SIGNATURE") or "")
+        try:
+            accepted = self.receive_nerve_webhook(payload, signature)
+        except NerveWebhookRejected as error:
+            return Probe(error.status_code, {"status": error.code})
+        except RuntimeNotReady:
+            return Probe(503, {"status": "runtime_not_ready"})
+        except Exception:
+            return Probe(503, {"status": "webhook_unavailable"})
+        return Probe(
+            200,
+            {
+                "status": "accepted" if accepted.created else "duplicate",
+                "event_id": accepted.event.id,
+            },
+        )
 
     def _dsar(self, path: str, method: str, authorization: str) -> Probe:
         expected = self.env.get(ENV_RUNTIME_DSAR_TOKEN, "")
@@ -281,6 +423,32 @@ def _bootstrap_until_active(
             return
 
 
+def _nerve_worker_until_stopped(
+    service: RuntimeService,
+    source: Mapping[str, str],
+    stop: threading.Event,
+) -> None:
+    try:
+        interval = max(float(source.get(ENV_NERVE_WORKER_SECONDS, "2")), 0.1)
+    except ValueError:
+        interval = 2.0
+    while not stop.is_set():
+        if service.can_start_workers:
+            try:
+                result = service.run_nerve_once()
+            except RuntimeNotReady:
+                pass
+            except Exception as error:
+                print(
+                    f"Nerve ingress pending ({error.__class__.__name__})",
+                    file=sys.stderr,
+                )
+            else:
+                if result is not None:
+                    continue
+        stop.wait(interval)
+
+
 class _QuietRequestHandler(WSGIRequestHandler):
     def log_message(self, _format: str, *args: object) -> None:
         """Health requests are intentionally absent from application logs."""
@@ -305,12 +473,20 @@ def serve_runtime(*, env: Mapping[str, str] | None = None) -> None:
         name="runtime-bootstrap",
         daemon=True,
     )
+    nerve_worker = threading.Thread(
+        target=_nerve_worker_until_stopped,
+        args=(service, source, stop),
+        name="nerve-ingress",
+        daemon=True,
+    )
     worker.start()
+    nerve_worker.start()
     try:
         server.serve_forever()
     finally:
         stop.set()
         worker.join(timeout=1.0)
+        nerve_worker.join(timeout=1.0)
         server.server_close()
 
 

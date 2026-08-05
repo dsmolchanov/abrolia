@@ -57,6 +57,9 @@ class RetentionReport:
     memory_candidates_deleted: int = 0
     email_ingress_receipts_deleted: int = 0
     email_sends_deleted: int = 0
+    nerve_payloads_blanked: int = 0
+    nerve_attachments_blanked: int = 0
+    nerve_webhooks_deleted: int = 0
     memory_due_for_review: list[str] = field(default_factory=list)
 
     @property
@@ -66,6 +69,7 @@ class RetentionReport:
             + self.effects_deleted + self.extraction_runs_deleted
             + self.candidates_deleted + self.memory_candidates_deleted
             + self.email_ingress_receipts_deleted + self.email_sends_deleted
+            + self.nerve_webhooks_deleted
         )
 
 
@@ -87,10 +91,24 @@ class RetentionJob:
                 " WHERE received_at <= ? AND length(raw) > 0",
                 (b"", now, now - RAW_EVENT_DAYS * DAY),
             ).rowcount
+            report.nerve_payloads_blanked = connection.execute(
+                "UPDATE nerve_webhook_events SET payload = ?, updated_at = ?"
+                " WHERE received_at <= ? AND length(payload) > 0",
+                (b"", now, now - RAW_EVENT_DAYS * DAY),
+            ).rowcount
+            report.nerve_attachments_blanked = connection.execute(
+                "UPDATE nerve_attachments SET content = ?"
+                " WHERE retention_until <= ? AND length(content) > 0",
+                (b"", now),
+            ).rowcount
 
             # Provider receipt metadata follows the same action-journal TTL.
             report.email_ingress_receipts_deleted = connection.execute(
                 "DELETE FROM email_ingress_receipts WHERE created_at <= ?",
+                (now - ACTIONS_DAYS * DAY,),
+            ).rowcount
+            report.nerve_webhooks_deleted = connection.execute(
+                "DELETE FROM nerve_webhook_events WHERE received_at <= ?",
                 (now - ACTIONS_DAYS * DAY,),
             ).rowcount
 
