@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
@@ -117,6 +118,37 @@ def _email_binding(config, database) -> EmailBinding | None:
 
 def _mail(config, database, binding: EmailBinding | None):
     """Исходящая почта. Нет учётных данных — нет и отправки, но предложить можно."""
+    if binding is not None and binding.provider.startswith("nerve"):
+        from hermes_cloud.email.nerve_client import (
+            DEFAULT_REST_URL,
+            DEFAULT_RUNTIME_URL,
+            NerveEmailClient,
+        )
+        from hermes_cloud.execute.email_send import EmailSender
+        from hermes_cloud.execute.nerve_send import NerveSendProvider
+
+        try:
+            refs = json.loads(binding.provider_ref or "")
+            secret_name = binding.secret_names[0]
+            secrets = json.loads(os.environ.get(secret_name, ""))
+            inbox_id = str(refs["inbox_id"])
+            api_key = str(secrets["api_key"])
+        except (IndexError, KeyError, TypeError, json.JSONDecodeError):
+            return None
+        client = NerveEmailClient(
+            api_key=api_key,
+            runtime_url=os.environ.get("ABROLIA_NERVE_RUNTIME_URL", DEFAULT_RUNTIME_URL),
+            rest_url=os.environ.get("ABROLIA_NERVE_REST_URL", DEFAULT_REST_URL),
+        )
+        return EmailSender(
+            NerveSendProvider(client, inbox_id=inbox_id),
+            sender=binding.address,
+            identity_id=binding.identity_id,
+            binding_revision=binding.revision,
+            provider=binding.provider,
+            binding_store=EmailBindingStore(database),
+            send_store=EmailSendStore(database),
+        )
     if not config.has_gmail:
         return None
     from hermes_cloud.execute.email_send import EmailSender, SmtpSsl

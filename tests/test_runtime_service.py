@@ -57,11 +57,11 @@ agent_inbox = "runtime@abrolia.test"
 fallback = "owner@example.test"
 '''
     if with_email_binding:
-        body += '''\
+        body += """\
 provider_kind = "nerve-managed"
-provider_binding_ref = "identity-1"
+provider_binding_ref = '{"org_id":"org-1","inbox_id":"inbox-1"}'
 secret_binding_ref = "HERMES_EMAIL_BINDING"
-'''
+"""
     digest = compute_config_sha256(body)
     return body.replace("schema_version = 1\n", f'schema_version = 1\nconfig_sha256 = "{digest}"\n')
 
@@ -227,9 +227,46 @@ def test_revision_mismatch_never_becomes_ready(tmp_path: Path) -> None:
         service.require_ready()
 
 
-def test_readiness_materializes_public_email_binding_without_secrets(
+def test_readiness_materializes_public_email_binding_without_exposing_secrets(
     tmp_path: Path,
 ) -> None:
+    content = manifest_toml(with_email_binding=True)
+    manifest = parse_runtime_manifest(content)
+    manifest_path = atomic_write(tmp_path / "household.toml", content.encode())
+    activation_path = tmp_path / "activation.json"
+    write_activation_state(
+        activation_path,
+        ActivationState(
+            status="active",
+            runtime_ref=RUNTIME_REF,
+            household_id=manifest.household_id,
+            config_revision=manifest.config_revision,
+            config_sha256=manifest.config_sha256,
+            updated_at=1.0,
+        ),
+    )
+    service = RuntimeService(
+        manifest_path=manifest_path,
+        activation_path=activation_path,
+        runtime_ref=RUNTIME_REF,
+        env={
+            "HERMES_DB": str(tmp_path / "hermes.db"),
+            "HERMES_EMAIL_BINDING": json.dumps(
+                {"api_key": "synthetic-key", "webhook_signing_key": "synthetic-signing"}
+            ),
+        },
+    )
+
+    probe = service.readyz()
+
+    assert probe.status_code == 200
+    assert probe.payload["email_provider"] == "nerve-managed"
+    assert probe.payload["email_binding_revision"] == manifest.config_revision
+    assert "runtime@abrolia.test" not in str(probe.payload)
+    assert "HERMES_EMAIL_BINDING" not in str(probe.payload)
+
+
+def test_nerve_readiness_fails_closed_without_credential_bundle(tmp_path: Path) -> None:
     content = manifest_toml(with_email_binding=True)
     manifest = parse_runtime_manifest(content)
     manifest_path = atomic_write(tmp_path / "household.toml", content.encode())
@@ -252,13 +289,8 @@ def test_readiness_materializes_public_email_binding_without_secrets(
         env={"HERMES_DB": str(tmp_path / "hermes.db")},
     )
 
-    probe = service.readyz()
-
-    assert probe.status_code == 200
-    assert probe.payload["email_provider"] == "nerve-managed"
-    assert probe.payload["email_binding_revision"] == manifest.config_revision
-    assert "runtime@abrolia.test" not in str(probe.payload)
-    assert "HERMES_EMAIL_BINDING" not in str(probe.payload)
+    assert service.readyz().status_code == 503
+    assert service.readyz().payload["reason"] == "email_provider_unavailable"
 
 
 def test_claim_metadata_must_match_manifest(tmp_path: Path) -> None:

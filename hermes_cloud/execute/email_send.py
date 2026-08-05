@@ -256,6 +256,18 @@ class EmailSender:
         message = build_message(letter, sender=binding.address, approval_id=effect_id)
         raw = message.as_bytes()
         request_sha256 = hashlib.sha256(raw).hexdigest()
+        provider_request = (
+            EmailSendRequest(
+                effect_id=effect_id,
+                approval_id=approval_id,
+                binding=binding,
+                message_id=str(message["Message-ID"]),
+                mime_bytes=raw,
+                request_sha256=request_sha256,
+            )
+            if getattr(self.backend, "provider", None)
+            else None
+        )
         if self.send_store is not None:
             previous, fresh = self.send_store.begin(
                 effect_id=effect_id,
@@ -275,6 +287,58 @@ class EmailSender:
                         return receipt
                     raise EmailRejected("previous email send failed definitively")
                 if previous == "pending":
+                    if (
+                        provider_request is not None
+                        and getattr(self.backend, "supports_idempotent_reconcile", False)
+                        and hasattr(self.backend, "reconcile")
+                    ):
+                        try:
+                            reconciled = self.backend.reconcile(provider_request)  # type: ignore[attr-defined]
+                        except EmailOutcomeUnknown:
+                            reconciled = EmailDeliveryReceipt(
+                                effect_id=effect_id,
+                                approval_id=approval_id,
+                                message_id=str(message["Message-ID"]),
+                                provider_ref=None,
+                                accepted_at=None,
+                                status="outcome_unknown",
+                            )
+                        except Exception as error:
+                            failed = EmailDeliveryReceipt(
+                                effect_id=effect_id,
+                                approval_id=approval_id,
+                                message_id=str(message["Message-ID"]),
+                                provider_ref=None,
+                                accepted_at=None,
+                                status="failed",
+                            )
+                            self.send_store.settle(failed, error_code=type(error).__name__)
+                            raise
+                        if (
+                            reconciled.effect_id != effect_id
+                            or reconciled.approval_id != approval_id
+                            or reconciled.message_id != str(message["Message-ID"])
+                        ):
+                            self.send_store.settle(
+                                EmailDeliveryReceipt(
+                                    effect_id=effect_id,
+                                    approval_id=approval_id,
+                                    message_id=str(message["Message-ID"]),
+                                    provider_ref=None,
+                                    accepted_at=None,
+                                    status="failed",
+                                ),
+                                error_code="mismatched_receipt",
+                            )
+                            raise EmailRejected("email provider returned a mismatched receipt")
+                        self.send_store.settle(reconciled)
+                        if reconciled.status == "accepted":
+                            return reconciled
+                        if reconciled.status == "outcome_unknown":
+                            raise EmailOutcomeUnknown(
+                                "provider reconciliation could not determine send outcome"
+                            )
+                        raise EmailRejected("provider reconciliation rejected the message")
                     unknown = EmailDeliveryReceipt(
                         effect_id=effect_id,
                         approval_id=approval_id,
@@ -289,15 +353,8 @@ class EmailSender:
                     )
         try:
             if getattr(self.backend, "provider", None):
-                request = EmailSendRequest(
-                    effect_id=effect_id,
-                    approval_id=approval_id,
-                    binding=binding,
-                    message_id=str(message["Message-ID"]),
-                    mime_bytes=raw,
-                    request_sha256=request_sha256,
-                )
-                receipt = self.backend.send(request)  # type: ignore[arg-type]
+                assert provider_request is not None
+                receipt = self.backend.send(provider_request)  # type: ignore[arg-type]
                 if (
                     receipt.effect_id != effect_id
                     or receipt.approval_id != approval_id
