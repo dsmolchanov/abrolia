@@ -42,12 +42,14 @@ class OnboardingService:
         jobs: JobsRepository,
         *,
         runtime_provider: str = "dry-run-runtime",
+        email_provider: str = "fake-email",
         email_identities: EmailIdentityService | None = None,
     ) -> None:
         self.households = households
         self.onboarding = onboarding
         self.jobs = jobs
         self.runtime_provider = runtime_provider
+        self.email_provider = email_provider
         self.email_identities = email_identities
 
     @staticmethod
@@ -232,10 +234,9 @@ class OnboardingService:
             raise InvalidTransition(f"{kind.value} is not a selectable user step")
         return adapters[kind].validate_python(selection).model_dump(mode="json")
 
-    @staticmethod
-    def _provider_for(kind: StepKind, selection_kind: str) -> str:
+    def _provider_for(self, kind: StepKind, selection_kind: str) -> str:
         return {
-            StepKind.EMAIL: "fake-email",
+            StepKind.EMAIL: self.email_provider,
             StepKind.WHATSAPP: "fake-whatsapp",
             StepKind.PRIMARY_CHANNEL: "fake-channel",
         }[kind]
@@ -352,6 +353,10 @@ class OnboardingService:
                 "attempt": attempt,
             }
             if email_identity is not None:
+                intent_key = (
+                    f"{household_id}:{kind.value}:{email_identity.id}:"
+                    f"{selection_kind}:{attempt}"
+                )
                 job_request.update({
                     "email_identity_id": email_identity.id,
                     "household_id": household_id,
@@ -599,6 +604,10 @@ class OnboardingService:
                     raise InvalidTransition("email retry has no durable identity")
                 self.email_identities.repository.retry_provisioning(
                     connection, identity.id, now=now
+                )
+                intent_key = (
+                    f"{household_id}:{kind.value}:{identity.id}:{parsed['kind']}:"
+                    f"{attempt}"
                 )
                 job_request.update({
                     "email_identity_id": identity.id,

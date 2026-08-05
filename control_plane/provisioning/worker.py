@@ -572,6 +572,54 @@ class ProvisioningWorker:
                     job, request, "outcome_unknown", "reconcile_inconclusive"
                 )
             return WorkResult(job.id, "outcome_unknown", "reconcile_inconclusive")
+        reconcile_email = getattr(provider, "reconcile", None)
+        if job.kind == "email_identity" and callable(reconcile_email):
+            namespace_ref = self._secret_namespace_ref(job.household_id)
+            if namespace_ref is None:
+                return WorkResult(
+                    job.id, "outcome_unknown", "secret_namespace_not_ready"
+                )
+            provider_request = {
+                "identity_id": request["email_identity_id"],
+                "household_id": job.household_id,
+                "option": request["option"],
+                "selection": request["selection"],
+                "secret_namespace_ref": namespace_ref,
+            }
+            try:
+                result = reconcile_email(provider_request, job.intent_key)
+                if (
+                    job.error_code == "secret_handoff_unknown"
+                    and result.secret_material.is_empty
+                ):
+                    return WorkResult(
+                        job.id, "outcome_unknown", "secret_handoff_unknown"
+                    )
+                if not self._stage_email_secret(
+                    job, request, result, namespace_ref
+                ):
+                    return self._mark_step_problem(
+                        job, request, "outcome_unknown", "secret_handoff_unknown"
+                    )
+                return self._finish_step(job, request, result)
+            except _ProjectionCancelled:
+                return self._cleanup_cancelled_result(job, result, provider)
+            except ProviderRateLimited as error:
+                self.jobs.retry_later(
+                    job.id,
+                    not_before=self.clock() + error.retry_after,
+                    error_code=error.code,
+                    now=self.clock(),
+                )
+                return WorkResult(job.id, "pending", error.code)
+            except ProviderWaiting as error:
+                return self._mark_step_problem(
+                    job, request, "waiting_user", error.code
+                )
+            except ProviderRejected as error:
+                return self._mark_step_problem(job, request, "failed", error.code)
+            except (OutcomeUnknown, TimeoutError, ConnectionError):
+                return WorkResult(job.id, "outcome_unknown", "reconcile_inconclusive")
         inspected = provider.inspect(job.intent_key)
         if inspected.state is InspectState.READY and inspected.result:
             try:
