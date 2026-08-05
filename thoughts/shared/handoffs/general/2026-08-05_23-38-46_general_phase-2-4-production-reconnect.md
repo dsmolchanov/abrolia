@@ -89,6 +89,8 @@ type: implementation_strategy
 - Nerve PR #66, merge `56826658a69423136b45f3bd575744e7e1511699`
 - Nerve PR #67, merge `99092688c3213af3cf7dc8e72cc28bd89983f6a1`
 - Abrolia PR #21, merge `261a35f0d71b66159aea2036501d6cad9381e104`
+- Abrolia PR #22, merge `246c1008be46907c42a227dbe1aca4e95c126c41`
+- Abrolia PR #23, merge `168d25c20c27b80bcda031210c40f41751a2c7b4`
 - Abrolia release 12 image digest
   `sha256:d2762fdba1e272257966adfb71b9813e8ebb8a768feb4dc1ffa0003d041394cc`
 - Nerve release 68 image digest
@@ -97,6 +99,8 @@ type: implementation_strategy
   `sha256:7406baea1ea524f0b9de43ff4e5d40ae9d407f3e316f70f10dafa44851229d08`
 - Abrolia release 15 image digest
   `sha256:82134117d06cbd53841850e7511c08385b97d872e55fed2874fb59f7b9cc699c`
+- Current Abrolia release 16 image digest
+  `sha256:2aa6100eda56f3cce124e4cf928519b3ca1fee74d6b8a66d317b71868604c92f`
 - Generation A identity/org:
   `a51cb145-63fb-4277-96eb-ef2e28e4907f` /
   `70d15c36-3ab4-40d6-9c58-ae35744d8db5`
@@ -130,8 +134,9 @@ type: implementation_strategy
   onto the production Nerve email path.
 - Generation B remains active as the canary. Its org-scoped attachment flag is
   enabled; generation A and the diagnostic orphan are tombstoned.
-- Abrolia release 15 passed its Fly service check and `/healthz`; generation B
+- Abrolia release 16 passed its Fly service check and `/healthz`; generation B
   remained `verified` after deployment. `/readyz` remains 503 only because the
-  older cleanup job above is still `outcome_unknown`.
+  older cleanup job above is still `outcome_unknown`; PR #22's fix is deployed,
+  but the quarantined job still needs one explicit operator reconcile.
 - Resume with:
   `/resume_handoff thoughts/shared/handoffs/general/2026-08-05_23-38-46_general_phase-2-4-production-reconnect.md`
