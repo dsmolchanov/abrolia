@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 
 import pytest
 
+from control_plane.db import ControlPlaneDatabase
 from control_plane.email.models import EmailIdentityStatus, EmailOption
+from control_plane.email.repository import EmailIdentityRepository
 from control_plane.models import StepKind
 from control_plane.providers.email.nerve_byo_domain import NerveByoDomainProvisioner
 from control_plane.providers.email.nerve_managed import NERVE_SECRET_BINDING
@@ -83,6 +86,10 @@ class FakeByoNerveAdmin:
             "external_ref": external_ref,
         }
 
+    def list_keys(self, *, org_id):
+        del org_id
+        return []
+
     def ensure_webhook(self, *, org_id, url, external_ref):
         return {
             "id": WEBHOOK_ID,
@@ -138,6 +145,41 @@ class LostVerifyResponseNerveAdmin(FakeByoNerveAdmin):
             self.lose_next_verify = False
             raise OutcomeUnknown("synthetic lost verification response")
         return super().verify_domain(org_id=org_id, domain_id=domain_id)
+
+
+class DoubleLostKeyResponseNerveAdmin(FakeByoNerveAdmin):
+    def __init__(self) -> None:
+        super().__init__()
+        self.active = True
+        self._key_calls = 0
+        self.keys: dict[str, dict[str, object]] = {}
+
+    def issue_key(self, *, org_id, external_ref):
+        del org_id
+        self._key_calls += 1
+        key = self.keys.get(external_ref)
+        if key is None:
+            key = {
+                "id": f"10000000-0000-4000-8000-{10 + self._key_calls:012d}",
+                "external_ref": external_ref,
+            }
+            self.keys[external_ref] = key
+        response = {**key, "secret_available": self._key_calls > 2}
+        if self._key_calls > 2:
+            response["key"] = "synthetic-recovered-byo-key"
+        return response
+
+    def list_keys(self, *, org_id):
+        del org_id
+        return [dict(item) for item in self.keys.values()]
+
+    def delete(self, path, *, org_id=None):
+        if path.startswith("/v1/keys/"):
+            key_id = path.rsplit("/", 1)[-1]
+            self.keys = {
+                ref: key for ref, key in self.keys.items() if key["id"] != key_id
+            }
+        super().delete(path, org_id=org_id)
 
 
 def _select(cp_stack) -> None:
@@ -213,6 +255,102 @@ def test_dns_records_resume_until_all_checks_are_active(cp_stack) -> None:
     assert sink.get(runtime_ref, NERVE_SECRET_BINDING) is not None
 
 
+def test_dns_verification_polls_with_persisted_backoff_then_finishes(cp_stack) -> None:
+    cp_stack.complete_profile()
+    _select(cp_stack)
+    client = FakeByoNerveAdmin()
+    registry = ProviderRegistry()
+    registry.register("nerve-byo-domain", NerveByoDomainProvisioner(client))
+    sink = InMemorySecretSink()
+
+    first = cp_stack.make_worker(
+        providers=registry, secret_sink=sink, now=1_800_000_100.0
+    ).run_once()
+    assert first.status == "waiting_user"
+    scheduled = cp_stack.database.query_one(
+        "SELECT status, error_code, not_before, attempts FROM provisioning_jobs"
+        " WHERE id = ?",
+        (first.job_id,),
+    )
+    assert dict(scheduled) == {
+        "status": "waiting_user",
+        "error_code": "dns_verification_scheduled",
+        "not_before": 1_800_000_130.0,
+        "attempts": 1,
+    }
+    assert cp_stack.make_worker(
+        providers=registry, secret_sink=sink, now=1_800_000_129.0
+    ).run_once() is None
+
+    still_waiting = cp_stack.make_worker(
+        providers=registry, secret_sink=sink, now=1_800_000_130.0
+    ).run_once()
+    assert still_waiting.status == "waiting_user"
+    assert cp_stack.database.query_one(
+        "SELECT not_before FROM provisioning_jobs WHERE id = ?", (first.job_id,)
+    )["not_before"] == 1_800_000_190.0
+
+    client.active = True
+    client.checks = {"ownership": True, "mx": True, "spf": True, "dkim": True}
+    finished = cp_stack.make_worker(
+        providers=registry, secret_sink=sink, now=1_800_000_190.0
+    ).run_once()
+
+    assert finished.status == "succeeded"
+    assert finished.job_id == first.job_id
+    assert dict(cp_stack.database.query_one(
+        "SELECT attempts, not_before FROM provisioning_jobs WHERE id = ?", (first.job_id,)
+    )) == {"attempts": 3, "not_before": None}
+    assert len(cp_stack.database.query(
+        "SELECT id FROM provisioning_jobs WHERE kind = 'email_identity'"
+    )) == 1
+
+
+def test_dns_polling_stops_after_bound_and_keeps_manual_check_available(cp_stack) -> None:
+    cp_stack.complete_profile()
+    _select(cp_stack)
+    client = FakeByoNerveAdmin()
+    registry = ProviderRegistry()
+    registry.register("nerve-byo-domain", NerveByoDomainProvisioner(client))
+    worker = cp_stack.make_worker(providers=registry, now=1_800_000_100.0)
+    first = worker.run_once()
+    assert first.status == "waiting_user"
+
+    for _ in range(5):
+        row = cp_stack.database.query_one(
+            "SELECT not_before FROM provisioning_jobs WHERE id = ?", (first.job_id,)
+        )
+        assert row["not_before"] is not None
+        result = cp_stack.make_worker(
+            providers=registry, now=row["not_before"]
+        ).run_once()
+        assert result.status == "waiting_user"
+
+    bounded = cp_stack.database.query_one(
+        "SELECT status, error_code, not_before, attempts FROM provisioning_jobs"
+        " WHERE id = ?",
+        (first.job_id,),
+    )
+    assert dict(bounded) == {
+        "status": "waiting_user",
+        "error_code": "dns_manual_check_required",
+        "not_before": None,
+        "attempts": 6,
+    }
+    assert cp_stack.make_worker(providers=registry, now=1_900_000_000.0).run_once() is None
+
+    snapshot = cp_stack.onboarding.snapshot(cp_stack.household.id)
+    cp_stack.service.check(
+        cp_stack.household.id,
+        StepKind.EMAIL,
+        context=cp_stack.context(expected_version=snapshot.version),
+        now=1_900_000_001.0,
+    )
+    assert cp_stack.make_worker(
+        providers=registry, now=1_900_000_002.0
+    ).run_once().status == "waiting_user"
+
+
 def test_provider_cannot_verify_a_mailbox_outside_selected_domain(cp_stack) -> None:
     cp_stack.complete_profile()
     _select(cp_stack)
@@ -231,6 +369,30 @@ def test_provider_cannot_verify_a_mailbox_outside_selected_domain(cp_stack) -> N
     identity = cp_stack.email_identities.current_for_household(cp_stack.household.id)
     assert identity.status is EmailIdentityStatus.OUTCOME_UNKNOWN
     assert identity.address == "assistant@family.example.test"
+
+
+def test_double_lost_key_response_reconciles_without_orphaned_credentials(
+    cp_stack,
+) -> None:
+    cp_stack.complete_profile()
+    _select(cp_stack)
+    client = DoubleLostKeyResponseNerveAdmin()
+    registry = ProviderRegistry()
+    registry.register("nerve-byo-domain", NerveByoDomainProvisioner(client))
+    sink = InMemorySecretSink()
+    worker = cp_stack.make_worker(providers=registry, secret_sink=sink)
+
+    unknown = worker.run_once()
+    recovered = worker.reconcile(unknown.job_id)
+
+    assert unknown.status == "outcome_unknown"
+    assert recovered.status == "succeeded"
+    assert len(client.keys) == 1
+    identity = cp_stack.email_identities.current_for_household(cp_stack.household.id)
+    assert list(client.keys)[0].startswith(
+        f"arbolia:email:{identity.id}:key:recovery:"
+    )
+    assert len([path for path in client.deleted if path.startswith("/v1/keys/")]) == 2
 
 
 def test_malformed_dns_instructions_fail_without_stranding_job(cp_stack) -> None:
@@ -393,6 +555,50 @@ def test_same_normalized_domain_cannot_be_claimed_by_another_household(cp_stack)
             option=EmailOption.OWN_DOMAIN,
             address="other@FAMILY.EXAMPLE.TEST",
         )
+
+
+def test_concurrent_writers_cannot_claim_the_same_normalized_domain(cp_stack) -> None:
+    account_one = cp_stack.accounts.create_verified("domain-race-one@family.test")
+    account_two = cp_stack.accounts.create_verified("domain-race-two@family.test")
+    household_one = cp_stack.households.create_for_owner(account_one.id)
+    household_two = cp_stack.households.create_for_owner(account_two.id)
+    first_db = ControlPlaneDatabase(cp_stack.config.database_path, timeout=2)
+    second_db = ControlPlaneDatabase(cp_stack.config.database_path, timeout=2)
+    repositories = [
+        EmailIdentityRepository(first_db, cp_stack.cipher, cp_stack.lookup),
+        EmailIdentityRepository(second_db, cp_stack.cipher, cp_stack.lookup),
+    ]
+    start = threading.Barrier(2)
+    outcomes: list[str] = []
+
+    def claim(index: int, household_id: str) -> None:
+        try:
+            start.wait(2)
+            with repositories[index].db.write() as connection:
+                repositories[index].create_selected(
+                    connection,
+                    household_id=household_id,
+                    option=EmailOption.OWN_DOMAIN,
+                    address=f"assistant-{index}@Race.Example.Test",
+                )
+            outcomes.append("claimed")
+        except sqlite3.IntegrityError:
+            outcomes.append("rejected")
+
+    threads = [
+        threading.Thread(target=claim, args=(0, household_one.id)),
+        threading.Thread(target=claim, args=(1, household_two.id)),
+    ]
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(3)
+        assert all(not thread.is_alive() for thread in threads)
+        assert sorted(outcomes) == ["claimed", "rejected"]
+    finally:
+        first_db.close()
+        second_db.close()
 
 
 def test_legacy_domain_claim_without_new_hmac_still_blocks_another_household(

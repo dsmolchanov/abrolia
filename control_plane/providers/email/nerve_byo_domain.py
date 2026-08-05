@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import secrets
 from dataclasses import dataclass
 from typing import Any
 
@@ -189,18 +190,13 @@ class NerveByoDomainProvisioner:
         )
         inbox = inbox_envelope.get("inbox", inbox_envelope)
         key_ref = self._resource_ref(parsed.identity_id, "key")
-        key = self.client.issue_key(org_id=refs.org_id, external_ref=key_ref)
+        key = self._issue_recoverable_key(org_id=refs.org_id, key_ref=key_ref)
         webhook_ref = self._resource_ref(parsed.identity_id, "webhook")
         webhook = self.client.ensure_webhook(
             org_id=refs.org_id,
             url=f"https://{parsed.secret_namespace_ref}.fly.dev/v1/email/nerve/webhook",
             external_ref=webhook_ref,
         )
-        if not key.get("key"):
-            self.client.delete(f"/v1/keys/{key.get('id', '')}", org_id=refs.org_id)
-            key = self.client.issue_key(
-                org_id=refs.org_id, external_ref=f"{key_ref}:recovery"
-            )
         if not webhook.get("secret"):
             webhook = self.client.rotate_webhook(
                 org_id=refs.org_id, webhook_id=str(webhook.get("id", ""))
@@ -243,6 +239,49 @@ class NerveByoDomainProvisioner:
             secret_material=SecretMaterial.from_mapping({
                 NERVE_SECRET_BINDING: bundle
             }),
+        )
+
+    def _issue_recoverable_key(self, *, org_id: str, key_ref: str) -> dict[str, Any]:
+        recovery_prefix = f"{key_ref}:recovery:"
+        prior_keys = [
+            item
+            for item in self.client.list_keys(org_id=org_id)
+            if item.get("external_ref") == key_ref
+            or str(item.get("external_ref", "")).startswith(recovery_prefix)
+        ]
+        for item in prior_keys:
+            key_id = str(item.get("id", ""))
+            if not key_id:
+                raise OutcomeUnknown("Nerve recovery key identity is incomplete")
+            self.client.delete(f"/v1/keys/{key_id}", org_id=org_id)
+
+        issue_ref = (
+            f"{recovery_prefix}{secrets.token_hex(8)}" if prior_keys else key_ref
+        )
+        key = self.client.issue_key(org_id=org_id, external_ref=issue_ref)
+        if key.get("key"):
+            return key
+
+        candidates = [
+            item
+            for item in self.client.list_keys(org_id=org_id)
+            if item.get("external_ref") == key_ref
+            or str(item.get("external_ref", "")).startswith(recovery_prefix)
+        ]
+        if key.get("id") and not any(
+            str(item.get("id", "")) == str(key["id"]) for item in candidates
+        ):
+            candidates.append(key)
+        if not candidates:
+            raise OutcomeUnknown("Nerve key response was lost without an inspectable key")
+        for item in candidates:
+            key_id = str(item.get("id", ""))
+            if not key_id:
+                raise OutcomeUnknown("Nerve key identity is incomplete")
+            self.client.delete(f"/v1/keys/{key_id}", org_id=org_id)
+        return self.client.issue_key(
+            org_id=org_id,
+            external_ref=f"{recovery_prefix}{secrets.token_hex(8)}",
         )
 
     def inspect(self, stable_ref: str) -> InspectResult:

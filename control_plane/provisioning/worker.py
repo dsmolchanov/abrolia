@@ -51,6 +51,9 @@ class _ProjectionCancelled(RuntimeError):
     pass
 
 
+_DNS_POLL_DELAYS_SECONDS = (30.0, 60.0, 120.0, 300.0, 600.0)
+
+
 class ProvisioningWorker:
     def __init__(
         self,
@@ -206,9 +209,18 @@ class ProvisioningWorker:
                     if request.get("email_identity_id") and request.get("option")
                     else request
                 )
-            if job.operation == "inspect":
+            automatic_dns_poll = (
+                job.kind == "email_identity"
+                and job.operation == "ensure"
+                and job.error_code == "dns_verification_scheduled"
+            )
+            if job.operation == "inspect" or automatic_dns_poll:
                 inspect_request = (
-                    {**request, "secret_namespace_ref": namespace_ref}
+                    {
+                        **request,
+                        "stable_ref": request.get("stable_ref", job.intent_key),
+                        "secret_namespace_ref": namespace_ref,
+                    }
                     if job.kind == "email_identity"
                     else request
                 )
@@ -367,13 +379,56 @@ class ProvisioningWorker:
                 )
                 if cleanup is not None:
                     return cleanup
-        return self._mark_step_problem(
+        return self._mark_waiting_user(
+            job,
+            request,
+            public_result=public_result,
+            external_ref=external_ref,
+            fallback_error=error.code,
+        )
+
+    def _mark_waiting_user(
+        self,
+        job: JobRecord,
+        request: dict[str, Any],
+        *,
+        public_result: dict[str, Any] | None,
+        external_ref: str | None,
+        fallback_error: str,
+    ) -> WorkResult:
+        automatic_dns = (
+            job.kind == "email_identity"
+            and job.operation == "ensure"
+            and request.get("option") == EmailOption.OWN_DOMAIN.value
+        )
+        poll_index = job.attempts - 1
+        should_schedule = automatic_dns and poll_index < len(_DNS_POLL_DELAYS_SECONDS)
+        error_code = (
+            "dns_verification_scheduled"
+            if should_schedule
+            else "dns_manual_check_required" if automatic_dns else fallback_error
+        )
+        result = self._mark_step_problem(
             job,
             request,
             "waiting_user",
-            error.code,
+            error_code,
             public_result=public_result,
             external_ref=external_ref,
+        )
+        if result.status != "waiting_user" or not should_schedule:
+            return result
+        now = self.clock()
+        scheduled = self.jobs.schedule_waiting_poll(
+            job.id,
+            not_before=now + _DNS_POLL_DELAYS_SECONDS[poll_index],
+            error_code=error_code,
+            now=now,
+        )
+        return result if scheduled else self._durable_work_result(
+            job.id,
+            fallback_status=result.status,
+            fallback_error=result.error_code or error_code,
         )
 
     def _schedule_cancelled_waiting_cleanup(
@@ -861,13 +916,12 @@ class ProvisioningWorker:
                     raise OutcomeUnknown(
                         "email provider returned an invalid waiting result"
                     ) from error
-            return self._mark_step_problem(
+            return self._mark_waiting_user(
                 job,
                 request,
-                "waiting_user",
-                "waiting_user",
                 public_result=public_result,
                 external_ref=waiting_external_ref,
+                fallback_error="waiting_user",
             )
         if inspected.state in {InspectState.UNKNOWN, InspectState.READY}:
             return self._mark_step_problem(
