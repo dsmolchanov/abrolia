@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block title %}Verify · Abrolia{% endblock %}
+{% block page %}verify{% endblock %}
+{% block content %}
+<section class="panel narrow">
+  <p class="eyebrow">Secure sign-in</p>
+  <h1>Confirm this browser</h1>
+  <p id="verify-status" role="status" aria-live="assertive">Checking your one-time link…</p>
+  <noscript>This confirmation needs first-party JavaScript to move the token out of the URL fragment.</noscript>
+</section>
+{% endblock %}

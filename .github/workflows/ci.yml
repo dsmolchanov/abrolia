@@ -1,0 +1,62 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  fixtures:
+    name: fixtures & lint & tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install --disable-pip-version-check -r requirements-dev.txt
+      - name: Materialise private deny patterns
+        # Реальные имена и ID донора нельзя держать в публичном репозитории даже
+        # как правило, поэтому они приходят из секрета. Секрет не настроен =>
+        # файл пуст => следующий шаг падает: гейт fail-closed.
+        env:
+          HERMES_DENY_PATTERNS: ${{ secrets.HERMES_DENY_PATTERNS }}
+        run: |
+          umask 077
+          printf '%s\n' "$HERMES_DENY_PATTERNS" > "$RUNNER_TEMP/deny-patterns.txt"
+      - name: Sanitised fixtures (Gate -1)
+        env:
+          HERMES_EXTRA_DENY_FILE: ${{ runner.temp }}/deny-patterns.txt
+        run: python scripts/check_fixtures.py --all --require-deny
+      - name: Lint
+        run: ruff check .
+      - name: Tests
+        run: pytest -m "not live"
+      - name: Control-plane contract suite
+        run: pytest tests/control_plane -q
+
+  secrets:
+    name: gitleaks (full history)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Gate -1 требует зелёного скана по всей истории
+      - name: Install gitleaks
+        env:
+          # Версия закреплена и проверена локально на этом репозитории вместе с
+          # .gitleaks.toml: набор правил по умолчанию меняется между релизами,
+          # и «зелено у меня» без пина ничего не значит. Проверено на 8.18.4 и
+          # 8.30.1 — обе чистые; в CI идёт более строгая из них.
+          GITLEAKS_VERSION: 8.30.1
+        run: |
+          set -euo pipefail
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            | tar -xz -C /usr/local/bin gitleaks
+          gitleaks version
+      - name: Scan full history
+        run: gitleaks detect --source . --config .gitleaks.toml --log-opts="--all" --redact --verbose

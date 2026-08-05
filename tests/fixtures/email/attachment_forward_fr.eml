@@ -1,0 +1,33 @@
+From: Mario Rossi <mario.rossi@example.com>
+To: Hermes <hermes@household.example>
+Subject: Fwd: Sortie scolaire du 18 septembre
+Date: Wed, 2 Sep 2026 20:15:00 +0200
+Message-ID: <ATT0005synthetic@mail.example.com>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="fwd1"
+
+--fwd1
+Content-Type: text/plain; charset="utf-8"
+
+Voir piece jointe.
+
+--fwd1
+Content-Type: message/rfc822
+Content-Disposition: attachment; filename="sortie.eml"
+
+From: Secretariat Ecole Exemple <secretariat@ecole.example>
+To: Parents CE2 <ce2@ecole.example>
+Subject: Sortie scolaire du 18 septembre
+Date: Tue, 1 Sep 2026 11:02:00 +0200
+Message-ID: <INNER0004synthetic@mail.example.com>
+Content-Type: text/plain; charset="utf-8"
+
+Chers parents,
+
+La sortie scolaire aura lieu le 18 septembre 2026. La participation est de
+8,00 EUR, a regler avant le 15 septembre 2026.
+
+Cordialement,
+Le secretariat
+
+--fwd1--

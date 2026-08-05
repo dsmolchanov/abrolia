@@ -1,0 +1,39 @@
+# gitleaks-конфиг Gate −1. Сканируется вся история (`--log-opts=--all`),
+# вывод — только в redacted-режиме.
+#
+# Исключений по путям здесь намеренно нет: исключённый целиком файл — это
+# слепая зона (реальный секрет в тестовом файле переставал быть виден обоим
+# гейтам). Образцы в tests/test_check_fixtures.py собираются из кусков в коде
+# теста, поэтому не срабатывают и без исключений.
+
+title = "hermes-cloud"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "anthropic-api-key"
+description = "Anthropic API key"
+regex = '''sk-ant-[A-Za-z0-9\-_]{16,}'''
+keywords = ["sk-ant-"]
+
+[[rules]]
+id = "telegram-bot-token"
+description = "Telegram bot token"
+regex = '''\b\d{8,10}:[A-Za-z0-9_\-]{35,}'''
+keywords = [":AA"]
+
+[[rules]]
+# Генератор nerve-cloud (internal/cloudapi/handler_keys.go,
+# generateCloudAPIKeyMaterial) выдаёт "nrv_live_" + 64 hex: второй underscore
+# ломал прежнее правило `nrv_[A-Za-z0-9]{24,}`, и реальный ключ проходил насквозь.
+id = "nerve-api-key"
+description = "Nerve cloud API key"
+regex = '''\bnrv_(?:[a-z]+_)?[A-Za-z0-9]{24,}\b'''
+keywords = ["nrv_"]
+
+[[rules]]
+id = "evolution-instance-apikey"
+description = "Evolution (WhatsApp relay) instance apikey"
+regex = '''(?i)(evolution[_-]?api[_-]?key|EVOLUTION_APIKEY)\s*[:=]\s*['\"][A-Za-z0-9\-_]{16,}['\"]'''
+keywords = ["evolution"]

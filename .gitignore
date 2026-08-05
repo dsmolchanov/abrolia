@@ -4,5 +4,7 @@ __pycache__/
 .env.*
 data/
 *.egg-info/
+build/
 .pytest_cache/
 household.toml
+backups/

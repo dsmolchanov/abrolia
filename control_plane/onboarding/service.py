@@ -1,0 +1,883 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import time
+from typing import Any
+
+from pydantic import TypeAdapter
+
+from control_plane.crypto import canonical_json
+from control_plane.models import (
+    EmailSelection,
+    OnboardingSnapshot,
+    PrimaryChannelSelection,
+    ProfileInput,
+    StepKind,
+    StepStatus,
+    WhatsAppSelection,
+)
+from control_plane.onboarding.contracts import (
+    CommandContext,
+    CommandResult,
+    IdempotencyConflict,
+    InvalidTransition,
+    WorkflowConflict,
+)
+from control_plane.onboarding.state import CHECK, RETRY, SAVE_PROFILE, SELECT, next_status
+from control_plane.privacy.consent import consent_version_and_sha
+from control_plane.repositories.households import HouseholdsRepository
+from control_plane.repositories.jobs import JobsRepository
+from control_plane.repositories.onboarding import OnboardingRepository, WorkflowRecord
+
+IDEMPOTENCY_TTL_SECONDS = 24 * 60 * 60
+
+
+class OnboardingService:
+    def __init__(
+        self,
+        households: HouseholdsRepository,
+        onboarding: OnboardingRepository,
+        jobs: JobsRepository,
+    ) -> None:
+        self.households = households
+        self.onboarding = onboarding
+        self.jobs = jobs
+
+    @staticmethod
+    def _request_sha(body: dict[str, Any]) -> str:
+        return hashlib.sha256(canonical_json(body)).hexdigest()
+
+    def _replay(
+        self,
+        connection,
+        *,
+        context: CommandContext,
+        route: str,
+        request_sha: str,
+        now: float,
+    ) -> CommandResult | None:
+        key_hmac = self.onboarding.lookup.digest(context.idempotency_key)
+        row = connection.execute(
+            "SELECT * FROM idempotency_requests WHERE account_id = ? AND route = ?"
+            " AND idempotency_key_hmac = ?",
+            (context.account_id, route, key_hmac),
+        ).fetchone()
+        if row is None:
+            return None
+        if row["expires_at"] <= now:
+            # The idempotency row's primary key is the reusable command key.
+            # Remove an expired generation inside the command transaction so
+            # _remember() can insert the new generation without a PK collision.
+            connection.execute(
+                "DELETE FROM idempotency_requests WHERE account_id = ? AND route = ?"
+                " AND idempotency_key_hmac = ? AND expires_at <= ?",
+                (context.account_id, route, key_hmac, now),
+            )
+            return None
+        if row["request_sha"] != request_sha:
+            raise IdempotencyConflict("idempotency key was already used with another body")
+        body = json.loads(row["response_body_json"])
+        return CommandResult(OnboardingSnapshot.model_validate(body), replayed=True)
+
+    def _remember(
+        self,
+        connection,
+        *,
+        context: CommandContext,
+        route: str,
+        request_sha: str,
+        snapshot: OnboardingSnapshot,
+        now: float,
+    ) -> None:
+        key_hmac = self.onboarding.lookup.digest(context.idempotency_key)
+        connection.execute(
+            "INSERT INTO idempotency_requests (account_id, route, idempotency_key_hmac,"
+            " request_sha, response_status, response_body_json, created_at, expires_at)"
+            " VALUES (?, ?, ?, ?, 200, ?, ?, ?)",
+            (
+                context.account_id,
+                route,
+                key_hmac,
+                request_sha,
+                json.dumps(snapshot.model_dump(mode="json"), sort_keys=True),
+                now,
+                now + IDEMPOTENCY_TTL_SECONDS,
+            ),
+        )
+
+    @staticmethod
+    def _scoped_workflow(connection, account_id: str, household_id: str):
+        row = connection.execute(
+            "SELECT w.* FROM onboarding_workflows w"
+            " JOIN household_memberships m ON m.household_id = w.household_id"
+            " JOIN households h ON h.id = w.household_id"
+            " WHERE w.household_id = ? AND m.account_id = ? AND m.status = 'active'"
+            " AND h.status NOT IN ('deleting','deleted')",
+            (household_id, account_id),
+        ).fetchone()
+        if row is None:
+            raise KeyError(household_id)
+        return row
+
+    @staticmethod
+    def _check_version(row, expected: int) -> None:
+        if row["version"] != expected:
+            raise WorkflowConflict(
+                f"stale workflow version {expected}; current version is {row['version']}"
+            )
+
+    @staticmethod
+    def _workflow_record(row) -> WorkflowRecord:
+        return WorkflowRecord(
+            row["id"], row["household_id"], row["state"], row["current_step"], row["version"]
+        )
+
+    def save_profile(
+        self,
+        household_id: str,
+        profile: ProfileInput,
+        *,
+        context: CommandContext,
+        now: float | None = None,
+    ) -> CommandResult:
+        now = time.time() if now is None else now
+        route = "/api/v1/onboarding/profile"
+        body = profile.model_dump(mode="json")
+        request_sha = self._request_sha(body)
+        with self.onboarding.db.write() as connection:
+            replay = self._replay(
+                connection, context=context, route=route, request_sha=request_sha, now=now
+            )
+            if replay:
+                return replay
+            row = self._scoped_workflow(connection, context.account_id, household_id)
+            self._check_version(row, context.expected_version)
+            step = connection.execute(
+                "SELECT * FROM onboarding_steps WHERE workflow_id = ? AND kind = 'profile'",
+                (row["id"],),
+            ).fetchone()
+            new_status = next_status(
+                StepKind.PROFILE, StepStatus(step["status"]), SAVE_PROFILE
+            )
+            self.households.save_profile(
+                household_id, profile, now=now, connection=connection
+            )
+            connection.execute(
+                "UPDATE onboarding_steps SET status = ?, public_status_json = ?,"
+                " updated_at = ? WHERE workflow_id = ? AND kind = 'profile'",
+                (new_status.value, '{"state":"complete"}', now, row["id"]),
+            )
+            connection.execute(
+                "UPDATE onboarding_steps SET status = 'available', updated_at = ?"
+                " WHERE workflow_id = ? AND kind = 'email_identity' AND status = 'locked'",
+                (now, row["id"]),
+            )
+            new_version = row["version"] + 1
+            connection.execute(
+                "UPDATE onboarding_workflows SET state = 'in_progress',"
+                " current_step = 'email_identity', version = ?, updated_at = ? WHERE id = ?",
+                (new_version, now, row["id"]),
+            )
+            self.onboarding.append_transition(
+                connection,
+                workflow=self._workflow_record(row),
+                new_version=new_version,
+                command=SAVE_PROFILE,
+                to_state="in_progress",
+                account_id=context.account_id,
+                session_id=context.session_id,
+                request_id=context.request_id,
+                step_kind="profile",
+                from_step_status=step["status"],
+                to_step_status=new_status.value,
+                now=now,
+            )
+            snapshot = self.onboarding.snapshot(household_id)
+            self._remember(
+                connection,
+                context=context,
+                route=route,
+                request_sha=request_sha,
+                snapshot=snapshot,
+                now=now,
+            )
+            return CommandResult(snapshot)
+
+    def _parse_selection(self, kind: StepKind, selection: dict[str, Any]) -> dict[str, Any]:
+        adapters = {
+            StepKind.EMAIL: TypeAdapter(EmailSelection),
+            StepKind.WHATSAPP: TypeAdapter(WhatsAppSelection),
+            StepKind.PRIMARY_CHANNEL: TypeAdapter(PrimaryChannelSelection),
+        }
+        if kind not in adapters:
+            raise InvalidTransition(f"{kind.value} is not a selectable user step")
+        return adapters[kind].validate_python(selection).model_dump(mode="json")
+
+    @staticmethod
+    def _provider_for(kind: StepKind, selection_kind: str) -> str:
+        return {
+            StepKind.EMAIL: "fake-email",
+            StepKind.WHATSAPP: "fake-whatsapp",
+            StepKind.PRIMARY_CHANNEL: "fake-channel",
+        }[kind]
+
+    @staticmethod
+    def _record_whatsapp_consents(
+        connection,
+        *,
+        parsed: dict[str, Any],
+        household_id: str,
+        account_id: str,
+        locale: str,
+        now: float,
+    ) -> None:
+        receipts = [
+            (
+                parsed["privacy_notice_receipt_id"],
+                "whatsapp_channel_privacy",
+            )
+        ]
+        if parsed["kind"] == "dedicated_number":
+            receipts.append((
+                parsed["linked_device_risk_receipt_id"],
+                "whatsapp_linked_device_risk",
+            ))
+        for receipt_id, purpose in receipts:
+            existing = connection.execute(
+                "SELECT household_id, account_id, purpose FROM consent_receipts WHERE id = ?",
+                (receipt_id,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["household_id"] != household_id
+                    or existing["account_id"] != account_id
+                    or existing["purpose"] != purpose
+                ):
+                    raise IdempotencyConflict("consent receipt belongs to another command")
+                continue
+            text_version, text_sha = consent_version_and_sha(purpose)
+            connection.execute(
+                "INSERT INTO consent_receipts (id, household_id, account_id, purpose,"
+                " text_version, text_sha256, locale, accepted_at, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    receipt_id,
+                    household_id,
+                    account_id,
+                    purpose,
+                    text_version,
+                    text_sha,
+                    locale,
+                    now,
+                    now,
+                ),
+            )
+
+    def select(
+        self,
+        household_id: str,
+        kind: StepKind,
+        selection: dict[str, Any],
+        *,
+        context: CommandContext,
+        now: float | None = None,
+    ) -> CommandResult:
+        now = time.time() if now is None else now
+        parsed = self._parse_selection(kind, selection)
+        route = f"/api/v1/onboarding/steps/{kind.value}/select"
+        request_sha = self._request_sha(parsed)
+        with self.onboarding.db.write() as connection:
+            replay = self._replay(
+                connection, context=context, route=route, request_sha=request_sha, now=now
+            )
+            if replay:
+                return replay
+            row = self._scoped_workflow(connection, context.account_id, household_id)
+            self._check_version(row, context.expected_version)
+            if row["current_step"] != kind.value:
+                raise InvalidTransition("onboarding steps cannot be skipped or reordered")
+            step = connection.execute(
+                "SELECT * FROM onboarding_steps WHERE workflow_id = ? AND kind = ?",
+                (row["id"], kind.value),
+            ).fetchone()
+            if kind is StepKind.WHATSAPP:
+                household_row = connection.execute(
+                    "SELECT family_language FROM households WHERE id = ?", (household_id,)
+                ).fetchone()
+                self._record_whatsapp_consents(
+                    connection,
+                    parsed=parsed,
+                    household_id=household_id,
+                    account_id=context.account_id,
+                    locale=household_row["family_language"] or "en",
+                    now=now,
+                )
+            new_status = next_status(kind, StepStatus(step["status"]), SELECT)
+            attempt = step["attempt"] + 1
+            selection_kind = parsed["kind"]
+            encrypted = self.onboarding.encrypt_json(
+                "onboarding_steps", f"{row['id']}:{kind.value}", "selection", parsed
+            )
+            intent_key = f"{household_id}:{kind.value}:{selection_kind}:{attempt}"
+            job_id, _ = self.jobs.create(
+                connection,
+                household_id=household_id,
+                workflow_id=row["id"],
+                kind=("channel_binding" if kind is StepKind.PRIMARY_CHANNEL else kind.value),
+                operation="ensure",
+                intent_key=intent_key,
+                request={"step_kind": kind.value, "selection": parsed, "attempt": attempt},
+                provider=self._provider_for(kind, selection_kind),
+                now=now,
+            )
+            public = {"state": "setting_up", "option": selection_kind}
+            connection.execute(
+                "UPDATE onboarding_steps SET status = ?, selection_kind = ?,"
+                " selection_ciphertext = ?, result_ciphertext = NULL,"
+                " encryption_key_version = ?, public_status_json = ?, error_code = NULL,"
+                " attempt = ?, updated_at = ? WHERE workflow_id = ? AND kind = ?",
+                (
+                    new_status.value,
+                    selection_kind,
+                    encrypted.ciphertext,
+                    encrypted.key_version,
+                    self.onboarding.public_json(public),
+                    attempt,
+                    now,
+                    row["id"],
+                    kind.value,
+                ),
+            )
+            new_version = row["version"] + 1
+            connection.execute(
+                "UPDATE onboarding_workflows SET version = ?, updated_at = ? WHERE id = ?",
+                (new_version, now, row["id"]),
+            )
+            self.onboarding.append_transition(
+                connection,
+                workflow=self._workflow_record(row),
+                new_version=new_version,
+                command=SELECT,
+                to_state=row["state"],
+                account_id=context.account_id,
+                session_id=context.session_id,
+                request_id=context.request_id,
+                step_kind=kind.value,
+                from_step_status=step["status"],
+                to_step_status=new_status.value,
+                related_job_id=job_id,
+                metadata={"selection_kind": selection_kind},
+                now=now,
+            )
+            snapshot = self.onboarding.snapshot(household_id)
+            self._remember(
+                connection,
+                context=context,
+                route=route,
+                request_sha=request_sha,
+                snapshot=snapshot,
+                now=now,
+            )
+            return CommandResult(snapshot)
+
+    def retry(
+        self,
+        household_id: str,
+        kind: StepKind,
+        *,
+        context: CommandContext,
+        now: float | None = None,
+    ) -> CommandResult:
+        self.households.authorized(context.account_id, household_id)
+        workflow = self.onboarding.workflow_for_household(household_id)
+        selection = self.onboarding.selection(workflow.id, kind)
+        if selection is None:
+            raise InvalidTransition("failed step has no durable selection to retry")
+        # A retry is a new attempt/intent but uses the same selection. Give it a
+        # distinct route so a prior select idempotency key cannot alias it.
+        return self._retry_selection(
+            household_id, kind, selection, context=context, now=now
+        )
+
+    def check(
+        self,
+        household_id: str,
+        kind: StepKind,
+        *,
+        context: CommandContext,
+        now: float | None = None,
+    ) -> CommandResult:
+        if kind not in {StepKind.EMAIL, StepKind.WHATSAPP, StepKind.PRIMARY_CHANNEL}:
+            raise InvalidTransition("only a user identity/channel step can be checked")
+        now = time.time() if now is None else now
+        route = f"/api/v1/onboarding/steps/{kind.value}/check"
+        request_sha = self._request_sha({"kind": kind.value})
+        job_kind = "channel_binding" if kind is StepKind.PRIMARY_CHANNEL else kind.value
+        with self.onboarding.db.write() as connection:
+            replay = self._replay(
+                connection, context=context, route=route, request_sha=request_sha, now=now
+            )
+            if replay:
+                return replay
+            row = self._scoped_workflow(connection, context.account_id, household_id)
+            self._check_version(row, context.expected_version)
+            if row["current_step"] != kind.value:
+                raise InvalidTransition("only the current waiting step can be checked")
+            step = connection.execute(
+                "SELECT * FROM onboarding_steps WHERE workflow_id = ? AND kind = ?",
+                (row["id"], kind.value),
+            ).fetchone()
+            new_status = next_status(kind, StepStatus(step["status"]), CHECK)
+            waiting_job = connection.execute(
+                "SELECT * FROM provisioning_jobs WHERE workflow_id = ? AND kind = ?"
+                " AND status = 'waiting_user' ORDER BY created_at DESC, id DESC LIMIT 1",
+                (row["id"], job_kind),
+            ).fetchone()
+            if waiting_job is None:
+                raise InvalidTransition("waiting step has no inspectable provider intent")
+            stable_ref = waiting_job["intent_key"]
+            if waiting_job["operation"] == "inspect":
+                prior_request = self.jobs.decrypt_json(
+                    "provisioning_jobs",
+                    waiting_job["id"],
+                    "request",
+                    waiting_job["request_ciphertext"],
+                    waiting_job["encryption_key_version"],
+                )
+                stable_ref = prior_request.get("stable_ref", stable_ref)
+            connection.execute(
+                "UPDATE provisioning_jobs SET status = 'cancelled', settled_at = ?,"
+                " updated_at = ? WHERE id = ? AND status = 'waiting_user'",
+                (now, now, waiting_job["id"]),
+            )
+            inspect_id, _ = self.jobs.create(
+                connection,
+                household_id=household_id,
+                workflow_id=row["id"],
+                kind=job_kind,
+                operation="inspect",
+                intent_key=(
+                    f"{household_id}:{kind.value}:inspect:{step['attempt']}:{row['version'] + 1}"
+                ),
+                request={
+                    "step_kind": kind.value,
+                    "stable_ref": stable_ref,
+                    "attempt": step["attempt"],
+                },
+                provider=waiting_job["provider"],
+                now=now,
+            )
+            connection.execute(
+                "UPDATE onboarding_steps SET status = ?, public_status_json = ?,"
+                " error_code = NULL, updated_at = ? WHERE workflow_id = ? AND kind = ?",
+                (
+                    new_status.value,
+                    self.onboarding.public_json({"state": "checking"}),
+                    now,
+                    row["id"],
+                    kind.value,
+                ),
+            )
+            new_version = row["version"] + 1
+            connection.execute(
+                "UPDATE onboarding_workflows SET version = ?, updated_at = ? WHERE id = ?",
+                (new_version, now, row["id"]),
+            )
+            self.onboarding.append_transition(
+                connection,
+                workflow=self._workflow_record(row),
+                new_version=new_version,
+                command=CHECK,
+                to_state=row["state"],
+                account_id=context.account_id,
+                session_id=context.session_id,
+                request_id=context.request_id,
+                step_kind=kind.value,
+                from_step_status=step["status"],
+                to_step_status=new_status.value,
+                related_job_id=inspect_id,
+                now=now,
+            )
+            snapshot = self.onboarding.snapshot(household_id)
+            self._remember(
+                connection,
+                context=context,
+                route=route,
+                request_sha=request_sha,
+                snapshot=snapshot,
+                now=now,
+            )
+            return CommandResult(snapshot)
+
+    def _retry_selection(
+        self,
+        household_id: str,
+        kind: StepKind,
+        selection: dict[str, Any],
+        *,
+        context: CommandContext,
+        now: float | None,
+    ) -> CommandResult:
+        now = time.time() if now is None else now
+        parsed = self._parse_selection(kind, selection)
+        route = f"/api/v1/onboarding/steps/{kind.value}/retry"
+        request_sha = self._request_sha(parsed)
+        with self.onboarding.db.write() as connection:
+            replay = self._replay(
+                connection, context=context, route=route, request_sha=request_sha, now=now
+            )
+            if replay:
+                return replay
+            row = self._scoped_workflow(connection, context.account_id, household_id)
+            self._check_version(row, context.expected_version)
+            step = connection.execute(
+                "SELECT * FROM onboarding_steps WHERE workflow_id = ? AND kind = ?",
+                (row["id"], kind.value),
+            ).fetchone()
+            new_status = next_status(kind, StepStatus(step["status"]), RETRY)
+            attempt = step["attempt"] + 1
+            intent_key = f"{household_id}:{kind.value}:{parsed['kind']}:{attempt}"
+            job_id, _ = self.jobs.create(
+                connection,
+                household_id=household_id,
+                workflow_id=row["id"],
+                kind=("channel_binding" if kind is StepKind.PRIMARY_CHANNEL else kind.value),
+                operation="ensure",
+                intent_key=intent_key,
+                request={"step_kind": kind.value, "selection": parsed, "attempt": attempt},
+                provider=self._provider_for(kind, parsed["kind"]),
+                now=now,
+            )
+            connection.execute(
+                "UPDATE onboarding_steps SET status = ?, error_code = NULL, attempt = ?,"
+                " public_status_json = ?, updated_at = ? WHERE workflow_id = ? AND kind = ?",
+                (
+                    new_status.value,
+                    attempt,
+                    self.onboarding.public_json({"state": "setting_up", "option": parsed["kind"]}),
+                    now,
+                    row["id"],
+                    kind.value,
+                ),
+            )
+            new_version = row["version"] + 1
+            connection.execute(
+                "UPDATE onboarding_workflows SET version = ?, updated_at = ? WHERE id = ?",
+                (new_version, now, row["id"]),
+            )
+            self.onboarding.append_transition(
+                connection,
+                workflow=self._workflow_record(row),
+                new_version=new_version,
+                command=RETRY,
+                to_state=row["state"],
+                account_id=context.account_id,
+                session_id=context.session_id,
+                request_id=context.request_id,
+                step_kind=kind.value,
+                from_step_status=step["status"],
+                to_step_status=new_status.value,
+                related_job_id=job_id,
+                now=now,
+            )
+            snapshot = self.onboarding.snapshot(household_id)
+            self._remember(
+                connection,
+                context=context,
+                route=route,
+                request_sha=request_sha,
+                snapshot=snapshot,
+                now=now,
+            )
+            return CommandResult(snapshot)
+
+    def _schedule_registered_cleanup(
+        self,
+        connection,
+        *,
+        household_id: str,
+        workflow_id: str,
+        workflow_version: int,
+        now: float,
+        resource_types: set[str] | None = None,
+    ) -> list[str]:
+        job_ids: list[str] = []
+        resources = connection.execute(
+            "SELECT * FROM external_resources WHERE household_id = ?"
+            " AND status IN ('creating','ready','outcome_unknown')"
+            " ORDER BY CASE resource_type"
+            " WHEN 'runtime' THEN 4 WHEN 'channel_binding' THEN 3"
+            " WHEN 'whatsapp_identity' THEN 2 WHEN 'email_identity' THEN 1"
+            " ELSE 0 END DESC, created_at DESC, id DESC",
+            (household_id,),
+        ).fetchall()
+        resources = [
+            resource
+            for resource in resources
+            if resource_types is None or resource["resource_type"] in resource_types
+        ]
+        for sequence, resource in enumerate(resources):
+            external_ref = self.jobs.decrypt_json(
+                "external_resources",
+                resource["id"],
+                "external_id",
+                resource["external_id_ciphertext"],
+                resource["encryption_key_version"],
+            )
+            job_id, _ = self.jobs.create(
+                connection,
+                household_id=household_id,
+                workflow_id=workflow_id,
+                kind="cleanup",
+                operation="deprovision",
+                intent_key=(
+                    f"{household_id}:cleanup:{resource['id']}:{workflow_version}"
+                ),
+                request={
+                    "resource_id": resource["id"],
+                    "resource_type": resource["resource_type"],
+                    "external_ref": external_ref,
+                },
+                provider=resource["provider"],
+                now=now + sequence * 0.000001,
+            )
+            job_ids.append(job_id)
+            connection.execute(
+                "UPDATE external_resources SET status = 'deleting', updated_at = ?"
+                " WHERE id = ?",
+                (now, resource["id"]),
+            )
+        return job_ids
+
+    @staticmethod
+    def _supersede_unsettled_jobs(
+        connection,
+        *,
+        household_id: str,
+        reason: str,
+        now: float,
+    ) -> None:
+        # A pending job has never crossed the provider boundary and is safe to
+        # cancel. Running and waiting-user jobs may already have created
+        # upstream state, so preserve their durable intent for explicit
+        # inspect/reconcile/compensation instead of claiming they are absent.
+        connection.execute(
+            "UPDATE provisioning_jobs SET status = 'cancelled', settled_at = ?,"
+            " updated_at = ?, lease_until = NULL, leased_by = NULL,"
+            " error_code = ? WHERE household_id = ? AND status = 'pending'"
+            " AND kind NOT IN ('cleanup','bootstrap_cleanup')",
+            (now, now, f"{reason}_before_provider_call", household_id),
+        )
+        connection.execute(
+            "UPDATE provisioning_jobs SET status = 'outcome_unknown', settled_at = ?,"
+            " updated_at = ?, lease_until = NULL, leased_by = NULL,"
+            " error_code = ? WHERE household_id = ?"
+            " AND status IN ('running','waiting_user')"
+            " AND kind NOT IN ('cleanup','bootstrap_cleanup')",
+            (now, now, f"{reason}_requires_reconciliation", household_id),
+        )
+
+    def reset_from(
+        self,
+        household_id: str,
+        kind: StepKind,
+        *,
+        context: CommandContext,
+        now: float | None = None,
+    ) -> CommandResult:
+        if kind not in {StepKind.EMAIL, StepKind.WHATSAPP, StepKind.PRIMARY_CHANNEL}:
+            raise InvalidTransition("profile reset is not a product step reset")
+        now = time.time() if now is None else now
+        route = f"/api/v1/onboarding/reset/{kind.value}"
+        request_sha = self._request_sha({"kind": kind.value})
+        order = [StepKind.EMAIL, StepKind.WHATSAPP, StepKind.PRIMARY_CHANNEL]
+        start = order.index(kind)
+        with self.onboarding.db.write() as connection:
+            replay = self._replay(
+                connection, context=context, route=route, request_sha=request_sha, now=now
+            )
+            if replay:
+                return replay
+            row = self._scoped_workflow(connection, context.account_id, household_id)
+            self._check_version(row, context.expected_version)
+            target = connection.execute(
+                "SELECT * FROM onboarding_steps WHERE workflow_id = ? AND kind = ?",
+                (row["id"], kind.value),
+            ).fetchone()
+            if target["status"] != "verified":
+                raise InvalidTransition("only a verified choice can be reset explicitly")
+            # Cleanup jobs are persisted before any external deprovision call,
+            # including a runtime already activated from these choices.
+            cleanup_jobs = self._schedule_registered_cleanup(
+                connection,
+                household_id=household_id,
+                workflow_id=row["id"],
+                workflow_version=row["version"] + 1,
+                now=now,
+                resource_types={
+                    StepKind.EMAIL: {
+                        "email_identity",
+                        "whatsapp_identity",
+                        "channel_binding",
+                        "runtime",
+                    },
+                    StepKind.WHATSAPP: {
+                        "whatsapp_identity",
+                        "channel_binding",
+                        "runtime",
+                    },
+                    StepKind.PRIMARY_CHANNEL: {"channel_binding", "runtime"},
+                }[kind],
+            )
+            self._supersede_unsettled_jobs(
+                connection,
+                household_id=household_id,
+                reason="reset",
+                now=now,
+            )
+            for index, downstream in enumerate(order[start:]):
+                connection.execute(
+                    "UPDATE onboarding_steps SET status = ?, selection_kind = NULL,"
+                    " selection_ciphertext = NULL, result_ciphertext = NULL, error_code = NULL,"
+                    " public_status_json = '{}', updated_at = ?"
+                    " WHERE workflow_id = ? AND kind = ?",
+                    (
+                        "available" if index == 0 else "locked",
+                        now,
+                        row["id"],
+                        downstream.value,
+                    ),
+                )
+            connection.execute(
+                "UPDATE config_revisions SET status = 'revoked' WHERE household_id = ?"
+                " AND status IN ('planned','issued','claimed','active')",
+                (household_id,),
+            )
+            connection.execute(
+                "UPDATE bootstrap_tokens SET revoked_at = ? WHERE household_id = ?"
+                " AND used_at IS NULL AND revoked_at IS NULL",
+                (now, household_id),
+            )
+            connection.execute(
+                "UPDATE households SET status = 'onboarding', runtime_ref = NULL,"
+                " current_config_revision = 0, updated_at = ?"
+                " WHERE id = ?",
+                (now, household_id),
+            )
+            new_version = row["version"] + 1
+            connection.execute(
+                "UPDATE onboarding_workflows SET state = 'in_progress', current_step = ?,"
+                " version = ?, updated_at = ?, completed_at = NULL WHERE id = ?",
+                (kind.value, new_version, now, row["id"]),
+            )
+            self.onboarding.append_transition(
+                connection,
+                workflow=self._workflow_record(row),
+                new_version=new_version,
+                command="reset",
+                to_state="in_progress",
+                account_id=context.account_id,
+                session_id=context.session_id,
+                request_id=context.request_id,
+                step_kind=kind.value,
+                from_step_status="verified",
+                to_step_status="available",
+                related_job_id=cleanup_jobs[0] if cleanup_jobs else None,
+                metadata={"cleanup_jobs": len(cleanup_jobs)},
+                now=now,
+            )
+            snapshot = self.onboarding.snapshot(household_id)
+            self._remember(
+                connection,
+                context=context,
+                route=route,
+                request_sha=request_sha,
+                snapshot=snapshot,
+                now=now,
+            )
+            return CommandResult(snapshot)
+
+    def cancel(
+        self,
+        household_id: str,
+        *,
+        context: CommandContext,
+        now: float | None = None,
+    ) -> CommandResult:
+        now = time.time() if now is None else now
+        route = "/api/v1/onboarding/cancel"
+        request_sha = self._request_sha({"cancel": True})
+        with self.onboarding.db.write() as connection:
+            replay = self._replay(
+                connection, context=context, route=route, request_sha=request_sha, now=now
+            )
+            if replay:
+                return replay
+            row = self._scoped_workflow(connection, context.account_id, household_id)
+            self._check_version(row, context.expected_version)
+            if row["state"] in {"complete", "cancelled"}:
+                raise InvalidTransition("workflow is already terminal")
+            cleanup_jobs = self._schedule_registered_cleanup(
+                connection,
+                household_id=household_id,
+                workflow_id=row["id"],
+                workflow_version=row["version"] + 1,
+                now=now,
+            )
+            self._supersede_unsettled_jobs(
+                connection,
+                household_id=household_id,
+                reason="cancel",
+                now=now,
+            )
+            connection.execute(
+                "UPDATE onboarding_steps SET status = 'cancelled', updated_at = ?"
+                " WHERE workflow_id = ? AND status != 'verified'",
+                (now, row["id"]),
+            )
+            connection.execute(
+                "UPDATE config_revisions SET status = 'revoked' WHERE household_id = ?"
+                " AND status IN ('planned','issued','claimed')",
+                (household_id,),
+            )
+            connection.execute(
+                "UPDATE bootstrap_tokens SET revoked_at = ? WHERE household_id = ?"
+                " AND used_at IS NULL AND revoked_at IS NULL",
+                (now, household_id),
+            )
+            connection.execute(
+                "UPDATE households SET status = 'draft', runtime_ref = NULL,"
+                " current_config_revision = 0, updated_at = ?"
+                " WHERE id = ?",
+                (now, household_id),
+            )
+            new_version = row["version"] + 1
+            connection.execute(
+                "UPDATE onboarding_workflows SET state = 'cancelled', version = ?,"
+                " updated_at = ? WHERE id = ?",
+                (new_version, now, row["id"]),
+            )
+            self.onboarding.append_transition(
+                connection,
+                workflow=self._workflow_record(row),
+                new_version=new_version,
+                command="cancel",
+                to_state="cancelled",
+                account_id=context.account_id,
+                session_id=context.session_id,
+                request_id=context.request_id,
+                related_job_id=cleanup_jobs[0] if cleanup_jobs else None,
+                metadata={"cleanup_jobs": len(cleanup_jobs)},
+                now=now,
+            )
+            snapshot = self.onboarding.snapshot(household_id)
+            self._remember(
+                connection,
+                context=context,
+                route=route,
+                request_sha=request_sha,
+                snapshot=snapshot,
+                now=now,
+            )
+            return CommandResult(snapshot)

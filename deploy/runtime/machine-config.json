@@ -1,0 +1,35 @@
+{
+  "name": "abrolia-runtime",
+  "region": "ams",
+  "config": {
+    "image": "registry.example.invalid/abrolia/runtime@sha256:REPLACE_WITH_PUBLISHED_DIGEST",
+    "env": {
+      "HERMES_DATA_DIR": "/data",
+      "HERMES_DB": "/data/hermes.db",
+      "HERMES_HOUSEHOLD": "/data/household.toml",
+      "HERMES_ACTIVATION_STATE": "/data/runtime-activation.json",
+      "HERMES_REQUIRE_MANIFEST": "1",
+      "HERMES_RUNTIME_HOST": "0.0.0.0",
+      "HERMES_RUNTIME_PORT": "8080"
+    },
+    "metadata": {
+      "abrolia_managed": "true",
+      "abrolia_environment": "synthetic"
+    },
+    "mounts": [
+      {
+        "volume": "REPLACE_WITH_EXACT_VOLUME_ID",
+        "path": "/data"
+      }
+    ],
+    "guest": {
+      "cpu_kind": "shared",
+      "cpus": 1,
+      "memory_mb": 512
+    },
+    "restart": {
+      "policy": "on-failure",
+      "max_retries": 3
+    }
+  }
+}

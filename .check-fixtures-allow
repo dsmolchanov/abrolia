@@ -1,0 +1,47 @@
+# Точечные исключения для scripts/check_fixtures.py.
+#
+# Формат:  путь (glob) | правило | точное значение
+#
+# Исключение снимает ровно одну находку: то же значение в другом файле или
+# другое нарушение на той же строке останутся видимыми. Строка целиком никогда
+# не выключается — прошлый вариант с построчным маркером давал ложные «чисто».
+#
+# Правило `custom` (приватные deny-паттерны) исключению не подлежит: загрузка
+# такого файла — ошибка.
+#
+# Сюда попадают ТОЛЬКО заведомо вымышленные значения из прозы. Реальные адреса,
+# номера и ID семей или донора не исключаются — они удаляются. Значения в
+# тестах санитайзера собираются из кусков в коде теста, поэтому исключений не
+# требуют.
+
+# Иллюстративный адрес школы в каноническом плане и privacy-документах
+# (вымышленный получатель в примерах карточек исходящего письма).
+thoughts/shared/plans/*.md | email | schule@example.de
+thoughts/shared/implementations/*.md | email | schule@example.de
+docs/*.md | email | schule@example.de
+docs/privacy/*.md | email | schule@example.de
+# Файл исключений содержит значения, которые исключает, — включая себя же.
+.check-fixtures-allow | email | schule@example.de
+
+# Public pilot contact shown on the static Abrolia landing page. This is an
+# organisation contact, not fixture or donor data; every other address at the
+# production domain remains blocked.
+landing/*.html | email | hello@abrolia.com
+landing/*.js | email | hello@abrolia.com
+.check-fixtures-allow | email | hello@abrolia.com
+
+# Illustrative managed-inbox address in the implementation plan. The concrete
+# value is prose only; runtime tests continue to use reserved .test domains.
+thoughts/shared/plans/*.md | email | firstname.lastname@abrolia.com
+.check-fixtures-allow | email | firstname.lastname@abrolia.com
+
+# Product-address examples in the user-authored Phase 2 plan. These are exact
+# illustrative/system values; this does not allow arbitrary production-domain
+# addresses anywhere else in the repository.
+thoughts/shared/plans/2026-08-04-abrolia-phase-2-email-identity.md | email | first_last@abrolia.com
+thoughts/shared/plans/2026-08-04-abrolia-phase-2-email-identity.md | email | hello@abrolia.com
+thoughts/shared/plans/2026-08-04-abrolia-phase-2-email-identity.md | email | name@abrolia.com
+thoughts/shared/plans/2026-08-04-abrolia-phase-2-email-identity.md | email | name@family.abrolia.com
+.check-fixtures-allow | email | first_last@abrolia.com
+.check-fixtures-allow | email | name@abrolia.com
+.check-fixtures-allow | email | name@family.abrolia.com

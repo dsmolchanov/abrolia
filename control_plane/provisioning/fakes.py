@@ -1,0 +1,127 @@
+from __future__ import annotations
+
+import hashlib
+from dataclasses import dataclass, field
+from typing import Any
+
+from control_plane.provisioning.contracts import (
+    InspectResult,
+    InspectState,
+    OutcomeUnknown,
+    ProviderRegistry,
+    ProviderRejected,
+    ProviderWaiting,
+    ProvisionResult,
+)
+
+
+def _ref(prefix: str, key: str) -> str:
+    return f"synthetic:{prefix}:{hashlib.sha256(key.encode()).hexdigest()[:24]}"
+
+
+@dataclass
+class DeterministicFakeProvisioner:
+    kind: str
+    behavior: str = "success"
+    resources: dict[str, ProvisionResult] = field(default_factory=dict)
+    ensure_calls: int = 0
+    pending: set[str] = field(default_factory=set)
+
+    def ensure(self, intent: dict[str, Any], idempotency_key: str) -> ProvisionResult:
+        self.ensure_calls += 1
+        if idempotency_key in self.resources:
+            return self.resources[idempotency_key]
+        if self.behavior == "wait":
+            self.pending.add(idempotency_key)
+            raise ProviderWaiting("synthetic provider waits for user")
+        if self.behavior == "reject":
+            raise ProviderRejected("synthetic provider rejected the request")
+        if self.behavior in {"timeout", "unknown", "crash_after_accept"}:
+            # The provider deterministically accepted the stable identity even
+            # though the caller did not receive a result. inspect() can recover it.
+            result = self._result(intent, idempotency_key)
+            self.resources[idempotency_key] = result
+            raise OutcomeUnknown("connection ended after synthetic acceptance")
+        result = self._result(intent, idempotency_key)
+        self.resources[idempotency_key] = result
+        return result
+
+    def _result(self, intent: dict[str, Any], key: str) -> ProvisionResult:
+        selection = intent.get("selection", {})
+        option = selection.get("kind", self.kind)
+        external_ref = _ref(self.kind, key)
+        if self.kind == "email":
+            local = selection.get("local_part", "family.assistant")
+            public = {
+                "agent_inbox": f"{local}@abrolia.com",
+                "mode": option,
+                "masked_external_ref": external_ref[-8:],
+            }
+        elif self.kind == "whatsapp":
+            public = {
+                "mode": option,
+                "verified_member_ref": selection.get(
+                    "member_phone_test_ref", selection.get("phone_test_ref", "synthetic-phone:owner")
+                ),
+                "masked_external_ref": external_ref[-8:],
+            }
+        elif self.kind == "channel":
+            public = {
+                "channel": option,
+                "actor_id": selection.get("actor_id", "synthetic-owner"),
+                "chat_id": selection.get("chat_id", "synthetic-chat"),
+                "test_receipt_id": _ref("receipt", key),
+            }
+        else:
+            public = {"mode": option, "masked_external_ref": external_ref[-8:]}
+        return ProvisionResult(external_ref=external_ref, public_result=public)
+
+    def inspect(self, stable_ref: str) -> InspectResult:
+        if stable_ref in self.pending:
+            return InspectResult(InspectState.PENDING)
+        result = self.resources.get(stable_ref)
+        if result:
+            return InspectResult(InspectState.READY, result)
+        # Fake stable refs are idempotency keys during reconciliation.
+        for key, candidate in self.resources.items():
+            if candidate.external_ref == stable_ref or key == stable_ref:
+                return InspectResult(InspectState.READY, candidate)
+        return InspectResult(InspectState.ABSENT)
+
+    def complete_wait(self, stable_ref: str, intent: dict[str, Any]) -> None:
+        if stable_ref not in self.pending:
+            raise KeyError(stable_ref)
+        self.pending.remove(stable_ref)
+        self.resources[stable_ref] = self._result(intent, stable_ref)
+
+    def deprovision(self, external_ref: str) -> InspectResult:
+        keys = [key for key, value in self.resources.items() if value.external_ref == external_ref]
+        for key in keys:
+            self.resources.pop(key, None)
+        return InspectResult(InspectState.ABSENT)
+
+
+class DryRunRuntimeProvisioner(DeterministicFakeProvisioner):
+    def __init__(self) -> None:
+        super().__init__("runtime")
+
+    def _result(self, intent: dict[str, Any], key: str) -> ProvisionResult:
+        household_id = intent["manifest"]["household_id"]
+        return ProvisionResult(
+            external_ref=f"synthetic-runtime:{household_id}",
+            public_result={
+                "runtime_ref": f"synthetic-runtime:{household_id}",
+                "region": "ams",
+                "planned_writes": ["app", "volume", "staged-secrets", "machine"],
+            },
+        )
+
+
+def synthetic_provider_registry() -> ProviderRegistry:
+    registry = ProviderRegistry()
+    registry.register("fake-email", DeterministicFakeProvisioner("email"))
+    registry.register("fake-whatsapp", DeterministicFakeProvisioner("whatsapp"))
+    registry.register("fake-channel", DeterministicFakeProvisioner("channel"))
+    registry.register("fake-cleanup", DeterministicFakeProvisioner("cleanup"))
+    registry.register("dry-run-runtime", DryRunRuntimeProvisioner())
+    return registry
