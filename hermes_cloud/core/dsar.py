@@ -59,6 +59,28 @@ EXPORTED: dict[str, tuple[str, ...]] = {
         "valid_to", "updated_at",
     ),
     "jobs": ("id", "event_id", "kind", "payload", "run_at", "status", "created_at"),
+    "email_bindings": (
+        "identity_id", "revision", "provider", "address", "provider_ref", "state",
+        "activated_at", "updated_at",
+    ),
+    "email_ingress_receipts": (
+        "id", "binding_identity_id", "binding_revision", "source", "provider_event_id",
+        "canonical_message_id", "content_sha256", "event_id", "state", "received_at",
+        "created_at",
+    ),
+    "email_sync_state": (
+        "binding_identity_id", "binding_revision", "cursor", "connected_at",
+        "last_success_at", "backoff_until", "health", "updated_at",
+    ),
+    "email_sends": (
+        "effect_id", "approval_id", "binding_identity_id", "binding_revision",
+        "request_sha256", "state", "message_id", "provider_ref", "error_code",
+        "created_at", "updated_at",
+    ),
+    "email_delivery_receipts": (
+        "effect_id", "approval_id", "message_id", "provider_ref", "state",
+        "accepted_at", "reconciled_at", "created_at", "updated_at",
+    ),
 }
 
 # Таблицы, которых в экспорте нет — и почему. Список существует, чтобы
@@ -67,6 +89,9 @@ NOT_EXPORTED = {
     "schema_migrations": "служебная: версии схемы, не данные семьи",
     "channel_state": "служебная: курсор апдейтов канала",
     "approval_attempts": "счётчик неверных кодов; содержимого не несёт",
+    "oauth_grants": (
+        "зашифрованный provider credential; в DSAR не выдаётся и удаляется целиком"
+    ),
 }
 
 # То, что нельзя удалить у себя, потому что оно не у нас.
@@ -118,6 +143,8 @@ def wipe_household(database: Database, *, now: float | None = None) -> dict[str,
     """
     now = time.time() if now is None else now
     order = (
+        "email_delivery_receipts", "email_sends", "email_ingress_receipts",
+        "oauth_grants", "email_sync_state", "email_bindings",
         "evidence_refs", "extraction_runs", "effects", "commitments",
         "memory_statements", "reminders", "approval_attempts", "approvals",
         "jobs", "events", "channel_state",

@@ -25,13 +25,26 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
 import smtplib
+import time
 from dataclasses import dataclass
 from email.message import EmailMessage
 from typing import Any, Protocol
+
+from hermes_cloud.email.contracts import (
+    EmailBinding,
+    EmailDeliveryReceipt,
+    EmailSendRequest,
+)
+from hermes_cloud.email.receipts import (
+    BindingRevisionChanged,
+    EmailBindingStore,
+    EmailSendStore,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +73,10 @@ class EmailOutcomeUnknown(RuntimeError):
     """Связь оборвалась во время отправки. Повторять запрещено."""
 
 
+class EmailBindingChanged(BindingRevisionChanged):
+    """The approved sender identity is no longer the active binding."""
+
+
 @dataclass(frozen=True)
 class Outgoing:
     """Письмо, каким его подтвердил человек."""
@@ -69,6 +86,9 @@ class Outgoing:
     body: str
     in_reply_to: str | None = None
     references: str | None = None
+    from_identity_id: str | None = None
+    binding_revision: int | None = None
+    from_address: str | None = None
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> Outgoing:
@@ -78,6 +98,13 @@ class Outgoing:
             body=str(payload.get("body") or ""),
             in_reply_to=payload.get("in_reply_to") or None,
             references=payload.get("references") or None,
+            from_identity_id=payload.get("from_identity_id") or None,
+            binding_revision=(
+                int(payload["binding_revision"])
+                if payload.get("binding_revision") is not None
+                else None
+            ),
+            from_address=payload.get("from_address") or None,
         )
 
 
@@ -176,17 +203,150 @@ class SmtpSsl:
 class EmailSender:
     """Отправка подтверждённого письма. Ничего не решает — только исполняет."""
 
-    def __init__(self, backend: SmtpBackend, *, sender: str) -> None:
+    def __init__(
+        self,
+        backend: SmtpBackend,
+        *,
+        sender: str,
+        identity_id: str | None = None,
+        binding_revision: int = 1,
+        provider: str = "smtp-test",
+        binding_store: EmailBindingStore | None = None,
+        send_store: EmailSendStore | None = None,
+    ) -> None:
         self.backend = backend
         self.sender = sender
+        self.binding = EmailBinding(
+            identity_id=identity_id or f"legacy-smtp:{sender.casefold()}",
+            revision=binding_revision,
+            provider=provider,
+            address=sender,
+        )
+        self.binding_store = binding_store
+        self.send_store = send_store
 
-    def send(self, letter: Outgoing, *, approval_id: str) -> str:
-        """Отправить и вернуть Message-ID. Флаг перечитывается здесь."""
+    def send(
+        self,
+        letter: Outgoing,
+        *,
+        approval_id: str,
+        effect_id: str | None = None,
+    ) -> EmailDeliveryReceipt:
+        """Send once and return a provider-neutral delivery receipt."""
         if os.environ.get(ENV_KILL_SWITCH, "0") != "1":
             raise EgressBlocked(
                 f"исходящая почта выключена (${ENV_KILL_SWITCH}=0) — письмо не отправлено"
             )
-        message = build_message(letter, sender=self.sender, approval_id=approval_id)
-        self.backend.send(message)
-        logger.info("письмо по подтверждению %s отправлено", approval_id)
-        return message["Message-ID"]
+        effect_id = effect_id or approval_id
+        identity_id = letter.from_identity_id or self.binding.identity_id
+        revision = letter.binding_revision or self.binding.revision
+        if self.binding_store is not None:
+            try:
+                binding = self.binding_store.require_current(identity_id, revision)
+            except BindingRevisionChanged as error:
+                raise EmailBindingChanged(str(error)) from error
+        else:
+            binding = self.binding
+            if identity_id != binding.identity_id or revision != binding.revision:
+                raise EmailBindingChanged(
+                    "email binding changed after approval; cancel and stage a new message"
+                )
+        if letter.from_address and letter.from_address.casefold() != binding.address.casefold():
+            raise EmailBindingChanged("approved From address is no longer active")
+        message = build_message(letter, sender=binding.address, approval_id=effect_id)
+        raw = message.as_bytes()
+        request_sha256 = hashlib.sha256(raw).hexdigest()
+        if self.send_store is not None:
+            previous, fresh = self.send_store.begin(
+                effect_id=effect_id,
+                approval_id=approval_id,
+                binding=binding,
+                request_sha256=request_sha256,
+                message_id=str(message["Message-ID"]),
+            )
+            if not fresh:
+                receipt = self.send_store.get(effect_id)
+                if receipt is not None:
+                    if receipt.status == "outcome_unknown":
+                        raise EmailOutcomeUnknown(
+                            "previous send outcome is unknown; automatic replay is forbidden"
+                        )
+                    if receipt.status == "accepted":
+                        return receipt
+                    raise EmailRejected("previous email send failed definitively")
+                if previous == "pending":
+                    unknown = EmailDeliveryReceipt(
+                        effect_id=effect_id,
+                        approval_id=approval_id,
+                        message_id=str(message["Message-ID"]),
+                        provider_ref=None,
+                        accepted_at=None,
+                        status="outcome_unknown",
+                    )
+                    self.send_store.settle(unknown, error_code="interrupted_before_receipt")
+                    raise EmailOutcomeUnknown(
+                        "previous send was interrupted; automatic replay is forbidden"
+                    )
+        try:
+            if getattr(self.backend, "provider", None):
+                request = EmailSendRequest(
+                    effect_id=effect_id,
+                    approval_id=approval_id,
+                    binding=binding,
+                    message_id=str(message["Message-ID"]),
+                    mime_bytes=raw,
+                    request_sha256=request_sha256,
+                )
+                receipt = self.backend.send(request)  # type: ignore[arg-type]
+                if (
+                    receipt.effect_id != effect_id
+                    or receipt.approval_id != approval_id
+                    or receipt.message_id != str(message["Message-ID"])
+                ):
+                    raise EmailRejected("email provider returned a mismatched receipt")
+                if receipt.status == "outcome_unknown":
+                    raise EmailOutcomeUnknown("email provider could not determine send outcome")
+                if receipt.status != "accepted":
+                    raise EmailRejected("email provider rejected the message")
+            else:
+                self.backend.send(message)
+                receipt = EmailDeliveryReceipt(
+                    effect_id=effect_id,
+                    approval_id=approval_id,
+                    message_id=str(message["Message-ID"]),
+                    provider_ref=None,
+                    accepted_at=time.time(),
+                    status="accepted",
+                )
+        except EmailOutcomeUnknown:
+            if self.send_store is not None:
+                self.send_store.settle(
+                    EmailDeliveryReceipt(
+                        effect_id=effect_id,
+                        approval_id=approval_id,
+                        message_id=str(message["Message-ID"]),
+                        provider_ref=None,
+                        accepted_at=None,
+                        status="outcome_unknown",
+                    ),
+                    error_code="transport_unknown",
+                )
+            raise
+        except Exception as error:
+            if self.send_store is not None:
+                self.send_store.settle(
+                    EmailDeliveryReceipt(
+                        effect_id=effect_id,
+                        approval_id=approval_id,
+                        message_id=str(message["Message-ID"]),
+                        provider_ref=None,
+                        accepted_at=None,
+                        status="failed",
+                    ),
+                    error_code=type(error).__name__,
+                )
+            raise
+        if self.send_store is not None:
+            self.send_store.settle(receipt)
+        logger.info("email effect %s accepted by %s", effect_id, binding.provider)
+        return receipt

@@ -616,12 +616,20 @@ flags остаются false до provider-specific gates.
 
 #### Acceptance
 
-- Same EML through Nerve/Gmail/test injection yields one normalized Message-ID,
+- [x] Same EML through Nerve/Gmail/test injection yields one normalized Message-ID,
   same thread key and no duplicate work.
-- Existing email approval tests remain green for every backend contract fixture.
-- An approval created for binding revision N cannot send after revision N+1 activates.
-- Unknown send outcome is never replayed automatically.
-- Provider secrets are absent from config repr, diagnostics, DSAR and logs.
+- [x] Existing email approval tests remain green for every backend contract fixture.
+- [x] An approval created for binding revision N cannot send after revision N+1 activates.
+- [x] Unknown send outcome is never replayed automatically.
+- [x] Provider secrets are absent from config repr, diagnostics, DSAR and logs.
+
+#### Status — automated implementation complete (2026-08-05)
+
+- Runtime migration `0006_email_identity.sql`, provider-neutral contracts,
+  canonical RFC822 ingress and durable send/delivery receipts are implemented.
+- Full repository regression, Ruff, fixture scanner and `git diff --check` pass.
+- Manual runtime smoke with a real provider remains deferred to the Phase 2.6
+  Nerve adapter; Phase 2.5 itself makes no external provider call.
 
 ### Phase 2.6 — Nerve runtime ingress and send
 

@@ -19,6 +19,8 @@ from hermes_cloud.core.config import load_config, load_dotenv
 from hermes_cloud.core.db import open_database
 from hermes_cloud.core.effects import EffectJournal
 from hermes_cloud.core.events import EventStore
+from hermes_cloud.email.contracts import EmailBinding
+from hermes_cloud.email.receipts import EmailBindingStore, EmailSendStore
 from hermes_cloud.execute.reminder import ReminderStore
 from hermes_cloud.ingest.inject import ingest_file
 from hermes_cloud.ingest.worker import Worker
@@ -73,6 +75,8 @@ def _pipeline(args: argparse.Namespace, database) -> Pipeline:
     approvals = ApprovalStore(database)
     reminders = ReminderStore(database)
     calendar = _calendar(config)
+    email_binding = _email_binding(config, database)
+    mail = _mail(config, database, email_binding)
     return Pipeline(
         approvals=approvals,
         reminders=reminders,
@@ -86,16 +90,32 @@ def _pipeline(args: argparse.Namespace, database) -> Pipeline:
         chat=config.require_chat(),
         thread=config.thread,
         calendar=calendar,
-        mail=_mail(config),
+        mail=mail,
         loop=ToolLoop(
             journal=EffectJournal(database),
-            services=Services.on(database, calendar=calendar),
+            services=Services.on(
+                database, calendar=calendar, email_binding=email_binding
+            ),
             family_language=config.language,
         ),
     )
 
 
-def _mail(config):
+def _email_binding(config, database) -> EmailBinding | None:
+    if not config.has_email_identity:
+        return None
+    binding = EmailBinding(
+        identity_id=config.email_identity_id,
+        revision=config.email_binding_revision,
+        provider=config.email_provider,
+        address=config.email_address,
+        provider_ref=config.email_identity_id,
+        secret_names=config.email_secret_names,
+    )
+    return EmailBindingStore(database).activate(binding)
+
+
+def _mail(config, database, binding: EmailBinding | None):
     """Исходящая почта. Нет учётных данных — нет и отправки, но предложить можно."""
     if not config.has_gmail:
         return None
@@ -109,6 +129,11 @@ def _mail(config):
             port=config.smtp_port,
         ),
         sender=config.gmail_address,
+        identity_id=(binding.identity_id if binding else None),
+        binding_revision=(binding.revision if binding else 1),
+        provider=(binding.provider if binding else "legacy-smtp-test"),
+        binding_store=EmailBindingStore(database) if binding else None,
+        send_store=EmailSendStore(database),
     )
 
 
@@ -298,6 +323,10 @@ def cmd_retention(args: argparse.Namespace) -> int:
     print(
         f"  неподтверждённые гипотезы: {report.candidates_deleted},"
         f" памяти: {report.memory_candidates_deleted}"
+    )
+    print(
+        f"  email ingress receipts: {report.email_ingress_receipts_deleted},"
+        f" sends: {report.email_sends_deleted}"
     )
     if report.memory_due_for_review:
         print(

@@ -252,7 +252,11 @@ def test_a_confirmed_letter_is_sent_once(world) -> None:
     assert handled.executed == KIND_BUNDLE
     assert len(smtp.sent) == 1
     assert smtp.sent[0]["To"] == SCHOOL
-    assert smtp.sent[0]["Message-ID"] == message_id_for(staged.id)
+    effect = next(
+        effect for effect in pipeline.effects.for_run(staged.id)
+        if effect.kind == KIND_EMAIL
+    )
+    assert smtp.sent[0]["Message-ID"] == message_id_for(effect.id)
 
     # Повторное нажатие не отправляет второе письмо.
     pipeline.handle_callback(

@@ -75,6 +75,12 @@ CONFIDENCE_MARKER = 0.85
 CONFIDENCE_SUBJECT_ONLY = 0.55
 
 
+def normalize_message_id(value: str | None) -> str | None:
+    """Canonical Message-ID shared by all providers and test injection."""
+    normalized = (value or "").strip().strip("<>").strip().casefold()
+    return normalized or None
+
+
 @dataclass(frozen=True)
 class Attachment:
     filename: str | None
@@ -289,8 +295,8 @@ def _thread_key(message: Message, message_id: str | None) -> str | None:
     """Ключ цепочки: корень References → In-Reply-To → собственный Message-ID."""
     references = _header(message, "References").split()
     if references:
-        return references[0].strip("<>") or None
-    in_reply_to = _header(message, "In-Reply-To").strip("<>")
+        return normalize_message_id(references[0])
+    in_reply_to = normalize_message_id(_header(message, "In-Reply-To"))
     if in_reply_to:
         return in_reply_to
     return message_id
@@ -305,7 +311,7 @@ def parse_message(message: Message) -> ParsedEmail:
     to = tuple(
         address for _, address in email.utils.getaddresses([_header(message, "To")]) if address
     )
-    message_id = _header(message, "Message-ID").strip("<>") or None
+    message_id = normalize_message_id(_header(message, "Message-ID"))
     return ParsedEmail(
         message_id=message_id,
         subject=subject,

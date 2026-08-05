@@ -24,6 +24,8 @@ from hermes_cloud.core.runtime_manifest import (
     RuntimeManifest,
     load_runtime_manifest,
 )
+from hermes_cloud.email.contracts import EmailBinding
+from hermes_cloud.email.receipts import EmailBindingStore
 from hermes_cloud.runtime.bootstrap import (
     DEFAULT_ACTIVATION_STATE,
     DEFAULT_MANIFEST_PATH,
@@ -108,13 +110,23 @@ class RuntimeService:
         manifest, reason = self._ready_manifest()
         if manifest is None:
             return Probe(503, {"status": "not_ready", "reason": reason})
+        try:
+            binding = self._sync_email_binding(manifest)
+        except Exception:
+            return Probe(503, {"status": "not_ready", "reason": "email_state_unavailable"})
+        payload = {
+            "status": "ready",
+            "household_id": manifest.household_id,
+            "config_revision": manifest.config_revision,
+        }
+        if binding is not None:
+            payload.update(
+                email_provider=binding.provider,
+                email_binding_revision=binding.revision,
+            )
         return Probe(
             200,
-            {
-                "status": "ready",
-                "household_id": manifest.household_id,
-                "config_revision": manifest.config_revision,
-            },
+            payload,
         )
 
     @property
@@ -125,7 +137,30 @@ class RuntimeService:
         manifest, reason = self._ready_manifest()
         if manifest is None:
             raise RuntimeNotReady(f"runtime is not active ({reason})")
+        try:
+            self._sync_email_binding(manifest)
+        except Exception as error:
+            raise RuntimeNotReady("runtime is not active (email_state_unavailable)") from error
         return manifest
+
+    def _sync_email_binding(self, manifest: RuntimeManifest) -> EmailBinding | None:
+        identity_id = manifest.email.provider_binding_ref
+        if not identity_id:
+            return None
+        binding = EmailBinding(
+            identity_id=identity_id,
+            revision=manifest.config_revision,
+            provider=manifest.email.provider_kind,
+            address=manifest.email.agent_inbox,
+            provider_ref=identity_id,
+            secret_names=(
+                (manifest.email.secret_binding_ref,)
+                if manifest.email.secret_binding_ref
+                else ()
+            ),
+        )
+        with open_database(self.database_path) as database:
+            return EmailBindingStore(database).activate(binding)
 
     def __call__(self, environ: Mapping[str, Any], start_response: Callable) -> list[bytes]:
         """Health probes plus an authenticated private DSAR boundary."""

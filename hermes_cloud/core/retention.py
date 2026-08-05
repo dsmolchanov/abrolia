@@ -55,6 +55,8 @@ class RetentionReport:
     extraction_runs_deleted: int = 0
     candidates_deleted: int = 0
     memory_candidates_deleted: int = 0
+    email_ingress_receipts_deleted: int = 0
+    email_sends_deleted: int = 0
     memory_due_for_review: list[str] = field(default_factory=list)
 
     @property
@@ -63,6 +65,7 @@ class RetentionReport:
             self.events_deleted + self.reminders_deleted + self.approvals_deleted
             + self.effects_deleted + self.extraction_runs_deleted
             + self.candidates_deleted + self.memory_candidates_deleted
+            + self.email_ingress_receipts_deleted + self.email_sends_deleted
         )
 
 
@@ -85,6 +88,12 @@ class RetentionJob:
                 (b"", now, now - RAW_EVENT_DAYS * DAY),
             ).rowcount
 
+            # Provider receipt metadata follows the same action-journal TTL.
+            report.email_ingress_receipts_deleted = connection.execute(
+                "DELETE FROM email_ingress_receipts WHERE created_at <= ?",
+                (now - ACTIONS_DAYS * DAY,),
+            ).rowcount
+
             # 2. Метаданные события — часть журнала действий.
             report.events_deleted = connection.execute(
                 "DELETE FROM events WHERE received_at <= ?",
@@ -102,6 +111,11 @@ class RetentionJob:
             # обратный порядок оставил бы эффекты без связи.
             report.effects_deleted = connection.execute(
                 "DELETE FROM effects WHERE created_at <= ?",
+                (now - ACTIONS_DAYS * DAY,),
+            ).rowcount
+            # Delivery receipts cascade from sends; no MIME body is stored here.
+            report.email_sends_deleted = connection.execute(
+                "DELETE FROM email_sends WHERE created_at <= ?",
                 (now - ACTIONS_DAYS * DAY,),
             ).rowcount
             # Статус подтверждения здесь не спрашивается намеренно: TTL кода —

@@ -36,6 +36,7 @@ from typing import Any
 
 from hermes_cloud.core.db import Database
 from hermes_cloud.core.events import EventStore
+from hermes_cloud.ingest.rfc822 import ingest_rfc822
 
 logger = logging.getLogger(__name__)
 
@@ -230,14 +231,14 @@ class GmailPoller:
                     skipped += 1
                     continue
                 if ingest:
-                    self.events.append(
+                    result = ingest_rfc822(
+                        self.events,
                         source=SOURCE,
-                        external_id=f"eml:{message_id}",
-                        raw=raw,
-                        context_key=f"gmail:{self.label}",
+                        provider_event_id=f"imap:{current or 'unknown'}:{uid.decode()}",
+                        raw_bytes=raw,
                         received_at=now,
                     )
-                    accepted += 1
+                    accepted += int(result.created)
         finally:
             # Разлогиниться важно, но неудача выхода уже ничего не меняет.
             with suppress(Exception):

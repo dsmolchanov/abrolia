@@ -39,6 +39,7 @@ from hermes_cloud.core.runcontext import (
     RunContext,
 )
 from hermes_cloud.execute.email_send import (
+    EmailBindingChanged,
     EmailOutcomeUnknown,
     EmailSender,
     Outgoing,
@@ -99,6 +100,10 @@ TEXT_NO_RIGHT = (
 TEXT_OUTCOME_UNKNOWN = (
     "Связь оборвалась на полпути, и я не знаю, дошло ли отправленное. "
     "Проверьте, пожалуйста, — повторять сам не буду, чтобы не сделать дважды."
+)
+TEXT_BINDING_CHANGED = (
+    "Адрес отправителя изменился после подтверждения. Старое предложение отменено — "
+    "создайте и подтвердите письмо заново."
 )
 
 # Право, необходимое для подтверждения предложения этого вида. Подтверждение —
@@ -467,6 +472,8 @@ class Pipeline:
                 text = self._execute_export(approval)
             elif payload["kind"] == KIND_DELETE:
                 text = self._execute_delete(approval, now=now)
+            elif payload["kind"] == KIND_EMAIL:
+                text = self._execute_email(approval, payload, effect_id=effect.id)
             elif payload["kind"] == KIND_BUNDLE:
                 text = self._execute_bundle(approval, payload, now=now)
             else:
@@ -494,6 +501,15 @@ class Pipeline:
             )
             logger.warning("approval %s outcome unknown", approval.id)
             return Handled(approval_id=approval.id, message=TEXT_OUTCOME_UNKNOWN)
+        except EmailBindingChanged as error:
+            self.effects.fail(effect.id, f"EmailBindingChanged: {error}", now=now)
+            self.approvals.mark(
+                approval.id, STATUS_FAILED, error="email_binding_changed", now=now
+            )
+            self.transport.send_message(
+                chat=approval.chat, text=TEXT_BINDING_CHANGED, thread=approval.thread
+            )
+            return Handled(approval_id=approval.id, message=TEXT_BINDING_CHANGED)
         except Exception as error:
             self.effects.fail(effect.id, f"{type(error).__name__}: {error}", now=now)
             self.approvals.mark(
@@ -639,6 +655,7 @@ class Pipeline:
                 text = self._execute_item(
                     approval,
                     {**item.payload, "commitment_id": payload.get("commitment_id")},
+                    effect_id=effect.id,
                     now=now,
                 )
             except (SendOutcomeUnknown, CalendarOutcomeUnknown, EmailOutcomeUnknown) as error:
@@ -649,6 +666,11 @@ class Pipeline:
                 )
                 logger.warning("исход пункта %s связки %s неизвестен", index, approval.id)
                 lines.append(f"⚠️ {item_line(item)} — не знаю, дошло ли; повторять не буду")
+                continue
+            except EmailBindingChanged as error:
+                failures += 1
+                self.effects.fail(effect.id, f"EmailBindingChanged: {error}", now=now)
+                lines.append(f"✗ {item_line(item)} — адрес отправителя изменился; подтвердите заново")
                 continue
             except Exception as error:
                 failures += 1
@@ -668,7 +690,14 @@ class Pipeline:
             raise BundlePartiallyFailed("\n".join(lines))
         return "\n".join(lines)
 
-    def _execute_item(self, approval, payload: dict, *, now: float | None) -> str:
+    def _execute_item(
+        self,
+        approval,
+        payload: dict,
+        *,
+        effect_id: str,
+        now: float | None,
+    ) -> str:
         """Один пункт связки. Те же исполнители, что и у одиночного действия."""
         kind = payload["kind"]
         if kind == KIND_REMINDER:
@@ -678,7 +707,7 @@ class Pipeline:
         if kind == KIND_ICS:
             return self._execute_ics(approval, payload)
         if kind == KIND_EMAIL:
-            return self._execute_email(approval, payload)
+            return self._execute_email(approval, payload, effect_id=effect_id)
         raise ValueError(f"неизвестный вид пункта: {kind!r}")
 
     def _toggle_item(
@@ -752,13 +781,17 @@ class Pipeline:
         link = f"\n{written.link}" if written.link else ""
         return f"Готово: {verb} в календаре «{payload['title']}».{link}"
 
-    def _execute_email(self, approval, payload: dict) -> str:
+    def _execute_email(self, approval, payload: dict, *, effect_id: str) -> str:
         """Отправить подтверждённое письмо. Отозвать его будет уже нельзя."""
         if self.mail is None:
             raise ValueError("исходящая почта не настроена")
         letter = Outgoing.from_payload(payload)
-        message_id = self.mail.send(letter, approval_id=approval.id)
-        logger.info("письмо %s отправлено по подтверждению %s", message_id, approval.id)
+        receipt = self.mail.send(
+            letter, approval_id=approval.id, effect_id=effect_id
+        )
+        logger.info(
+            "email effect %s accepted as %s", effect_id, receipt.message_id
+        )
         return f"Готово: письмо для {letter.to} отправлено."
 
     def _execute_ics(self, approval, payload: dict) -> str:
