@@ -173,7 +173,12 @@ if (page === "onboarding") {
     let selection = {kind: option};
     if (option === "abrolia_managed") selection.local_part = "family.assistant";
     if (option === "gmail_agent") selection.separate_agent_account_acknowledged = true;
-    if (option === "family_domain") selection.domain = "family.example.test";
+    if (option === "family_domain") selection = {
+      kind: option,
+      domain: form.elements.domain.value,
+      local_part: form.elements.local_part.value,
+      mx_change_acknowledged: form.elements.mx_change_acknowledged.checked,
+    };
     if (option === "shared_abrolia") selection = {kind: option, member_phone_test_ref: "synthetic-phone:owner", privacy_notice_receipt_id: crypto.randomUUID()};
     if (option === "dedicated_number") selection = {kind: option, phone_test_ref: "synthetic-phone:owner", privacy_notice_receipt_id: crypto.randomUUID(), linked_device_risk_receipt_id: crypto.randomUUID()};
     if (["telegram", "whatsapp", "web"].includes(option)) selection = {kind: option, actor_id: "synthetic-owner", chat_id: "synthetic-chat"};

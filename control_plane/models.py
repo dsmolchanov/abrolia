@@ -7,9 +7,18 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 from control_plane.crypto import reject_secret_fields
+from control_plane.email.domain_policy import canonicalize_domain, domain_guidance
+from control_plane.email.local_part import normalize_local_part
 
 _SYNTHETIC_ACTOR_OR_CHAT = re.compile(
     r"^synthetic-[a-z0-9](?:[a-z0-9._-]{0,126})$"
@@ -138,14 +147,32 @@ class GmailAgentSelection(DurableContract):
 
 class FamilyDomainSelection(DurableContract):
     kind: Literal["family_domain"] = "family_domain"
-    domain: str = Field(pattern=r"^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])$")
+    domain: str = Field(min_length=3, max_length=253)
+    local_part: str = "assistant"
+    mx_change_acknowledged: bool = False
 
     @field_validator("domain")
     @classmethod
-    def _reserved_test_domain_only(cls, value: str) -> str:
-        if not value.endswith(".test"):
-            raise ValueError("Phase 1 custom email domains must use reserved .test")
-        return value
+    def _canonical_domain(cls, value: str, info: ValidationInfo) -> str:
+        canonical = canonicalize_domain(value)
+        allow_real = bool(
+            isinstance(info.context, dict)
+            and info.context.get("allow_real_email_domains")
+        )
+        if not allow_real and not canonical.endswith(".test"):
+            raise ValueError("real email domains are disabled by the rollout gate")
+        return canonical
+
+    @field_validator("local_part")
+    @classmethod
+    def _canonical_local_part(cls, value: str) -> str:
+        return normalize_local_part(value)
+
+    @model_validator(mode="after")
+    def _acknowledge_apex_mx_risk(self) -> FamilyDomainSelection:
+        if domain_guidance(self.domain).apex_mx_risk and not self.mx_change_acknowledged:
+            raise ValueError("apex MX changes require explicit acknowledgement")
+        return self
 
 
 EmailSelection = Annotated[

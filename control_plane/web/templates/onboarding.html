@@ -61,7 +61,10 @@
       </form>
       <form method="post" action="/onboarding/select/email_identity">
         {{ command_fields() }}<input type="hidden" name="kind" value="family_domain">
-        <input type="hidden" name="domain" value="family.example.test">
+        <label>Mail domain<input name="domain" value="family.example.test" autocomplete="off" required></label>
+        <label>Assistant address<input name="local_part" value="assistant" autocomplete="off" required></label>
+        <label class="consent"><input type="checkbox" name="mx_change_acknowledged" value="yes">
+          I understand that changing apex MX records can interrupt existing family mail; a dedicated subdomain is recommended.</label>
         <button class="card" data-select="email_identity" data-kind="family_domain">
           <strong>Your family domain</strong><span>Use a dedicated assistant address on a domain you control.</span>
         </button>
@@ -126,7 +129,7 @@
       <p id="status-copy">No new onboarding work will be started.</p>
     {% elif current.status == 'waiting_user' %}
       <h2 id="status-title">Waiting for you</h2>
-      <p id="status-copy">Complete the synthetic verification, then check again.</p>
+      <p id="status-copy">Complete the synthetic verification, then check again. For a family domain, add the displayed DNS records; the same records remain available after reload.</p>
     {% elif current.status == 'verifying' %}
       <h2 id="status-title">Checking verification</h2>
       <p id="status-copy">The durable worker is inspecting the existing provider result.</p>

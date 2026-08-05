@@ -53,3 +53,32 @@ def test_local_part_api_returns_only_suggestion_or_availability(api_harness) -> 
     )
     assert reserved.json() == {"available": False}
     assert set(reserved.json()) == {"available"}
+
+
+def test_domain_guidance_is_owner_scoped_and_returns_no_inventory(api_harness) -> None:
+    unauthenticated = api_harness.client.get(
+        "/api/v1/email/domain/guidance", params={"domain": "example.com"}
+    )
+    assert unauthenticated.status_code == 401
+
+    world = api_harness.create_principal("domain-guidance-owner@family.test")
+    api_harness.authenticate(world)
+    apex = api_harness.client.get(
+        "/api/v1/email/domain/guidance", params={"domain": "Example.COM."}
+    )
+    subdomain = api_harness.client.get(
+        "/api/v1/email/domain/guidance", params={"domain": "mail.example.com"}
+    )
+    blocked = api_harness.client.get(
+        "/api/v1/email/domain/guidance", params={"domain": "mail.abrolia.com"}
+    )
+
+    assert apex.json() == {
+        "domain": "example.com",
+        "registrable_domain": "example.com",
+        "recommended_domain": "assistant.example.com",
+        "apex_mx_risk": True,
+    }
+    assert subdomain.json()["apex_mx_risk"] is False
+    assert blocked.status_code == 422
+    assert blocked.json() == {"detail": "invalid domain"}

@@ -18,6 +18,18 @@ class ProviderRejected(ProvisioningError):
 class ProviderWaiting(ProvisioningError):
     code = "waiting_user"
 
+    def __init__(
+        self,
+        message: str = "provider is waiting for user action",
+        *,
+        public_result: dict[str, Any] | None = None,
+        external_ref: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.public_result = public_result or {}
+        self.external_ref = external_ref
+        reject_secret_fields(self.public_result)
+
 
 class ProviderRateLimited(ProvisioningError):
     code = "rate_limited"
@@ -56,6 +68,10 @@ class InspectResult:
     state: InspectState
     result: ProvisionResult | None = None
     error_code: str | None = None
+    public_result: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        reject_secret_fields(self.public_result)
 
 
 @dataclass(frozen=True)

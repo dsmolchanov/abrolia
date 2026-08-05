@@ -117,7 +117,12 @@ def _selection(
             return {"kind": option, "local_part": form.get("local_part", "family.assistant")}
         if option == "gmail_agent":
             return {"kind": option, "separate_agent_account_acknowledged": True}
-        return {"kind": option, "domain": form.get("domain", "family.example.test")}
+        return {
+            "kind": option,
+            "domain": form.get("domain", "family.example.test"),
+            "local_part": form.get("local_part", "assistant"),
+            "mx_change_acknowledged": form.get("mx_change_acknowledged") == "yes",
+        }
     if kind is StepKind.WHATSAPP:
         if form.get("privacy_notice_accepted") != "yes":
             raise ValueError("privacy notice acceptance required")
