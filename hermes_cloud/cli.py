@@ -30,6 +30,11 @@ from hermes_cloud.runner.tools import Services
 DEFAULT_DB_PATH = "data/hermes.db"
 DB_ENV = "HERMES_DB"
 
+PROVISIONED_GATED_COMMANDS = frozenset({
+    "inject-eml", "worker", "reconcile", "gmail-poll", "replay", "tick",
+    "confirm", "listen", "export", "delete",
+})
+
 
 def _database(args: argparse.Namespace):
     load_dotenv()
@@ -73,7 +78,10 @@ def _pipeline(args: argparse.Namespace, database) -> Pipeline:
         reminders=reminders,
         transport=transport,
         extractor=Extractor(
-            model=config.model, effort=config.effort, family_language=config.language
+            model=config.model,
+            effort=config.effort,
+            family_language=config.language,
+            timezone=config.timezone,
         ),
         chat=config.require_chat(),
         thread=config.thread,
@@ -477,6 +485,75 @@ def cmd_replay(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_validate_manifest(args: argparse.Namespace) -> int:
+    """Validate a versioned household manifest without starting runtime work."""
+    from hermes_cloud.core.runtime_manifest import ManifestError, load_runtime_manifest
+
+    load_dotenv()
+    try:
+        manifest = load_runtime_manifest(args.path)
+    except ManifestError as error:
+        print(f"manifest invalid: {error}", file=sys.stderr)
+        return 1
+    print(
+        f"manifest ok: household={manifest.household_id} "
+        f"revision={manifest.config_revision} sha256={manifest.config_sha256}"
+    )
+    return 0
+
+
+def cmd_bootstrap(args: argparse.Namespace) -> int:
+    """Claim and activate one manifest; bootstrap token is accepted from env only."""
+    from hermes_cloud.core.runtime_manifest import ENV_CONFIG_REVISION, ENV_HOUSEHOLD_ID
+    from hermes_cloud.runtime.bootstrap import (
+        ENV_BOOTSTRAP_TOKEN,
+        ENV_CONTROL_PLANE_URL,
+        ENV_RUNTIME_REF,
+        BootstrapError,
+        ControlPlaneBootstrapClient,
+        RuntimeBootstrapper,
+    )
+
+    load_dotenv()
+    token = os.environ.get(ENV_BOOTSTRAP_TOKEN, "")
+    base_url = args.control_plane_url or os.environ.get(ENV_CONTROL_PLANE_URL, "")
+    runtime_ref = args.runtime_ref or os.environ.get(ENV_RUNTIME_REF, "")
+    household_id = os.environ.get(ENV_HOUSEHOLD_ID, "")
+    config_revision = os.environ.get(ENV_CONFIG_REVISION, "")
+    if not all((token, base_url, runtime_ref, household_id, config_revision)):
+        print(
+            f"bootstrap requires ${ENV_BOOTSTRAP_TOKEN}, ${ENV_CONTROL_PLANE_URL}, "
+            f"${ENV_RUNTIME_REF}, ${ENV_HOUSEHOLD_ID}, and ${ENV_CONFIG_REVISION}",
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        revision = int(config_revision)
+    except ValueError:
+        print(
+            f"bootstrap failed: ${ENV_CONFIG_REVISION} must be an integer",
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        manifest = RuntimeBootstrapper(
+            ControlPlaneBootstrapClient(base_url, timeout=args.timeout),
+            runtime_ref=runtime_ref,
+            household_id=household_id,
+            config_revision=revision,
+            manifest_path=args.manifest,
+            activation_path=args.activation_state,
+        ).run(token)
+    except BootstrapError as error:
+        print(f"bootstrap failed: {error}", file=sys.stderr)
+        return 1
+    print(
+        f"runtime active: household={manifest.household_id} "
+        f"revision={manifest.config_revision}"
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="hermes-cloud", description=__doc__)
     parser.add_argument("--db", help=f"путь к базе (иначе ${DB_ENV} или {DEFAULT_DB_PATH})")
@@ -556,11 +633,44 @@ def build_parser() -> argparse.ArgumentParser:
     listen.add_argument("--rounds", type=int, default=0, help="0 — бесконечно")
     listen.add_argument("--timeout", type=int, default=25)
     listen.set_defaults(func=cmd_listen)
+
+    validate_manifest = commands.add_parser(
+        "validate-manifest", help="проверить versioned household.toml"
+    )
+    validate_manifest.add_argument("path", nargs="?", type=Path)
+    validate_manifest.set_defaults(func=cmd_validate_manifest)
+
+    bootstrap = commands.add_parser(
+        "bootstrap", help="получить и активировать manifest control plane"
+    )
+    bootstrap.add_argument("--control-plane-url")
+    bootstrap.add_argument("--runtime-ref")
+    bootstrap.add_argument("--manifest", type=Path, default=Path("/data/household.toml"))
+    bootstrap.add_argument(
+        "--activation-state", type=Path, default=Path("/data/runtime-activation.json")
+    )
+    bootstrap.add_argument("--timeout", type=float, default=20.0)
+    bootstrap.set_defaults(func=cmd_bootstrap)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.command in PROVISIONED_GATED_COMMANDS:
+        load_dotenv()
+        provisioned = bool(
+            os.environ.get("HERMES_CONFIG_REVISION")
+            or os.environ.get("HERMES_REQUIRE_MANIFEST", "").strip().casefold()
+            in {"1", "true", "yes", "on"}
+        )
+        if provisioned:
+            from hermes_cloud.runtime.service import RuntimeNotReady, RuntimeService
+
+            try:
+                RuntimeService().require_ready()
+            except RuntimeNotReady as error:
+                print(str(error), file=sys.stderr)
+                return 2
     return args.func(args)
 
 

@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from hermes_cloud.core.db import new_id
+from hermes_cloud.core.runtime_manifest import maybe_load_runtime_manifest
 
 # --- права --------------------------------------------------------------------
 
@@ -90,6 +91,9 @@ class Household:
     family: frozenset[str] = frozenset()
     guests: frozenset[str] = frozenset()
     allowed_chats: frozenset[str] = frozenset()
+    # Legacy config authorizes actors and chats as two allowlists.  A versioned
+    # manifest carries exact verified bindings and therefore denies cross-pairs.
+    verified_bindings: frozenset[tuple[str, str]] | None = None
 
     def role_for(self, actor_id: str) -> str:
         actor = str(actor_id)
@@ -104,6 +108,11 @@ class Household:
     def knows_chat(self, chat_id: str) -> bool:
         """Пустой allowlist означает «чат не настроен», а не «разрешены все»."""
         return bool(self.allowed_chats) and str(chat_id) in self.allowed_chats
+
+    def knows_binding(self, actor_id: str, chat_id: str) -> bool:
+        if self.verified_bindings is None:
+            return self.knows_chat(chat_id)
+        return (str(actor_id), str(chat_id)) in self.verified_bindings
 
 
 def _split(value: str | None) -> frozenset[str]:
@@ -120,6 +129,16 @@ def load_household(
     """
     source = dict(os.environ if env is None else env)
     file = Path(path or source.get(ENV_HOUSEHOLD_FILE) or DEFAULT_HOUSEHOLD_FILE)
+    manifest = maybe_load_runtime_manifest(file, env=source)
+    if manifest is not None:
+        return Household(
+            household_id=manifest.household_id,
+            owner=manifest.actors.owner,
+            family=manifest.actors.family,
+            guests=manifest.actors.guests,
+            allowed_chats=manifest.allowed_chats,
+            verified_bindings=manifest.verified_actor_chat_pairs,
+        )
     if file.is_file():
         data = tomllib.loads(file.read_text(encoding="utf-8"))
         actors = data.get("actors", {})
@@ -190,7 +209,7 @@ def build_run_context(
     актор: свой человек, написавший из чужого чата, не должен там ничего мочь.
     """
     role = household.role_for(actor_id)
-    if not household.knows_chat(chat_id):
+    if not household.knows_binding(actor_id, chat_id):
         role = ROLE_UNKNOWN
     read_caps, mutate_caps = ROLE_CAPS[role]
     return RunContext(

@@ -36,6 +36,8 @@ jobs:
         run: ruff check .
       - name: Tests
         run: pytest -m "not live"
+      - name: Control-plane contract suite
+        run: pytest tests/control_plane -q
 
   secrets:
     name: gitleaks (full history)

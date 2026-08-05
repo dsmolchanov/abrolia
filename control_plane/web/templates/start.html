@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}Start · Abrolia{% endblock %}
+{% block page %}start{% endblock %}
+{% block content %}
+<section class="panel narrow">
+  <p class="eyebrow">Private synthetic pilot</p>
+  <h1>Set up your family assistant</h1>
+  <p>Use a reserved <code>.test</code> address. Real family data and real provider accounts are blocked.</p>
+  <form id="request-link" class="stack" method="post" action="/start/request-link">
+    <label for="email">Recovery email</label>
+    <input id="email" name="email" type="email" autocomplete="email" required
+           placeholder="owner@example.test">
+    <button type="submit">Send secure link</button>
+    <p class="form-status" role="status" aria-live="polite">{% if sent %}If this synthetic address is eligible, its secure link has been sent.{% endif %}</p>
+  </form>
+</section>
+{% endblock %}

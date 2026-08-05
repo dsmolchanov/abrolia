@@ -1,25 +1,55 @@
-# Post-MVP Roadmap: каналы связи и голос
+# Channel Roadmap: baseline v3, post-MVP каналы и голос
 
-> Статус: roadmap-документ (решения владельца, 2026-08-02). MVP-каналы — Telegram (топики = сессии) и WhatsApp от имени номера семьи — описаны в основном плане (`thoughts/shared/plans/2026-08-02-family-ops-assistant-mvp.md`). Здесь — что добавляем после MVP и почему.
+> Статус: обновлён под v3-решение владельца 2026-08-04. MVP onboarding идёт
+> `email identity → WhatsApp identity → preferred communication channel`.
+> Telegram рекомендован, WhatsApp Beta доступен после шага 2, минимальный
+> authenticated Abrolia Web — третья primary-альтернатива; verified recovery
+> email владельца остаётся fallback и никогда не совпадает с agent inbox.
 
 ## Контекст
 
 Telegram в Западной/Южной Европе — не массовый канал: доминирует WhatsApp (примерно IT/ES ~90% пользователей мессенджеров, NL/DE ~80–85%, FR ~65%; Telegram — сильный второй в ES/IT и диаспорах). Ассистент, живущий только в Telegram, отрезает большинство местных семей.
 
-Архитектурный инвариант, который делает добавление каналов дешёвым: **context-модель канало-независима** (`context_key` = сессия; в Telegram сессии мапятся на форум-топики, донорский `channels.py`). Требование к Фазе 2 основного плана: ни один модуль выше транспорта не знает, из какого канала пришёл ход — только `RunContext` + `context_key`.
+Архитектурный инвариант, который делает добавление каналов дешёвым:
+`RunContext + context_key + source channel` — единственный интерфейс транспорта
+к ядру. Ответ на входящий ход остаётся в verified source channel; household
+primary управляет proactive/digest. Permanent failure может дать короткую
+ссылку на verified recovery email, но `outcome_unknown` никогда не дублируется.
 
-## Очерёдность каналов
+## MVP baseline (не roadmap)
 
-### MVP+1: WhatsApp — выделенный номер ассистента
+### WhatsApp identity: два Beta-режима
 
-- Отличие от MVP-режима («ассистент действует от имени номера семьи») — только идентичность: ассистент получает **свой** номер per household, семья пишет ему как обычному контакту.
-- Переиспользуется весь MVP-контур целиком: Evolution-инстанс с per-instance apikey, relay-webhook с per-household HMAC, staged-sends, транспортная таксономия.
+- **Shared Abrolia number** — quick start для verified взрослых и только
+  семейного диалога. Exact sender binding идёт через узкий gateway без
+  model/tools/household provider secrets; внешний школьный/group contour закрыт.
+- **Dedicated family number** — рекомендуемый full contour: отдельная SIM/eSIM,
+  QR linked-device, Evolution per household, per-instance apikey,
+  per-household relay-HMAC и отдельный informed-risk consent.
+- Оба режима Beta; все исходящие staged. Official WhatsApp Business — отдельный
+  eligibility/legal workstream, не обещанный глобальный GA default.
 - Сессии: в WhatsApp нет топиков — эквивалент это отдельные групповые чаты с ассистентом («Школа», «Дом», «Поездки») → каждый маппится на свой `context_key`; fallback — контекст-инференс в основном чате.
 - Ограничение: номер должен пройти WhatsApp-регистрацию — VoIP-номера обычно отбраковываются (см. «Ловушка номеров» ниже).
 
-### MVP+1 (параллельно): Email как диалоговый канал
+### Primary communication cards
 
-- У нас уже три email-входа (managed-ящик / BYO-домен / Gmail семьи) — осталось оформить email не только как ингест, но как полноценный канал: письмо ассистенту = ход диалога, ответ — письмом.
+- **Telegram** — selected/recommended default, одноразовый deep link и семейная группа.
+- **WhatsApp** — Beta, enabled только после verified step 2.
+- **Abrolia Web** — authenticated chat/PWA с opt-in push, без полного vault.
+
+Email не является primary-card. Recovery email account owner получает только
+fallback notification; при Web без push — ссылку без sensitive content. Agent
+mailbox из шага 1 запрещён как fallback, чтобы не создать self-ingestion loop.
+
+## Post-MVP order
+
+### MVP+1: Email как диалоговый канал
+
+- У нас уже три **agent email identities** (`@abrolia.com`, separate agent Gmail
+  OAuth, family domain). Post-MVP работа делает agent inbox полноценным
+  диалоговым transport: письмо ассистенту = ход, ответ = compose в thread.
+- Это не означает подключение личного Gmail, не превращает recovery fallback в
+  agent inbox и не добавляет email в MVP primary cards.
 - Охват 100%, нулевая инфраструктурная стоимость, «работает у любой бабушки»; сессия = email-thread → `context_key`.
 
 ### Privacy-тир: Signal
@@ -71,5 +101,7 @@ WhatsApp-регистрация отбраковывает большинств�
 
 ## Влияние на основной план
 
-- Фаза 2: закрепить канало-независимость (`RunContext` + `context_key` — единственный интерфейс транспорта к ядру) — уже требование плана, этот документ его мотивирует.
-- Новые каналы и голос не входят в критерии MVP-фаз; каждый добавляется отдельным планом после пилотных go-сигналов.
+- MVP обязан закрепить `RunContext + context_key + source channel`, strict
+  identity binding и household primary/fallback routing до подключения real adapters.
+- Shared/dedicated WhatsApp и minimal Web уже входят в v3 MVP. Email-dialog,
+  Signal, RCS и voice остаются отдельными post-MVP plans после pilot go-signals.

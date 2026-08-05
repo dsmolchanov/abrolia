@@ -15,6 +15,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from hermes_cloud.core.runtime_manifest import maybe_load_runtime_manifest
+
 ENV_DB = "HERMES_DB"
 ENV_CHAT = "HERMES_CHAT"
 ENV_THREAD = "HERMES_THREAD"
@@ -29,6 +31,7 @@ ENV_GMAIL_PASSWORD = "HERMES_GMAIL_APP_PASSWORD"
 ENV_GMAIL_LABEL = "HERMES_GMAIL_LABEL"
 ENV_SMTP_HOST = "HERMES_SMTP_HOST"
 ENV_SMTP_PORT = "HERMES_SMTP_PORT"
+ENV_VERTEX_EU_ENABLED = "HERMES_VERTEX_EU_ENABLED"
 
 DEFAULT_DB_PATH = "data/hermes.db"
 DEFAULT_LANGUAGE = "русский"
@@ -72,6 +75,13 @@ class Config:
     smtp_host: str
     smtp_port: int
     telegram_token: str | None
+    timezone: str | None = None
+    country_code: str | None = None
+    residency_mode: str | None = None
+    config_revision: int | None = None
+    config_sha256: str | None = None
+    manifest_path: Path | None = None
+    primary_channel: str | None = None
 
     @property
     def has_telegram(self) -> bool:
@@ -98,15 +108,27 @@ class Config:
         return self.chat
 
 
-def load_config(*, env: dict[str, str] | None = None) -> Config:
+def load_config(
+    *, env: dict[str, str] | None = None, manifest_path: Path | str | None = None
+) -> Config:
     source = dict(os.environ if env is None else env)
+    manifest = maybe_load_runtime_manifest(manifest_path, env=source)
+    if (
+        manifest is not None
+        and manifest.residency_mode == "eu-strict"
+        and (source.get(ENV_VERTEX_EU_ENABLED) or "").strip().casefold()
+        not in {"1", "true", "yes", "on"}
+    ):
+        raise RuntimeError(
+            f"residency_mode eu-strict requires ${ENV_VERTEX_EU_ENABLED}; refusing downgrade"
+        )
     thread_raw = source.get(ENV_THREAD, "").strip()
     effort = source.get(ENV_EFFORT, "").strip()
     return Config(
         database_path=Path(source.get(ENV_DB) or DEFAULT_DB_PATH),
-        chat=source.get(ENV_CHAT, "").strip(),
+        chat=manifest.primary_chat_id if manifest else source.get(ENV_CHAT, "").strip(),
         thread=int(thread_raw) if thread_raw else None,
-        language=source.get(ENV_LANGUAGE) or DEFAULT_LANGUAGE,
+        language=manifest.family_language if manifest else source.get(ENV_LANGUAGE) or DEFAULT_LANGUAGE,
         model=source.get(ENV_MODEL) or DEFAULT_MODEL,
         effort=effort or DEFAULT_EFFORT,
         telegram_token=source.get(ENV_TELEGRAM) or None,
@@ -114,9 +136,19 @@ def load_config(*, env: dict[str, str] | None = None) -> Config:
             Path(source[ENV_GOOGLE_TOKEN]) if source.get(ENV_GOOGLE_TOKEN) else None
         ),
         calendar_id=source.get(ENV_CALENDAR) or DEFAULT_CALENDAR,
-        gmail_address=(source.get(ENV_GMAIL_ADDRESS) or "").strip(),
+        gmail_address=(
+            manifest.email.agent_inbox
+            if manifest else (source.get(ENV_GMAIL_ADDRESS) or "").strip()
+        ),
         gmail_app_password=source.get(ENV_GMAIL_PASSWORD) or None,
         gmail_label=source.get(ENV_GMAIL_LABEL) or DEFAULT_GMAIL_LABEL,
         smtp_host=source.get(ENV_SMTP_HOST) or DEFAULT_SMTP_HOST,
         smtp_port=int(source.get(ENV_SMTP_PORT) or DEFAULT_SMTP_PORT),
+        timezone=manifest.timezone if manifest else None,
+        country_code=manifest.country_code if manifest else None,
+        residency_mode=manifest.residency_mode if manifest else None,
+        config_revision=manifest.config_revision if manifest else None,
+        config_sha256=manifest.config_sha256 if manifest else None,
+        manifest_path=Path(manifest.source) if manifest else None,
+        primary_channel=manifest.primary_channel if manifest else None,
     )

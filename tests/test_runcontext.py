@@ -35,6 +35,14 @@ from hermes_cloud.core.runcontext import (
     build_run_context,
     load_household,
 )
+from hermes_cloud.core.runtime_manifest import (
+    ManifestEnvironmentMismatch,
+    ManifestError,
+    ManifestHashMismatch,
+    UnsupportedManifestVersion,
+    compute_config_sha256,
+    load_runtime_manifest,
+)
 from hermes_cloud.runner.tools import REGISTRY, Services, UnknownTool
 
 OWNER = "990000001"
@@ -42,6 +50,48 @@ PARENT = "990000002"
 NANNY = "990000003"
 STRANGER = "990000009"
 CHAT = "-100990000101"
+HOUSEHOLD_ID = "11111111-1111-4111-8111-111111111111"
+
+
+def versioned_manifest(
+    *, verified: bool = True, fallback: str = "owner@example.test"
+) -> str:
+    body = f'''\
+schema_version = 1
+household_id = "{HOUSEHOLD_ID}"
+config_revision = 7
+family_language = "русский"
+timezone = "Europe/Prague"
+country_code = "CZ"
+residency_mode = "eu-app"
+
+[actors]
+owner = "{OWNER}"
+family = ["{OWNER}", "{PARENT}"]
+guests = ["{NANNY}"]
+
+[channels]
+primary = "telegram"
+
+[[channel_bindings]]
+channel = "telegram"
+actor_id = "{OWNER}"
+chat_id = "{CHAT}"
+verified = {str(verified).lower()}
+external_ref = "telegram:test-owner"
+
+[[channel_bindings]]
+channel = "web"
+actor_id = "{PARENT}"
+chat_id = "web-parent"
+verified = true
+
+[email]
+agent_inbox = "family@abrolia.test"
+fallback = "{fallback}"
+'''
+    digest = compute_config_sha256(body)
+    return body.replace("schema_version = 1\n", f'schema_version = 1\nconfig_sha256 = "{digest}"\n')
 
 HOUSEHOLD = Household(
     household_id="test",
@@ -310,3 +360,58 @@ def test_household_without_chats_trusts_no_chat() -> None:
     assert build_run_context(
         household=household, actor_id=OWNER, chat_id=CHAT
     ).role == ROLE_UNKNOWN
+
+
+def test_versioned_manifest_loads_exact_verified_bindings(tmp_path: Path) -> None:
+    path = tmp_path / "household.toml"
+    path.write_text(versioned_manifest(), encoding="utf-8")
+
+    manifest = load_runtime_manifest(path)
+    household = load_household(path)
+
+    assert manifest.timezone == "Europe/Prague"
+    assert household.household_id == HOUSEHOLD_ID
+    assert build_run_context(household=household, actor_id=OWNER, chat_id=CHAT).role == ROLE_OWNER
+    assert (
+        build_run_context(household=household, actor_id=PARENT, chat_id="web-parent").role
+        == ROLE_FAMILY
+    )
+    assert build_run_context(
+        household=household, actor_id=OWNER, chat_id="web-parent"
+    ).role == ROLE_UNKNOWN, "known actor in another actor's verified binding must be denied"
+
+
+def test_versioned_manifest_rejects_tamper_future_schema_and_env_mismatch(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "household.toml"
+    path.write_text(versioned_manifest(), encoding="utf-8")
+
+    for env in (
+        {"HERMES_HOUSEHOLD_ID": "99999999-9999-4999-8999-999999999999"},
+        {"HERMES_CONFIG_REVISION": "8"},
+        {"HERMES_CONFIG_SHA256": "0" * 64},
+    ):
+        with pytest.raises(ManifestEnvironmentMismatch):
+            load_runtime_manifest(path, env=env)
+
+    path.write_text(versioned_manifest().replace('country_code = "CZ"', 'country_code = "DE"'))
+    with pytest.raises(ManifestHashMismatch):
+        load_runtime_manifest(path)
+
+    path.write_text(versioned_manifest().replace("schema_version = 1", "schema_version = 2"))
+    with pytest.raises(UnsupportedManifestVersion):
+        load_runtime_manifest(path)
+
+
+def test_versioned_manifest_requires_primary_binding_and_distinct_fallback(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "household.toml"
+    path.write_text(versioned_manifest(verified=False), encoding="utf-8")
+    with pytest.raises(ManifestError, match="no verified binding"):
+        load_runtime_manifest(path)
+
+    path.write_text(versioned_manifest(fallback="FAMILY@ABROLIA.TEST"), encoding="utf-8")
+    with pytest.raises(ManifestError, match="must not equal"):
+        load_runtime_manifest(path)

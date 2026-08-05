@@ -141,6 +141,17 @@ def test_family_language_reaches_the_prompt() -> None:
     assert "español" in client.messages.calls[0]["system"][0]["text"]
 
 
+def test_runtime_timezone_reaches_prompt_without_location_guessing() -> None:
+    client = FakeClient()
+    Extractor(client, timezone="Europe/Prague").extract_email(
+        load("direct_invoice_it.eml")
+    )
+
+    prompt = client.messages.calls[0]["system"][0]["text"]
+    assert "Europe/Prague" in prompt
+    assert "не угадывай часовой пояс" in prompt
+
+
 def test_refusal_is_raised_before_reading_content() -> None:
     client = FakeClient(FakeResponse(stop_reason="refusal"))
 

@@ -1,0 +1,43 @@
+app = "abrolia-control-plane-synthetic"
+primary_region = "ams"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  ABROLIA_CONTROL_PLANE_DB = "/data/control-plane.db"
+  ABROLIA_PUBLIC_ORIGIN = "https://abrolia-control-plane-synthetic.fly.dev"
+  ABROLIA_RUNTIME_PROVIDER = "fly-runtime"
+  ABROLIA_SYNTHETIC_ONLY = "1"
+  REAL_FAMILY_DATA_ENABLED = "0"
+  ABROLIA_REAL_EMAIL_ENABLED = "0"
+  ABROLIA_REAL_WHATSAPP_ENABLED = "0"
+  ABROLIA_REAL_CHANNEL_ENABLED = "0"
+  ABROLIA_FLY_ORG = "personal"
+  ABROLIA_INTERNAL_BOOTSTRAP_HOST = "abrolia-control-plane-synthetic.flycast"
+
+[http_service]
+  internal_port = 8080
+  # Flycast has no TLS certificates and is HTTP-only. The application redirects
+  # every non-Flycast HTTP host to HTTPS before routing any request.
+  force_https = false
+  auto_start_machines = true
+  auto_stop_machines = "off"
+  min_machines_running = 1
+  processes = ["app"]
+
+  [[http_service.checks]]
+    grace_period = "10s"
+    interval = "15s"
+    method = "GET"
+    path = "/healthz"
+    timeout = "2s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
+
+[mounts]
+  source = "control_plane_data"
+  destination = "/data"
+  initial_size = "1gb"

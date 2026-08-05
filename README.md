@@ -1,17 +1,41 @@
-# Hermes Cloud
+# Abrolia
 
 Family operations assistant for households living in a foreign language. Forward a school email, a photo of a notice, or a voice note — get back a structured proposal in your family's language (what it is, what's due, how much, by when). One tap turns it into a calendar event, a task, a reminder, or an approved outgoing email. Nothing outward-facing ever happens without explicit human confirmation.
 
-- **Email layer**: three options per family — a managed inbox on our domain ([Nerve](https://github.com/dsmolchanov)), your own domain (DNS verification), or direct access to your existing Gmail (label-scoped: only messages you label `Hermes` are ever read).
+- **Onboarding**: an invite-only Abrolia account leads through three resumable steps: email identity, WhatsApp identity, then the preferred communication channel. Account identity, runtime actor identity, and the assistant's mailbox are separate credentials.
+- **Email identity**: three options in a fixed order — a recommended `@abrolia.com` assistant inbox ([Nerve](https://github.com/dsmolchanov)), a separate Gmail account created for the assistant and connected through Google OAuth, or the family's own domain after DNS verification. Abrolia never asks for a Gmail password or app password, and connecting a personal Gmail mailbox is not a product path.
 - **Model layer**: Anthropic Claude API (commercial terms) — typed tools only, no shell, no direct send capability for the model.
-- **Channels**: Telegram for confirmations and notifications; WhatsApp on the family's own number (QR-paired browser session — unofficial automation, risks disclosed at onboarding; official Business Platform is the GA path).
+- **WhatsApp identity**: a shared Abrolia number provides a Beta quick start for verified adults only; a dedicated family SIM/eSIM provides the full Beta WhatsApp contour through an explicitly consented QR-linked session. Eligibility and legal review for the official Business Platform is a separate post-MVP workstream, not an assumed GA migration.
+- **Communication channel**: Telegram is recommended by default; verified WhatsApp and a minimal authenticated Abrolia Web surface are alternatives. The verified Abrolia-account recovery email remains the notification fallback and can never be the assistant mailbox.
 - **Calendar**: family Google Calendar shared to a dedicated assistant account.
-- **Privacy**: EU-hosted application with documented international subprocessors (model API, email delivery); no training on your data; per-household isolation; full export and delete. DPAs and transfer mechanisms are still being put in place — see [`docs/privacy/processors.md`](docs/privacy/processors.md) for the actual, unfinished status.
+- **Privacy**: a metadata-only control plane on `app.abrolia.com` provisions a dedicated runtime per household. Family content stays out of the control plane; no training on your data; full export and delete span both control plane and runtime. The application is EU-hosted with documented international subprocessors. DPAs and transfer mechanisms are still being put in place — see [`docs/privacy/processors.md`](docs/privacy/processors.md) for the actual, unfinished status.
 
-Status: pilot MVP under construction. **Gate −1 (right-to-build) is open**: the engineering and privacy drafts exist and are under review, and the system runs on synthetic data only. Real data — including the owner's own mailbox — is not connected before Phase 2 and counsel sign-off.
+Status: pilot MVP under construction. **Engineering Gate −1 closed on 2026-08-03 for synthetic-only work.** It did not authorize real-family processing. Real data — including the owner's own correspondence — remains blocked until the legal basis for special-category data, counsel review, processor agreements and transfer safeguards are complete; the separate-agent Gmail option also remains blocked until Google OAuth verification/CASA prerequisites are complete.
 See `thoughts/shared/plans/2026-08-02-family-ops-assistant-mvp.md` for the implementation plan and `thoughts/shared/implementations/2026-08-02-family-ops-assistant-mvp-validation.md` for the Gate −1 validation report.
 
-## Running the Phase 1 slice (synthetic data only)
+## Running the onboarding control plane (synthetic data only)
+
+The control plane requires independent urlsafe-base64 encryption, lookup-HMAC,
+and token-HMAC keys and fails closed if they or the synthetic-only gates are
+missing. See [`docs/onboarding-runbook.md`](docs/onboarding-runbook.md) for the
+complete deployment and bootstrap procedure.
+
+```bash
+export ABROLIA_ENCRYPTION_KEY_VERSION=v1
+export ABROLIA_ENCRYPTION_KEY='<32-byte urlsafe-base64 test key>'
+export ABROLIA_LOOKUP_HMAC_KEY='<independent 32-byte urlsafe-base64 test key>'
+export ABROLIA_TOKEN_HMAC_KEY='<independent 32-byte urlsafe-base64 test key>'
+export ABROLIA_PUBLIC_ORIGIN=https://app.example.test
+export ABROLIA_SYNTHETIC_ONLY=1 REAL_FAMILY_DATA_ENABLED=0
+abrolia-control-plane serve --host 127.0.0.1 --port 8080
+```
+
+## Running the existing runtime slice (synthetic data only)
+
+The commands below exercise the dedicated household runtime, whose Python package
+retains the historical `hermes_cloud` name. They do not create an Abrolia account
+or run the new control plane. The IMAP poller is a legacy test seam retained for
+pipeline compatibility; it is not offered by production onboarding.
 
 ```bash
 pip install -r requirements-dev.txt
@@ -23,16 +47,16 @@ export HERMES_GUEST_ACTORS=990000003  # optional: read-only actors (nanny, grand
 export TELEGRAM_BOT_TOKEN=...         # optional: without it messages print to the console
 
 python3 -m hermes_cloud.cli inject-eml tests/fixtures/email/forwarded_school_de.eml
-python3 -m hermes_cloud.cli gmail-poll --baseline  # first run: mark existing mail as seen
-python3 -m hermes_cloud.cli gmail-poll   # fetch mail labelled Hermes (email option c)
+python3 -m hermes_cloud.cli gmail-poll --baseline  # synthetic legacy-IMAP seam: initialise cursor
+python3 -m hermes_cloud.cli gmail-poll   # synthetic legacy-IMAP seam only
 python3 -m hermes_cloud.cli worker     # extraction → card with ✅ / ✏️ / ❌
 python3 -m hermes_cloud.cli listen     # long-poll the channel, handle button presses
 python3 -m hermes_cloud.cli status     # queue counters
 python3 -m hermes_cloud.cli tick       # deliver reminders that came due
 python3 -m hermes_cloud.cli reconcile  # settle effects left hanging by a crash
 python3 -m hermes_cloud.cli retention  # delete what the retention matrix says is due
-python3 -m hermes_cloud.cli export     # owner-only: stage a full data export
-python3 -m hermes_cloud.cli delete     # owner-only: stage an irreversible wipe
+python3 -m hermes_cloud.cli export     # runtime owner-actor: export this runtime only
+python3 -m hermes_cloud.cli delete     # runtime owner-actor: wipe this runtime only
 python3 -m hermes_cloud.cli backup     # encrypted snapshot (HERMES_BACKUP_KEY)
 python3 -m hermes_cloud.cli restore <archive> --target /data/restored.db
 python3 -m hermes_cloud.cli dlq        # events that exhausted their attempts
@@ -66,6 +90,12 @@ Actor roles decide who may press it. The mapping comes from `household.toml`
 when the file exists and from the variables above otherwise; anyone not listed —
 and anyone writing from a chat outside `HERMES_CHAT` — gets zero capabilities,
 not reduced ones.
+
+`HERMES_OWNER` is a channel actor inside one dedicated runtime, not the owner of
+an Abrolia Web account. Likewise, the runtime `export` and `delete` commands are
+only one side of the complete data-subject workflow: the control plane must also
+authenticate the account owner, orchestrate runtime cleanup and remove its own
+account/onboarding metadata before deletion is reported complete.
 
 Model benchmark and the extraction-model decision: [`bench/README.md`](bench/README.md).
 

@@ -57,6 +57,8 @@ SYSTEM_PROMPT = """\
 сообщение.
 
 ПРАВИЛА ИЗВЛЕЧЕНИЯ.
+- Часовой пояс семьи: {timezone}. Используй только его для названных дат и \
+времени; не угадывай часовой пояс по языку, стране, адресу или месту.
 - Не выдумывай факты. Если даты, суммы или ответственного в письме нет, \
 оставляй поле пустым — пустое поле честнее выдуманного.
 - Даты приводи к календарным (ISO). Относительные («до пятницы») разрешай \
@@ -201,12 +203,14 @@ class Extractor:
         *,
         model: str = DEFAULT_MODEL,
         family_language: str = "русский",
+        timezone: str | None = None,
         max_tokens: int = DEFAULT_MAX_TOKENS,
         effort: str | None = DEFAULT_EFFORT,
     ) -> None:
         self._client = client
         self.model = model
         self.family_language = family_language
+        self.timezone = timezone
         self.max_tokens = max_tokens
         self.effort = effort
 
@@ -220,7 +224,10 @@ class Extractor:
 
     def system_prompt(self) -> str:
         return SYSTEM_PROMPT.format(
-            open=CONTENT_OPEN, close=CONTENT_CLOSE, language=self.family_language
+            open=CONTENT_OPEN,
+            close=CONTENT_CLOSE,
+            language=self.family_language,
+            timezone=self.timezone or "не задан; оставляй неоднозначное время без догадки",
         )
 
     def extract_email(self, parsed: ParsedEmail) -> Extraction:

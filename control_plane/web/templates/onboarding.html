@@ -1,0 +1,164 @@
+{% extends "base.html" %}
+{% block title %}Onboarding · Abrolia{% endblock %}
+{% block page %}onboarding{% endblock %}
+{% block content %}
+{% macro command_fields() -%}
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <input type="hidden" name="idempotency_key" value="{{ idempotency_key }}">
+  <input type="hidden" name="version" value="{{ snapshot.version }}">
+{%- endmacro %}
+<section class="onboarding-shell" data-version="{{ snapshot.version if snapshot else 0 }}" data-workflow-state="{{ snapshot.state.value }}">
+  <header class="onboarding-heading">
+    <div>
+      <p class="eyebrow">Household setup</p>
+      <h1>Choose how Abrolia works with your family</h1>
+    </div>
+    <p class="recovery">Recovery contact: <strong>{{ recovery_email }}</strong><br>
+      <small>This is fallback contact only — never the agent inbox.</small>
+    </p>
+  </header>
+
+  <ol class="progress" aria-label="Onboarding progress">
+    <li data-progress="email_identity"><span>1</span> Email</li>
+    <li data-progress="whatsapp_identity"><span>2</span> WhatsApp</li>
+    <li data-progress="primary_channel"><span>3</span> Communication</li>
+  </ol>
+
+  {% if error %}<p class="form-error" role="alert">That command could not be accepted. The durable state below is unchanged.</p>{% endif %}
+
+  <section class="profile-preflight" data-step="profile"{% if snapshot.state.value != 'profile_required' or snapshot.current_step.value != 'profile' %} hidden{% endif %}>
+    <h2>First, your household basics</h2>
+    <form id="profile-form" class="profile-grid" method="post" action="/onboarding/profile">
+      {{ command_fields() }}
+      <label>First name<input name="first_name" autocomplete="given-name" required></label>
+      <label>Last name<input name="last_name" autocomplete="family-name" required></label>
+      <label>Family language<input name="family_language" value="en" required></label>
+      <label>Timezone<input name="timezone" value="Europe/Prague" required></label>
+      <label>Country<input name="country_code" value="CZ" pattern="[A-Z]{2}" required></label>
+      <input name="residency_mode" type="hidden" value="eu-app">
+      <button type="submit">Continue to Email</button>
+    </form>
+  </section>
+
+  <section class="choice-step" data-step="email_identity"{% if snapshot.state.value != 'in_progress' or snapshot.current_step.value != 'email_identity' %} hidden{% endif %}>
+    <h2>1. Email identity</h2>
+    <p>The assistant uses a separate inbox. Your recovery address remains fallback only.</p>
+    <div class="cards">
+      <form method="post" action="/onboarding/select/email_identity">
+        {{ command_fields() }}<input type="hidden" name="kind" value="abrolia_managed">
+        <input type="hidden" name="local_part" value="family.assistant">
+        <button class="card recommended" data-select="email_identity" data-kind="abrolia_managed">
+          <span class="badge">Recommended</span> <strong>@abrolia.com</strong>
+          <span>Managed assistant inbox with a synthetic pilot identity.</span>
+        </button>
+      </form>
+      <form method="post" action="/onboarding/select/email_identity">
+        {{ command_fields() }}<input type="hidden" name="kind" value="gmail_agent">
+        <button class="card" data-select="email_identity" data-kind="gmail_agent">
+          <strong>Separate agent Gmail</strong>
+          <span>A dedicated agent account with OAuth — never your personal Gmail or an app password.</span>
+        </button>
+      </form>
+      <form method="post" action="/onboarding/select/email_identity">
+        {{ command_fields() }}<input type="hidden" name="kind" value="family_domain">
+        <input type="hidden" name="domain" value="family.example.test">
+        <button class="card" data-select="email_identity" data-kind="family_domain">
+          <strong>Your family domain</strong><span>Use a dedicated assistant address on a domain you control.</span>
+        </button>
+      </form>
+    </div>
+  </section>
+
+  <section class="choice-step" data-step="whatsapp_identity"{% if snapshot.state.value != 'in_progress' or snapshot.current_step.value != 'whatsapp_identity' %} hidden{% endif %}>
+    <h2>2. WhatsApp identity</h2>
+    <div class="cards two">
+      <form method="post" action="/onboarding/select/whatsapp_identity">
+        {{ command_fields() }}<input type="hidden" name="kind" value="shared_abrolia">
+        <label class="consent"><input type="checkbox" name="privacy_notice_accepted" value="yes" required> I accept the channel privacy notice.</label>
+        <button class="card recommended" data-select="whatsapp_identity" data-kind="shared_abrolia">
+          <span class="badge">Recommended · Beta</span><strong>Shared Abrolia WhatsApp</strong>
+          <span>Accept the channel privacy notice before the synthetic member test.</span>
+        </button>
+      </form>
+      <form method="post" action="/onboarding/select/whatsapp_identity">
+        {{ command_fields() }}<input type="hidden" name="kind" value="dedicated_number">
+        <label class="consent"><input type="checkbox" name="privacy_notice_accepted" value="yes" required> I accept the channel privacy notice.</label>
+        <label class="consent"><input type="checkbox" name="linked_device_risk_accepted" value="yes" required> I accept linked-device and number-blocking risk.</label>
+        <button class="card" data-select="whatsapp_identity" data-kind="dedicated_number">
+          <span class="badge">Beta</span><strong>Dedicated number</strong>
+          <span>QR linking requires explicit linked-device and number-blocking risk consent.</span>
+        </button>
+      </form>
+    </div>
+  </section>
+
+  <section class="choice-step" data-step="primary_channel"{% if snapshot.state.value != 'in_progress' or snapshot.current_step.value != 'primary_channel' %} hidden{% endif %}>
+    <h2>3. Communication</h2>
+    <div class="cards">
+      {% for channel, label, recommended in [('telegram', 'Telegram', true), ('whatsapp', 'WhatsApp', false), ('web', 'Web', false)] %}
+      <form method="post" action="/onboarding/select/primary_channel">
+        {{ command_fields() }}<input type="hidden" name="kind" value="{{ channel }}">
+        <button class="card{% if recommended %} recommended{% endif %}" data-select="primary_channel" data-kind="{{ channel }}">
+          {% if recommended %}<span class="badge">Recommended</span>{% endif %}<strong>{{ label }}</strong>
+          <span>{% if channel == 'telegram' %}Bind a verified synthetic chat.{% elif channel == 'whatsapp' %}Use the verified WhatsApp identity above.{% else %}Minimal first-party web channel binding.{% endif %}</span>
+        </button>
+      </form>
+      {% endfor %}
+    </div>
+  </section>
+
+  {% set current = namespace(status='') %}
+  {% for step in snapshot.steps %}
+    {% if step.kind.value == snapshot.current_step.value %}{% set current.status = step.status.value %}{% endif %}
+  {% endfor %}
+  <section class="status-panel" aria-live="polite">
+    {% if snapshot.state.value == 'runtime_provisioning' %}
+      <h2 id="status-title">Preparing your private runtime</h2>
+      <p id="status-copy">The durable worker is creating the synthetic runtime and immutable configuration.</p>
+    {% elif snapshot.state.value == 'activating' %}
+      <h2 id="status-title">Activating your runtime</h2>
+      <p id="status-copy">Waiting for the runtime to acknowledge the exact configuration revision.</p>
+    {% elif snapshot.state.value == 'complete' %}
+      <h2 id="status-title">Setup complete</h2>
+      <p id="status-copy">Your synthetic household runtime is active.</p>
+    {% elif snapshot.state.value == 'cancelled' %}
+      <h2 id="status-title">Setup cancelled</h2>
+      <p id="status-copy">No new onboarding work will be started.</p>
+    {% elif current.status == 'waiting_user' %}
+      <h2 id="status-title">Waiting for you</h2>
+      <p id="status-copy">Complete the synthetic verification, then check again.</p>
+    {% elif current.status == 'verifying' %}
+      <h2 id="status-title">Checking verification</h2>
+      <p id="status-copy">The durable worker is inspecting the existing provider result.</p>
+    {% elif current.status == 'failed' %}
+      <h2 id="status-title">Needs attention</h2>
+      <p id="status-copy">The provider returned a safe error. You can retry this selection.</p>
+    {% else %}
+      <h2 id="status-title">Resume setup</h2>
+      <p id="status-copy">Loading the durable control-plane state…</p>
+    {% endif %}
+    <form method="post" action="/onboarding/retry/{{ snapshot.current_step.value }}">
+      {{ command_fields() }}<button id="retry-step" type="submit"{% if current.status != 'failed' %} hidden{% endif %}>Try again</button>
+    </form>
+    <form method="post" action="/onboarding/check/{{ snapshot.current_step.value }}">
+      {{ command_fields() }}<button id="check-step" type="submit"{% if current.status != 'waiting_user' %} hidden{% endif %}>Check again</button>
+    </form>
+  </section>
+
+  {% set verified_steps = snapshot.steps | selectattr('status.value', 'equalto', 'verified') | list %}
+  {% if verified_steps %}
+  <section class="verified-choices" aria-label="Verified choices">
+    <h2>Verified choices</h2>
+    <p>A verified choice cannot be changed by going back. Reset it explicitly; downstream setup will be cleaned up first.</p>
+    <div class="reset-actions">
+    {% for step in verified_steps if step.kind.value in ['email_identity', 'whatsapp_identity', 'primary_channel'] %}
+      <form method="post" action="/onboarding/reset/{{ step.kind.value }}">
+        {{ command_fields() }}
+        <button type="submit" class="secondary" data-reset="{{ step.kind.value }}">Change {{ step.kind.value | replace('_identity', '') | replace('_', ' ') }}</button>
+      </form>
+    {% endfor %}
+    </div>
+  </section>
+  {% endif %}
+</section>
+{% endblock %}

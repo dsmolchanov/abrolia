@@ -4,13 +4,48 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from hermes_cloud import cli
 from hermes_cloud.channels.telegram import FakeTransport
 from hermes_cloud.core.approvals import ApprovalStore
 from hermes_cloud.core.config import Config, load_config, load_dotenv
 from hermes_cloud.core.db import open_database
+from hermes_cloud.core.runtime_manifest import compute_config_sha256
 from hermes_cloud.execute.reminder import ReminderStore
 from hermes_cloud.runner.pipeline import Pipeline
+
+
+def runtime_manifest(*, residency_mode: str = "eu-app") -> str:
+    body = f'''\
+schema_version = 1
+household_id = "22222222-2222-4222-8222-222222222222"
+config_revision = 3
+family_language = "čeština"
+timezone = "Europe/Prague"
+country_code = "CZ"
+residency_mode = "{residency_mode}"
+
+[actors]
+owner = "owner"
+family = ["owner"]
+guests = []
+
+[channels]
+primary = "telegram"
+
+[[channel_bindings]]
+channel = "telegram"
+actor_id = "owner"
+chat_id = "configured-chat"
+verified = true
+
+[email]
+agent_inbox = "agent@abrolia.test"
+fallback = "owner@example.test"
+'''
+    digest = compute_config_sha256(body)
+    return body.replace("schema_version = 1\n", f'schema_version = 1\nconfig_sha256 = "{digest}"\n')
 
 
 def test_config_defaults_are_safe() -> None:
@@ -126,6 +161,92 @@ def test_config_is_immutable() -> None:
     except Exception:
         return
     raise AssertionError("конфиг должен быть неизменяемым")
+
+
+def test_versioned_manifest_wins_over_legacy_runtime_environment(tmp_path: Path) -> None:
+    path = tmp_path / "household.toml"
+    path.write_text(runtime_manifest(), encoding="utf-8")
+
+    config = load_config(
+        manifest_path=path,
+        env={
+            "HERMES_CHAT": "wrong-chat",
+            "HERMES_FAMILY_LANGUAGE": "wrong-language",
+            "HERMES_GMAIL_ADDRESS": "wrong@example.test",
+        },
+    )
+
+    assert config.chat == "configured-chat"
+    assert config.language == "čeština"
+    assert config.gmail_address == "agent@abrolia.test"
+    assert config.timezone == "Europe/Prague"
+    assert config.country_code == "CZ"
+    assert config.config_revision == 3
+    assert config.primary_channel == "telegram"
+
+
+def test_eu_strict_manifest_fails_without_explicit_provider(tmp_path: Path) -> None:
+    path = tmp_path / "household.toml"
+    path.write_text(runtime_manifest(residency_mode="eu-strict"), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="refusing downgrade"):
+        load_config(manifest_path=path, env={})
+
+    config = load_config(
+        manifest_path=path, env={"HERMES_VERTEX_EU_ENABLED": "true"}
+    )
+    assert config.residency_mode == "eu-strict"
+
+
+def test_validate_manifest_command_is_safe_and_actionable(
+    tmp_path: Path, capsys
+) -> None:
+    path = tmp_path / "household.toml"
+    path.write_text(runtime_manifest(), encoding="utf-8")
+
+    assert cli.main(["validate-manifest", str(path)]) == 0
+    output = capsys.readouterr()
+    assert "manifest ok" in output.out
+    assert "agent@abrolia.test" not in output.out
+
+    path.write_text(runtime_manifest().replace("Europe/Prague", "Invalid/Zone"), encoding="utf-8")
+    assert cli.main(["validate-manifest", str(path)]) == 1
+    assert "manifest invalid" in capsys.readouterr().err
+
+
+def test_bootstrap_command_never_accepts_token_in_argv(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(cli, "load_dotenv", lambda: None)
+    for key in (
+        "HERMES_BOOTSTRAP_TOKEN",
+        "HERMES_CONTROL_PLANE_URL",
+        "HERMES_RUNTIME_REF",
+        "HERMES_HOUSEHOLD_ID",
+        "HERMES_CONFIG_REVISION",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    assert cli.main(["bootstrap"]) == 1
+    error = capsys.readouterr().err
+    assert "HERMES_BOOTSTRAP_TOKEN" in error
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(["bootstrap", "--token", "must-not-be-supported"])
+
+
+def test_bootstrap_command_rejects_non_integer_revision_before_network(
+    monkeypatch, capsys
+) -> None:
+    monkeypatch.setattr(cli, "load_dotenv", lambda: None)
+    monkeypatch.setenv("HERMES_BOOTSTRAP_TOKEN", "one-time-secret")
+    monkeypatch.setenv("HERMES_CONTROL_PLANE_URL", "https://control.example.test")
+    monkeypatch.setenv("HERMES_RUNTIME_REF", "runtime-ref")
+    monkeypatch.setenv("HERMES_HOUSEHOLD_ID", "22222222-2222-4222-8222-222222222222")
+    monkeypatch.setenv("HERMES_CONFIG_REVISION", "not-an-integer")
+
+    assert cli.main(["bootstrap"]) == 1
+
+    error = capsys.readouterr().err
+    assert "HERMES_CONFIG_REVISION" in error
+    assert "one-time-secret" not in error
 
 
 def test_listen_processes_updates_and_remembers_the_offset(
