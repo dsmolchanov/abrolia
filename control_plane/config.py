@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import os
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -22,6 +23,29 @@ def _decode_key(value: str, *, name: str) -> bytes:
     return decoded
 
 
+def _uuid_set(value: str, *, name: str) -> frozenset[str]:
+    parsed: set[str] = set()
+    for item in value.split(","):
+        candidate = item.strip()
+        if not candidate:
+            continue
+        try:
+            parsed.add(str(uuid.UUID(candidate)))
+        except ValueError as error:
+            raise ConfigurationError(f"{name} must contain comma-separated UUIDs") from error
+    return frozenset(parsed)
+
+
+def _canonical_uuid(value: str | None, *, name: str) -> str:
+    try:
+        parsed = str(uuid.UUID(value or ""))
+    except ValueError as error:
+        raise ConfigurationError(f"{name} must be a canonical UUID") from error
+    if value != parsed:
+        raise ConfigurationError(f"{name} must be a canonical UUID")
+    return parsed
+
+
 @dataclass(frozen=True)
 class ControlPlaneConfig:
     database_path: Path = Path("data/control-plane.db")
@@ -34,8 +58,13 @@ class ControlPlaneConfig:
     synthetic_only: bool = True
     real_family_data_enabled: bool = False
     real_email_enabled: bool = False
+    real_email_household_allowlist: frozenset[str] = field(default_factory=frozenset)
     real_whatsapp_enabled: bool = False
     real_channel_enabled: bool = False
+    nerve_base_url: str | None = None
+    nerve_admin_key: str | None = field(default=None, repr=False)
+    nerve_platform_org_id: str | None = None
+    nerve_platform_domain_id: str | None = None
     fly_api_token: str | None = field(default=None, repr=False)
     fly_org_slug: str | None = None
     runtime_image_digest: str | None = None
@@ -64,7 +93,6 @@ class ControlPlaneConfig:
             raise ConfigurationError("Phase 1 runtime region is locked to ams")
         if self.synthetic_only and (
             self.real_family_data_enabled
-            or self.real_email_enabled
             or self.real_whatsapp_enabled
             or self.real_channel_enabled
             or self.gmail_real_enabled
@@ -76,6 +104,35 @@ class ControlPlaneConfig:
             )
         if self.real_whatsapp_enabled or self.real_channel_enabled:
             raise ConfigurationError("real WhatsApp/channel adapters are not enabled yet")
+        if self.real_email_enabled:
+            if not all((
+                self.nerve_base_url,
+                self.nerve_admin_key,
+                self.nerve_platform_org_id,
+                self.nerve_platform_domain_id,
+            )):
+                raise ConfigurationError(
+                    "real email requires complete Nerve admin and platform configuration"
+                )
+            if not self.nerve_base_url.startswith("https://"):
+                raise ConfigurationError("Nerve admin origin must use HTTPS")
+            if not self.real_email_household_allowlist:
+                raise ConfigurationError(
+                    "real email requires an explicit household allowlist"
+                )
+            for household_id in self.real_email_household_allowlist:
+                _canonical_uuid(
+                    household_id,
+                    name="ABROLIA_REAL_EMAIL_HOUSEHOLD_ALLOWLIST entry",
+                )
+            _canonical_uuid(
+                self.nerve_platform_org_id,
+                name="ABROLIA_NERVE_PLATFORM_ORG_ID",
+            )
+            _canonical_uuid(
+                self.nerve_platform_domain_id,
+                name="ABROLIA_NERVE_PLATFORM_DOMAIN_ID",
+            )
         google_configured = bool(
             self.google_oauth_client_id and self.google_oauth_client_secret
         )
@@ -170,8 +227,18 @@ class ControlPlaneConfig:
             synthetic_only=source.get("ABROLIA_SYNTHETIC_ONLY", "1") == "1",
             real_family_data_enabled=source.get("REAL_FAMILY_DATA_ENABLED", "0") == "1",
             real_email_enabled=source.get("ABROLIA_REAL_EMAIL_ENABLED", "0") == "1",
+            real_email_household_allowlist=_uuid_set(
+                source.get("ABROLIA_REAL_EMAIL_HOUSEHOLD_ALLOWLIST", ""),
+                name="ABROLIA_REAL_EMAIL_HOUSEHOLD_ALLOWLIST",
+            ),
             real_whatsapp_enabled=source.get("ABROLIA_REAL_WHATSAPP_ENABLED", "0") == "1",
             real_channel_enabled=source.get("ABROLIA_REAL_CHANNEL_ENABLED", "0") == "1",
+            nerve_base_url=source.get("ABROLIA_NERVE_BASE_URL") or None,
+            nerve_admin_key=source.get("ABROLIA_NERVE_ADMIN_KEY") or None,
+            nerve_platform_org_id=source.get("ABROLIA_NERVE_PLATFORM_ORG_ID") or None,
+            nerve_platform_domain_id=(
+                source.get("ABROLIA_NERVE_PLATFORM_DOMAIN_ID") or None
+            ),
             fly_api_token=source.get("FLY_API_TOKEN") or None,
             fly_org_slug=source.get("ABROLIA_FLY_ORG") or None,
             runtime_image_digest=source.get("ABROLIA_RUNTIME_IMAGE") or None,

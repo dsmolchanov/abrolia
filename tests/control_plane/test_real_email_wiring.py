@@ -1,0 +1,75 @@
+from __future__ import annotations
+
+from dataclasses import replace
+
+import pytest
+
+from control_plane.config import ControlPlaneConfig
+from control_plane.container import ControlPlaneContainer
+from control_plane.models import StepKind
+from control_plane.onboarding.contracts import InvalidTransition
+
+
+def test_production_container_registers_real_nerve_providers_fail_closed(
+    tmp_path,
+) -> None:
+    household_id = "10000000-0000-4000-8000-000000000001"
+    config = replace(
+        ControlPlaneConfig.for_test(tmp_path),
+        real_email_enabled=True,
+        real_email_household_allowlist=frozenset({household_id}),
+        nerve_base_url="https://nerve.example.test",
+        nerve_admin_key="synthetic-admin-key",
+        nerve_platform_org_id="20000000-0000-4000-8000-000000000001",
+        nerve_platform_domain_id="30000000-0000-4000-8000-000000000001",
+    )
+
+    with ControlPlaneContainer.build(config) as container:
+        assert container.providers.health() == {
+            "dry-run-runtime": "configured",
+            "fake-channel": "configured",
+            "fake-cleanup": "configured",
+            "fake-email": "configured",
+            "fake-whatsapp": "configured",
+            "google-oauth": "configured",
+            "nerve-byo-domain": "configured",
+            "nerve-managed": "configured",
+        }
+        assert container.onboarding.email_provider == "nerve-managed"
+        assert container.onboarding.byo_domain_provider == "nerve-byo-domain"
+        assert container.onboarding.allow_real_email_domains
+
+
+def test_real_email_rollout_rejects_non_allowlisted_household(cp_stack) -> None:
+    cp_stack.complete_profile()
+    cp_stack.service.real_email_enabled = True
+    cp_stack.service.real_email_household_allowlist = frozenset()
+
+    with pytest.raises(InvalidTransition, match="not enabled for this household"):
+        cp_stack.service.select(
+            cp_stack.household.id,
+            StepKind.EMAIL,
+            {"kind": "abrolia_managed", "local_part": "family-agent"},
+            context=cp_stack.context(),
+        )
+
+
+def test_real_email_rollout_does_not_route_gmail_to_nerve(cp_stack) -> None:
+    cp_stack.complete_profile()
+    cp_stack.service.real_email_enabled = True
+    cp_stack.service.gmail_provider = "google-oauth"
+    cp_stack.service.real_email_household_allowlist = frozenset({
+        cp_stack.household.id
+    })
+
+    cp_stack.service.select(
+        cp_stack.household.id,
+        StepKind.EMAIL,
+        {"kind": "gmail_agent", "separate_agent_account_acknowledged": True},
+        context=cp_stack.context(),
+    )
+
+    job = cp_stack.database.query_one(
+        "SELECT provider FROM provisioning_jobs WHERE kind = 'email_identity'"
+    )
+    assert job["provider"] == "google-oauth"

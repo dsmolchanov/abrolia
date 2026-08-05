@@ -46,6 +46,8 @@ class OnboardingService:
         gmail_provider: str | None = None,
         byo_domain_provider: str | None = None,
         allow_real_email_domains: bool = False,
+        real_email_enabled: bool = False,
+        real_email_household_allowlist: frozenset[str] = frozenset(),
         email_identities: EmailIdentityService | None = None,
     ) -> None:
         self.households = households
@@ -56,6 +58,8 @@ class OnboardingService:
         self.gmail_provider = gmail_provider or email_provider
         self.byo_domain_provider = byo_domain_provider or email_provider
         self.allow_real_email_domains = allow_real_email_domains
+        self.real_email_enabled = real_email_enabled
+        self.real_email_household_allowlist = real_email_household_allowlist
         self.email_identities = email_identities
 
     @staticmethod
@@ -254,6 +258,14 @@ class OnboardingService:
             StepKind.PRIMARY_CHANNEL: "fake-channel",
         }[kind]
 
+    def _assert_email_rollout(self, household_id: str, selection: dict[str, Any]) -> None:
+        if not self.real_email_enabled:
+            return
+        if selection.get("kind") == "gmail_agent":
+            return
+        if household_id not in self.real_email_household_allowlist:
+            raise InvalidTransition("real email is not enabled for this household")
+
     @staticmethod
     def _record_whatsapp_consents(
         connection,
@@ -326,6 +338,8 @@ class OnboardingService:
             if replay:
                 return replay
             row = self._scoped_workflow(connection, context.account_id, household_id)
+            if kind is StepKind.EMAIL:
+                self._assert_email_rollout(household_id, parsed)
             self._check_version(row, context.expected_version)
             if row["current_step"] != kind.value:
                 raise InvalidTransition("onboarding steps cannot be skipped or reordered")

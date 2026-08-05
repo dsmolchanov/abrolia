@@ -222,25 +222,43 @@ not a reason to weaken the current reserved set.
 
 ### Remaining Phase 2.4 blockers
 
-1. Implement bounded scheduled DNS verification with persisted backoff and a
-   terminal/manual fallback.
-2. Fix the verified inbox/domain/org deletion lifecycle in `nerve-cloud` and
-   cover it with an integration fixture that matches real Nerve semantics.
-3. Prove recovery when both the original and recovery key responses are lost;
-   avoid an idempotency conflict on the revoked original reference.
-4. Wire the real BYO adapter and rollout gate only after the Nerve security and
-   lifecycle blockers are closed.
-5. Run staging/live DNS, Nerve, logout/login/reload, and cleanup tests. These
-   manual checks are intentionally not marked complete here.
+1. Merge and deploy the Nerve bootstrap hard-delete change from PR #64.
+2. Install the Nerve admin secret and non-secret platform/allowlist settings,
+   deploy this Abrolia remediation with the flag still off, then enable only the
+   operator-owned staging household.
+3. Run staging/live DNS, Nerve, logout/login/reload, cleanup, rejected old replay,
+   and fresh reconnect tests. These manual checks are intentionally not marked
+   complete here.
+4. Wire a production mailer if repeated login is to be validated through public
+   delivery rather than the documented maintenance-window operator invite.
 
 ## Automated verification
+
+### Phase 2.4 production-wiring/reconnect remediation (2026-08-05)
+
+- `ABROLIA_REAL_EMAIL_ENABLED=1` now requires an HTTPS Nerve origin, bootstrap
+  admin secret, canonical platform org/domain UUIDs, and a non-empty canonical
+  household UUID allowlist. Real family data, Gmail, WhatsApp and primary-channel
+  gates remain closed.
+- Production composition registers `nerve-managed` and `nerve-byo-domain` and
+  routes only allowlisted households to them.
+- Nerve org identity is now scoped to the immutable email identity generation:
+  `arbolia:household:<household_id>:email:<email_identity_id>`. The worker
+  validates that exact value before persisting any provider result or wait state.
+- Hermetic lifecycle coverage proves that cleanup tombstones generation A,
+  replaying A remains rejected, and reconnecting the same household as generation
+  B receives a distinct org. No Nerve tombstone is restored or reused.
+- The live DNS/logout/login/cleanup/reconnect rehearsal remains the manual gate;
+  it also requires the Nerve bootstrap hard-delete change from PR #64 to be
+  merged and deployed first.
 
 | Check | Current result |
 |---|---|
 | `python3 -m pytest -q -p no:cacheprovider tests/control_plane` | **pass** — 349 tests |
-| `python3 -m pytest -m "not live" -q -p no:cacheprovider` | **pass** — 789 tests on current main after Nerve attachment readiness |
+| `python3 -m pytest -m "not live" -q -p no:cacheprovider` | **pass** — 824 tests after rebasing production-wiring/reconnect remediation over Gmail lifecycle main |
 | `python3 -m pytest -q -p no:cacheprovider tests/control_plane/email` | **pass** — 93 tests |
 | Phase 2.4 focused matrix (domain policy, BYO adapter/API, UI and DB) | **pass** — 47 tests; 10 + 15 + 2 + 15 + 5 |
+| Production wiring + Nerve managed/BYO + Google OAuth regression matrix | **pass** — 60 tests |
 | Final lifecycle/security regression matrix | **pass** — 124 tests; no additional local P0/P1 finding remained in the final read-only audit (V-01 remains upstream) |
 | `ruff check control_plane tests/control_plane` | **pass** |
 | `python3 scripts/check_fixtures.py --all` | **pass**; private deny patterns are unavailable locally, as expected |

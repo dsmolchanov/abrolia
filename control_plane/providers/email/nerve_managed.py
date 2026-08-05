@@ -11,7 +11,10 @@ from control_plane.email.models import (
     EmailOption,
     EmailProvisionIntent,
 )
-from control_plane.providers.email.nerve_client import NerveAdminClient
+from control_plane.providers.email.nerve_client import (
+    NerveAdminClient,
+    email_org_external_ref,
+)
 from control_plane.provisioning.contracts import (
     InspectResult,
     InspectState,
@@ -39,6 +42,7 @@ class _Refs:
     key_id: str
     webhook_id: str
     address: str
+    org_external_ref: str = ""
 
     def encode(self) -> str:
         return json.dumps(self.__dict__, sort_keys=True, separators=(",", ":"))
@@ -113,7 +117,13 @@ class NerveManagedEmailProvisioner:
         if not isinstance(local_part, str):
             raise ProviderRejected("managed address is missing")
         address = f"{local_part}@abrolia.com"
-        org = self.client.ensure_org(household_id=parsed.household_id)
+        org_external_ref = email_org_external_ref(
+            parsed.household_id, parsed.identity_id
+        )
+        org = self.client.ensure_org(
+            household_id=parsed.household_id,
+            identity_id=parsed.identity_id,
+        )
         org_id = str(org.get("org_id", ""))
         if not org_id:
             raise OutcomeUnknown("Nerve org identity is missing")
@@ -155,6 +165,7 @@ class NerveManagedEmailProvisioner:
             key_id=str(key.get("id", "")),
             webhook_id=str(webhook.get("id", "")),
             address=str(inbox.get("address", address)),
+            org_external_ref=org_external_ref,
         )
         if not all((refs.grant_id, refs.inbox_id, refs.key_id, refs.webhook_id)):
             raise OutcomeUnknown("Nerve resource identity is incomplete")
@@ -200,7 +211,9 @@ class NerveManagedEmailProvisioner:
     def inspect(self, stable_ref: str) -> InspectResult:
         if stable_ref.startswith("{"):
             refs = _Refs.decode(stable_ref)
-            org = self.client.get_org(household_id=refs.household_id)
+            if not refs.org_external_ref:
+                return InspectResult(InspectState.UNKNOWN)
+            org = self.client.get_org(external_ref=refs.org_external_ref)
             if org.get("org_id") != refs.org_id:
                 return InspectResult(InspectState.ABSENT)
             identity_id = self._identity_id(refs.stable_ref)
@@ -211,7 +224,8 @@ class NerveManagedEmailProvisioner:
         if identity_id is None:
             return InspectResult(InspectState.UNKNOWN)
         household_id = stable_ref.split(":", 1)[0]
-        org = self.client.get_org(household_id=household_id)
+        org_external_ref = email_org_external_ref(household_id, identity_id)
+        org = self.client.get_org(external_ref=org_external_ref)
         org_id = str(org.get("org_id", ""))
         if not org_id:
             return InspectResult(InspectState.ABSENT)
@@ -245,6 +259,7 @@ class NerveManagedEmailProvisioner:
             key_id=str(key["id"]),
             webhook_id=str(webhook["id"]),
             address=str(inbox["address"]),
+            org_external_ref=org_external_ref,
         )
         return self._recover_and_probe(refs, identity_id)
 
@@ -278,6 +293,7 @@ class NerveManagedEmailProvisioner:
             key_id=str(recovered_key["id"]),
             webhook_id=str(webhook["id"]),
             address=refs.address,
+            org_external_ref=refs.org_external_ref,
         )
         if not self.client.attachment_feature_enabled(
             api_key=str(recovered_key["key"]), expected_org_id=refs.org_id

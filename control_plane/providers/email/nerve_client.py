@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
@@ -12,10 +12,15 @@ from control_plane.provisioning.contracts import (
 )
 
 
+def email_org_external_ref(household_id: str, identity_id: str) -> str:
+    """Bind a Nerve org to one reconnect-safe email identity generation."""
+    return f"arbolia:household:{household_id}:email:{identity_id}"
+
+
 @dataclass(frozen=True)
 class NerveAdminSettings:
     base_url: str
-    admin_key: str
+    admin_key: str = field(repr=False)
     platform_org_id: str
     platform_domain_id: str
 
@@ -79,21 +84,21 @@ class NerveAdminClient:
             raise OutcomeUnknown("Nerve returned an unexpected response")
         return payload
 
-    def ensure_org(self, *, household_id: str) -> dict[str, Any]:
+    def ensure_org(self, *, household_id: str, identity_id: str) -> dict[str, Any]:
         return self.request(
             "POST",
             "/v1/orgs",
             json={
                 "name": f"Abrolia household {household_id}",
-                "external_ref": f"arbolia:household:{household_id}",
+                "external_ref": email_org_external_ref(household_id, identity_id),
             },
         )
 
-    def get_org(self, *, household_id: str) -> dict[str, Any]:
+    def get_org(self, *, external_ref: str) -> dict[str, Any]:
         return self.request(
             "GET",
             "/v1/orgs",
-            params={"external_ref": f"arbolia:household:{household_id}"},
+            params={"external_ref": external_ref},
             allow_not_found=True,
         )
 

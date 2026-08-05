@@ -13,6 +13,16 @@ data_policy: synthetic-only-until-explicit-launch-gates
 
 # Abrolia Phase 2 — Family Email Identity
 
+> **Revision 2026-08-05 — production wiring and reconnect identity.** Real
+> Nerve email remains independently gated from real family data and is enabled
+> only for an explicit household allowlist with a complete HTTPS/admin/platform
+> configuration. Nerve org reconciliation identity is lifecycle-scoped as
+> `arbolia:household:<household_id>:email:<email_identity_id>`, not household-only.
+> Cleanup leaves the old org tombstoned: retrying the old identity remains a
+> conflict, while a new email identity creates a fresh isolated org. Automatic
+> tombstone resurrection is forbidden because it could revive a delayed job and
+> expose retained org history to a newly issued runtime credential.
+
 ## Overview
 
 Эта фаза заменяет fake email step из Phase 1 тремя реальными, но единообразно
@@ -539,7 +549,10 @@ flags остаются false до provider-specific gates.
 
 #### Changes
 
-1. Ensure household Nerve org by stable Abrolia household external ref.
+1. Ensure the Nerve org by a stable email-lifecycle external ref containing both
+   the Abrolia household ID and email identity ID. Replays of one identity return
+   the same org; reconnect after cleanup creates a fresh org and never restores
+   the tombstoned predecessor.
 2. Ensure platform-domain grant and reserved inbox.
 3. Create minimum-scope tenant runtime key and per-household signed webhook.
 4. Stream one-time key/webhook secret directly into household Fly secrets;
@@ -586,6 +599,10 @@ flags остаются false до provider-specific gates.
 - Domain cannot be claimed by two households through race or normalization trick.
 - Delete/reconnect tests cover DNS still present, provider unavailable and lost
   response.
+- [x] Production composition registers both Nerve providers only when the
+  fail-closed real-email config and household allowlist are complete.
+- [x] Cleanup followed by reconnect of the same household creates a new org, while
+  a delayed ensure for the deleted email identity remains rejected.
 
 ### Phase 2.5 — Provider-neutral runtime email core
 
