@@ -49,7 +49,7 @@ Verify: сквозной чек-лист Фазы 5 + chaos-тесты (kill -9 
 | Решение | Выбор |
 |---|---|
 | Скоуп | Пилотный MVP, dedicated-инстанс на household; прототип — synthetic data only |
-| Репозиторий | Публичный `dsmolchanov/arbolia`; донорские фикстуры — только санитизированные |
+| Репозиторий | Публичный `dsmolchanov/abrolia`; донорские фикстуры — только санитизированные |
 | Residency | Честная формулировка: «EU-hosted application, документированные международные передачи»: приложение и данные — Fly EU (`ams`), субпроцессоры Anthropic (global/US) и Resend (US) — в реестре процессоров, с DPA/SCC/TIA как **обязательным условием до реальных данных** (на момент Gate −1 ничего из этого не подписано — актуальный статус в `docs/privacy/processors.md`, р. 1). Конфиг `residency_mode: eu-app | eu-strict`; `eu-strict` требует Vertex-EU-клиент и падает при его отсутствии — **никакого молчаливого downgrade**. Пилот стартует в `eu-app`; Vertex EU — задокументированный upgrade-путь после бенчмарка |
 | Email-вход (шаг 1) | Три карточки в фиксированном порядке: **(a) `@abrolia.com` — предвыбрано и рекомендуется:** Nerve создаёт доступный транслитерированный `имя_фамилия@abrolia.com`, семья может изменить local-part; **(b) отдельный Gmail агента:** семья сама регистрирует новый Google-аккаунт, затем подключает именно его через Google OAuth account chooser — личный Gmail не рекомендуется, пароль/app password Abrolia не получает; **(c) домен семьи:** Nerve выдаёт DNS-записи, ждёт verify и создаёт ящик. Gmail restricted scopes, OAuth verification и CASA становятся launch-gate этой опции, а не GA-долгом |
 | Исходящий email | Только compose с явно подтверждённым получателем: (a/c) через Nerve, (b) через Gmail API от отдельного аккаунта агента. Для пересылки оригинальный адресат извлекается из цепочки; для прямого письма виден в заголовках. Подключение существующего личного Gmail, IMAP/app password и неограниченное чтение личного ящика не предлагаются |
@@ -216,7 +216,7 @@ Verify: сквозной чек-лист Фазы 5 + chaos-тесты (kill -9 
 ## Phase 3: Nerve extension (отдельный план в nerve-cloud)
 
 ### Overview
-Работы в nerve-cloud/nerve-oss/SDK — **отдельный план** `nerve-cloud/thoughts/shared/plans/2026-08-02-inbound-events-and-attachments.md` (написан, закоммичен в nerve-cloud @ `0ec3758`: org event journal → email.received fan-out → attachments в обе стороны → SDK 0.2.0, миграции 0018–0020) со своими миграциями, contract-тестами и последовательностью PR. Здесь — только контракт-требования потребителя.
+Работы в nerve-cloud/nerve-oss/SDK — **отдельный план** `nerve-cloud/thoughts/shared/plans/2026-08-02-inbound-events-and-attachments.md`. Он реализован и выведен в production: org event journal → `email.received` fan-out → attachments в обе стороны → SDK 0.2.0; финальные доказательства — Revision 28 и Phase 8 Nerve-плана. В Abrolia реализован потребительский live contract suite; остаётся его первый операторский прогон. Отдельного staging Nerve нет: проверка идёт только на явно синтетическом org-scoped production canary при выключенном global attachment flag.
 
 ### Контракт, который обязан дать Nerve-план
 
@@ -229,11 +229,13 @@ Verify: сквозной чек-лист Фазы 5 + chaos-тесты (kill -9 
 ### Success Criteria
 
 #### Automated Verification:
-- [ ] Nerve-план написан, принят и реализован (свои критерии там)
-- [ ] Contract-тесты hermes-cloud против staging-Nerve зелёные
+- [x] Nerve-план написан, принят, реализован и выведен в production; upstream canary и rollback drill записаны в Revision 28 Nerve-плана
+- [x] Consumer-owned live contract suite Abrolia против синтетического org-scoped production canary зелёный — подтверждено оператором 2026-08-06
 
 #### Manual Verification:
-- [ ] Письмо с PDF на staging-inbox → подписанный webhook → вложение скачано runtime-ключом → compose с вложением доставлен
+- [x] Синтетическое письмо с PDF на production-canary inbox → подписанный webhook → вложение скачано runtime-ключом → compose с вложением доставлен; временные keys/webhook удалены, global flag остался off — письмо отправлено и получено 2026-08-06
+
+**Статус: Фаза 3 закрыта 2026-08-06.** Upstream Nerve-контракт в production и consumer-owned Abrolia live suite подтверждены на синтетических canary-данных. Это не меняет открытые правовые и processor-gates для реальных семей.
 
 **Пауза. Фазы 1–2 не зависят от этой фазы (inject-eml); Nerve-расширения нужны для `@abrolia.com` и домена семьи (шаг 1: a/c). Dedicated Gmail (b) идёт через отдельный OAuth/Gmail API тракт Фазы 5 и от Nerve не зависит.**
 

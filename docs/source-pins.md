@@ -51,10 +51,15 @@
 - `nerve-email==0.2.0` wheel:
   `9f0a7d6316bf47eef64236f96d1a7a151b5517641930422b1b16711da8b02540`.
 
-Abrolia `main` на момент перепина содержит HTTP-contract тесты bootstrap/admin
-provisioning, но ещё не содержит полный live consumer-suite из Phase 3. Поэтому
-upstream production contract и локальный provisioning suite записываются как
-два разных доказательства; локальные тесты нельзя называть staging/live smoke.
+Abrolia содержит HTTP-contract тесты bootstrap/admin provisioning и
+consumer-owned live suite `tests/live/test_nerve_phase3_contract.py`. Live suite
+отделён от обычного CI, закреплён на `nerve-email==0.2.0` и требует
+явного synthetic-production-canary confirmation. До первого зелёного
+операторского прогона его наличие не считалось live-доказательством. Первый
+прогон подтверждён оператором 2026-08-06: подписанный inbound webhook,
+дедупликация, REST-download PDF через runtime key и внешняя PDF-доставка
+прошли; письмо получено. Команда и имена секретов описаны в
+`docs/nerve-phase3-live-contract.md`; значения секретов в доказательства не записываются.
 
 **Activation gate реализован:** managed provisioning создаёт и проверяет domain
 grant, но не объявляет household готовым только по наличию inbox/key. Оно
