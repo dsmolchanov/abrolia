@@ -742,6 +742,18 @@ class OnboardingService:
                 resource["external_id_ciphertext"],
                 resource["encryption_key_version"],
             )
+            if resource["resource_type"] == "runtime" and isinstance(
+                external_ref, dict
+            ):
+                # The manifest digest proves the runtime configuration during
+                # provisioning, but deletion is bound to the recorded app,
+                # Machine and volume identifiers. Keeping a 64-hex digest under
+                # the cleanup request's open `external_ref` channel makes the
+                # credential scanner correctly reject the whole transaction.
+                # Remove only this non-secret, deletion-irrelevant field; exact
+                # resource identifiers remain intact.
+                external_ref = dict(external_ref)
+                external_ref.pop("config_sha256", None)
             request = {
                 "resource_id": resource["id"],
                 "resource_type": resource["resource_type"],
