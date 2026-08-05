@@ -45,8 +45,9 @@ The two blockers discovered after Nerve PR #64 are closed in production:
   tombstoned the orphan, observed the retained generation-A reference, and
   received HTTP 409 from a delayed ensure using that reference.
 - Generation B (`2265aaea-83a3-4138-bf54-2af0a4909bb9`) created fresh org
-  `d9509937-6ac0-4e6f-9788-981d3e8c0cd0` and inbox
-  `phase24-reconnect-b@abrolia.com`; it did not revive generation A. The
+  `d9509937-6ac0-4e6f-9788-981d3e8c0cd0` and inbox local-part
+  `phase24-reconnect-b` on the `abrolia.com` platform domain; it did not revive
+  generation A. The
   org-scoped attachment flag was enabled with audit replay
   `bd4ccb08-9a94-4fae-88be-b67647f27673`, after which the identity reached
   `verified` at workflow version 17.

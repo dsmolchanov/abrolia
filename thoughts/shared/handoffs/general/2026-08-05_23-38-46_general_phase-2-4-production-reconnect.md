@@ -89,7 +89,7 @@ type: implementation_strategy
 - Generation B identity/org/inbox:
   `2265aaea-83a3-4138-bf54-2af0a4909bb9` /
   `d9509937-6ac0-4e6f-9788-981d3e8c0cd0` /
-  `phase24-reconnect-b@abrolia.com`
+  local-part `phase24-reconnect-b` on platform domain `abrolia.com`
 - Generation B attachment-flag audit replay:
   `bd4ccb08-9a94-4fae-88be-b67647f27673`
 
