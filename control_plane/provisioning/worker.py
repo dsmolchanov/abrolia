@@ -54,6 +54,11 @@ class _ProjectionCancelled(RuntimeError):
     pass
 
 
+DNS_POLL_INITIAL_SECONDS = 30.0
+DNS_POLL_MAX_SECONDS = 300.0
+DNS_POLL_MAX_JOB_ATTEMPTS = 5
+
+
 class ProvisioningWorker:
     def __init__(
         self,
@@ -1424,13 +1429,39 @@ class ProvisioningWorker:
                 return WorkResult(job.id, "outcome_unknown", current["error_code"])
             if current["status"] not in {"running", "outcome_unknown"}:
                 return WorkResult(job.id, current["status"], current["status"])
-            self.jobs.settle(
-                connection,
-                job.id,
-                status=job_status,
-                error_code=error_code,
-                now=now,
+            scheduled_dns_inspect = (
+                job_status == "waiting_user"
+                and job.kind == "email_identity"
+                and job.provider == "nerve-byo-domain"
             )
+            if scheduled_dns_inspect:
+                inspect_request = {
+                    **request,
+                    "stable_ref": request.get("stable_ref", job.intent_key),
+                }
+                not_before = None
+                if job.attempts < DNS_POLL_MAX_JOB_ATTEMPTS:
+                    delay = min(
+                        DNS_POLL_INITIAL_SECONDS * (2 ** max(0, job.attempts - 1)),
+                        DNS_POLL_MAX_SECONDS,
+                    )
+                    not_before = now + delay
+                self.jobs.schedule_waiting_inspect(
+                    connection,
+                    job.id,
+                    request=inspect_request,
+                    not_before=not_before,
+                    error_code=error_code,
+                    now=now,
+                )
+            else:
+                self.jobs.settle(
+                    connection,
+                    job.id,
+                    status=job_status,
+                    error_code=error_code,
+                    now=now,
+                )
             if external_ref and job_status == "waiting_user":
                 self._external_resource(
                     connection,

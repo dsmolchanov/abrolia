@@ -10,9 +10,9 @@
 **PR integration base:** `f3d8c8f` (`origin/main` after Nerve attachment readiness)
 **Scope:** Phase 2.0–2.4; Phase 2.5 runtime-email work is explicitly excluded
 **Current status:** the production wiring and generation-safe cleanup/reconnect
-gate is **accepted**. Full Phase 2.4 remains **partial / not accepted** until the
-BYO-domain bounded-poll/live-DNS gate and the unrelated V-01 tenant token issue
-are closed.
+gate is **accepted**, and bounded BYO-domain polling is implemented and green
+locally. Full Phase 2.4 remains **partial / not accepted** until the live-DNS
+matrix runs and the unrelated V-01 tenant token fix is deployed.
 
 > The path in the original request used `Programs/arbolia`; the active repository
 > is `Programs/abrolia`. Phase 2.5 advanced the shared checkout while this work
@@ -72,7 +72,7 @@ DNS acceptance matrix.
 | V-02 — false verification after one-time-secret loss | **Safety fixed / convergence partial** | False verification is eliminated; crash-after-install still needs a durable non-secret receipt/inspection contract |
 | V-03 — provider secret in allowed values | **Fixed locally for durable/public email paths** | Provider outputs are typed, credential-shaped values are rejected, and external error codes are normalized |
 | V-04 — expired hold reported claimable while identity is live | **Fixed fail-closed locally** | Availability stays false until the owning identity is terminal; automatic TTL ownership transfer remains deferred |
-| Phase 2.4 — family-owned domain | **Partial / not accepted** | Production composition and managed cleanup/reconnect pass; bounded BYO polling and the live DNS matrix remain |
+| Phase 2.4 — family-owned domain | **Partial / not accepted** | Production composition, managed cleanup/reconnect and bounded BYO polling pass; the live DNS matrix remains |
 
 The fixes and managed-path rehearsal restore the cleanup/reconnect safety
 boundary. They do not make the full BYO-domain or Gmail rollout ready.
@@ -224,7 +224,7 @@ not a reason to weaken the current reserved set.
 | 1. IDNA/domain policy | **Pass locally** | Unicode labels are IDNA-canonicalized; provider-compatible ASCII labels, public suffixes, Abrolia/reserved names and real-vs-synthetic `.test` gates are covered. IDN TLDs are rejected locally because current Nerve rejects their punycode form |
 | 2. Subdomain recommendation and MX warning | **Partial** | UI calls the guidance endpoint, shows `recommended_domain`, and requires apex acknowledgement; it conservatively warns for every apex rather than querying existing MX state |
 | 3. Durable typed DNS result | **Pass locally** | A non-empty typed record set retains type, host, value, priority, purpose and required flag; server and JS render exact records and record-level status after reload |
-| 4. Bounded poll/inspect backoff | **Fail / open** | Durable manual `CHECK` inspection and response-loss reconciliation use the original stable reference, but `waiting_user` is not scheduled for bounded automatic polling |
+| 4. Bounded poll/inspect backoff | **Pass locally** | The durable job becomes an `inspect` intent, leases only when `not_before` is due, backs off at 30/60/120/240 seconds, stops after five total attempts, and retains manual `CHECK` |
 | 5. Create inbox/key/webhook only after verification | **Partial** | Hermetic path advances once and never creates an inbox while DNS is pending; lost original-and-recovery key response remains unproved |
 | 6. Ordered cleanup with explicit unknown | **Pass for managed live path / BYO live pending** | Nerve PR #64 made the graph deletable and PR #66 retained generation tombstones; production generation A cleanup and generation B reconnect passed |
 
@@ -265,8 +265,7 @@ not a reason to weaken the current reserved set.
 
 ### Remaining Phase 2.4 blockers
 
-1. Implement bounded BYO-domain DNS polling/backoff and lost-recovery-response
-   handling; the current flow remains explicit user-driven `CHECK` inspection.
+1. Merge and deploy the bounded BYO-domain DNS polling change.
 2. Run the live BYO-domain DNS matrix with an operator-owned test domain,
    including wrong/partial records, verified advance, persisted DNS state,
    cleanup while DNS remains present, and reconnect. The managed-domain live
