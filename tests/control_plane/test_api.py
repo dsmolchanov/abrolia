@@ -314,7 +314,11 @@ def test_current_household_is_derived_from_session_not_request_input(api_harness
     )
     assert extra_field.status_code == 422
     assert foreign.household.id not in extra_field.text
-    route_paths = {route.path for route in api_harness.client.app.routes}
+    route_paths = {
+        path
+        for route in api_harness.client.app.routes
+        if isinstance(path := getattr(route, "path", None), str)
+    }
     assert not any("{household_id}" in path for path in route_paths if path.startswith("/api/"))
 
 
