@@ -74,7 +74,8 @@ agent inbox и channels); отдельное согласие (память, ded
 |---|---|---|
 | Anthropic | модель, понимающая текст письма | США / global |
 | Fly.io | metadata-only control plane, dedicated runtime, базы/secrets и будущий shared-WA gateway | Нидерланды (ЕС), provider control plane — США |
-| Nerve + Resend | `@abrolia.com` или domain-family agent inbox и доставка (email a/c) | США |
+| Resend | доставка magic-link для аккаунта; доставка для Nerve-managed inbox | США |
+| Nerve | `@abrolia.com` или domain-family agent inbox (email a/c) | США |
 | Google | календарь; отдельный Gmail агента через OAuth только в email option b | глобально |
 | Telegram / WhatsApp | выбранные communication channels; WhatsApp shared/dedicated — разные Beta-режимы | вне ЕС |
 | Web Push provider | optional push для Abrolia Web; ещё не выбран и выключен | TBD |

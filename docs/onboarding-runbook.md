@@ -24,6 +24,7 @@ ABROLIA_REAL_WHATSAPP_ENABLED=0
 ABROLIA_REAL_CHANNEL_ENABLED=0
 ABROLIA_RUNTIME_PROVIDER=fly-runtime
 ABROLIA_PUBLIC_ORIGIN=https://app.abrolia.com
+ABROLIA_MAGIC_LINK_DELIVERY_ENABLED=0
 ABROLIA_CONTROL_PLANE_DB=/data/control-plane.db
 ABROLIA_FLY_ORG=<staging-org-slug>
 ABROLIA_INTERNAL_BOOTSTRAP_HOST=abrolia-control-plane-synthetic.flycast
@@ -33,11 +34,28 @@ ABROLIA_RUNTIME_IMAGE=registry.example.invalid/abrolia/runtime@sha256:<published
 The following values are Fly secrets, never config-file values or command-line
 arguments: `ABROLIA_ENCRYPTION_KEY`, `ABROLIA_LOOKUP_HMAC_KEY`,
 `ABROLIA_TOKEN_HMAC_KEY`, `FLY_API_TOKEN`, and the separately controlled
-`ABROLIA_CONTROL_PLANE_BACKUP_KEY`. `ABROLIA_NERVE_ADMIN_KEY` is also a Fly
+`ABROLIA_CONTROL_PLANE_BACKUP_KEY`. `ABROLIA_RESEND_API_KEY` is the dedicated,
+sending-only key for public magic-link delivery; do not reuse Nerve's Resend
+key. `ABROLIA_NERVE_ADMIN_KEY` is also a Fly
 secret whenever the Nerve gate is configured. The three application keys are independent
 32-byte urlsafe-base64 values. Record the active encryption version in
 `ABROLIA_ENCRYPTION_KEY_VERSION`; retain an old field key until its rows have
 been re-encrypted.
+
+### Public magic-link delivery gate
+
+The default remains the `.test`-only in-memory mailer. To stage production
+delivery, configure `ABROLIA_MAGIC_LINK_FROM=Abrolia <login@abrolia.com>` as a
+non-secret environment value and install a separate `ABROLIA_RESEND_API_KEY`
+through the Fly secret store. The sender domain must already be verified in
+Resend. Only then set `ABROLIA_MAGIC_LINK_DELIVERY_ENABLED=1` and deploy.
+
+Enabling the gate sends the recovery email address and the one-time login URL
+to Resend. The link expires after 15 minutes. Provider failures retain the
+generic public `accepted` response and never include the address, link, API key,
+or provider response body in an application error. Roll back by setting the
+gate to `0`; this immediately restores `.test`-only delivery without weakening
+the real-family provider gates.
 
 The dedicated runtime has a separate, locked `HERMES_*` contract. Its Machine
 environment contains `HERMES_HOUSEHOLD=/data/household.toml`,

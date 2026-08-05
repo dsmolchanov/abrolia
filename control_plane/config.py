@@ -75,6 +75,9 @@ class ControlPlaneConfig:
     session_cookie_name: str = "__Host-abrolia_session"
     csrf_cookie_name: str = "__Host-abrolia_csrf"
     bootstrap_ttl_seconds: int = 3600
+    magic_link_delivery_enabled: bool = False
+    resend_api_key: str | None = field(default=None, repr=False)
+    magic_link_from: str | None = None
     google_oauth_client_id: str | None = None
     google_oauth_client_secret: str | None = field(default=None, repr=False)
     google_oauth_test_users: tuple[str, ...] = ()
@@ -104,6 +107,14 @@ class ControlPlaneConfig:
             )
         if self.real_whatsapp_enabled or self.real_channel_enabled:
             raise ConfigurationError("real WhatsApp/channel adapters are not enabled yet")
+        if self.magic_link_delivery_enabled and not (
+            self.resend_api_key and self.magic_link_from
+        ):
+            raise ConfigurationError("production magic-link mailer configuration is incomplete")
+        if self.magic_link_from and any(
+            character in self.magic_link_from for character in "\r\n"
+        ):
+            raise ConfigurationError("magic-link sender contains invalid characters")
         if self.real_email_enabled:
             if not all((
                 self.nerve_base_url,
@@ -244,6 +255,11 @@ class ControlPlaneConfig:
             runtime_image_digest=source.get("ABROLIA_RUNTIME_IMAGE") or None,
             runtime_provider=source.get("ABROLIA_RUNTIME_PROVIDER", "dry-run-runtime"),
             internal_bootstrap_host=source.get("ABROLIA_INTERNAL_BOOTSTRAP_HOST") or None,
+            magic_link_delivery_enabled=(
+                source.get("ABROLIA_MAGIC_LINK_DELIVERY_ENABLED", "0") == "1"
+            ),
+            resend_api_key=source.get("ABROLIA_RESEND_API_KEY") or None,
+            magic_link_from=source.get("ABROLIA_MAGIC_LINK_FROM") or None,
             google_oauth_client_id=source.get("ABROLIA_GOOGLE_OAUTH_CLIENT_ID") or None,
             google_oauth_client_secret=(
                 source.get("ABROLIA_GOOGLE_OAUTH_CLIENT_SECRET") or None

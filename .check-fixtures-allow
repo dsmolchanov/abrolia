@@ -45,3 +45,8 @@ thoughts/shared/plans/2026-08-04-abrolia-phase-2-email-identity.md | email | nam
 .check-fixtures-allow | email | first_last@abrolia.com
 .check-fixtures-allow | email | name@abrolia.com
 .check-fixtures-allow | email | name@family.abrolia.com
+
+# System sender for account magic-link delivery. This is an operator-owned
+# product address, not family or donor fixture data.
+docs/onboarding-runbook.md | email | login@abrolia.com
+.check-fixtures-allow | email | login@abrolia.com
