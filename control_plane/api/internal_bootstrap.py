@@ -24,6 +24,9 @@ class BootstrapBinding(BaseModel):
 
 class ActivationRequest(BootstrapBinding):
     config_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    email_inbound_check: str | None = Field(default=None, pattern=r"^(healthy|failed)$")
+    email_outbound_check: str | None = Field(default=None, pattern=r"^(healthy|failed)$")
+    email_receipt_digest: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
 
 def _bearer(authorization: str | None) -> str:
@@ -35,9 +38,7 @@ def _bearer(authorization: str | None) -> str:
     return token
 
 
-def _bootstrap_transport_allowed(
-    *, scheme: str, hostname: str | None, expected_host: str | None
-) -> bool:
+def _bootstrap_transport_allowed(*, scheme: str, hostname: str | None, expected_host: str | None) -> bool:
     if hostname is None:
         return False
     exact_host = expected_host is None or hostname == expected_host
@@ -59,16 +60,10 @@ def _limit(request: Request, token: str) -> None:
         hostname=request.url.hostname,
         expected_host=expected_host,
     ):
-        raise HTTPException(
-            status.HTTP_403_FORBIDDEN, "private bootstrap transport required"
-        )
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "private bootstrap transport required")
     try:
-        active.rate_limiter.check(
-            "bootstrap-network", network_bucket(request), limit=60, window_seconds=3600
-        )
-        active.rate_limiter.check(
-            "bootstrap-token", token, limit=20, window_seconds=3600
-        )
+        active.rate_limiter.check("bootstrap-network", network_bucket(request), limit=60, window_seconds=3600)
+        active.rate_limiter.check("bootstrap-token", token, limit=20, window_seconds=3600)
     except RateLimitExceeded as error:
         raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "try again later") from error
 
@@ -126,6 +121,9 @@ def activate(
             runtime_ref=payload.runtime_ref,
             config_revision=payload.config_revision,
             activated_sha256=payload.config_sha256,
+            email_inbound_check=payload.email_inbound_check,
+            email_outbound_check=payload.email_outbound_check,
+            email_receipt_digest=payload.email_receipt_digest,
             receipt_acknowledged=receipt_acknowledged,
         )
     except (BootstrapDenied, BootstrapConflict) as error:
@@ -136,7 +134,5 @@ def activate(
         "runtime_ref": result.runtime_ref,
         "config_revision": result.config_revision,
         "config_sha256": result.manifest_sha256,
-        "bootstrap_cleanup": (
-            "pending" if result.cleanup_pending else "awaiting_runtime_receipt"
-        ),
+        "bootstrap_cleanup": ("pending" if result.cleanup_pending else "awaiting_runtime_receipt"),
     }

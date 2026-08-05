@@ -46,6 +46,14 @@ class ControlPlaneConfig:
     session_cookie_name: str = "__Host-abrolia_session"
     csrf_cookie_name: str = "__Host-abrolia_csrf"
     bootstrap_ttl_seconds: int = 3600
+    google_oauth_client_id: str | None = None
+    google_oauth_client_secret: str | None = field(default=None, repr=False)
+    google_oauth_test_users: tuple[str, ...] = ()
+    gmail_real_enabled: bool = False
+    google_oauth_app_verified: bool = False
+    google_gmail_scope_approved: bool = False
+    google_casa_current: bool = False
+    google_limited_use_disclosed: bool = False
 
     def validate(self) -> ControlPlaneConfig:
         if self.public_origin != self.public_origin.rstrip("/"):
@@ -54,10 +62,38 @@ class ControlPlaneConfig:
             raise ConfigurationError("control-plane public origin must use HTTPS")
         if self.runtime_region != "ams":
             raise ConfigurationError("Phase 1 runtime region is locked to ams")
-        if not self.synthetic_only or self.real_family_data_enabled:
-            raise ConfigurationError("Phase 1 is synthetic-only; real family data is blocked")
-        if self.real_email_enabled or self.real_whatsapp_enabled or self.real_channel_enabled:
-            raise ConfigurationError("real provider adapters are disabled in Phase 1")
+        if self.synthetic_only and (
+            self.real_family_data_enabled
+            or self.real_email_enabled
+            or self.real_whatsapp_enabled
+            or self.real_channel_enabled
+            or self.gmail_real_enabled
+        ):
+            raise ConfigurationError("synthetic-only mode blocks real provider data")
+        if not self.synthetic_only and not self.real_family_data_enabled:
+            raise ConfigurationError(
+                "real provider mode requires the family-data launch gate"
+            )
+        if self.real_whatsapp_enabled or self.real_channel_enabled:
+            raise ConfigurationError("real WhatsApp/channel adapters are not enabled yet")
+        google_configured = bool(
+            self.google_oauth_client_id and self.google_oauth_client_secret
+        )
+        if bool(self.google_oauth_client_id) != bool(self.google_oauth_client_secret):
+            raise ConfigurationError("Google OAuth client configuration is incomplete")
+        if self.gmail_real_enabled and (
+            not self.real_email_enabled
+            or not google_configured
+            or not all((
+                self.google_oauth_app_verified,
+                self.google_gmail_scope_approved,
+                self.google_casa_current,
+                self.google_limited_use_disclosed,
+            ))
+        ):
+            raise ConfigurationError(
+                "real Gmail requires verified OAuth, scope, CASA and Limited Use evidence"
+            )
         active = self.encryption_keys.get(self.active_encryption_key_version)
         if active is None or len(active) != 32:
             raise ConfigurationError("active AES-256-GCM key is missing or invalid")
@@ -141,6 +177,28 @@ class ControlPlaneConfig:
             runtime_image_digest=source.get("ABROLIA_RUNTIME_IMAGE") or None,
             runtime_provider=source.get("ABROLIA_RUNTIME_PROVIDER", "dry-run-runtime"),
             internal_bootstrap_host=source.get("ABROLIA_INTERNAL_BOOTSTRAP_HOST") or None,
+            google_oauth_client_id=source.get("ABROLIA_GOOGLE_OAUTH_CLIENT_ID") or None,
+            google_oauth_client_secret=(
+                source.get("ABROLIA_GOOGLE_OAUTH_CLIENT_SECRET") or None
+            ),
+            google_oauth_test_users=tuple(
+                sorted({
+                    item.strip().casefold()
+                    for item in source.get("ABROLIA_GOOGLE_OAUTH_TEST_USERS", "").split(",")
+                    if item.strip()
+                })
+            ),
+            gmail_real_enabled=source.get("ABROLIA_GMAIL_REAL_ENABLED", "0") == "1",
+            google_oauth_app_verified=(
+                source.get("ABROLIA_GOOGLE_OAUTH_APP_VERIFIED", "0") == "1"
+            ),
+            google_gmail_scope_approved=(
+                source.get("ABROLIA_GOOGLE_GMAIL_SCOPE_APPROVED", "0") == "1"
+            ),
+            google_casa_current=source.get("ABROLIA_GOOGLE_CASA_CURRENT", "0") == "1",
+            google_limited_use_disclosed=(
+                source.get("ABROLIA_GOOGLE_LIMITED_USE_DISCLOSED", "0") == "1"
+            ),
         )
         return config.validate()
 

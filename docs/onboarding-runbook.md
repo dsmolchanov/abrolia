@@ -118,6 +118,47 @@ prefix scans.
 
 ## Bootstrap and readiness
 
+### Gmail operator rollout
+
+Gmail has an independent connect gate. Keep `ABROLIA_GMAIL_REAL_ENABLED=0`
+for synthetic households; allowlisted operator accounts may exercise OAuth with
+`ABROLIA_GOOGLE_OAUTH_TEST_USERS` while the family-data gate remains closed.
+The public switch may be enabled only when all four evidence flags are `1`:
+verified OAuth app, approved restricted Gmail scopes, current CASA assessment,
+and the in-product Google Limited Use disclosure. Turning Gmail off blocks new
+connections; inspect, exact revoke, cleanup, export, and deletion remain
+available.
+
+Use only a separate agent mailbox. The consent screen must request exactly
+`openid`, `email`, `gmail.readonly`, and `gmail.send`. A recovery/personal
+mailbox match, an extra or missing scope, stale workflow, session/household swap,
+or late callback is a failed connection and must start from a new OAuth state.
+Never retry an authorization code.
+
+Runtime health exposes only enum/timestamp signals. Alert when Gmail health is
+`auth_revoked`, `needs_attention`, or `stale_cursor` (three missed 60-second
+poll intervals); alert independently on Nerve webhook lag/DLQ, repeated
+credential revocation, address reservations that outlive terminal identities,
+and control-plane `outcome_unknown`. Metrics and alerts must not carry mailbox
+addresses, subjects, Message-IDs, or content.
+
+Rollout order is fixed: synthetic fixtures → allowlisted operator Gmail →
+invited pilot families. Before each promotion prove receive, approved send,
+restart/cursor resume, exact Sent reconciliation, reconnect, export, revoke, and
+delete. A Gmail History gap that exceeds bounded overlap is `needs_attention`,
+never a silent baseline. A revoke/delete timeout remains unknown and blocks
+resource tombstoning. Restores may recover encrypted grant rows and cursors, but
+must not be considered usable without the dedicated Fly secret namespace.
+
+If Gmail is disconnected before the household runtime Machine is launched, the
+control plane creates a deterministic one-shot `abrolia-google-revoker-*`
+Machine in that exact household app. It runs the pinned runtime image with no
+volume or service, inherits the staged grant from the app secret namespace, and
+is deleted only after Fly reports a clean exit. A timeout, non-zero/unknown exit,
+Machine drift, or unconfirmed deletion remains `google_revoke_runtime_unavailable`;
+do not delete the app secret or mark the identity revoked until reconciliation
+returns absent.
+
 Managed Nerve email has a separate attachment-readiness gate. Provisioning
 creates the household org, domain grant, inbox, runtime key and signed webhook,
 then probes `GET /internal/feature-flags/attachments` with that household key.

@@ -14,6 +14,7 @@ from control_plane.email.contracts import EmailFailureKind, EmailProviderError
 from control_plane.email.domain_policy import canonicalize_domain
 from control_plane.email.models import (
     EmailDnsPublicStatus,
+    EmailGoogleOAuthPublicStatus,
     EmailIdentityStatus,
     EmailNerveAttachmentPublicStatus,
     EmailOption,
@@ -560,7 +561,14 @@ class ProvisioningWorker:
             raise OutcomeUnknown("email provider result is not safely attributable") from error
         binding_ref = public_result.get("secret_binding_ref")
         if result.secret_material.is_empty:
-            return not isinstance(binding_ref, str) or not binding_ref
+            if not isinstance(binding_ref, str) or not binding_ref:
+                return True
+            provider = self.providers.get(job.provider)
+            verifier = getattr(provider, "pre_staged_secret_verified", None)
+            return bool(
+                callable(verifier)
+                and verifier(request, namespace_ref, binding_ref)
+            )
         material_names = [name for name, _value in result.secret_material.items()]
         if not isinstance(binding_ref, str) or material_names != [binding_ref]:
             result.secret_material.clear()
@@ -644,7 +652,17 @@ class ProvisioningWorker:
                 raise ProviderRejected("synthetic email identity reference drifted")
             return
         if provider == "gmail":
-            raise ProviderRejected("Gmail email provider is not implemented")
+            if request.get("option") != EmailOption.GMAIL.value:
+                raise ProviderRejected("Gmail provider does not match the selected option")
+            if not isinstance(identity_id, str):
+                raise ProviderRejected("Gmail identity is missing")
+            refs = public_result.get("provider_refs", {})
+            expected_ref = f"google-oauth:{identity_id}"
+            if external_ref != expected_ref or refs.get("google_subject") != (
+                public_result.get("provider_subject")
+            ):
+                raise ProviderRejected("Gmail resource reference does not match intent")
+            return
         try:
             reference = json.loads(external_ref)
         except (TypeError, ValueError) as error:
@@ -717,6 +735,12 @@ class ProvisioningWorker:
             if expected_provider != "synthetic" or external_ref is not None:
                 raise ValueError("untyped email waiting reference")
             return {}, None
+        if expected_provider == "gmail":
+            typed = EmailGoogleOAuthPublicStatus.model_validate(public_result)
+            expected_ref = f"google-oauth:{request.get('email_identity_id', '')}"
+            if external_ref != expected_ref:
+                raise ValueError("Gmail waiting state has no durable identity reference")
+            return typed.model_dump(mode="json", exclude_none=True), external_ref
         if expected_provider != "nerve":
             raise ValueError("waiting state does not match the configured adapter")
         option = request.get("option")

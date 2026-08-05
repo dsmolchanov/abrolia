@@ -78,11 +78,14 @@ def test_bootstrap_api_transport_matches_client_contract(
     expected_host: str | None,
     allowed: bool,
 ) -> None:
-    assert _bootstrap_transport_allowed(
-        scheme=scheme,
-        hostname=hostname,
-        expected_host=expected_host,
-    ) is allowed
+    assert (
+        _bootstrap_transport_allowed(
+            scheme=scheme,
+            hostname=hostname,
+            expected_host=expected_host,
+        )
+        is allowed
+    )
 
 
 @dataclass(frozen=True)
@@ -95,9 +98,7 @@ class RuntimeBootstrap:
 
 
 def _context(container, world, sequence: int) -> CommandContext:
-    version = container.onboarding_repository.workflow_for_household(
-        world.household.id
-    ).version
+    version = container.onboarding_repository.workflow_for_household(world.household.id).version
     return CommandContext(
         account_id=world.account.id,
         session_id=world.session.id,
@@ -170,16 +171,14 @@ def test_runtime_stages_only_expected_hermes_runtime_secrets(api_harness) -> Non
     assert sink.get(runtime.runtime_ref, "HERMES_BOOTSTRAP_TOKEN") is not None
     assert sink.get(runtime.runtime_ref, "ABROLIA_BOOTSTRAP_TOKEN") is None
     assert sink.get(runtime.runtime_ref, "HERMES_RUNTIME_DSAR_TOKEN") == (
-        api_harness.container.configs.token_hasher.digest(
-            f"runtime-dsar:{runtime.runtime_ref}"
-        ).encode("ascii")
+        api_harness.container.configs.token_hasher.digest(f"runtime-dsar:{runtime.runtime_ref}").encode(
+            "ascii"
+        )
     )
 
 
 @pytest.mark.parametrize("changed", ["household_id", "runtime_ref", "config_revision"])
-def test_bootstrap_token_is_bound_to_household_runtime_and_revision(
-    api_harness, changed: str
-) -> None:
+def test_bootstrap_token_is_bound_to_household_runtime_and_revision(api_harness, changed: str) -> None:
     runtime = _provision_runtime(api_harness)
     binding = _binding(runtime)
     binding[changed] = {
@@ -233,13 +232,9 @@ def test_claim_and_activation_are_resumable_and_cleanup_is_durable(
     assert not receipt.cleanup_pending
     assert active.households.get(runtime.world.household.id).status == "active"
     assert active.configs.get(runtime.world.household.id, 1).status == "active"
-    workflow = active.onboarding_repository.workflow_for_household(
-        runtime.world.household.id
-    )
+    workflow = active.onboarding_repository.workflow_for_household(runtime.world.household.id)
     assert workflow.state == "complete"
-    cleanup = active.database.query_one(
-        "SELECT * FROM provisioning_jobs WHERE kind = 'bootstrap_cleanup'"
-    )
+    cleanup = active.database.query_one("SELECT * FROM provisioning_jobs WHERE kind = 'bootstrap_cleanup'")
     assert cleanup is None
 
     with pytest.raises(BootstrapGone):
@@ -250,9 +245,12 @@ def test_claim_and_activation_are_resumable_and_cleanup_is_durable(
         activated_sha256=runtime.manifest_sha256,
     )
     assert replayed == receipt
-    assert active.database.query_one(
-        "SELECT COUNT(*) AS count FROM provisioning_jobs WHERE kind = 'bootstrap_cleanup'"
-    )["count"] == 0
+    assert (
+        active.database.query_one(
+            "SELECT COUNT(*) AS count FROM provisioning_jobs WHERE kind = 'bootstrap_cleanup'"
+        )["count"]
+        == 0
+    )
     with pytest.raises(BootstrapConflict, match="hash mismatch"):
         active.bootstrap.activate(
             runtime.raw_token,
@@ -266,34 +264,53 @@ def test_claim_and_activation_are_resumable_and_cleanup_is_durable(
         receipt_acknowledged=True,
     )
     assert acknowledged.cleanup_pending
-    cleanup = active.database.query_one(
-        "SELECT * FROM provisioning_jobs WHERE kind = 'bootstrap_cleanup'"
-    )
+    cleanup = active.database.query_one("SELECT * FROM provisioning_jobs WHERE kind = 'bootstrap_cleanup'")
     assert cleanup["status"] == "pending"
-    assert active.bootstrap.activate(
-        runtime.raw_token,
-        **binding,
-        activated_sha256=runtime.manifest_sha256,
-        receipt_acknowledged=True,
-    ) == acknowledged
-    assert active.database.query_one(
-        "SELECT COUNT(*) AS count FROM provisioning_jobs WHERE kind = 'bootstrap_cleanup'"
-    )["count"] == 1
+    assert (
+        active.bootstrap.activate(
+            runtime.raw_token,
+            **binding,
+            activated_sha256=runtime.manifest_sha256,
+            receipt_acknowledged=True,
+        )
+        == acknowledged
+    )
+    assert (
+        active.database.query_one(
+            "SELECT COUNT(*) AS count FROM provisioning_jobs WHERE kind = 'bootstrap_cleanup'"
+        )["count"]
+        == 1
+    )
 
     result = active.worker.run_once()
     assert result.job_id == cleanup["id"]
     assert result.status == "succeeded"
-    assert active.secret_sink.get(
-        runtime.runtime_ref, "HERMES_BOOTSTRAP_TOKEN"
-    ) is None
-    assert active.secret_sink.get(
-        runtime.runtime_ref, "ABROLIA_BOOTSTRAP_TOKEN"
-    ) is None
+    assert active.secret_sink.get(runtime.runtime_ref, "HERMES_BOOTSTRAP_TOKEN") is None
+    assert active.secret_sink.get(runtime.runtime_ref, "ABROLIA_BOOTSTRAP_TOKEN") is None
     assert active.secret_sink.get(
         runtime.runtime_ref, "HERMES_RUNTIME_DSAR_TOKEN"
-    ) == active.configs.token_hasher.digest(
-        f"runtime-dsar:{runtime.runtime_ref}"
-    ).encode("ascii")
+    ) == active.configs.token_hasher.digest(f"runtime-dsar:{runtime.runtime_ref}").encode("ascii")
+
+
+def test_failed_email_health_receipt_blocks_runtime_activation(api_harness) -> None:
+    runtime = _provision_runtime(api_harness)
+    active = api_harness.container
+    binding = _binding(runtime)
+    active.bootstrap.claim(runtime.raw_token, **binding)
+
+    with pytest.raises(BootstrapConflict, match="healthy email receipt"):
+        active.bootstrap.activate(
+            runtime.raw_token,
+            **binding,
+            activated_sha256=runtime.manifest_sha256,
+            email_inbound_check="failed",
+            email_outbound_check="healthy",
+            email_receipt_digest="a" * 64,
+        )
+
+    assert active.households.get(runtime.world.household.id).status == "provisioning"
+    identity = active.email_identities.current_for_household(runtime.world.household.id)
+    assert identity is not None and identity.status.value == "verified"
 
 
 def test_tombstone_and_expiry_block_delayed_bootstrap_callbacks(api_harness) -> None:
@@ -326,16 +343,10 @@ def test_internal_bootstrap_api_maps_conflicts_replay_and_never_echoes_token(
     runtime = _provision_runtime(api_harness)
     binding = _binding(runtime)
     bearer = {"Authorization": f"Bearer {runtime.raw_token}"}
-    assert api_harness.client.post(
-        "/internal/v1/bootstrap/claim", json=binding
-    ).status_code == 401
+    assert api_harness.client.post("/internal/v1/bootstrap/claim", json=binding).status_code == 401
 
-    claimed = api_harness.client.post(
-        "/internal/v1/bootstrap/claim", headers=bearer, json=binding
-    )
-    resumed = api_harness.client.post(
-        "/internal/v1/bootstrap/claim", headers=bearer, json=binding
-    )
+    claimed = api_harness.client.post("/internal/v1/bootstrap/claim", headers=bearer, json=binding)
+    resumed = api_harness.client.post("/internal/v1/bootstrap/claim", headers=bearer, json=binding)
     assert claimed.status_code == resumed.status_code == 200
     assert claimed.json() == resumed.json()
     assert runtime.raw_token not in claimed.text
@@ -448,12 +459,17 @@ def test_fastapi_to_real_runtime_client_resumes_lost_activation_response(
     manifest = bootstrapper.run(runtime.raw_token)
     assert load_activation_state(activation_path).status == "active"
     assert manifest.config_sha256 == runtime.manifest_sha256
-    assert RuntimeService(
-        manifest_path=manifest_path,
-        activation_path=activation_path,
-        runtime_ref=runtime.runtime_ref,
-        env=env,
-    ).readyz().status_code == 200
+    assert (
+        RuntimeService(
+            manifest_path=manifest_path,
+            activation_path=activation_path,
+            runtime_ref=runtime.runtime_ref,
+            env=env,
+        )
+        .readyz()
+        .status_code
+        == 200
+    )
     assert [path for path, _payload in calls] == [
         "/internal/v1/bootstrap/claim",
         "/internal/v1/bootstrap/activate",
@@ -466,10 +482,16 @@ def test_fastapi_to_real_runtime_client_resumes_lost_activation_response(
         "runtime_ref",
         "config_revision",
         "config_sha256",
+        "email_inbound_check",
+        "email_outbound_check",
+        "email_receipt_digest",
     }
-    assert api_harness.container.database.query_one(
-        "SELECT COUNT(*) AS count FROM provisioning_jobs WHERE kind = 'bootstrap_cleanup'"
-    )["count"] == 1
+    assert (
+        api_harness.container.database.query_one(
+            "SELECT COUNT(*) AS count FROM provisioning_jobs WHERE kind = 'bootstrap_cleanup'"
+        )["count"]
+        == 1
+    )
 
 
 def test_crash_after_activate_response_cannot_delete_secret_before_local_receipt(
@@ -528,13 +550,19 @@ def test_crash_after_activate_response_cannot_delete_secret_before_local_receipt
     with pytest.raises(BootstrapError, match="cannot persist active revision receipt"):
         bootstrapper.run(runtime.raw_token)
     assert load_activation_state(activation_path).status == "activating"
-    assert api_harness.container.database.query_one(
-        "SELECT COUNT(*) AS count FROM provisioning_jobs WHERE kind = 'bootstrap_cleanup'"
-    )["count"] == 0
-    assert api_harness.container.secret_sink.get(
-        runtime.runtime_ref,
-        "HERMES_BOOTSTRAP_TOKEN",
-    ) is not None
+    assert (
+        api_harness.container.database.query_one(
+            "SELECT COUNT(*) AS count FROM provisioning_jobs WHERE kind = 'bootstrap_cleanup'"
+        )["count"]
+        == 0
+    )
+    assert (
+        api_harness.container.secret_sink.get(
+            runtime.runtime_ref,
+            "HERMES_BOOTSTRAP_TOKEN",
+        )
+        is not None
+    )
 
     recovered = bootstrapper.run(runtime.raw_token)
     assert recovered.config_sha256 == runtime.manifest_sha256

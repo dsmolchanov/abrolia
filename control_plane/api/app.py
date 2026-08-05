@@ -146,6 +146,7 @@ def create_app(
                 "csrf_token": request.cookies.get(active_container.config.csrf_cookie_name, ""),
                 "idempotency_key": new_id(),
                 "error": request.query_params.get("error"),
+                "google_confirm": request.query_params.get("google") == "confirm",
             },
         )
 

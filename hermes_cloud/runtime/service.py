@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hmac
 import json
 import os
@@ -12,6 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from wsgiref.simple_server import WSGIRequestHandler, make_server
+
+import httpx
 
 from hermes_cloud.core.config import DEFAULT_DB_PATH, ENV_DB
 from hermes_cloud.core.db import open_database
@@ -25,12 +28,15 @@ from hermes_cloud.core.runtime_manifest import (
     load_runtime_manifest,
 )
 from hermes_cloud.email.contracts import EmailBinding
+from hermes_cloud.email.google_client import GmailHttpClient
+from hermes_cloud.email.google_grant import GoogleGrantError, GoogleGrantStore
 from hermes_cloud.email.nerve_client import (
     DEFAULT_REST_URL,
     DEFAULT_RUNTIME_URL,
     NerveEmailClient,
 )
 from hermes_cloud.email.receipts import EmailBindingStore
+from hermes_cloud.email.service import EmailRuntimeService
 from hermes_cloud.ingest.nerve_webhook import (
     MAX_WEBHOOK_BYTES,
     NerveAttachmentWorker,
@@ -94,13 +100,9 @@ class RuntimeService:
         nerve_client_factory: Callable[..., Any] = NerveEmailClient,
     ) -> None:
         self.env = dict(os.environ if env is None else env)
-        self.manifest_path = Path(
-            manifest_path or self.env.get(ENV_HOUSEHOLD_FILE) or DEFAULT_MANIFEST_PATH
-        )
+        self.manifest_path = Path(manifest_path or self.env.get(ENV_HOUSEHOLD_FILE) or DEFAULT_MANIFEST_PATH)
         self.activation_path = Path(
-            activation_path
-            or self.env.get(ENV_ACTIVATION_STATE)
-            or DEFAULT_ACTIVATION_STATE
+            activation_path or self.env.get(ENV_ACTIVATION_STATE) or DEFAULT_ACTIVATION_STATE
         )
         self.runtime_ref = runtime_ref or self.env.get(ENV_RUNTIME_REF) or ""
         self.nerve_client_factory = nerve_client_factory
@@ -162,8 +164,18 @@ class RuntimeService:
             if binding.provider.startswith("nerve"):
                 try:
                     with open_database(self.database_path) as database:
+                        payload.update(email_health=NerveWebhookStore(database).health(binding))
+                except Exception:
+                    payload.update(email_health={"status": "unavailable"})
+            elif binding.provider == "gmail":
+                try:
+                    with open_database(self.database_path) as database:
+                        health = EmailRuntimeService(database).health()
                         payload.update(
-                            email_health=NerveWebhookStore(database).health(binding)
+                            email_health={
+                                "status": health.status,
+                                "last_success_at": health.last_success_at,
+                            }
                         )
                 except Exception:
                     payload.update(email_health={"status": "unavailable"})
@@ -198,14 +210,123 @@ class RuntimeService:
             provider=manifest.email.provider_kind,
             address=manifest.email.agent_inbox,
             provider_ref=identity_id,
-            secret_names=(
-                (manifest.email.secret_binding_ref,)
-                if manifest.email.secret_binding_ref
-                else ()
-            ),
+            secret_names=((manifest.email.secret_binding_ref,) if manifest.email.secret_binding_ref else ()),
         )
         with open_database(self.database_path) as database:
-            return EmailBindingStore(database).activate(binding)
+            active = EmailBindingStore(database).activate(binding)
+            if active.provider == "gmail":
+                self._install_gmail_grant(database, active, manifest)
+            return active
+
+    def _gmail_bundle(self, manifest: RuntimeManifest) -> dict[str, Any]:
+        secret_name = manifest.email.secret_binding_ref or ""
+        try:
+            bundle = json.loads(self.env.get(secret_name, ""))
+        except (TypeError, json.JSONDecodeError) as error:
+            raise RuntimeNotReady("Gmail credential bundle is unavailable") from error
+        required = {
+            "client_id",
+            "client_secret",
+            "refresh_credential",
+            "provider_subject",
+            "scopes",
+            "wrapping_key",
+        }
+        if not isinstance(bundle, dict) or set(bundle) != required:
+            raise RuntimeNotReady("Gmail credential bundle is invalid")
+        return bundle
+
+    @staticmethod
+    def _grant_key(bundle: dict[str, Any]) -> bytes:
+        value = str(bundle.get("wrapping_key") or "")
+        try:
+            key = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+        except (ValueError, TypeError) as error:
+            raise RuntimeNotReady("Gmail grant key is invalid") from error
+        if len(key) != 32:
+            raise RuntimeNotReady("Gmail grant key is invalid")
+        return key
+
+    def _install_gmail_grant(self, database, binding: EmailBinding, manifest: RuntimeManifest) -> None:
+        bundle = self._gmail_bundle(manifest)
+        store = GoogleGrantStore(database, {1: self._grant_key(bundle)}, active_version=1)
+        try:
+            store.load(binding.identity_id, binding.revision)
+        except GoogleGrantError as error:
+            scopes = bundle.get("scopes")
+            if not isinstance(scopes, list) or not all(isinstance(item, str) for item in scopes):
+                raise RuntimeNotReady("Gmail scope bundle is invalid") from error
+            store.put(
+                identity_id=binding.identity_id,
+                revision=binding.revision,
+                refresh_credential=str(bundle["refresh_credential"]),
+                provider_subject=str(bundle["provider_subject"]),
+                scopes=tuple(scopes),
+            )
+
+    def _revoke_google_credential(self, manifest: RuntimeManifest) -> bool:
+        binding = self._sync_email_binding(manifest)
+        if binding is None or binding.provider != "gmail":
+            return True
+        bundle = self._gmail_bundle(manifest)
+        with open_database(self.database_path) as database:
+            store = GoogleGrantStore(database, {1: self._grant_key(bundle)}, active_version=1)
+            try:
+                grant = store.load(binding.identity_id, binding.revision)
+            except GoogleGrantError:
+                return True
+            try:
+                response = httpx.post(
+                    "https://oauth2.googleapis.com/revoke",
+                    params={"token": grant.refresh_credential},
+                    timeout=20.0,
+                )
+            except (httpx.TimeoutException, httpx.TransportError):
+                return False
+            if response.status_code not in {200, 400}:
+                return False
+            store.revoke(binding.identity_id, binding.revision)
+        return True
+
+    def email_activation_health(self, manifest: RuntimeManifest) -> tuple[str, str]:
+        provider = manifest.email.provider_kind
+        if provider == "synthetic":
+            return "healthy", "healthy"
+        if provider.startswith("nerve"):
+            config = self._nerve_config(manifest)
+            client = self.nerve_client_factory(
+                api_key=config.api_key,
+                runtime_url=config.runtime_url,
+                rest_url=config.rest_url,
+            )
+            try:
+                healthy = bool(client.health_check())
+            finally:
+                close = getattr(client, "close", None)
+                if close is not None:
+                    close()
+            state = "healthy" if healthy else "failed"
+            return state, state
+        if provider == "gmail":
+            binding = self._sync_email_binding(manifest)
+            if binding is None:
+                return "failed", "failed"
+            bundle = self._gmail_bundle(manifest)
+            with open_database(self.database_path) as database:
+                store = GoogleGrantStore(database, {1: self._grant_key(bundle)}, active_version=1)
+                client = GmailHttpClient(
+                    store,
+                    identity_id=binding.identity_id,
+                    revision=binding.revision,
+                    client_id=str(bundle["client_id"]),
+                    client_secret=str(bundle["client_secret"]),
+                )
+                profile = client.profile()
+                inbound = "healthy" if profile.get("historyId") else "failed"
+                scopes = {str(item) for item in bundle.get("scopes", [])}
+                outbound = "healthy" if "https://www.googleapis.com/auth/gmail.send" in scopes else "failed"
+                return inbound, outbound
+        return "failed", "failed"
 
     def _nerve_config(self, manifest: RuntimeManifest) -> NerveRuntimeConfig:
         if not manifest.email.provider_kind.startswith("nerve"):
@@ -274,6 +395,8 @@ class RuntimeService:
             probe = self._nerve_webhook(environ)
         elif path in {"/internal/v1/dsar/export", "/internal/v1/dsar/delete"}:
             probe = self._dsar(path, method, str(environ.get("HTTP_AUTHORIZATION") or ""))
+        elif path == "/internal/v1/email/google/revoke":
+            probe = self._google_revoke(method, str(environ.get("HTTP_AUTHORIZATION") or ""))
         elif method != "GET" or path not in {"/healthz", "/readyz"}:
             probe = Probe(404, {"status": "not_found"})
         else:
@@ -357,12 +480,30 @@ class RuntimeService:
                     return Probe(410, {"status": "runtime_deleted"})
                 if path.endswith("/export"):
                     return Probe(200, export_household(database))
+                manifest = self.require_ready()
+                if manifest.email.provider_kind == "gmail" and not self._revoke_google_credential(manifest):
+                    return Probe(503, {"status": "provider_cleanup_unknown"})
                 wipe_household(database)
             atomic_write(self.deletion_marker, b'{"status":"deleted"}')
             return Probe(200, {"state": "absent"})
         except Exception:
             # Runtime payloads and exception strings must never cross this boundary.
             return Probe(503, {"status": "runtime_boundary_unavailable"})
+
+    def _google_revoke(self, method: str, authorization: str) -> Probe:
+        expected = self.env.get(ENV_RUNTIME_DSAR_TOKEN, "")
+        supplied = authorization[7:] if authorization.startswith("Bearer ") else ""
+        if method != "POST" or not expected:
+            return Probe(404, {"status": "not_found"})
+        if not supplied or not hmac.compare_digest(supplied, expected):
+            return Probe(401, {"status": "unauthorized"})
+        try:
+            manifest = self.require_ready()
+            if not self._revoke_google_credential(manifest):
+                return Probe(503, {"status": "provider_cleanup_unknown"})
+        except Exception:
+            return Probe(503, {"status": "provider_cleanup_unknown"})
+        return Probe(200, {"state": "absent"})
 
 
 def bootstrap_from_environment(
@@ -397,6 +538,7 @@ def bootstrap_from_environment(
         manifest_path=service.manifest_path,
         activation_path=service.activation_path,
         env=source,
+        email_health_checker=service.email_activation_health,
     ).run(token)
 
 

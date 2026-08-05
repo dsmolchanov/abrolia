@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import time
 from dataclasses import dataclass
@@ -56,9 +57,7 @@ class BootstrapService:
 
     def _token_row(self, connection, raw_token: str):
         digest = self.configs.token_hasher.digest(raw_token)
-        return connection.execute(
-            "SELECT * FROM bootstrap_tokens WHERE token_hash = ?", (digest,)
-        ).fetchone()
+        return connection.execute("SELECT * FROM bootstrap_tokens WHERE token_hash = ?", (digest,)).fetchone()
 
     def _assert_not_deleted(self, connection, household_id: str) -> None:
         tombstone = self.configs.lookup.digest(household_id)
@@ -153,9 +152,7 @@ class BootstrapService:
                 or household["status"] in {"deleting", "deleted"}
                 or not self._constant_match(household["runtime_ref"], runtime_ref)
                 or revision["status"] not in {"issued", "claimed"}
-                or not self._constant_match(
-                    revision["manifest_sha256"], row["manifest_sha256"]
-                )
+                or not self._constant_match(revision["manifest_sha256"], row["manifest_sha256"])
             ):
                 raise BootstrapConflict("bootstrap target is not claimable")
             if row["claimed_at"] is None:
@@ -187,6 +184,9 @@ class BootstrapService:
         runtime_ref: str,
         config_revision: int,
         activated_sha256: str,
+        email_inbound_check: str | None = None,
+        email_outbound_check: str | None = None,
+        email_receipt_digest: str | None = None,
         receipt_acknowledged: bool = False,
         now: float | None = None,
     ) -> ActivationReceipt:
@@ -229,10 +229,29 @@ class BootstrapService:
                     and household["current_config_revision"] == config_revision
                     and revision["status"] == "active"
                     and workflow["state"] == "complete"
-                    and self._constant_match(
-                        revision["manifest_sha256"], activated_sha256
-                    )
+                    and self._constant_match(revision["manifest_sha256"], activated_sha256)
                 ):
+                    email_receipt = connection.execute(
+                        "SELECT inbound_check, outbound_check, receipt_digest"
+                        " FROM email_activation_receipts WHERE desired_revision = ?"
+                        " AND runtime_ref = ? ORDER BY checked_at DESC LIMIT 1",
+                        (config_revision, runtime_ref),
+                    ).fetchone()
+                    supplied_health = (
+                        email_inbound_check,
+                        email_outbound_check,
+                        email_receipt_digest,
+                    )
+                    if any(value is not None for value in supplied_health) and (
+                        email_receipt is None
+                        or supplied_health
+                        != (
+                            email_receipt["inbound_check"],
+                            email_receipt["outbound_check"],
+                            email_receipt["receipt_digest"],
+                        )
+                    ):
+                        raise BootstrapConflict("activation email receipt mismatch")
                     if receipt_acknowledged:
                         self._enqueue_cleanup(
                             connection,
@@ -251,9 +270,7 @@ class BootstrapService:
                     )
                 raise BootstrapGone("bootstrap credential is no longer available")
             if receipt_acknowledged:
-                raise BootstrapConflict(
-                    "activation receipt cannot be acknowledged before activation"
-                )
+                raise BootstrapConflict("activation receipt cannot be acknowledged before activation")
             if row["expires_at"] <= now:
                 raise BootstrapGone("bootstrap credential expired")
             if row["claimed_at"] is None:
@@ -278,6 +295,18 @@ class BootstrapService:
             manifest = self.configs.manifest(household_id, config_revision)
             if manifest_sha256(manifest) != activated_sha256:
                 raise BootstrapConflict("activation content hash mismatch")
+            provider_kind = str(manifest.get("email", {}).get("provider_kind") or "")
+            if provider_kind == "synthetic" and email_inbound_check is None:
+                email_inbound_check = email_outbound_check = "healthy"
+                email_receipt_digest = hashlib.sha256(
+                    f"synthetic-email-health:{activated_sha256}".encode()
+                ).hexdigest()
+            if (
+                email_inbound_check != "healthy"
+                or email_outbound_check != "healthy"
+                or email_receipt_digest is None
+            ):
+                raise BootstrapConflict("activation requires healthy email receipt")
             workflow_row = connection.execute(
                 "SELECT * FROM onboarding_workflows WHERE household_id = ?", (household_id,)
             ).fetchone()
@@ -293,6 +322,48 @@ class BootstrapService:
                 for kind in ("email_identity", "whatsapp_identity", "primary_channel")
             ):
                 raise BootstrapConflict("activation requires all verified onboarding results")
+            identity = connection.execute(
+                "SELECT id, status FROM email_identities WHERE household_id = ?"
+                " AND status NOT IN ('disconnecting','deleted')"
+                " ORDER BY created_at DESC LIMIT 1",
+                (household_id,),
+            ).fetchone()
+            if identity is None or identity["status"] not in {
+                "verified",
+                "activating",
+                "active",
+            }:
+                raise BootstrapConflict("activation email identity is unavailable")
+            connection.execute(
+                "UPDATE email_identities SET status = 'activating', version = version + 1,"
+                " updated_at = ? WHERE id = ? AND status = 'verified'",
+                (now, identity["id"]),
+            )
+            connection.execute(
+                "INSERT INTO email_activation_receipts (email_identity_id, desired_revision,"
+                " runtime_ref, provider, inbound_check, outbound_check, checked_at,"
+                " receipt_digest, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active')"
+                " ON CONFLICT (email_identity_id, desired_revision) DO UPDATE SET"
+                " runtime_ref = excluded.runtime_ref, provider = excluded.provider,"
+                " inbound_check = excluded.inbound_check, outbound_check = excluded.outbound_check,"
+                " checked_at = excluded.checked_at, receipt_digest = excluded.receipt_digest,"
+                " status = 'active'",
+                (
+                    identity["id"],
+                    config_revision,
+                    runtime_ref,
+                    provider_kind,
+                    email_inbound_check,
+                    email_outbound_check,
+                    now,
+                    email_receipt_digest,
+                ),
+            )
+            connection.execute(
+                "UPDATE email_identities SET status = 'active', activated_at = ?,"
+                " version = version + 1, updated_at = ? WHERE id = ?",
+                (now, now, identity["id"]),
+            )
             owner = connection.execute(
                 "SELECT account_id FROM household_memberships WHERE household_id = ?"
                 " AND role = 'owner' AND status = 'active' LIMIT 1",
@@ -309,9 +380,7 @@ class BootstrapService:
                 "UPDATE config_revisions SET status = 'active', activated_at = ? WHERE id = ?",
                 (now, revision["id"]),
             )
-            connection.execute(
-                "UPDATE bootstrap_tokens SET used_at = ? WHERE id = ?", (now, row["id"])
-            )
+            connection.execute("UPDATE bootstrap_tokens SET used_at = ? WHERE id = ?", (now, row["id"]))
             connection.execute(
                 "UPDATE households SET status = 'active', current_config_revision = ?,"
                 " updated_at = ? WHERE id = ?",

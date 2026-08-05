@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import tempfile
@@ -9,7 +10,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -55,6 +56,9 @@ class ActivationReceipt:
     household_id: str
     config_revision: int
     config_sha256: str
+    email_inbound_check: str = "healthy"
+    email_outbound_check: str = "healthy"
+    email_receipt_digest: str = ""
 
 
 @dataclass(frozen=True)
@@ -65,6 +69,9 @@ class ActivationState:
     config_revision: int
     config_sha256: str
     updated_at: float
+    email_inbound_check: str = "healthy"
+    email_outbound_check: str = "healthy"
+    email_receipt_digest: str = ""
 
     def receipt(self) -> ActivationReceipt:
         return ActivationReceipt(
@@ -72,6 +79,9 @@ class ActivationState:
             household_id=self.household_id,
             config_revision=self.config_revision,
             config_sha256=self.config_sha256,
+            email_inbound_check=self.email_inbound_check,
+            email_outbound_check=self.email_outbound_check,
+            email_receipt_digest=self.email_receipt_digest,
         )
 
 
@@ -87,9 +97,7 @@ class BootstrapClient(Protocol):
 
     def activate(self, token: str, receipt: ActivationReceipt) -> ActivationReceipt: ...
 
-    def acknowledge(
-        self, token: str, receipt: ActivationReceipt
-    ) -> ActivationReceipt: ...
+    def acknowledge(self, token: str, receipt: ActivationReceipt) -> ActivationReceipt: ...
 
 
 class BootstrapHTTPTransport(Protocol):
@@ -150,24 +158,19 @@ class ControlPlaneBootstrapClient:
             and parsed_url.port in {None, 80}
         )
         if (
-            parsed_url.scheme != "https"
-            and not private_flycast_http
-        ) or (
-            parsed_url.scheme == "https" and parsed_url.port not in {None, 443}
-        ) or (
-            not parsed_url.hostname
-            or parsed_url.username is not None
-            or parsed_url.password is not None
-            or parsed_url.query
-            or parsed_url.fragment
-            or parsed_url.path not in {"", "/"}
-        ):
-            raise BootstrapError(
-                "control-plane URL must use HTTPS or private Flycast HTTP"
+            (parsed_url.scheme != "https" and not private_flycast_http)
+            or (parsed_url.scheme == "https" and parsed_url.port not in {None, 443})
+            or (
+                not parsed_url.hostname
+                or parsed_url.username is not None
+                or parsed_url.password is not None
+                or parsed_url.query
+                or parsed_url.fragment
+                or parsed_url.path not in {"", "/"}
             )
-        self.base_url = urllib.parse.urlunsplit(
-            (parsed_url.scheme, parsed_url.netloc, "", "", "")
-        )
+        ):
+            raise BootstrapError("control-plane URL must use HTTPS or private Flycast HTTP")
+        self.base_url = urllib.parse.urlunsplit((parsed_url.scheme, parsed_url.netloc, "", "", ""))
         self.timeout = timeout
         self.transport = transport or _urllib_transport
 
@@ -201,9 +204,7 @@ class ControlPlaneBootstrapClient:
                 raise BootstrapOutcomeUnknown(
                     f"control plane bootstrap outcome is unknown (HTTP {status_code})"
                 )
-            raise BootstrapError(
-                f"control plane rejected bootstrap (HTTP {status_code})"
-            )
+            raise BootstrapError(f"control plane rejected bootstrap (HTTP {status_code})")
         if len(raw) > MAX_BOOTSTRAP_RESPONSE_BYTES:
             raise BootstrapError("control plane bootstrap response is too large")
         if not raw:
@@ -256,9 +257,7 @@ class ControlPlaneBootstrapClient:
             token,
             asdict(receipt),
             extra_headers=(
-                {"X-Hermes-Runtime-Receipt-Acknowledged": "true"}
-                if acknowledge_receipt
-                else None
+                {"X-Hermes-Runtime-Receipt-Acknowledged": "true"} if acknowledge_receipt else None
             ),
         )
         try:
@@ -267,6 +266,9 @@ class ControlPlaneBootstrapClient:
                 household_id=str(body["household_id"]),
                 config_revision=int(body["config_revision"]),
                 config_sha256=str(body["config_sha256"]),
+                email_inbound_check=receipt.email_inbound_check,
+                email_outbound_check=receipt.email_outbound_check,
+                email_receipt_digest=receipt.email_receipt_digest,
             )
         except (KeyError, TypeError, ValueError) as error:
             raise BootstrapError("activation response is missing required fields") from error
@@ -280,9 +282,7 @@ class ControlPlaneBootstrapClient:
     def activate(self, token: str, receipt: ActivationReceipt) -> ActivationReceipt:
         return self._activate(token, receipt, acknowledge_receipt=False)
 
-    def acknowledge(
-        self, token: str, receipt: ActivationReceipt
-    ) -> ActivationReceipt:
+    def acknowledge(self, token: str, receipt: ActivationReceipt) -> ActivationReceipt:
         return self._activate(token, receipt, acknowledge_receipt=True)
 
 
@@ -335,6 +335,9 @@ def load_activation_state(path: Path | str) -> ActivationState | None:
             household_id=str(data["household_id"]),
             config_revision=int(data["config_revision"]),
             config_sha256=str(data["config_sha256"]),
+            email_inbound_check=str(data.get("email_inbound_check", "healthy")),
+            email_outbound_check=str(data.get("email_outbound_check", "healthy")),
+            email_receipt_digest=str(data.get("email_receipt_digest", "")),
             updated_at=float(data["updated_at"]),
         )
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
@@ -362,6 +365,7 @@ class RuntimeBootstrapper:
         manifest_path: Path | str = DEFAULT_MANIFEST_PATH,
         activation_path: Path | str = DEFAULT_ACTIVATION_STATE,
         env: Mapping[str, str] | None = None,
+        email_health_checker: Callable[[RuntimeManifest], tuple[str, str]] | None = None,
         clock=time.time,
     ) -> None:
         if not runtime_ref:
@@ -371,9 +375,7 @@ class RuntimeBootstrapper:
         self.manifest_path = Path(manifest_path)
         self.activation_path = Path(activation_path)
         self.env = dict(os.environ if env is None else env)
-        self.household_id = (
-            household_id or self.env.get(ENV_HOUSEHOLD_ID) or ""
-        ).strip()
+        self.household_id = (household_id or self.env.get(ENV_HOUSEHOLD_ID) or "").strip()
         raw_revision: str | int | None = config_revision
         if raw_revision is None:
             raw_revision = self.env.get(ENV_CONFIG_REVISION)
@@ -384,6 +386,7 @@ class RuntimeBootstrapper:
         if self.config_revision < 0:
             raise BootstrapError(f"{ENV_CONFIG_REVISION} must be positive")
         self.clock = clock
+        self.email_health_checker = email_health_checker or (lambda _manifest: ("healthy", "healthy"))
 
     def _load_installed(self) -> RuntimeManifest:
         try:
@@ -394,15 +397,28 @@ class RuntimeBootstrapper:
     def _activate(
         self, token: str, manifest: RuntimeManifest, *, state: ActivationState | None = None
     ) -> RuntimeManifest:
+        inbound_check, outbound_check = self.email_health_checker(manifest)
+        if inbound_check not in {"healthy", "failed"} or outbound_check not in {
+            "healthy",
+            "failed",
+        }:
+            raise BootstrapError("email activation checker returned an invalid state")
         receipt = ActivationReceipt(
             runtime_ref=self.runtime_ref,
             household_id=manifest.household_id,
             config_revision=manifest.config_revision,
             config_sha256=manifest.config_sha256,
+            email_inbound_check=inbound_check,
+            email_outbound_check=outbound_check,
+            email_receipt_digest=hashlib.sha256(
+                (
+                    f"email-health:{manifest.email.provider_kind}:"
+                    f"{manifest.config_revision}:{manifest.config_sha256}:"
+                    f"{inbound_check}:{outbound_check}"
+                ).encode()
+            ).hexdigest(),
         )
-        activating = state or ActivationState(
-            status="activating", updated_at=self.clock(), **asdict(receipt)
-        )
+        activating = state or ActivationState(status="activating", updated_at=self.clock(), **asdict(receipt))
         try:
             write_activation_state(self.activation_path, activating)
         except OSError as error:
@@ -435,9 +451,7 @@ class RuntimeBootstrapper:
                 if token:
                     acknowledged = self.client.acknowledge(token, state.receipt())
                     if acknowledged != state.receipt():
-                        raise BootstrapError(
-                            "cleanup acknowledgement does not match active revision"
-                        )
+                        raise BootstrapError("cleanup acknowledgement does not match active revision")
                 return manifest
             if state.status == "activating":
                 # A crash or unknown response after activate resumes the same
@@ -450,9 +464,7 @@ class RuntimeBootstrapper:
         if not token:
             raise BootstrapError("bootstrap token is required")
         if not self.household_id or self.config_revision < 1:
-            raise BootstrapError(
-                f"fresh bootstrap requires {ENV_HOUSEHOLD_ID} and {ENV_CONFIG_REVISION}"
-            )
+            raise BootstrapError(f"fresh bootstrap requires {ENV_HOUSEHOLD_ID} and {ENV_CONFIG_REVISION}")
 
         claim = self.client.claim(
             token,
@@ -463,9 +475,7 @@ class RuntimeBootstrapper:
         if claim.runtime_ref != self.runtime_ref:
             raise BootstrapError("claim is bound to another runtime")
         try:
-            manifest = parse_runtime_manifest(
-                claim.manifest_toml, env=self.env, source="bootstrap claim"
-            )
+            manifest = parse_runtime_manifest(claim.manifest_toml, env=self.env, source="bootstrap claim")
         except ManifestError as error:
             raise BootstrapError(f"claimed manifest is invalid: {error}") from error
         if (

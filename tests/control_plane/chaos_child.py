@@ -137,6 +137,9 @@ class _DirectBootstrapClient:
             runtime_ref=receipt.runtime_ref,
             config_revision=receipt.config_revision,
             activated_sha256=receipt.config_sha256,
+            email_inbound_check=receipt.email_inbound_check,
+            email_outbound_check=receipt.email_outbound_check,
+            email_receipt_digest=receipt.email_receipt_digest,
         )
         if self.pause_after_activate:
             _checkpoint()
@@ -145,6 +148,9 @@ class _DirectBootstrapClient:
             result.household_id,
             result.config_revision,
             result.manifest_sha256,
+            receipt.email_inbound_check,
+            receipt.email_outbound_check,
+            receipt.email_receipt_digest,
         )
 
     def acknowledge(self, token: str, receipt: RuntimeActivationReceipt) -> RuntimeActivationReceipt:
@@ -154,6 +160,9 @@ class _DirectBootstrapClient:
             runtime_ref=receipt.runtime_ref,
             config_revision=receipt.config_revision,
             activated_sha256=receipt.config_sha256,
+            email_inbound_check=receipt.email_inbound_check,
+            email_outbound_check=receipt.email_outbound_check,
+            email_receipt_digest=receipt.email_receipt_digest,
             receipt_acknowledged=True,
         )
         return RuntimeActivationReceipt(
@@ -161,6 +170,9 @@ class _DirectBootstrapClient:
             result.household_id,
             result.config_revision,
             result.manifest_sha256,
+            receipt.email_inbound_check,
+            receipt.email_outbound_check,
+            receipt.email_receipt_digest,
         )
 
 

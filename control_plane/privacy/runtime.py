@@ -36,11 +36,11 @@ class PrivateRuntimeDsarClient:
             raise RuntimeBoundaryError("runtime reference is outside the managed namespace")
         return self.token_hasher.digest(f"runtime-dsar:{runtime_ref}")
 
-    def _request(self, runtime_ref: str, operation: str) -> dict[str, Any]:
+    def _request(self, runtime_ref: str, operation: str, *, resource: str = "dsar") -> dict[str, Any]:
         token = self._token(runtime_ref)
         try:
             response = self.client.post(
-                f"http://{runtime_ref}.internal:8080/internal/v1/dsar/{operation}",
+                f"http://{runtime_ref}.internal:8080/internal/v1/{resource}/{operation}",
                 headers={
                     "Authorization": f"Bearer {token}",
                     "Content-Type": "application/json",
@@ -72,7 +72,14 @@ class PrivateRuntimeDsarClient:
         except RuntimeBoundaryError:
             return InspectState.UNKNOWN
         return (
-            InspectState.ABSENT
-            if payload.get("state") == InspectState.ABSENT.value
-            else InspectState.UNKNOWN
+            InspectState.ABSENT if payload.get("state") == InspectState.ABSENT.value else InspectState.UNKNOWN
+        )
+
+    def revoke_google(self, runtime_ref: str) -> InspectState:
+        try:
+            payload = self._request(runtime_ref, "revoke", resource="email/google")
+        except RuntimeBoundaryError:
+            return InspectState.UNKNOWN
+        return (
+            InspectState.ABSENT if payload.get("state") == InspectState.ABSENT.value else InspectState.UNKNOWN
         )

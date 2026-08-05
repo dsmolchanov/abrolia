@@ -58,6 +58,9 @@ class EmailRuntimeService:
                         binding=binding,
                     )
                     accepted += int(result.created)
+                acknowledge = getattr(source, "ack", None)
+                if callable(acknowledge):
+                    acknowledge()
         except Exception as error:
             self._last_error = type(error).__name__
             raise
@@ -69,6 +72,25 @@ class EmailRuntimeService:
         binding = self.bindings.current()
         if binding is None:
             return EmailHealth("not_configured", None, None, self._last_success_at)
+        if binding.provider == "gmail":
+            row = self.db.query_one(
+                "SELECT last_success_at, health FROM email_sync_state"
+                " WHERE binding_identity_id = ? AND binding_revision = ?",
+                (binding.identity_id, binding.revision),
+            )
+            if row is None:
+                return EmailHealth("pending", "gmail", binding.revision, None)
+            last_success = row["last_success_at"]
+            health = str(row["health"])
+            if health == "ready" and (last_success is None or self.clock() - last_success > 180):
+                health = "stale_cursor"
+            return EmailHealth(
+                health,
+                "gmail",
+                binding.revision,
+                last_success,
+                None if health == "ready" else health,
+            )
         return EmailHealth(
             "degraded" if self._last_error else "ready",
             binding.provider,

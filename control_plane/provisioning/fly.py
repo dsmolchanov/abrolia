@@ -120,6 +120,8 @@ class FlyRuntimeProvisioner:
             except ValueError:
                 retry_after = 30.0
             raise ProviderRateLimited(retry_after)
+        if response.status_code == 408:
+            raise OutcomeUnknown("Fly Machine wait outcome is unknown")
         if response.status_code >= 500:
             raise OutcomeUnknown("Fly service outcome is unknown")
         if response.status_code in {401, 403, 422}:
@@ -151,6 +153,15 @@ class FlyRuntimeProvisioner:
     @staticmethod
     def stable_machine_name() -> str:
         return "abrolia-runtime"
+
+    @staticmethod
+    def stable_google_revoker_name(transaction_id: str) -> str:
+        if (
+            len(transaction_id) != 32
+            or not set(transaction_id) <= set("0123456789abcdef")
+        ):
+            raise ProviderRejected("Google revoke transaction identity is invalid")
+        return f"abrolia-google-revoker-{transaction_id[:12]}"
 
     @staticmethod
     def _validate_app_ref(app_ref: str) -> str:
@@ -288,6 +299,132 @@ class FlyRuntimeProvisioner:
     def _machines(self, app: str) -> list[dict[str, Any]]:
         payload = self._request("GET", f"/v1/apps/{app}/machines")
         return payload if isinstance(payload, list) else payload.get("machines", [])
+
+    def _google_revoker_payload(self, transaction_id: str) -> dict[str, Any]:
+        return {
+            "name": self.stable_google_revoker_name(transaction_id),
+            "region": self.region,
+            "skip_service_registration": True,
+            "config": {
+                "image": self.image_digest,
+                "init": {"exec": ["hermes-cloud", "revoke-google-grant"]},
+                "auto_destroy": False,
+                "metadata": {
+                    "abrolia_managed": "true",
+                    "abrolia_google_revoke": transaction_id,
+                    "fly_platform_version": "v2",
+                    "fly_process_group": "google-revoker",
+                },
+                "guest": {"cpu_kind": "shared", "cpus": 1, "memory_mb": 256},
+                "restart": {"policy": "no"},
+            },
+        }
+
+    @staticmethod
+    def _google_revoker_matches(
+        machine: Mapping[str, Any], desired: Mapping[str, Any]
+    ) -> bool:
+        actual = machine.get("config", {})
+        expected = desired["config"]
+        return (
+            machine.get("name") == desired.get("name")
+            and machine.get("region") in {None, desired.get("region")}
+            and actual.get("image") == expected["image"]
+            and actual.get("init") == expected["init"]
+            and actual.get("auto_destroy") is False
+            and actual.get("metadata") == expected["metadata"]
+            and actual.get("guest") == expected["guest"]
+            and actual.get("restart") == expected["restart"]
+            and not actual.get("mounts")
+            and not actual.get("services")
+        )
+
+    @staticmethod
+    def _google_revoke_exit(machine: Mapping[str, Any]) -> InspectState:
+        events = machine.get("events")
+        if not isinstance(events, list):
+            return InspectState.UNKNOWN
+        for event in events:
+            if not isinstance(event, Mapping) or event.get("type") != "exit":
+                continue
+            request = event.get("request")
+            exit_event = request.get("exit_event") if isinstance(request, Mapping) else None
+            if not isinstance(exit_event, Mapping):
+                continue
+            if (
+                exit_event.get("exit_code") == 0
+                and exit_event.get("oom_killed") is False
+                and exit_event.get("requested_stop") is False
+            ):
+                return InspectState.ABSENT
+            return InspectState.FAILED
+        return InspectState.UNKNOWN
+
+    def revoke_google_secret(
+        self, app_ref: str, transaction_id: str
+    ) -> InspectState:
+        """Revoke an app-secret grant with a pinned, no-volume one-shot Machine."""
+
+        try:
+            app = self._validate_app_ref(app_ref)
+            desired = self._google_revoker_payload(transaction_id)
+            name = str(desired["name"])
+            matches = [item for item in self._machines(app) if item.get("name") == name]
+            if len(matches) > 1:
+                return InspectState.FAILED
+            machine = matches[0] if matches else None
+            if machine is None:
+                try:
+                    machine = self._request(
+                        "POST",
+                        f"/v1/apps/{app}/machines",
+                        json=desired,
+                        allow_conflict=True,
+                    )
+                except _Conflict:
+                    matches = [
+                        item for item in self._machines(app) if item.get("name") == name
+                    ]
+                    machine = matches[0] if len(matches) == 1 else None
+            if not isinstance(machine, Mapping):
+                return InspectState.UNKNOWN
+            if not self._google_revoker_matches(machine, desired):
+                return InspectState.FAILED
+            machine_id = machine.get("id")
+            instance_id = machine.get("instance_id")
+            if not isinstance(machine_id, str) or not machine_id:
+                return InspectState.UNKNOWN
+            if not isinstance(instance_id, str) or not instance_id.isalnum():
+                return InspectState.UNKNOWN
+            self._request(
+                "GET",
+                f"/v1/apps/{app}/machines/{machine_id}/wait"
+                f"?state=stopped&instance_id={instance_id}&timeout=30",
+            )
+            observed = self._request(
+                "GET", f"/v1/apps/{app}/machines/{machine_id}"
+            )
+            if not isinstance(observed, Mapping):
+                return InspectState.UNKNOWN
+            if not self._google_revoker_matches(observed, desired):
+                return InspectState.FAILED
+            exit_state = self._google_revoke_exit(observed)
+            if exit_state is not InspectState.ABSENT:
+                return exit_state
+            self._request(
+                "DELETE", f"/v1/apps/{app}/machines/{machine_id}?force=true"
+            )
+            remaining = self._machines(app)
+            if any(
+                item.get("id") == machine_id or item.get("name") == name
+                for item in remaining
+            ):
+                return InspectState.UNKNOWN
+            return InspectState.ABSENT
+        except (OutcomeUnknown, ProviderRateLimited):
+            return InspectState.UNKNOWN
+        except (ProviderRejected, ValueError):
+            return InspectState.FAILED
 
     def _machine_payload(
         self,

@@ -160,6 +160,20 @@
         {% endfor %}
       </ul>
     </div>
+    <div id="google-oauth-panel"{% if current.public_status.get('state') not in ['oauth_required', 'dedicated_account_confirmation'] and not google_confirm %} hidden{% endif %}>
+      <h3>Connect a dedicated Google account</h3>
+      <p id="google-disclosure">Abrolia reads and sends mail only for this dedicated agent mailbox; Google data is not used to train a general model.</p>
+      <p id="google-connected"{% if not current.public_status.get('connected_address_masked') %} hidden{% endif %}>
+        Connected mailbox: <strong>{{ current.public_status.get('connected_address_masked', '') }}</strong>
+      </p>
+      <button id="google-connect" type="button"{% if current.public_status.get('state') != 'oauth_required' %} hidden{% endif %}>Continue with Google</button>
+      <label id="google-confirm-label" class="consent"{% if current.public_status.get('state') != 'dedicated_account_confirmation' and not google_confirm %} hidden{% endif %}>
+        <input id="google-dedicated" type="checkbox" required>
+        I confirm this is a separate mailbox created for the agent, not my recovery or personal account.
+      </label>
+      <button id="google-confirm" type="button"{% if current.public_status.get('state') != 'dedicated_account_confirmation' and not google_confirm %} hidden{% endif %}>Confirm dedicated mailbox</button>
+      <p id="google-status" role="status"></p>
+    </div>
     <form method="post" action="/onboarding/retry/{{ snapshot.current_step.value }}">
       {{ command_fields() }}<button id="retry-step" type="submit"{% if current.status != 'failed' %} hidden{% endif %}>Try again</button>
     </form>

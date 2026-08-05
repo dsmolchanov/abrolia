@@ -29,6 +29,13 @@ _SYNTHETIC_ID_PATTERN = (
 SYNTHETIC_EMAIL_SECRET_BINDING = "ABROLIA_EMAIL_PROVIDER_KEY"
 NERVE_EMAIL_SECRET_BINDING = "ABROLIA_NERVE_EMAIL_CREDENTIALS"
 NERVE_EMAIL_SCOPES = ("nerve:email.read", "nerve:email.send")
+GMAIL_EMAIL_SECRET_BINDING = "ABROLIA_GMAIL_OAUTH_GRANT"
+GMAIL_EMAIL_SCOPES = tuple(sorted((
+    "openid",
+    "email",
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.send",
+)))
 
 
 class EmptyEmailProviderRefs(BaseModel):
@@ -61,11 +68,18 @@ class NerveByoEmailProviderRefs(BaseModel):
     webhook_id: str = Field(pattern=_UUID_TEXT_PATTERN)
 
 
+class GmailEmailProviderRefs(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    google_subject: str = Field(min_length=1, max_length=256)
+
+
 EmailProviderRefs = (
     EmptyEmailProviderRefs
     | SyntheticEmailProviderRefs
     | NerveManagedEmailProviderRefs
     | NerveByoEmailProviderRefs
+    | GmailEmailProviderRefs
 )
 
 
@@ -180,12 +194,30 @@ class EmailPublicBinding(BaseModel):
                 raise ValueError("Nerve provider returned an invalid secret binding")
             if self.granted_scopes != NERVE_EMAIL_SCOPES:
                 raise ValueError("Nerve provider returned an invalid scope set")
-        elif not isinstance(refs, EmptyEmailProviderRefs):
-            # Gmail has no implemented adapter or provider-reference contract yet.
-            raise ValueError("Gmail provider references are not implemented")
-        elif self.secret_binding_ref is not None or self.granted_scopes:
-            raise ValueError("Gmail provider authority is not implemented")
+        elif self.provider == "gmail":
+            if not isinstance(refs, GmailEmailProviderRefs):
+                raise ValueError("Gmail provider returned an invalid reference set")
+            if self.provider_subject != refs.google_subject:
+                raise ValueError("Gmail subject does not match its reference")
+            if self.secret_binding_ref != GMAIL_EMAIL_SECRET_BINDING:
+                raise ValueError("Gmail provider returned an invalid secret binding")
+            if self.granted_scopes != GMAIL_EMAIL_SCOPES:
+                raise ValueError("Gmail provider returned an invalid scope set")
         return self
+
+    def model_post_init(self, _context: Any) -> None:
+        reject_secret_fields(self.model_dump(mode="json"))
+
+
+class EmailGoogleOAuthPublicStatus(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    state: Literal["oauth_required", "dedicated_account_confirmation"]
+    disclosure: Literal[
+        "Abrolia reads and sends mail only for this dedicated agent mailbox; "
+        "Google data is not used to train a general model."
+    ]
+    connected_address_masked: str | None = Field(default=None, max_length=320)
 
     def model_post_init(self, _context: Any) -> None:
         reject_secret_fields(self.model_dump(mode="json"))
