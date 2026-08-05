@@ -6,7 +6,11 @@ from typing import Any
 
 from control_plane.crypto import SecretMaterial
 from control_plane.email.domain_policy import canonicalize_mailbox, domain_guidance
-from control_plane.email.models import EmailOption, EmailProvisionIntent
+from control_plane.email.models import (
+    EmailDnsPublicStatus,
+    EmailOption,
+    EmailProvisionIntent,
+)
 from control_plane.providers.email.nerve_client import NerveAdminClient
 from control_plane.providers.email.nerve_managed import (
     NERVE_SCOPES,
@@ -46,6 +50,8 @@ class _ByoRefs:
 
 
 class NerveByoDomainProvisioner:
+    email_public_provider = "nerve"
+
     def __init__(self, client: NerveAdminClient) -> None:
         self.client = client
 
@@ -78,7 +84,12 @@ class NerveByoDomainProvisioner:
             public["mx_change_warning"] = (
                 "Changing apex MX may interrupt existing family mail; use a dedicated subdomain."
             )
-        return public
+        try:
+            return EmailDnsPublicStatus.model_validate(public).model_dump(
+                mode="json", exclude_none=True
+            )
+        except ValueError as error:
+            raise OutcomeUnknown("Nerve returned invalid DNS instructions") from error
 
     def _domain_and_dns(
         self, parsed: EmailProvisionIntent

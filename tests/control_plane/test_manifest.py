@@ -12,7 +12,7 @@ from control_plane.models import (
     ProviderPublicResult,
     StepKind,
 )
-from control_plane.provisioning.contracts import ProvisionResult
+from control_plane.provisioning.contracts import InspectResult, InspectState, ProvisionResult
 from control_plane.provisioning.manifest import (
     ActorsV1,
     ChannelBindingV1,
@@ -165,6 +165,36 @@ def test_manifest_and_provider_public_result_reject_secret_shaped_fields(
         )
     with pytest.raises(ValidationError, match="secret-like field"):
         _manifest(provider_refs={secret_field: secret_value})
+
+
+@pytest.mark.parametrize(
+    "secret_value",
+    (
+        "GOCSPX-" + "oauth-client-secret-canary",
+        "1" + "//refresh-token-canary-0123456789",
+        "nrv_" + "live_" + "a" * 32,
+        "a" * 64,
+    ),
+)
+def test_manifest_and_provider_result_reject_secret_values_in_allowed_channels(
+    secret_value: str,
+) -> None:
+    with pytest.raises(SecretFieldError, match="credential-like value"):
+        ProvisionResult(
+            external_ref="synthetic:email:one",
+            public_result={"provider_refs": {"email": secret_value}},
+        )
+    with pytest.raises(ValidationError, match="credential-like value"):
+        _manifest(provider_refs={"email": secret_value})
+
+
+def test_unknown_provider_error_code_is_mapped_before_it_reaches_durable_state() -> None:
+    inspected = InspectResult(
+        InspectState.FAILED,
+        error_code="GOCSPX-" + "provider-secret-canary",
+    )
+
+    assert inspected.error_code == "provider_rejected"
 
 
 def test_phase_one_input_contracts_reject_real_provider_facing_identities() -> None:

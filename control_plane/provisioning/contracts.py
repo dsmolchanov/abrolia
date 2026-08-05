@@ -6,6 +6,33 @@ from typing import Any, Protocol
 
 from control_plane.crypto import SecretMaterial, reject_secret_fields
 
+_LOCAL_PROVIDER_ERROR_CODES = frozenset({
+    "credential_recovery_unknown",
+    "fly_delete_pending",
+    "fly_delete_rejected",
+    "fly_delete_unknown",
+    "fly_exact_machine_mismatch",
+    "fly_exact_volume_mismatch",
+    "fly_inspect_rejected",
+    "fly_inspect_unknown",
+    "fly_machine_config_drift",
+    "fly_machine_failed",
+    "fly_machine_id_unknown",
+    "fly_machine_metadata_mismatch",
+    "fly_machine_volume_mismatch",
+    "fly_managed_volume_missing",
+    "fly_manifest_rejected",
+    "fly_reference_rejected",
+    "fly_unrecorded_machine_present",
+    "fly_unrecorded_volume_present",
+    "fly_volume_backup_policy_mismatch",
+    "fly_volume_id_unknown",
+    "fly_volume_inspect_unknown",
+    "fly_volume_policy_mismatch",
+    "provider_absent",
+    "provider_rejected",
+})
+
 
 class ProvisioningError(RuntimeError):
     code = "provider_error"
@@ -29,6 +56,8 @@ class ProviderWaiting(ProvisioningError):
         self.public_result = public_result or {}
         self.external_ref = external_ref
         reject_secret_fields(self.public_result)
+        if external_ref is not None:
+            reject_secret_fields({"external_ref": external_ref})
 
 
 class ProviderRateLimited(ProvisioningError):
@@ -60,6 +89,7 @@ class ProvisionResult:
     )
 
     def __post_init__(self) -> None:
+        reject_secret_fields({"external_ref": self.external_ref})
         reject_secret_fields(self.public_result)
 
 
@@ -72,6 +102,8 @@ class InspectResult:
 
     def __post_init__(self) -> None:
         reject_secret_fields(self.public_result)
+        if self.error_code is not None and self.error_code not in _LOCAL_PROVIDER_ERROR_CODES:
+            object.__setattr__(self, "error_code", "provider_rejected")
 
 
 @dataclass(frozen=True)
@@ -104,6 +136,10 @@ class RuntimeProvisioner(Provisioner, Protocol):
         prepared: ProvisionResult,
         idempotency_key: str,
     ) -> ProvisionResult: ...
+
+    def deprovision_runtime(self, external_ref: Any) -> InspectResult:
+        """Remove runtime workload while preserving its secret namespace."""
+        ...
 
 
 class SecretSink(Protocol):

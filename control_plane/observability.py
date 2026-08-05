@@ -10,7 +10,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, TextIO
 
-from control_plane.crypto import reject_secret_fields
+from control_plane.crypto import SecretFieldError, reject_secret_fields
 from control_plane.db import ControlPlaneDatabase
 
 ALLOWED_FIELDS = frozenset({
@@ -41,7 +41,10 @@ def safe_event(event: str, **fields: Any) -> dict[str, Any]:
     unknown = set(payload) - ALLOWED_FIELDS
     if unknown:
         raise UnsafeTelemetry(f"telemetry field is not allowlisted: {sorted(unknown)[0]}")
-    reject_secret_fields(payload)
+    try:
+        reject_secret_fields(payload)
+    except SecretFieldError as error:
+        raise UnsafeTelemetry("telemetry resembles credential material") from error
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     if PII_PATTERN.search(encoded):
         raise UnsafeTelemetry("telemetry resembles PII or credential material")

@@ -712,8 +712,23 @@ class FlyRuntimeProvisioner:
             )
         return InspectResult(InspectState.PENDING)
 
+    def deprovision_runtime(
+        self, exact_ref: str | ProvisionResult | Mapping[str, Any]
+    ) -> InspectResult:
+        """Delete Machine/volume while preserving the app secret namespace."""
+
+        return self._deprovision(exact_ref, delete_app=False)
+
     def deprovision(
         self, exact_ref: str | ProvisionResult | Mapping[str, Any]
+    ) -> InspectResult:
+        return self._deprovision(exact_ref, delete_app=True)
+
+    def _deprovision(
+        self,
+        exact_ref: str | ProvisionResult | Mapping[str, Any],
+        *,
+        delete_app: bool,
     ) -> InspectResult:
         try:
             target = self._target(exact_ref)
@@ -801,6 +816,9 @@ class FlyRuntimeProvisioner:
                 return InspectResult(
                     InspectState.FAILED, error_code="fly_unrecorded_volume_present"
                 )
+
+            if not delete_app:
+                return InspectResult(InspectState.ABSENT)
 
             self._request(
                 "DELETE", f"/v1/apps/{target.app_ref}", allow_not_found=True

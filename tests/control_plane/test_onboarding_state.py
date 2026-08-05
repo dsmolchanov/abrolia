@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from control_plane.email.models import EmailIdentityStatus
 from control_plane.models import StepKind, StepStatus, WorkflowState
 from control_plane.onboarding.contracts import (
     IdempotencyConflict,
@@ -212,6 +213,8 @@ def test_cancel_only_cancels_intents_that_never_crossed_provider_boundary(
     job = cp_stack.database.query_one(
         "SELECT id FROM provisioning_jobs WHERE kind = 'email_identity'"
     )
+    identity = cp_stack.email_identities.current_for_household(cp_stack.household.id)
+    assert identity is not None
     with cp_stack.database.write() as connection:
         connection.execute(
             "UPDATE provisioning_jobs SET status = ?, leased_by = ?, lease_until = ?"
@@ -240,6 +243,17 @@ def test_cancel_only_cancels_intents_that_never_crossed_provider_boundary(
     assert current["error_code"] == expected_error
     assert current["leased_by"] is None and current["lease_until"] is None
     assert cp_stack.jobs.request(job["id"])["selection"] == EMAIL_SELECTION
+    stored_identity = cp_stack.email_identities.get(identity.id)
+    reservation = cp_stack.database.query_one(
+        "SELECT status FROM email_address_reservations WHERE email_identity_id = ?",
+        (identity.id,),
+    )
+    if starting_status == "pending":
+        assert stored_identity.status is EmailIdentityStatus.DELETED
+        assert reservation["status"] == "released"
+    else:
+        assert stored_identity.status is EmailIdentityStatus.DISCONNECTING
+        assert reservation["status"] == "held"
 
 
 def test_failed_provider_attempt_has_a_new_explicit_retry_intent(cp_stack) -> None:
@@ -379,6 +393,13 @@ def test_reset_email_cancels_and_clears_all_downstream_state(cp_stack) -> None:
     assert len(cp_stack.database.query(
         "SELECT id FROM provisioning_jobs WHERE kind = 'cleanup' AND status = 'pending'"
     )) == 3
+    cleanup_jobs = cp_stack.database.query(
+        "SELECT id FROM provisioning_jobs WHERE kind = 'cleanup' AND status = 'pending'"
+        " ORDER BY created_at, id"
+    )
+    assert [
+        cp_stack.jobs.request(job["id"])["resource_type"] for job in cleanup_jobs
+    ] == ["email_identity", "whatsapp_identity", "channel_binding"]
     assert cp_stack.database.query_one(
         "SELECT status FROM provisioning_jobs WHERE kind = 'runtime'"
         " AND operation = 'ensure_runtime'"

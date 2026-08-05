@@ -15,8 +15,16 @@ from control_plane.provisioning.contracts import (
     OutcomeUnknown,
     ProviderRegistry,
     ProviderWaiting,
+    ProvisionResult,
 )
 from control_plane.provisioning.secrets import InMemorySecretSink
+
+ORG_ID = "00000000-0000-4000-8000-000000000001"
+GRANT_ID = "00000000-0000-4000-8000-000000000002"
+INBOX_ID = "00000000-0000-4000-8000-000000000003"
+KEY_ID = "00000000-0000-4000-8000-000000000004"
+OLD_KEY_ID = "00000000-0000-4000-8000-000000000005"
+WEBHOOK_ID = "00000000-0000-4000-8000-000000000006"
 
 
 class FakeNerveAdmin:
@@ -34,18 +42,18 @@ class FakeNerveAdmin:
         self.key_calls = 0
         self.deleted: list[tuple[str, str | None]] = []
         self.grants = [
-            {"id": "grant-1", "external_ref": "arbolia:email:identity-1:grant"}
+            {"id": GRANT_ID, "external_ref": "arbolia:email:identity-1:grant"}
         ]
         self.inboxes = [{
-            "id": "inbox-1",
+            "id": INBOX_ID,
             "address": "family-agent@" + "abrolia.com",
             "external_ref": "arbolia:email:identity-1:inbox",
         }]
         self.keys = [
-            {"id": "key-old", "external_ref": "arbolia:email:identity-1:key"}
+            {"id": OLD_KEY_ID, "external_ref": "arbolia:email:identity-1:key"}
         ]
         self.webhooks = [{
-            "id": "webhook-1",
+            "id": WEBHOOK_ID,
             "external_ref": "arbolia:email:identity-1:webhook",
         }]
 
@@ -55,20 +63,20 @@ class FakeNerveAdmin:
         items.append(value)
 
     def ensure_org(self, *, household_id):
-        return {"org_id": f"org-{household_id}"}
+        return {"org_id": ORG_ID}
 
     def get_org(self, *, household_id):
-        return {"org_id": f"org-{household_id}"}
+        return {"org_id": ORG_ID}
 
     def ensure_grant(self, *, org_id, external_ref):
-        result = {"id": "grant-1", "external_ref": external_ref}
+        result = {"id": GRANT_ID, "external_ref": external_ref}
         self._replace(self.grants, result)
         return result
 
     def ensure_inbox(self, *, org_id, address, external_ref):
         result = {
             "inbox": {
-                "id": "inbox-1",
+                "id": INBOX_ID,
                 "address": address,
                 "external_ref": external_ref,
             }
@@ -80,14 +88,14 @@ class FakeNerveAdmin:
         self.key_calls += 1
         if self.replay_credentials and self.key_calls == 1:
             result = {
-                "id": "key-old",
+                "id": OLD_KEY_ID,
                 "external_ref": external_ref,
                 "secret_available": False,
             }
             self._replace(self.keys, result)
             return result
         result = {
-            "id": "key-1",
+            "id": KEY_ID,
             "key": "synthetic-nerve-key",
             "external_ref": external_ref,
             "secret_available": True,
@@ -97,7 +105,7 @@ class FakeNerveAdmin:
 
     def ensure_webhook(self, *, org_id, url, external_ref):
         result = {
-            "id": "webhook-1",
+            "id": WEBHOOK_ID,
             "external_ref": external_ref,
             "url": url,
             "secret_available": not self.replay_credentials,
@@ -179,7 +187,7 @@ def test_managed_provider_builds_isolated_resources_and_one_secret_bundle() -> N
     assert "synthetic-nerve-key" not in result.external_ref
     assert "synthetic-signing-key" not in repr(result.public_result)
     assert client.attachment_probe_calls == [
-        ("synthetic-nerve-key", "org-household-1")
+        ("synthetic-nerve-key", ORG_ID)
     ]
 
 
@@ -194,14 +202,14 @@ def test_managed_provider_waits_for_audited_attachment_activation() -> None:
     assert raised.value.code == "nerve_attachment_flag_pending"
     assert raised.value.public_result == {
         "readiness": "attachments_flag_pending",
-        "nerve_org_id": "org-household-1",
+        "nerve_org_id": ORG_ID,
         "operator_action": {
             "tool": "nerve-flags",
             "arguments": [
                 "set",
                 "attachments",
                 "--org",
-                "org-household-1",
+                ORG_ID,
                 "--enabled=true",
             ],
             "audit_actor_required": True,
@@ -228,7 +236,7 @@ def test_managed_provider_converges_from_flag_off_to_ready() -> None:
     assert not inspected.result.secret_material.is_empty
     assert client.attachment_probe_calls[-1] == (
         "synthetic-nerve-key",
-        "org-household-1",
+        ORG_ID,
     )
 
 
@@ -252,7 +260,7 @@ def test_replayed_one_time_credentials_are_revoked_or_rotated() -> None:
     bundle = json.loads(bytes(result.secret_material.items()[0][1]))
     assert bundle["api_key"] == "synthetic-nerve-key"
     assert bundle["webhook_signing_key"] == "synthetic-rotated-signing-key"
-    assert ("/v1/keys/key-old", "org-household-1") in client.deleted
+    assert (f"/v1/keys/{OLD_KEY_ID}", ORG_ID) in client.deleted
     assert client.key_calls == 2
 
 
@@ -265,7 +273,7 @@ def test_reconcile_rotates_credentials_before_returning_ready() -> None:
     assert inspected.state is InspectState.READY
     assert inspected.result is not None
     assert not inspected.result.secret_material.is_empty
-    assert ("/v1/keys/key-old", "org-household-1") in client.deleted
+    assert (f"/v1/keys/{OLD_KEY_ID}", ORG_ID) in client.deleted
 
 
 def test_cleanup_never_deletes_shared_platform_domain() -> None:
@@ -280,11 +288,11 @@ def test_cleanup_never_deletes_shared_platform_domain() -> None:
     assert cleaned.state is InspectState.ABSENT
     paths = [path for path, _ in client.deleted]
     assert paths == [
-        "/v1/webhooks/webhook-1",
-        "/v1/keys/key-1",
-        "/v1/inboxes/inbox-1",
-        "/v1/domain-grants/grant-1",
-        "/v1/orgs/org-household-1",
+        f"/v1/webhooks/{WEBHOOK_ID}",
+        f"/v1/keys/{KEY_ID}",
+        f"/v1/inboxes/{INBOX_ID}",
+        f"/v1/domain-grants/{GRANT_ID}",
+        f"/v1/orgs/{ORG_ID}",
     ]
     assert all("domains" not in path for path in paths)
 
@@ -359,7 +367,7 @@ def test_worker_keeps_onboarding_pending_until_attachment_flag_converges(
     snapshot = cp_stack.onboarding.snapshot(cp_stack.household.id)
     step = next(step for step in snapshot.steps if step.kind is StepKind.EMAIL)
     assert step.public_status["readiness"] == "attachments_flag_pending"
-    assert step.public_status["nerve_org_id"] == f"org-{cp_stack.household.id}"
+    assert step.public_status["nerve_org_id"] == ORG_ID
     namespace = cp_stack.database.query_one(
         "SELECT id, external_id_ciphertext, encryption_key_version"
         " FROM external_resources WHERE resource_type = 'secret_namespace'"
@@ -411,3 +419,39 @@ def test_worker_reconciles_lost_create_response_from_durable_intent(cp_stack) ->
     assert client.inbox_calls == 2
     identity = cp_stack.email_identities.current_for_household(cp_stack.household.id)
     assert identity is not None and identity.address == "family-agent@" + "abrolia.com"
+
+
+def test_worker_rejects_duplicate_key_noncanonical_nerve_reference(cp_stack) -> None:
+    cp_stack.complete_profile()
+    cp_stack.service.email_provider = "nerve-managed"
+    cp_stack.service.select(
+        cp_stack.household.id,
+        StepKind.EMAIL,
+        {"kind": "abrolia_managed", "local_part": "family-agent"},
+        context=cp_stack.context(),
+    )
+
+    class DuplicateKeyReferenceProvisioner(NerveManagedEmailProvisioner):
+        def _result(self, refs, *, secret=None):
+            result = super()._result(refs, secret=secret)
+            duplicate = (
+                '{"org_id":"short-lived-provider-password",'
+                + result.external_ref[1:]
+            )
+            return ProvisionResult(
+                external_ref=duplicate,
+                public_result=result.public_result,
+                secret_material=result.secret_material,
+            )
+
+    registry = ProviderRegistry()
+    registry.register(
+        "nerve-managed", DuplicateKeyReferenceProvisioner(FakeNerveAdmin())
+    )
+
+    failed = cp_stack.make_worker(
+        providers=registry, secret_sink=InMemorySecretSink()
+    ).run_once()
+
+    assert failed.status == "outcome_unknown"
+    assert failed.error_code == "outcome_unknown"

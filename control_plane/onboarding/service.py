@@ -694,8 +694,9 @@ class OnboardingService:
             "SELECT * FROM external_resources WHERE household_id = ?"
             " AND status IN ('creating','ready','outcome_unknown')"
             " ORDER BY CASE resource_type"
-            " WHEN 'runtime' THEN 4 WHEN 'channel_binding' THEN 3"
-            " WHEN 'whatsapp_identity' THEN 2 WHEN 'email_identity' THEN 1"
+            " WHEN 'email_identity' THEN 5 WHEN 'whatsapp_identity' THEN 4"
+            " WHEN 'channel_binding' THEN 3 WHEN 'runtime' THEN 2"
+            " WHEN 'secret_namespace' THEN 1"
             " ELSE 0 END DESC, created_at DESC, id DESC",
             (household_id,),
         ).fetchall()
@@ -704,6 +705,17 @@ class OnboardingService:
             for resource in resources
             if resource_types is None or resource["resource_type"] in resource_types
         ]
+        email_identity = connection.execute(
+            "SELECT id FROM email_identities WHERE household_id = ?"
+            " AND status != 'deleted' ORDER BY created_at DESC LIMIT 1",
+            (household_id,),
+        ).fetchone()
+        waiting_email_job = connection.execute(
+            "SELECT id FROM provisioning_jobs WHERE household_id = ?"
+            " AND kind = 'email_identity' AND status = 'waiting_user'"
+            " ORDER BY created_at DESC, id DESC LIMIT 1",
+            (household_id,),
+        ).fetchone()
         for sequence, resource in enumerate(resources):
             external_ref = self.jobs.decrypt_json(
                 "external_resources",
@@ -712,6 +724,15 @@ class OnboardingService:
                 resource["external_id_ciphertext"],
                 resource["encryption_key_version"],
             )
+            request = {
+                "resource_id": resource["id"],
+                "resource_type": resource["resource_type"],
+                "external_ref": external_ref,
+            }
+            if resource["resource_type"] == "email_identity" and email_identity:
+                request["email_identity_id"] = email_identity["id"]
+                if waiting_email_job is not None:
+                    request["parent_job_id"] = waiting_email_job["id"]
             job_id, _ = self.jobs.create(
                 connection,
                 household_id=household_id,
@@ -721,11 +742,7 @@ class OnboardingService:
                 intent_key=(
                     f"{household_id}:cleanup:{resource['id']}:{workflow_version}"
                 ),
-                request={
-                    "resource_id": resource["id"],
-                    "resource_type": resource["resource_type"],
-                    "external_ref": external_ref,
-                },
+                request=request,
                 provider=resource["provider"],
                 now=now + sequence * 0.000001,
             )
@@ -763,6 +780,22 @@ class OnboardingService:
             " AND status IN ('running','waiting_user')"
             " AND kind NOT IN ('cleanup','bootstrap_cleanup')",
             (now, now, f"{reason}_requires_reconciliation", household_id),
+        )
+
+    def _finish_safe_email_disconnect(
+        self, connection, household_id: str, *, now: float
+    ) -> None:
+        if self.email_identities is None:
+            return
+        identity = connection.execute(
+            "SELECT id FROM email_identities WHERE household_id = ?"
+            " AND status = 'disconnecting' ORDER BY created_at DESC LIMIT 1",
+            (household_id,),
+        ).fetchone()
+        if identity is None:
+            return
+        self.email_identities.repository.finish_disconnect(
+            connection, identity["id"], now=now
         )
 
     def reset_from(
@@ -830,6 +863,9 @@ class OnboardingService:
             )
             if kind is StepKind.EMAIL and self.email_identities is not None:
                 self.email_identities.repository.begin_disconnect(
+                    connection, household_id, now=now
+                )
+                self._finish_safe_email_disconnect(
                     connection, household_id, now=now
                 )
             for index, downstream in enumerate(order[start:]):
@@ -929,6 +965,9 @@ class OnboardingService:
             )
             if self.email_identities is not None:
                 self.email_identities.repository.begin_disconnect(
+                    connection, household_id, now=now
+                )
+                self._finish_safe_email_disconnect(
                     connection, household_id, now=now
                 )
             connection.execute(

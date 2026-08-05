@@ -74,6 +74,32 @@ def test_recursive_secret_field_validator_rejects_every_depth(payload: object) -
         canonical_json(payload)
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"error_code": "GOCSPX-" + "provider-secret-canary"},
+        {"external_ref": "GOCSPX-" + "provider-secret-canary"},
+        {"provider_refs": {"email": "1" + "//refresh-token-canary-0123456789"}},
+        {"provider_binding_ref": "a" * 64},
+        {"public_result": {"opaque": "nrv_" + "live_" + "a" * 32}},
+        {"provider_refs": {"webhook": "a" * 64}},
+        {"external_ref": json.dumps({"id": "a" * 64})},
+        {"secret_binding_ref": "GOCSPX-" + "provider-secret-canary"},
+    ],
+)
+def test_secret_value_validator_rejects_credentials_in_allowed_fields(
+    payload: object,
+) -> None:
+    with pytest.raises(
+        SecretFieldError, match="credential-like value|invalid secret binding reference"
+    ):
+        reject_secret_fields(payload)
+    with pytest.raises(
+        SecretFieldError, match="credential-like value|invalid secret binding reference"
+    ):
+        canonical_json(payload)
+
+
 def test_canonical_json_is_stable_and_strict() -> None:
     first = canonical_json({"z": [2, 1], "a": {"b": "✓"}})
     second = canonical_json({"a": {"b": "✓"}, "z": [2, 1]})
