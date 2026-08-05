@@ -14,6 +14,7 @@ from control_plane.api.dependencies import (
     require_origin,
     require_private_mutation,
 )
+from control_plane.auth.mailer import MailDeliveryError
 from control_plane.auth.rate_limit import RateLimitExceeded
 from control_plane.auth.sessions import SESSION_ABSOLUTE_TTL_SECONDS
 from control_plane.repositories.auth import InvalidCredential
@@ -67,7 +68,7 @@ def request_link(payload: LinkRequest, request: Request) -> dict[str, str]:
             "request-link-address", payload.email, limit=5, window_seconds=3600
         )
         issue_requested_link(request, payload.email)
-    except (RateLimitExceeded, ValueError):
+    except (MailDeliveryError, RateLimitExceeded, ValueError):
         # The public response deliberately does not reveal address eligibility,
         # account existence, or whether a synthetic message was emitted.
         pass

@@ -76,7 +76,8 @@ children. See our minors policy for detail.
 |---|---|---|
 | Anthropic | the model that reads the email text | US / global |
 | Fly.io | metadata-only control plane, dedicated runtime, databases/secrets, and future shared-WA gateway | Netherlands (EU); provider control plane in the US |
-| Nerve + Resend | `@abrolia.com` or family-domain agent inbox and delivery (email a/c) | US |
+| Resend | account magic-link delivery; delivery for Nerve-managed inboxes | US |
+| Nerve | `@abrolia.com` or family-domain agent inbox (email a/c) | US |
 | Google | calendar; a separate agent Gmail through OAuth only for email option b | global |
 | Telegram / WhatsApp | chosen communication channels; WhatsApp shared/dedicated are separate Beta modes | outside the EU |
 | Web Push provider | optional Abrolia Web push; not yet selected and disabled | TBD |

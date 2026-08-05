@@ -7,6 +7,7 @@ primary_region = "ams"
 [env]
   ABROLIA_CONTROL_PLANE_DB = "/data/control-plane.db"
   ABROLIA_PUBLIC_ORIGIN = "https://app.abrolia.com"
+  ABROLIA_MAGIC_LINK_DELIVERY_ENABLED = "0"
   ABROLIA_RUNTIME_PROVIDER = "fly-runtime"
   ABROLIA_SYNTHETIC_ONLY = "1"
   REAL_FAMILY_DATA_ENABLED = "0"

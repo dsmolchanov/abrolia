@@ -4,7 +4,7 @@ import secrets
 import time
 from dataclasses import dataclass
 
-from control_plane.auth.mailer import Mailer, require_test_recipient
+from control_plane.auth.mailer import Mailer
 from control_plane.repositories.auth import AuthRepository
 
 MAGIC_LINK_TTL_SECONDS = 15 * 60
@@ -30,7 +30,7 @@ class MagicLinkService:
         account_id: str | None = None,
         now: float | None = None,
     ) -> IssuedMagicLink:
-        require_test_recipient(email)
+        self.mailer.validate_recipient(email)
         now = time.time() if now is None else now
         token = secrets.token_urlsafe(32)
         expires_at = now + MAGIC_LINK_TTL_SECONDS

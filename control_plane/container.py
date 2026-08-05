@@ -6,7 +6,7 @@ import sys
 from dataclasses import dataclass
 from typing import Any
 
-from control_plane.auth.mailer import Mailer, MemoryMailer
+from control_plane.auth.mailer import Mailer, MemoryMailer, ResendMailer
 from control_plane.auth.rate_limit import RateLimiter
 from control_plane.auth.sessions import SessionService
 from control_plane.auth.tokens import MagicLinkService
@@ -109,7 +109,18 @@ class ControlPlaneContainer:
         email_identities = EmailIdentityRepository(database, cipher, lookup)
         email_identity_service = EmailIdentityService(email_identities)
         sessions = SessionService(auth)
-        magic_links = MagicLinkService(auth, mailer or MemoryMailer(), config.public_origin)
+        if mailer is None:
+            mailer = (
+                ResendMailer(
+                    api_key=config.resend_api_key,
+                    sender=config.magic_link_from,
+                )
+                if config.magic_link_delivery_enabled
+                and config.resend_api_key
+                and config.magic_link_from
+                else MemoryMailer()
+            )
+        magic_links = MagicLinkService(auth, mailer, config.public_origin)
         account_service = AccountService(auth, accounts, households, sessions)
         household_service = HouseholdService(households)
         rate_limiter = RateLimiter(database, lookup)

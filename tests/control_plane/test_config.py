@@ -6,6 +6,8 @@ import pytest
 
 from control_plane.config import ConfigurationError, ControlPlaneConfig
 
+LOGIN_FROM = "login@" + "abrolia.com"
+
 
 def _encoded(byte: int) -> str:
     return base64.urlsafe_b64encode(bytes([byte]) * 32).decode().rstrip("=")
@@ -30,6 +32,48 @@ def test_production_defaults_are_visibly_synthetic_and_real_providers_off() -> N
     assert not config.real_whatsapp_enabled
     assert not config.real_channel_enabled
     assert config.runtime_provider == "dry-run-runtime"
+    assert not config.magic_link_delivery_enabled
+    assert config.resend_api_key is None
+    assert config.magic_link_from is None
+
+
+def test_production_magic_link_mailer_requires_complete_secret_configuration() -> None:
+    with pytest.raises(ConfigurationError, match="mailer configuration is incomplete"):
+        ControlPlaneConfig.from_env(
+            _production_env(
+                ABROLIA_MAGIC_LINK_DELIVERY_ENABLED="1",
+                ABROLIA_RESEND_API_KEY="re_secret-canary",
+            )
+        )
+    with pytest.raises(ConfigurationError, match="mailer configuration is incomplete"):
+        ControlPlaneConfig.from_env(
+            _production_env(
+                ABROLIA_MAGIC_LINK_DELIVERY_ENABLED="1",
+                ABROLIA_MAGIC_LINK_FROM=LOGIN_FROM,
+            )
+        )
+
+    config = ControlPlaneConfig.from_env(
+        _production_env(
+            ABROLIA_RESEND_API_KEY="re_secret-canary",
+            ABROLIA_MAGIC_LINK_FROM=f"Abrolia <{LOGIN_FROM}>",
+            ABROLIA_MAGIC_LINK_DELIVERY_ENABLED="1",
+        )
+    )
+
+    assert config.magic_link_from == f"Abrolia <{LOGIN_FROM}>"
+    assert config.magic_link_delivery_enabled
+    assert "re_secret-canary" not in repr(config)
+
+
+def test_production_magic_link_sender_rejects_header_injection() -> None:
+    with pytest.raises(ConfigurationError, match="invalid characters"):
+        ControlPlaneConfig.from_env(
+            _production_env(
+                ABROLIA_RESEND_API_KEY="re_secret-canary",
+                ABROLIA_MAGIC_LINK_FROM=LOGIN_FROM + "\nBcc: attacker@example.com",
+            )
+        )
 
 
 @pytest.mark.parametrize(
