@@ -12,6 +12,7 @@ from control_plane.provisioning.contracts import (
     InspectState,
     OutcomeUnknown,
     ProviderRejected,
+    ProviderWaiting,
     ProvisionResult,
 )
 
@@ -26,9 +27,9 @@ class _Refs:
     org_id: str
     grant_id: str
     inbox_id: str
-    key_id: str
-    webhook_id: str
-    address: str
+    key_id: str = ""
+    webhook_id: str = ""
+    address: str = ""
 
     def encode(self) -> str:
         return json.dumps(self.__dict__, sort_keys=True, separators=(",", ":"))
@@ -78,24 +79,46 @@ class NerveManagedEmailProvisioner:
         inbox = inbox_envelope.get("inbox", inbox_envelope)
         key_ref = self._resource_ref(parsed.identity_id, "key")
         key = self.client.issue_key(org_id=org_id, external_ref=key_ref)
+        if not key.get("secret_available") or not key.get("key"):
+            self.client.delete(f"/v1/keys/{key.get('id', '')}", org_id=org_id)
+            key = self.client.issue_key(
+                org_id=org_id, external_ref=f"{key_ref}:recovery"
+            )
+        if not key.get("secret_available") or not key.get("key"):
+            raise OutcomeUnknown("Nerve key recovery lost one-time credential")
+        if not self.client.probe_attachment_readiness(
+            org_id=org_id, runtime_key=str(key["key"])
+        ):
+            self.client.delete(f"/v1/keys/{key.get('id', '')}", org_id=org_id)
+            refs = _Refs(
+                household_id=parsed.household_id,
+                stable_ref=idempotency_key,
+                org_id=org_id,
+                grant_id=str(grant.get("id", "")),
+                inbox_id=str(inbox.get("id", "")),
+                address=str(inbox.get("address", address)),
+            )
+            raise ProviderWaiting(
+                "Nerve attachment activation is required",
+                public_result={
+                    "state": "attachment_activation_required",
+                    "provider": "nerve",
+                    "provider_subject": org_id,
+                    "attachment_capability": "pending",
+                },
+                external_ref=refs.encode(),
+            )
         webhook_ref = self._resource_ref(parsed.identity_id, "webhook")
         webhook = self.client.ensure_webhook(
             org_id=org_id,
             url=f"https://{parsed.secret_namespace_ref}.fly.dev/v1/email/nerve/webhook",
             external_ref=webhook_ref,
         )
-        if not key.get("secret_available") or not key.get("key"):
-            self.client.delete(f"/v1/keys/{key.get('id', '')}", org_id=org_id)
-            key = self.client.issue_key(
-                org_id=org_id, external_ref=f"{key_ref}:recovery"
-            )
         if not webhook.get("secret_available") or not webhook.get("secret"):
             webhook = self.client.rotate_webhook(
                 org_id=org_id, webhook_id=str(webhook.get("id", ""))
             )
             webhook["secret_available"] = bool(webhook.get("secret"))
-        if not key.get("secret_available") or not key.get("key"):
-            raise OutcomeUnknown("Nerve key recovery lost one-time credential")
         if not webhook.get("secret_available") or not webhook.get("secret"):
             raise OutcomeUnknown("Nerve webhook recovery lost one-time credential")
         refs = _Refs(
@@ -123,6 +146,25 @@ class NerveManagedEmailProvisioner:
         """Resume the idempotent graph using the original durable intent."""
         return self.ensure(intent, idempotency_key)
 
+    def inspect_intent(self, request: dict[str, Any], stable_ref: str) -> InspectResult:
+        """Re-run the tenant probe for a user-requested readiness check."""
+        intent = {
+            "identity_id": request["email_identity_id"],
+            "household_id": request["household_id"],
+            "option": request["option"],
+            "selection": request["selection"],
+            "secret_namespace_ref": request["secret_namespace_ref"],
+        }
+        try:
+            return InspectResult(
+                InspectState.READY, self.ensure(intent, stable_ref)
+            )
+        except ProviderWaiting as error:
+            return InspectResult(
+                InspectState.PENDING,
+                public_result=error.public_result,
+            )
+
     def _result(self, refs: _Refs, *, secret: str | None = None) -> ProvisionResult:
         return ProvisionResult(
             external_ref=refs.encode(),
@@ -139,6 +181,7 @@ class NerveManagedEmailProvisioner:
                 },
                 "secret_binding_ref": NERVE_SECRET_BINDING,
                 "granted_scopes": list(NERVE_SCOPES),
+                "attachment_capability": "ready",
                 "masked_external_ref": refs.inbox_id[-8:],
             },
             secret_material=(
@@ -152,6 +195,20 @@ class NerveManagedEmailProvisioner:
         if stable_ref.startswith("{"):
             refs = _Refs.decode(stable_ref)
             org = self.client.get_org(household_id=refs.household_id)
+            if not refs.key_id or not refs.webhook_id:
+                return (
+                    InspectResult(
+                        InspectState.PENDING,
+                        public_result={
+                            "state": "attachment_activation_required",
+                            "provider": "nerve",
+                            "provider_subject": refs.org_id,
+                            "attachment_capability": "pending",
+                        },
+                    )
+                    if org.get("org_id") == refs.org_id
+                    else InspectResult(InspectState.ABSENT)
+                )
             return (
                 InspectResult(InspectState.READY, self._result(refs))
                 if org.get("org_id") == refs.org_id
@@ -220,9 +277,13 @@ class NerveManagedEmailProvisioner:
 
     def deprovision(self, external_ref: str) -> InspectResult:
         refs = _Refs.decode(external_ref)
-        self.client.delete(f"/v1/webhooks/{refs.webhook_id}", org_id=refs.org_id)
-        self.client.delete(f"/v1/keys/{refs.key_id}", org_id=refs.org_id)
-        self.client.delete(f"/v1/inboxes/{refs.inbox_id}", org_id=refs.org_id)
-        self.client.delete(f"/v1/domain-grants/{refs.grant_id}")
+        if refs.webhook_id:
+            self.client.delete(f"/v1/webhooks/{refs.webhook_id}", org_id=refs.org_id)
+        if refs.key_id:
+            self.client.delete(f"/v1/keys/{refs.key_id}", org_id=refs.org_id)
+        if refs.inbox_id:
+            self.client.delete(f"/v1/inboxes/{refs.inbox_id}", org_id=refs.org_id)
+        if refs.grant_id:
+            self.client.delete(f"/v1/domain-grants/{refs.grant_id}")
         self.client.delete(f"/v1/orgs/{refs.org_id}")
         return InspectResult(InspectState.ABSENT)

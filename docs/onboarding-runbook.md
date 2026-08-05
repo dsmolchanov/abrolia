@@ -112,6 +112,30 @@ abrolia-control-plane reconcile <exact-job-id>
 abrolia-control-plane retention
 ```
 
+### Managed Nerve attachment activation
+
+Managed Nerve email stays `waiting_user` after the household org, domain grant,
+and inbox exist until the org-scoped `attachments` flag resolves to `true` for
+that household's runtime key. The control plane does not expose a bootstrap
+writer and does not treat an admin-authenticated lookup as readiness.
+
+Read `provider_subject` from the redacted email step status, set the Nerve
+control-plane Fly app, and run the audited upstream writer:
+
+```bash
+NERVE_CONTROL_PLANE_APP=<nerve-control-plane-app> \
+  scripts/activate_nerve_attachments.sh <household-org-uuid> <operator-actor>
+```
+
+The command requires an explicit actor and returns Nerve's audit `replay_id`.
+Keep that redacted command result in the operator change record. Wait at least
+65 seconds (`2 × 30s` resolver TTL plus 5 seconds), then use the normal email
+check/resume action. Abrolia issues a household-scoped runtime key and probes
+`GET /internal/feature-flags/attachments` with `X-Nerve-Cloud-Key`; it proceeds
+only when `flag`, `org_id`, `enabled=true`, and `cache_ttl_seconds=30` all match.
+HTTP, authentication, transport, JSON, or identity mismatches remain
+`outcome_unknown`; `enabled=false` remains resumable `waiting_user`.
+
 `reconcile` is required for `outcome_unknown`; never use `worker` as a blind
 retry. Cleanup and deprovision act only on exact registry IDs, never globs or
 prefix scans.

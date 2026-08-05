@@ -79,6 +79,34 @@ class NerveAdminClient:
             raise OutcomeUnknown("Nerve returned an unexpected response")
         return payload
 
+    def probe_attachment_readiness(
+        self, *, org_id: str, runtime_key: str
+    ) -> bool:
+        """Resolve the attachment gate as the household runtime principal."""
+        try:
+            response = self.client.get(
+                f"{self.settings.base_url.rstrip('/')}/internal/feature-flags/attachments",
+                headers={"X-Nerve-Cloud-Key": runtime_key},
+            )
+        except (httpx.TimeoutException, httpx.TransportError) as error:
+            raise OutcomeUnknown("Nerve attachment readiness probe failed") from error
+        if response.status_code != 200:
+            raise OutcomeUnknown("Nerve attachment readiness probe failed")
+        try:
+            payload = response.json()
+        except ValueError as error:
+            raise OutcomeUnknown("Nerve attachment readiness probe was unreadable") from error
+        if not isinstance(payload, dict):
+            raise OutcomeUnknown("Nerve attachment readiness probe was invalid")
+        if (
+            payload.get("flag") != "attachments"
+            or payload.get("org_id") != org_id
+            or not isinstance(payload.get("enabled"), bool)
+            or payload.get("cache_ttl_seconds") != 30
+        ):
+            raise OutcomeUnknown("Nerve attachment readiness probe was invalid")
+        return payload["enabled"]
+
     def ensure_org(self, *, household_id: str) -> dict[str, Any]:
         return self.request(
             "POST",

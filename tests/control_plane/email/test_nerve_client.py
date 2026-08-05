@@ -81,3 +81,66 @@ def test_client_preserves_bounded_rate_limit_hint() -> None:
         client.ensure_org(household_id="household-1")
 
     assert raised.value.retry_after == 7
+
+
+def test_attachment_probe_uses_runtime_key_and_validates_effective_state() -> None:
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured["runtime_key"] = request.headers["X-Nerve-Cloud-Key"]
+        captured["admin_key"] = request.headers.get("X-API-Key")
+        return httpx.Response(
+            200,
+            json={
+                "flag": "attachments",
+                "org_id": "household-org",
+                "enabled": True,
+                "cache_ttl_seconds": 30,
+            },
+        )
+
+    enabled = _client(handler).probe_attachment_readiness(
+        org_id="household-org", runtime_key="synthetic-runtime-key"
+    )
+
+    assert enabled is True
+    assert captured == {
+        "path": "/internal/feature-flags/attachments",
+        "runtime_key": "synthetic-runtime-key",
+        "admin_key": None,
+    }
+
+
+@pytest.mark.parametrize(
+    "response",
+    (
+        httpx.Response(503),
+        httpx.Response(200, content=b"not-json"),
+        httpx.Response(
+            200,
+            json={
+                "flag": "attachments",
+                "org_id": "another-org",
+                "enabled": True,
+                "cache_ttl_seconds": 30,
+            },
+        ),
+        httpx.Response(
+            200,
+            json={
+                "flag": "attachments",
+                "org_id": "household-org",
+                "enabled": "true",
+                "cache_ttl_seconds": 30,
+            },
+        ),
+    ),
+)
+def test_attachment_probe_failures_are_outcome_unknown(response) -> None:
+    client = _client(lambda request: response)
+
+    with pytest.raises(OutcomeUnknown):
+        client.probe_attachment_readiness(
+            org_id="household-org", runtime_key="synthetic-runtime-key"
+        )

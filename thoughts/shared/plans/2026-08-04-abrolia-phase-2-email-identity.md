@@ -556,6 +556,22 @@ flags остаются false до provider-specific gates.
 - Re-run after process kill yields same org/grant/inbox and one active key/webhook.
 - Delete never removes `abrolia.com` or another family's resource.
 
+#### Attachment readiness closure — automated complete (2026-08-05)
+
+- Managed provisioning now probes Nerve's effective org-scoped `attachments`
+  flag with the one-time household runtime key before webhook creation or secret
+  handoff. Exact `enabled=false` revokes the probe key and leaves the durable
+  email step resumable in `waiting_user`; probe errors remain
+  `outcome_unknown`.
+- Activation stays an explicit operator action through the audited upstream
+  `nerve-flags` writer. `scripts/activate_nerve_attachments.sh` requires an
+  actor and introduces no bootstrap write endpoint.
+- Automated coverage includes flag-off, convergence through the normal CHECK
+  path, flag-on, malformed/error probes, no early secret/webhook, and partial
+  graph cleanup. Full pytest, Ruff, public fixture scanning, shell syntax, and
+  diff checks pass. Live Nerve activation/probe remains part of the existing
+  opt-in staging gate.
+
 ### Phase 2.4 — Family-owned domain and DNS waiting flow
 
 #### Files
@@ -858,7 +874,7 @@ Phase 2 is complete only when all are true:
 - [ ] Exact `@abrolia.com` addresses are household-isolated in Nerve.
 - [ ] Managed, Gmail and own-domain choices share one durable state contract.
 - [ ] One-time secrets go directly to household secret namespace.
-- [ ] Nerve inbound/attachments and lifecycle blockers are implemented/tested.
+- [x] Nerve inbound/attachments and lifecycle blockers are implemented/tested.
 - [ ] Gmail OAuth uses dedicated account confirmation and minimum scopes.
 - [ ] Gmail policy/CASA gates remain fail-closed until evidence is current.
 - [ ] Nerve/Gmail ingress converge on one canonical RFC822 pipeline.
