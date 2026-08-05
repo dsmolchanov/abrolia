@@ -85,10 +85,16 @@ Abrolia не подключает существующий личный Gmail и
 3. **Минимальные scopes.** Только `gmail.readonly` и `gmail.send`: без Drive,
    contacts, settings и удаления писем. Ингест идёт через Gmail history/cursor,
    исходящие — compose после staged approval.
-4. **Секрет.** Refresh token envelope-encrypted per household, отсутствует в
-   browser/API/job JSON/logs и недоступен модели. Disconnect отзывает grant и
+4. **Секрет.** Refresh token передаётся напрямую в ранний household Fly secret
+   namespace через `SecretSink`, отсутствует в browser/control-plane DB/API/job
+   JSON/runtime manifest/logs и недоступен модели. Disconnect отзывает grant и
    удаляет token material.
-5. **Launch gate.** Gmail restricted scopes требуют OAuth verification и CASA.
+5. **Limited Use.** Контекстное disclosure показывается непосредственно перед
+   OAuth. Gmail user data используется только для работы и улучшения
+   пользовательской email-функции, без рекламы, продажи, credit decisions или
+   общего обучения моделей; human access ограничен разрешёнными политикой
+   support/security/legal/operations случаями.
+6. **Launch gate.** Gmail restricted scopes требуют OAuth verification и CASA.
    До их закрытия real adapter fail-closed; Phase 1 использует только `.test`
    fake. Исторический IMAP poller остаётся внутренним synthetic test seam и не
    является пользовательским или production-путём.

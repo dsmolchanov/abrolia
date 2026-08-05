@@ -515,6 +515,25 @@ class FlyRuntimeProvisioner:
         volume = self._ensure_volume(app_name)
         return self._result(spec, app_name, volume)
 
+    def ensure_secret_namespace(
+        self, household_id: str, idempotency_key: str
+    ) -> ProvisionResult:
+        """Ensure only the deterministic Fly app used as the secret namespace."""
+
+        del idempotency_key
+        app_name = self.stable_app_name(household_id)
+        self._ensure_app(app_name)
+        return ProvisionResult(
+            external_ref=app_name,
+            public_result={
+                "runtime_ref": app_name,
+                "app_ref": app_name,
+                "household_id": household_id,
+                "region": self.region,
+                "stage": "secret_namespace_ready",
+            },
+        )
+
     def launch(
         self,
         intent: dict[str, Any],

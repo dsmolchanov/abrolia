@@ -174,7 +174,9 @@ def test_synthetic_selection_boundaries_fail_closed_at_api(api_harness) -> None:
     assert api_harness.container.onboarding_repository.snapshot(
         world.household.id
     ).version == 1
-    assert api_harness.container.database.query("SELECT id FROM provisioning_jobs") == []
+    assert api_harness.container.database.query(
+        "SELECT id FROM provisioning_jobs WHERE operation != 'ensure_secret_namespace'"
+    ) == []
 
     managed = api_harness.client.post(
         "/api/v1/onboarding/steps/email_identity/select",
@@ -229,19 +231,26 @@ def test_synthetic_selection_boundaries_fail_closed_at_api(api_harness) -> None:
 
 
 def test_auth_and_validation_errors_never_echo_submitted_credentials(api_harness) -> None:
-    secret_canary = "synthetic-invalid-bootstrap-style-token-canary-123456789"
-    missing_origin = api_harness.client.post(
-        "/api/v1/auth/consume", json={"token": secret_canary}
+    secret_canaries = (
+        "GOCSPX-" + "oauth-client-secret-canary",
+        "1" + "//refresh-token-canary-0123456789",
+        "nrv_" + "live_bootstrap-canary-0123456789",
+        "nrv_" + "live_runtime-canary-0123456789",
+        "0123456789abcdef" * 4,
     )
-    assert missing_origin.status_code == 403
-    assert secret_canary not in missing_origin.text
-    invalid = api_harness.client.post(
-        "/api/v1/auth/consume",
-        headers={"Origin": api_harness.config.public_origin},
-        json={"token": secret_canary},
-    )
-    assert invalid.status_code == 401
-    assert secret_canary not in invalid.text
+    for secret_canary in secret_canaries:
+        missing_origin = api_harness.client.post(
+            "/api/v1/auth/consume", json={"token": secret_canary}
+        )
+        assert missing_origin.status_code == 403
+        assert secret_canary not in missing_origin.text
+        invalid = api_harness.client.post(
+            "/api/v1/auth/consume",
+            headers={"Origin": api_harness.config.public_origin},
+            json={"token": secret_canary},
+        )
+        assert invalid.status_code == 401
+        assert secret_canary not in invalid.text
     structurally_invalid = api_harness.client.post(
         "/api/v1/auth/consume",
         headers={"Origin": api_harness.config.public_origin},

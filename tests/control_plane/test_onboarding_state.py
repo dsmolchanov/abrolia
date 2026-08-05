@@ -40,7 +40,9 @@ def test_steps_cannot_be_skipped_or_overwritten(cp_stack) -> None:
             context=cp_stack.context(expected_version=0),
             now=BASE_TIME + 1,
         )
-    assert cp_stack.database.query("SELECT id FROM provisioning_jobs") == []
+    assert cp_stack.database.query(
+        "SELECT id FROM provisioning_jobs WHERE operation != 'ensure_secret_namespace'"
+    ) == []
 
     cp_stack.complete_profile(now=BASE_TIME + 2)
     with pytest.raises(InvalidTransition, match="skipped or reordered"):
@@ -142,7 +144,9 @@ def test_stale_if_match_conflicts_without_side_effects(cp_stack) -> None:
             now=BASE_TIME + 2,
         )
     assert cp_stack.onboarding.snapshot(cp_stack.household.id) == before
-    assert cp_stack.database.query("SELECT id FROM provisioning_jobs") == []
+    assert cp_stack.database.query(
+        "SELECT id FROM provisioning_jobs WHERE operation != 'ensure_secret_namespace'"
+    ) == []
 
 
 def test_select_commits_exactly_one_durable_job_and_replays(cp_stack) -> None:
@@ -164,7 +168,9 @@ def test_select_commits_exactly_one_durable_job_and_replays(cp_stack) -> None:
     )
 
     assert not first.replayed and replay.replayed
-    jobs = cp_stack.database.query("SELECT * FROM provisioning_jobs")
+    jobs = cp_stack.database.query(
+        "SELECT * FROM provisioning_jobs WHERE operation != 'ensure_secret_namespace'"
+    )
     assert len(jobs) == 1
     assert jobs[0]["status"] == "pending"
     assert jobs[0]["intent_key"].endswith(":abrolia_managed:1")
@@ -203,7 +209,9 @@ def test_cancel_only_cancels_intents_that_never_crossed_provider_boundary(
         context=cp_stack.context(),
         now=BASE_TIME + 2,
     )
-    job = cp_stack.database.query_one("SELECT id FROM provisioning_jobs")
+    job = cp_stack.database.query_one(
+        "SELECT id FROM provisioning_jobs WHERE kind = 'email_identity'"
+    )
     with cp_stack.database.write() as connection:
         connection.execute(
             "UPDATE provisioning_jobs SET status = ?, leased_by = ?, lease_until = ?"
@@ -262,7 +270,8 @@ def test_failed_provider_attempt_has_a_new_explicit_retry_intent(cp_stack) -> No
     assert worker.run_once().status == "succeeded"
 
     jobs = cp_stack.database.query(
-        "SELECT intent_key, status FROM provisioning_jobs ORDER BY created_at, id"
+        "SELECT intent_key, status FROM provisioning_jobs WHERE kind = 'email_identity'"
+        " ORDER BY created_at, id"
     )
     assert len(jobs) == 2
     assert {row["intent_key"].rsplit(":", 1)[-1] for row in jobs} == {"1", "2"}
@@ -372,6 +381,7 @@ def test_reset_email_cancels_and_clears_all_downstream_state(cp_stack) -> None:
     )) == 3
     assert cp_stack.database.query_one(
         "SELECT status FROM provisioning_jobs WHERE kind = 'runtime'"
+        " AND operation = 'ensure_runtime'"
     )["status"] == "cancelled"
     assert cp_stack.database.query_one(
         "SELECT status FROM config_revisions WHERE household_id = ?",
@@ -402,6 +412,7 @@ def test_reset_quarantines_provider_crossed_runtime_intent(
         assert worker.run_once().status == "succeeded"
     runtime = cp_stack.database.query_one(
         "SELECT id FROM provisioning_jobs WHERE kind = 'runtime'"
+        " AND operation = 'ensure_runtime'"
     )
     with cp_stack.database.write() as connection:
         connection.execute(

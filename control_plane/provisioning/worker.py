@@ -8,6 +8,8 @@ from typing import Any
 
 from control_plane.crypto import SecretMaterial
 from control_plane.db import new_id
+from control_plane.email.models import EmailIdentityStatus
+from control_plane.email.repository import EmailIdentityRepository
 from control_plane.models import StepKind, StepStatus
 from control_plane.observability import StructuredLogger
 from control_plane.onboarding.state import VERIFY_RESULT, next_status
@@ -50,6 +52,7 @@ class ProvisioningWorker:
         planner: DesiredSpecPlanner,
         providers: ProviderRegistry,
         secret_sink: SecretSink,
+        email_identities: EmailIdentityRepository | None = None,
         worker_id: str = "worker",
         runtime_provider: str = "dry-run-runtime",
         bootstrap_ttl_seconds: int = 3600,
@@ -64,6 +67,7 @@ class ProvisioningWorker:
         self.planner = planner
         self.providers = providers
         self.secret_sink = secret_sink
+        self.email_identities = email_identities
         self.worker_id = worker_id
         self.runtime_provider = runtime_provider
         self.bootstrap_ttl_seconds = bootstrap_ttl_seconds
@@ -76,6 +80,21 @@ class ProvisioningWorker:
         result = self._run_once()
         if result is not None:
             self._emit_result(result, started=started)
+            job = self.jobs.get(result.job_id)
+            if (
+                result.status == "succeeded"
+                and job is not None
+                and job.operation == "ensure_secret_namespace"
+            ):
+                # Namespace creation is an internal prerequisite, not a visible
+                # onboarding step. If the owner already submitted the email
+                # choice, preserve one-tick UX while still crossing the Fly app
+                # boundary before the identity provider call.
+                continued_at = time.monotonic()
+                continued = self._run_once()
+                if continued is not None:
+                    self._emit_result(continued, started=continued_at)
+                    return continued
         return result
 
     def _emit_result(self, result: WorkResult, *, started: float) -> None:
@@ -123,8 +142,44 @@ class ProvisioningWorker:
             provider = self.providers.get(job.provider)
             if job.kind == "cleanup":
                 return self._cleanup(job, request, provider)
+            if job.operation == "ensure_secret_namespace":
+                ensure_namespace = getattr(provider, "ensure_secret_namespace", None)
+                if not callable(ensure_namespace):
+                    raise ProviderRejected(
+                        "runtime provider does not support an early secret namespace"
+                    )
+                result = ensure_namespace(request["household_id"], job.intent_key)
+                current = self.jobs.get(job.id)
+                if current is None or current.status == "cancelled":
+                    return self._cleanup_cancelled_namespace(job, result, provider)
+                return self._finish_secret_namespace(job, result)
+            provider_request = request
+            namespace_ref = None
+            if job.kind == "email_identity":
+                namespace_ref = self._secret_namespace_ref(job.household_id)
+                if namespace_ref is None:
+                    self.jobs.retry_later(
+                        job.id,
+                        not_before=self.clock() + 5,
+                        error_code="secret_namespace_not_ready",
+                        now=self.clock(),
+                    )
+                    return WorkResult(
+                        job.id, "pending", "secret_namespace_not_ready"
+                    )
+                provider_request = (
+                    {
+                        "identity_id": request["email_identity_id"],
+                        "household_id": job.household_id,
+                        "option": request["option"],
+                        "selection": request["selection"],
+                        "secret_namespace_ref": namespace_ref,
+                    }
+                    if request.get("email_identity_id") and request.get("option")
+                    else request
+                )
             if job.operation == "inspect":
-                return self._inspect_job(job, request, provider)
+                return self._inspect_job(job, request, provider, namespace_ref=namespace_ref)
             split_runtime = job.kind == "runtime" and all(
                 callable(getattr(provider, name, None)) for name in ("prepare", "launch")
             )
@@ -153,20 +208,29 @@ class ProvisioningWorker:
                     )
             if result is None:
                 result = (
-                    provider.prepare(request, job.intent_key)
+                    provider.prepare(provider_request, job.intent_key)
                     if split_runtime
-                    else provider.ensure(request, job.intent_key)
+                    else provider.ensure(provider_request, job.intent_key)
                 )
             current = self.jobs.get(job.id)
             if current is None or current.status == "cancelled":
                 return self._cleanup_cancelled_result(job, result, provider)
             if job.kind == "runtime":
                 return self._finish_runtime(job, request, result, provider)
-            self._reject_identity_secret(result)
+            if job.kind == "email_identity":
+                assert namespace_ref is not None
+                if not self._stage_email_secret(job, request, result, namespace_ref):
+                    return self._mark_step_problem(
+                        job, request, "outcome_unknown", "secret_handoff_unknown"
+                    )
+            else:
+                self._reject_identity_secret(result)
             return self._finish_step(job, request, result)
         except _ProjectionCancelled:
             if result is None or provider is None:
                 return WorkResult(job.id, "cancelled", "projection_cancelled")
+            if job.operation == "ensure_secret_namespace":
+                return self._cleanup_cancelled_namespace(job, result, provider)
             return self._cleanup_cancelled_result(job, result, provider)
         except ProviderRateLimited as error:
             current = self.jobs.get(job.id)
@@ -205,10 +269,60 @@ class ProvisioningWorker:
                 "identity adapter returned a secret before runtime secret handoff existed"
             )
 
-    def _inspect_job(self, job: JobRecord, request: dict, provider) -> WorkResult:
+    def _secret_namespace_ref(self, household_id: str) -> str | None:
+        row = self.jobs.db.query_one(
+            "SELECT * FROM external_resources WHERE household_id = ?"
+            " AND resource_type = 'secret_namespace' AND status = 'ready'"
+            " ORDER BY updated_at DESC, id DESC LIMIT 1",
+            (household_id,),
+        )
+        if row is None:
+            return None
+        value = self.jobs.decrypt_json(
+            "external_resources",
+            row["id"],
+            "external_id",
+            row["external_id_ciphertext"],
+            row["encryption_key_version"],
+        )
+        return value if isinstance(value, str) and value else None
+
+    def _stage_email_secret(
+        self,
+        job: JobRecord,
+        request: dict,
+        result: ProvisionResult,
+        namespace_ref: str,
+    ) -> bool:
+        del job, request
+        if result.secret_material.is_empty:
+            return True
+        try:
+            self.secret_sink.install(namespace_ref, result.secret_material)
+        except Exception:
+            result.secret_material.clear()
+            return False
+        return True
+
+    def _inspect_job(
+        self,
+        job: JobRecord,
+        request: dict,
+        provider,
+        *,
+        namespace_ref: str | None = None,
+    ) -> WorkResult:
         inspected = provider.inspect(request["stable_ref"])
         if inspected.state is InspectState.READY and inspected.result is not None:
-            self._reject_identity_secret(inspected.result)
+            if job.kind == "email_identity":
+                if namespace_ref is None or not self._stage_email_secret(
+                    job, request, inspected.result, namespace_ref
+                ):
+                    return self._mark_step_problem(
+                        job, request, "outcome_unknown", "secret_handoff_unknown"
+                    )
+            else:
+                self._reject_identity_secret(inspected.result)
             return self._finish_step(job, request, inspected.result)
         if inspected.state is InspectState.PENDING:
             return self._mark_step_problem(
@@ -348,6 +462,13 @@ class ProvisioningWorker:
                 )
             inspected = provider.inspect(external_ref)
             if inspected.state is InspectState.ABSENT:
+                if (
+                    request.get("resource_type") == "email_identity"
+                    and not self._delete_email_binding_secret(job.household_id)
+                ):
+                    return WorkResult(
+                        job.id, "outcome_unknown", "secret_cleanup_unknown"
+                    )
                 with self.jobs.db.write() as connection:
                     self.jobs.settle(
                         connection, job.id, status="succeeded", now=self.clock()
@@ -357,6 +478,13 @@ class ProvisioningWorker:
                             "UPDATE external_resources SET status = 'deleted', updated_at = ?"
                             " WHERE id = ?",
                             (self.clock(), request["resource_id"]),
+                        )
+                    if (
+                        request.get("resource_type") == "email_identity"
+                        and self.email_identities is not None
+                    ):
+                        self.email_identities.finish_disconnect(
+                            connection, job.household_id, now=self.clock()
                         )
                 return WorkResult(job.id, "succeeded")
             if inspected.state is InspectState.READY:
@@ -370,6 +498,26 @@ class ProvisioningWorker:
                 )
             return WorkResult(job.id, "outcome_unknown", "reconcile_inconclusive")
         if job.kind == "runtime":
+            if job.operation == "ensure_secret_namespace":
+                ensure_namespace = getattr(provider, "ensure_secret_namespace", None)
+                if not callable(ensure_namespace):
+                    return self._mark_step_problem(
+                        job, request, "failed", "provider_rejected"
+                    )
+                try:
+                    result = ensure_namespace(request["household_id"], job.intent_key)
+                    current = self.jobs.get(job.id)
+                    if current is None or current.status == "cancelled":
+                        return self._cleanup_cancelled_namespace(job, result, provider)
+                    return self._finish_secret_namespace(job, result)
+                except _ProjectionCancelled:
+                    return self._cleanup_cancelled_namespace(job, result, provider)
+                except ProviderRejected as error:
+                    return self._mark_step_problem(job, request, "failed", error.code)
+                except (OutcomeUnknown, TimeoutError, ConnectionError):
+                    return self._mark_step_problem(
+                        job, request, "outcome_unknown", "reconcile_inconclusive"
+                    )
             split_runtime = all(
                 callable(getattr(provider, name, None)) for name in ("prepare", "launch")
             )
@@ -427,7 +575,28 @@ class ProvisioningWorker:
         inspected = provider.inspect(job.intent_key)
         if inspected.state is InspectState.READY and inspected.result:
             try:
-                self._reject_identity_secret(inspected.result)
+                if job.kind == "email_identity":
+                    if (
+                        job.error_code == "secret_handoff_unknown"
+                        and inspected.result.secret_material.is_empty
+                    ):
+                        return WorkResult(
+                            job.id,
+                            "outcome_unknown",
+                            "secret_handoff_unknown",
+                        )
+                    namespace_ref = self._secret_namespace_ref(job.household_id)
+                    if namespace_ref is None or not self._stage_email_secret(
+                        job, request, inspected.result, namespace_ref
+                    ):
+                        return self._mark_step_problem(
+                            job,
+                            request,
+                            "outcome_unknown",
+                            "secret_handoff_unknown",
+                        )
+                else:
+                    self._reject_identity_secret(inspected.result)
                 return self._finish_step(job, request, inspected.result)
             except _ProjectionCancelled:
                 return self._cleanup_cancelled_result(
@@ -492,6 +661,22 @@ class ProvisioningWorker:
                 error_code=error_code,
                 now=now,
             )
+            if (
+                job.kind == "email_identity"
+                and self.email_identities is not None
+                and request.get("email_identity_id")
+            ):
+                problem_status = {
+                    "waiting_user": EmailIdentityStatus.WAITING_USER,
+                    "outcome_unknown": EmailIdentityStatus.OUTCOME_UNKNOWN,
+                    "failed": EmailIdentityStatus.NEEDS_ATTENTION,
+                }[job_status]
+                self.email_identities.mark_problem(
+                    connection,
+                    request["email_identity_id"],
+                    status=problem_status,
+                    now=now,
+                )
             step_kind = request.get("step_kind")
             if step_kind in {item.value for item in StepKind if item is not StepKind.RUNTIME}:
                 step_status = {
@@ -531,11 +716,15 @@ class ProvisioningWorker:
         *,
         status: str,
         revision: int | None = None,
+        resource_type: str | None = None,
+        stable_name: str | None = None,
     ) -> str:
+        resource_type = resource_type or job.kind
+        stable_name = stable_name or job.intent_key
         existing = connection.execute(
             "SELECT * FROM external_resources WHERE provider = ? AND resource_type = ?"
             " AND stable_name = ?",
-            (job.provider, job.kind, job.intent_key),
+            (job.provider, resource_type, stable_name),
         ).fetchone()
         resource_id = existing["id"] if existing else new_id()
         encrypted = self.jobs.encrypt_json(
@@ -565,8 +754,8 @@ class ProvisioningWorker:
                     resource_id,
                     job.household_id,
                     job.provider,
-                    job.kind,
-                    job.intent_key,
+                    resource_type,
+                    stable_name,
                     encrypted.ciphertext,
                     encrypted.key_version,
                     status,
@@ -576,6 +765,129 @@ class ProvisioningWorker:
                 ),
             )
         return resource_id
+
+    def _finish_secret_namespace(
+        self, job: JobRecord, result: ProvisionResult
+    ) -> WorkResult:
+        if not result.secret_material.is_empty:
+            result.secret_material.clear()
+            raise ProviderRejected(
+                "secret namespace creation returned unexpected secret material"
+            )
+        durable_result = {
+            "external_ref": result.external_ref,
+            "public_result": result.public_result,
+            "verified": True,
+        }
+        with self.jobs.db.write() as connection:
+            current = connection.execute(
+                "SELECT j.status, w.state AS workflow_state, h.status AS household_status"
+                " FROM provisioning_jobs j"
+                " JOIN onboarding_workflows w ON w.id = j.workflow_id"
+                " JOIN households h ON h.id = j.household_id WHERE j.id = ?",
+                (job.id,),
+            ).fetchone()
+            if current is None:
+                return WorkResult(job.id, "cancelled", "job_missing")
+            if current["status"] == "succeeded":
+                return WorkResult(job.id, "succeeded")
+            if current["status"] == "cancelled":
+                raise _ProjectionCancelled
+            if (
+                current["workflow_state"] == "cancelled"
+                or current["household_status"] in {"draft", "deleting", "deleted"}
+            ):
+                raise _ProjectionCancelled
+            if current["status"] not in {"running", "outcome_unknown"}:
+                return WorkResult(job.id, current["status"], current["status"])
+            self.jobs.settle(
+                connection,
+                job.id,
+                status="succeeded",
+                result=durable_result,
+                external_ref=result.external_ref,
+                now=self.clock(),
+            )
+            self._external_resource(
+                connection,
+                job,
+                result.external_ref,
+                status="ready",
+                resource_type="secret_namespace",
+            )
+        return WorkResult(job.id, "succeeded")
+
+    def _cleanup_cancelled_namespace(
+        self, job: JobRecord, result: ProvisionResult, provider
+    ) -> WorkResult:
+        result.secret_material.clear()
+        with self.jobs.db.write() as connection:
+            current = connection.execute(
+                "SELECT status FROM provisioning_jobs WHERE id = ?", (job.id,)
+            ).fetchone()
+            resource_id = self._external_resource(
+                connection,
+                job,
+                result.external_ref,
+                status="deleting",
+                resource_type="secret_namespace",
+            )
+        try:
+            inspected = provider.deprovision(result.external_ref)
+        except Exception:
+            inspected = None
+        if inspected is not None and inspected.state is InspectState.ABSENT:
+            with self.jobs.db.write() as connection:
+                connection.execute(
+                    "UPDATE external_resources SET status = 'deleted', updated_at = ?"
+                    " WHERE id = ?",
+                    (self.clock(), resource_id),
+                )
+                if current is not None and current["status"] in {
+                    "running",
+                    "outcome_unknown",
+                }:
+                    self.jobs.settle(
+                        connection,
+                        job.id,
+                        status="cancelled",
+                        error_code="cancelled_and_compensated",
+                        now=self.clock(),
+                    )
+            return WorkResult(job.id, "cancelled")
+        with self.jobs.db.write() as connection:
+            connection.execute(
+                "UPDATE external_resources SET status = 'outcome_unknown', updated_at = ?"
+                " WHERE id = ?",
+                (self.clock(), resource_id),
+            )
+            if current is not None and current["status"] in {
+                "running",
+                "outcome_unknown",
+            }:
+                self.jobs.settle(
+                    connection,
+                    job.id,
+                    status="outcome_unknown",
+                    error_code="cancelled_cleanup_unknown",
+                    now=self.clock(),
+                )
+            self.jobs.create(
+                connection,
+                household_id=job.household_id,
+                workflow_id=job.workflow_id,
+                kind="cleanup",
+                operation="deprovision",
+                intent_key=f"{job.household_id}:late-namespace-cleanup:{job.id}",
+                request={
+                    "resource_id": resource_id,
+                    "resource_type": "secret_namespace",
+                    "external_ref": result.external_ref,
+                },
+                provider=job.provider,
+                now=self.clock(),
+            )
+        return WorkResult(job.id, "outcome_unknown", "cancelled_cleanup_unknown")
 
     def _finish_step(
         self, job: JobRecord, request: dict, result: ProvisionResult
@@ -614,6 +926,44 @@ class ProvisioningWorker:
                 or workflow_state["household_status"] in {"draft", "deleting", "deleted"}
             ):
                 raise _ProjectionCancelled
+            if (
+                step_kind is StepKind.EMAIL
+                and self.email_identities is not None
+                and request.get("email_identity_id")
+            ):
+                address = result.public_result.get("agent_inbox")
+                if not isinstance(address, str) or not address:
+                    raise ProviderRejected("email provider returned no verified address")
+                raw_refs = result.public_result.get("provider_refs")
+                provider_refs = (
+                    {str(key): str(value) for key, value in raw_refs.items()}
+                    if isinstance(raw_refs, dict)
+                    else {"external_ref": result.external_ref}
+                )
+                raw_scopes = result.public_result.get("granted_scopes", [])
+                scopes = (
+                    [str(scope) for scope in raw_scopes]
+                    if isinstance(raw_scopes, (list, tuple))
+                    else []
+                )
+                self.email_identities.mark_verified(
+                    connection,
+                    request["email_identity_id"],
+                    address=address,
+                    provider_subject=(
+                        str(result.public_result["provider_subject"])
+                        if result.public_result.get("provider_subject")
+                        else None
+                    ),
+                    provider_refs=provider_refs,
+                    secret_binding_ref=(
+                        str(result.public_result["secret_binding_ref"])
+                        if result.public_result.get("secret_binding_ref")
+                        else None
+                    ),
+                    granted_scopes=scopes,
+                    now=now,
+                )
             desired = next_status(step_kind, StepStatus(step["status"]), VERIFY_RESULT)
             encrypted = self.onboarding.encrypt_json(
                 "onboarding_steps",
@@ -955,6 +1305,14 @@ class ProvisioningWorker:
         if inspected.state is not InspectState.ABSENT:
             self._mark_step_problem(job, request, "outcome_unknown", "cleanup_unknown")
             return WorkResult(job.id, "outcome_unknown", "cleanup_unknown")
+        if (
+            request.get("resource_type") == "email_identity"
+            and not self._delete_email_binding_secret(job.household_id)
+        ):
+            self._mark_step_problem(
+                job, request, "outcome_unknown", "secret_cleanup_unknown"
+            )
+            return WorkResult(job.id, "outcome_unknown", "secret_cleanup_unknown")
         with self.jobs.db.write() as connection:
             self.jobs.settle(connection, job.id, status="succeeded", now=self.clock())
             if request.get("resource_id"):
@@ -963,7 +1321,33 @@ class ProvisioningWorker:
                     " WHERE id = ?",
                     (self.clock(), request["resource_id"]),
                 )
+            if (
+                request.get("resource_type") == "email_identity"
+                and self.email_identities is not None
+            ):
+                self.email_identities.finish_disconnect(
+                    connection, job.household_id, now=self.clock()
+                )
         return WorkResult(job.id, "succeeded")
+
+    def _delete_email_binding_secret(self, household_id: str) -> bool:
+        if self.email_identities is None:
+            return True
+        identity_row = self.jobs.db.query_one(
+            "SELECT secret_binding_ref FROM email_identities WHERE household_id = ?"
+            " AND status = 'disconnecting' ORDER BY updated_at DESC LIMIT 1",
+            (household_id,),
+        )
+        if identity_row is None or not identity_row["secret_binding_ref"]:
+            return True
+        namespace_ref = self._secret_namespace_ref(household_id)
+        if namespace_ref is None:
+            return False
+        try:
+            self.secret_sink.delete(namespace_ref, identity_row["secret_binding_ref"])
+        except Exception:
+            return False
+        return True
 
     def _cleanup_bootstrap(self, job: JobRecord, request: dict) -> WorkResult:
         if request.get("cleanup_authorization") not in {

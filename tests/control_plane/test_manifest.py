@@ -145,14 +145,26 @@ def test_manifest_rejects_unverified_or_mismatched_runtime_identity() -> None:
         )
 
 
-def test_manifest_and_provider_public_result_reject_secret_shaped_fields() -> None:
+@pytest.mark.parametrize(
+    ("secret_field", "secret_value"),
+    (
+        ("client_secret", "GOCSPX-" + "oauth-client-secret-canary"),
+        ("refresh_token", "1" + "//refresh-token-canary-0123456789"),
+        ("nerve_bootstrap_key", "nrv_" + "live_bootstrap-canary-0123456789"),
+        ("nerve_runtime_key", "nrv_" + "live_runtime-canary-0123456789"),
+        ("webhook_secret", "0123456789abcdef" * 4),
+    ),
+)
+def test_manifest_and_provider_public_result_reject_secret_shaped_fields(
+    secret_field: str, secret_value: str
+) -> None:
     with pytest.raises(SecretFieldError):
         ProvisionResult(
             external_ref="synthetic:email:one",
-            public_result={"refresh_token": "provider-secret-canary"},
+            public_result={secret_field: secret_value},
         )
     with pytest.raises(ValidationError, match="secret-like field"):
-        _manifest(provider_refs={"api_key": "provider-secret-canary"})
+        _manifest(provider_refs={secret_field: secret_value})
 
 
 def test_phase_one_input_contracts_reject_real_provider_facing_identities() -> None:

@@ -33,7 +33,7 @@ def manifest_to_toml(value: DesiredHouseholdSpecV1 | Mapping[str, Any]) -> str:
         if isinstance(value, DesiredHouseholdSpecV1)
         else DesiredHouseholdSpecV1.model_validate(dict(value))
     )
-    document = spec.model_dump(mode="json")
+    document = spec.model_dump(mode="json", exclude_none=True)
     digest = manifest_sha256(document)
     if document["config_sha256"] != digest:
         raise ValueError("manifest hash does not match its canonical content")
@@ -75,6 +75,14 @@ def manifest_to_toml(value: DesiredHouseholdSpecV1 | Mapping[str, Any]) -> str:
             "[email]",
             f'agent_inbox = {_string(document["email"]["agent_inbox"])}',
             f'fallback = {_string(document["email"]["fallback"])}',
+            f'provider_kind = {_string(document["email"]["provider_kind"])}',
+        ]
+    )
+    for field in ("provider_binding_ref", "secret_binding_ref"):
+        if document["email"].get(field) is not None:
+            lines.append(f'{field} = {_string(document["email"][field])}')
+    lines.extend(
+        [
             "",
             "[consent]",
             f'authority = {_string(document["consent"]["authority"])}',

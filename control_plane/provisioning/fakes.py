@@ -105,6 +105,24 @@ class DryRunRuntimeProvisioner(DeterministicFakeProvisioner):
     def __init__(self) -> None:
         super().__init__("runtime")
 
+    def ensure_secret_namespace(
+        self, household_id: str, idempotency_key: str
+    ) -> ProvisionResult:
+        self.ensure_calls += 1
+        existing = self.resources.get(idempotency_key)
+        if existing is not None:
+            return existing
+        result = ProvisionResult(
+            external_ref=f"synthetic-runtime:{household_id}",
+            public_result={
+                "runtime_ref": f"synthetic-runtime:{household_id}",
+                "stage": "secret_namespace_ready",
+                "planned_writes": ["app"],
+            },
+        )
+        self.resources[idempotency_key] = result
+        return result
+
     def _result(self, intent: dict[str, Any], key: str) -> ProvisionResult:
         household_id = intent["manifest"]["household_id"]
         return ProvisionResult(

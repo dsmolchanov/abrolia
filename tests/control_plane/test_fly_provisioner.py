@@ -299,7 +299,6 @@ def test_ensure_inspects_before_create_orders_writes_and_is_idempotent(
         "auto_backup_enabled": True,
         "snapshot_retention": 5,
     }
-
     machine_payload = next(
         body
         for method, path, body in fly.calls
@@ -322,6 +321,30 @@ def test_ensure_inspects_before_create_orders_writes_and_is_idempotent(
     assert "fly-api-secret-canary" not in encoded
     assert spec.email.fallback not in encoded
     assert "ABROLIA_" not in encoded
+
+
+def test_secret_namespace_ensures_only_app_before_runtime_prepare() -> None:
+    fly = StatefulFly()
+    provisioner = _provisioner(fly)
+    spec = _spec()
+
+    first = provisioner.ensure_secret_namespace(spec.household_id, "namespace-one")
+    second = provisioner.ensure_secret_namespace(spec.household_id, "namespace-two")
+
+    assert first == second
+    assert first.public_result["stage"] == "secret_namespace_ready"
+    assert [call[:2] for call in fly.calls if call[0] == "POST"] == [
+        ("POST", "/v1/apps")
+    ]
+    assert not any(path.endswith("/volumes") for _method, path, _body in fly.calls)
+    assert not any(path.endswith("/machines") for _method, path, _body in fly.calls)
+
+    provisioner.prepare({"manifest": spec.model_dump(mode="json")}, "runtime-one")
+    assert len(
+        [call for call in fly.calls if call[0] == "POST" and call[1] == "/v1/apps"]
+    ) == 1
+    assert any(path.endswith("/volumes") for _method, path, _body in fly.calls)
+    assert not any(path.endswith("/machines") for _method, path, _body in fly.calls)
 
 
 @pytest.mark.parametrize(

@@ -130,8 +130,17 @@ synthetic-only этапа, а не production-обещание; до реаль�
 - OAuth account chooser всегда показывается; после callback вы ещё раз
   подтверждаете выбранный адрес. Запрашиваются только `gmail.readonly` и
   `gmail.send`.
-- Refresh token шифруется per household, не виден browser/модели/logs. Disconnect
-  отзывает grant и удаляет token material.
+- Когда опция будет включена, refresh token передаётся прямо в household Fly
+  secret namespace и отсутствует в browser, control-plane DB, job records,
+  runtime manifest, модели и logs. Disconnect отзывает grant и удаляет token
+  material.
+- Непосредственно перед OAuth мы объясняем, к каким Gmail-данным получит доступ
+  Abrolia и зачем. Использование и передача этих данных подчиняются Google API
+  Services User Data Policy, включая требования Limited Use: данные нужны
+  только для работы и улучшения пользовательского Gmail-ассистента и не
+  используются для рекламы, продажи, кредитных решений или общего обучения
+  моделей. Доступ человека ограничен разрешённой поддержкой, безопасностью,
+  юридическими и операционными случаями, предусмотренными этой политикой.
 - Для реальных семей эта опция fail-closed до Google verification/CASA; сейчас
   используется только synthetic fake.
 

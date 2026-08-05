@@ -132,8 +132,17 @@ storage locations and jurisdictions is in `docs/privacy/data-map.md`.
   connect personal Gmail and never request a password or app password.
 - The OAuth account chooser is always shown; after callback you confirm the
   selected address again. Scopes are only `gmail.readonly` and `gmail.send`.
-- The refresh token is encrypted per household and is absent from the browser,
-  model, and logs. Disconnect revokes the grant and removes token material.
+- When this option is enabled, the refresh token goes directly to the
+  household's Fly secret namespace; it is absent from the browser, control-plane
+  database, job records, runtime manifest, model, and logs. Disconnect revokes
+  the grant and removes token material.
+- Immediately before OAuth, we explain what Gmail data Abrolia will access and
+  why. Our use and transfer of that data follows the Google API Services User
+  Data Policy, including its Limited Use requirements: it is used only to
+  provide or improve the user-facing Gmail assistant, never for advertising,
+  sale, credit decisions, or generalized model training. Human access is
+  limited to consented support, security, legal, or operational cases allowed
+  by that policy.
 - This option fails closed for real families until Google verification/CASA;
   only a synthetic fake is used now.
 

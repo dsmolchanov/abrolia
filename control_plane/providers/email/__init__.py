@@ -1,0 +1,1 @@
+"""Email identity provider adapters."""

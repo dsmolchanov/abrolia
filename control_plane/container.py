@@ -13,6 +13,8 @@ from control_plane.auth.tokens import MagicLinkService
 from control_plane.config import ControlPlaneConfig
 from control_plane.crypto import FieldCipher, LookupHasher
 from control_plane.db import ControlPlaneDatabase
+from control_plane.email.repository import EmailIdentityRepository
+from control_plane.email.service import EmailIdentityService
 from control_plane.observability import StructuredLogger
 from control_plane.onboarding.service import OnboardingService
 from control_plane.privacy.delete import (
@@ -57,6 +59,8 @@ class ControlPlaneContainer:
     onboarding_repository: OnboardingRepository
     jobs: JobsRepository
     configs: ConfigRepository
+    email_identities: EmailIdentityRepository
+    email_identity_service: EmailIdentityService
     sessions: SessionService
     magic_links: MagicLinkService
     account_service: AccountService
@@ -96,11 +100,19 @@ class ControlPlaneContainer:
         onboarding_repository = OnboardingRepository(database, cipher, lookup)
         jobs = JobsRepository(database, cipher, lookup)
         configs = ConfigRepository(database, cipher, lookup, token_hasher)
+        email_identities = EmailIdentityRepository(database, cipher, lookup)
+        email_identity_service = EmailIdentityService(email_identities)
         sessions = SessionService(auth)
         magic_links = MagicLinkService(auth, mailer or MemoryMailer(), config.public_origin)
         account_service = AccountService(auth, accounts, households, sessions)
         household_service = HouseholdService(households)
-        onboarding = OnboardingService(households, onboarding_repository, jobs)
+        onboarding = OnboardingService(
+            households,
+            onboarding_repository,
+            jobs,
+            runtime_provider=config.runtime_provider,
+            email_identities=email_identity_service,
+        )
         rate_limiter = RateLimiter(database, lookup)
         providers = synthetic_provider_registry()
         if config.runtime_provider == "fly-runtime":
@@ -119,6 +131,7 @@ class ControlPlaneContainer:
             planner=planner,
             providers=providers,
             secret_sink=secret_sink,
+            email_identities=email_identities,
             runtime_provider=config.runtime_provider,
             bootstrap_ttl_seconds=config.bootstrap_ttl_seconds,
             logger=StructuredLogger(sys.stderr),
@@ -170,6 +183,8 @@ class ControlPlaneContainer:
             onboarding_repository,
             jobs,
             configs,
+            email_identities,
+            email_identity_service,
             sessions,
             magic_links,
             account_service,

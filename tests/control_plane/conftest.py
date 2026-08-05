@@ -15,6 +15,8 @@ from control_plane.config import ControlPlaneConfig
 from control_plane.container import ControlPlaneContainer
 from control_plane.crypto import FieldCipher, LookupHasher
 from control_plane.db import ControlPlaneDatabase
+from control_plane.email.repository import EmailIdentityRepository
+from control_plane.email.service import EmailIdentityService
 from control_plane.models import ProfileInput
 from control_plane.onboarding.contracts import CommandContext
 from control_plane.onboarding.service import OnboardingService
@@ -46,6 +48,7 @@ class ControlPlaneStack:
     onboarding: OnboardingRepository
     jobs: JobsRepository
     configs: ConfigRepository
+    email_identities: EmailIdentityRepository
     sessions: SessionService
     service: OnboardingService
     account: AccountRecord
@@ -85,13 +88,18 @@ class ControlPlaneStack:
         values.update(changes)
         return ProfileInput.model_validate(values)
 
-    def complete_profile(self, *, now: float = BASE_TIME + 1) -> None:
+    def complete_profile(
+        self, *, now: float = BASE_TIME + 1, provision_namespace: bool = True
+    ) -> None:
         self.service.save_profile(
             self.household.id,
             self.valid_profile(),
             context=self.context(),
             now=now,
         )
+        if provision_namespace:
+            result = self.make_worker(now=now + 0.5).run_once()
+            assert result is not None and result.status == "succeeded"
 
     def make_worker(
         self,
@@ -114,6 +122,7 @@ class ControlPlaneStack:
             planner=planner,
             providers=providers or synthetic_provider_registry(),
             secret_sink=secret_sink or InMemorySecretSink(),
+            email_identities=self.email_identities,
             worker_id="synthetic-worker",
             clock=lambda: now,
         )
@@ -171,6 +180,8 @@ def cp_stack(tmp_path: Path) -> ControlPlaneStack:
     onboarding = OnboardingRepository(database, cipher, lookup)
     jobs = JobsRepository(database, cipher, lookup)
     configs = ConfigRepository(database, cipher, lookup, token_hasher)
+    email_identities = EmailIdentityRepository(database, cipher, lookup)
+    email_identity_service = EmailIdentityService(email_identities)
     sessions = SessionService(auth)
     account = accounts.create_verified("owner@family.test", now=BASE_TIME)
     household = households.create_for_owner(account.id, now=BASE_TIME)
@@ -187,8 +198,15 @@ def cp_stack(tmp_path: Path) -> ControlPlaneStack:
         onboarding=onboarding,
         jobs=jobs,
         configs=configs,
+        email_identities=email_identities,
         sessions=sessions,
-        service=OnboardingService(households, onboarding, jobs),
+        service=OnboardingService(
+            households,
+            onboarding,
+            jobs,
+            runtime_provider=config.runtime_provider,
+            email_identities=email_identity_service,
+        ),
         account=account,
         household=household,
         session=session,

@@ -18,7 +18,8 @@
 * ``iban``       — строка, проходящая проверку контрольной суммы IBAN (mod-97),
                    в любом регистре и с любыми пробелами, вне списка примеров.
 * ``secret``     — форма ключа/токена (Anthropic, Nerve, Telegram bot, GitHub,
-                   AWS, Google OAuth, Slack, PEM private key).
+                   AWS, Google OAuth client/refresh, webhook signing secret,
+                   Slack, PEM private key).
 * ``unscannable``— файл или отдельное вложение письма, содержимое которого
                    проверить нельзя (бинарь, не-UTF-8, слишком большой) и
                    которое не описано в PROVENANCE.md ближайшего родительского
@@ -190,6 +191,18 @@ SECRET_RES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("github-token", re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{30,}\b")),
     ("aws-access-key", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
     ("google-oauth-secret", re.compile(r"\bGOCSPX-[A-Za-z0-9\-_]{10,}\b")),
+    ("google-refresh-token", re.compile(r"\b1//[A-Za-z0-9._~\-]{20,}\b")),
+    # Nerve webhook secrets are 32 random bytes rendered as 64 hex. A bare
+    # 64-hex pattern would flag ordinary SHA-256 digests, so require the
+    # signing-secret field/env context while still accepting future formats.
+    (
+        "webhook-secret",
+        re.compile(
+            r"(?i)\b(?:[a-z][a-z0-9]*_)*"
+            r"(?:webhook(?:_signing)?_secret|signing_secret)\b"
+            r"\s*[=:]\s*[\"']?(?:[a-f0-9]{64}|[A-Za-z0-9_\-]{32,})"
+        ),
+    ),
     ("private-key", re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |PGP )?PRIVATE KEY-----")),
     ("slack-token", re.compile(r"\bxox[abposr]-[A-Za-z0-9\-]{10,}\b")),
 )
