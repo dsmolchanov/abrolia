@@ -11,6 +11,13 @@ title = "hermes-cloud"
 [extend]
 useDefault = true
 
+# Historical Phase 2 boundary tests used this exact 16-character sequence as a
+# visibly synthetic webhook canary. Keep the exception value-scoped: paths are
+# never excluded, so any other secret in the same test files still fails.
+[allowlist]
+description = "Known synthetic webhook canary"
+stopwords = ["0123456789abcdef"]
+
 [[rules]]
 id = "anthropic-api-key"
 description = "Anthropic API key"

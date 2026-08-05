@@ -73,6 +73,9 @@ class ChannelBinding:
 class EmailRouting:
     agent_inbox: str
     fallback: str
+    provider_kind: str = "synthetic"
+    provider_binding_ref: str | None = None
+    secret_binding_ref: str | None = None
 
 
 @dataclass(frozen=True)
@@ -347,6 +350,13 @@ def parse_runtime_manifest(
     email = EmailRouting(
         agent_inbox=_email(_text(raw_email, "agent_inbox", "email"), "agent_inbox"),
         fallback=_email(_text(raw_email, "fallback", "email"), "fallback"),
+        provider_kind=(
+            _optional_text(raw_email, "provider_kind", "email") or "synthetic"
+        ),
+        provider_binding_ref=_optional_text(
+            raw_email, "provider_binding_ref", "email"
+        ),
+        secret_binding_ref=_optional_text(raw_email, "secret_binding_ref", "email"),
     )
     if email.agent_inbox.casefold() == email.fallback.casefold():
         raise ManifestError("email.agent_inbox must not equal email.fallback")

@@ -173,16 +173,40 @@ def test_versioned_manifest_wins_over_legacy_runtime_environment(tmp_path: Path)
             "HERMES_CHAT": "wrong-chat",
             "HERMES_FAMILY_LANGUAGE": "wrong-language",
             "HERMES_GMAIL_ADDRESS": "wrong@example.test",
+            "HERMES_GMAIL_APP_PASSWORD": "legacy-secret-canary",
+            "HERMES_LEGACY_IMAP_TEST_ONLY": "1",
         },
     )
 
     assert config.chat == "configured-chat"
     assert config.language == "čeština"
     assert config.gmail_address == "agent@abrolia.test"
+    assert config.gmail_app_password is None
+    assert not config.has_gmail
     assert config.timezone == "Europe/Prague"
     assert config.country_code == "CZ"
     assert config.config_revision == 3
     assert config.primary_channel == "telegram"
+
+
+def test_legacy_imap_requires_explicit_test_only_gate() -> None:
+    disabled = load_config(
+        env={
+            "HERMES_GMAIL_ADDRESS": "fixture@example.test",
+            "HERMES_GMAIL_APP_PASSWORD": "legacy-secret-canary",
+        }
+    )
+    enabled = load_config(
+        env={
+            "HERMES_GMAIL_ADDRESS": "fixture@example.test",
+            "HERMES_GMAIL_APP_PASSWORD": "legacy-secret-canary",
+            "HERMES_LEGACY_IMAP_TEST_ONLY": "1",
+        }
+    )
+
+    assert disabled.gmail_app_password is None
+    assert not disabled.has_gmail
+    assert enabled.has_gmail
 
 
 def test_eu_strict_manifest_fails_without_explicit_provider(tmp_path: Path) -> None:

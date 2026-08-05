@@ -155,7 +155,8 @@ def test_sigkill_after_transition_commit_leaves_one_recoverable_job(cp_stack) ->
     )
 
     jobs = cp_stack.database.query(
-        "SELECT * FROM provisioning_jobs WHERE household_id = ?",
+        "SELECT * FROM provisioning_jobs WHERE household_id = ?"
+        " AND kind = 'email_identity'",
         (cp_stack.household.id,),
     )
     assert len(jobs) == 1 and jobs[0]["status"] == "pending"
@@ -189,7 +190,9 @@ def test_sigkill_inside_result_projection_rolls_back_the_whole_transaction(
         " WHERE workflow_id = ? AND kind = 'email_identity'",
         (cp_stack.onboarding.workflow_for_household(cp_stack.household.id).id,),
     )
-    job = cp_stack.database.query_one("SELECT * FROM provisioning_jobs")
+    job = cp_stack.database.query_one(
+        "SELECT * FROM provisioning_jobs WHERE kind = 'email_identity'"
+    )
     assert step["status"] == "provisioning" and step["result_ciphertext"] is None
     assert job["status"] == "running" and job["result_ciphertext"] is None
 

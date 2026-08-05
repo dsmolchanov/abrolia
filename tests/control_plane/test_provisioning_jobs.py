@@ -16,7 +16,10 @@ from control_plane.provisioning.contracts import (
     ProviderWaiting,
     ProvisionResult,
 )
-from control_plane.provisioning.fakes import DeterministicFakeProvisioner
+from control_plane.provisioning.fakes import (
+    DeterministicFakeProvisioner,
+    DryRunRuntimeProvisioner,
+)
 from control_plane.provisioning.secrets import InMemorySecretSink
 
 BASE_TIME = 1_800_000_000.0
@@ -82,6 +85,80 @@ def _advance_to_runtime(cp_stack) -> None:
         )
         assert worker.run_once().status == "succeeded"
 
+
+def test_profile_queues_and_worker_ensures_app_only_secret_namespace(cp_stack) -> None:
+    cp_stack.complete_profile(provision_namespace=False)
+    job = cp_stack.database.query_one(
+        "SELECT * FROM provisioning_jobs WHERE operation = 'ensure_secret_namespace'"
+    )
+    assert job is not None
+    assert cp_stack.jobs.request(job["id"]) == {
+        "household_id": cp_stack.household.id
+    }
+    assert cp_stack.households.get(cp_stack.household.id).runtime_ref is None
+    assert cp_stack.database.query("SELECT id FROM config_revisions") == []
+
+    result = cp_stack.make_worker(now=BASE_TIME + 2).run_once()
+
+    assert result is not None and result.status == "succeeded"
+    durable = cp_stack.jobs.result(job["id"])
+    assert durable is not None
+    assert durable["public_result"]["stage"] == "secret_namespace_ready"
+    assert durable["public_result"]["planned_writes"] == ["app"]
+    resource = cp_stack.database.query_one(
+        "SELECT resource_type, status, config_revision FROM external_resources"
+    )
+    assert tuple(resource) == ("secret_namespace", "ready", None)
+    assert cp_stack.households.get(cp_stack.household.id).runtime_ref is None
+    assert cp_stack.database.query("SELECT id FROM config_revisions") == []
+
+
+def test_cancel_during_namespace_creation_persists_recoverable_cleanup(cp_stack) -> None:
+    cp_stack.complete_profile(provision_namespace=False)
+
+    class CancelNamespace(DryRunRuntimeProvisioner):
+        allow_delete = False
+
+        def ensure_secret_namespace(self, household_id, idempotency_key):
+            result = super().ensure_secret_namespace(household_id, idempotency_key)
+            cp_stack.service.cancel(
+                cp_stack.household.id,
+                context=cp_stack.context(),
+                now=BASE_TIME + 2,
+            )
+            return result
+
+        def deprovision(self, external_ref):
+            if not self.allow_delete:
+                return InspectResult(InspectState.UNKNOWN)
+            return super().deprovision(external_ref)
+
+    provider = CancelNamespace()
+    registry = ProviderRegistry()
+    registry.register("dry-run-runtime", provider)
+    worker = cp_stack.make_worker(providers=registry, now=BASE_TIME + 2)
+
+    result = worker.run_once()
+
+    assert result is not None and result.status == "outcome_unknown"
+    namespace_job = cp_stack.database.query_one(
+        "SELECT * FROM provisioning_jobs WHERE operation = 'ensure_secret_namespace'"
+    )
+    cleanup = cp_stack.database.query_one(
+        "SELECT * FROM provisioning_jobs WHERE kind = 'cleanup'"
+    )
+    resource = cp_stack.database.query_one(
+        "SELECT resource_type, status FROM external_resources"
+    )
+    assert namespace_job["status"] == "outcome_unknown"
+    assert cleanup is not None and cleanup["status"] == "pending"
+    assert tuple(resource) == ("secret_namespace", "outcome_unknown")
+
+    provider.allow_delete = True
+    assert worker.run_once().status == "succeeded"
+    assert cp_stack.database.query_one(
+        "SELECT status FROM external_resources"
+    )["status"] == "deleted"
 
 class SplitRuntimeProvisioner:
     def __init__(self, calls: list[str]) -> None:
@@ -294,7 +371,9 @@ def test_sigkill_after_lease_recovers_by_inspect_before_ensure(
         context=cp_stack.context(),
         now=BASE_TIME + 2,
     )
-    job = cp_stack.database.query_one("SELECT * FROM provisioning_jobs")
+    job = cp_stack.database.query_one(
+        "SELECT * FROM provisioning_jobs WHERE kind = 'email_identity'"
+    )
     marker = tmp_path / "provider-accepted.marker"
     helper = Path(__file__).with_name("chaos_child.py")
     project_root = Path(__file__).parents[2]
@@ -372,7 +451,9 @@ def test_provider_rejection_after_cancel_cannot_reopen_terminal_projection(cp_st
     registry.register("fake-email", CancelThenReject("email"))
     result = cp_stack.make_worker(providers=registry, now=BASE_TIME + 3).run_once()
     assert result.status == "failed"
-    job = cp_stack.database.query_one("SELECT status FROM provisioning_jobs")
+    job = cp_stack.database.query_one(
+        "SELECT status FROM provisioning_jobs WHERE kind = 'email_identity'"
+    )
     step = cp_stack.database.query_one(
         "SELECT status FROM onboarding_steps WHERE kind = 'email_identity'"
     )
@@ -407,6 +488,7 @@ def test_late_waiting_response_after_cancel_stays_reconcilable(cp_stack) -> None
     fake = CancelThenWait("email")
     registry = ProviderRegistry()
     registry.register("fake-email", fake)
+    registry.register("dry-run-runtime", DryRunRuntimeProvisioner())
     worker = cp_stack.make_worker(providers=registry, now=BASE_TIME + 3)
 
     late = worker.run_once()
@@ -456,14 +538,17 @@ def test_late_success_with_unknown_compensation_creates_recoverable_cleanup(
     fake = CancelThenSucceed("email")
     registry = ProviderRegistry()
     registry.register("fake-email", fake)
+    registry.register("dry-run-runtime", DryRunRuntimeProvisioner())
     worker = cp_stack.make_worker(providers=registry, now=BASE_TIME + 3)
     late = worker.run_once()
     assert late.status == "outcome_unknown"
     cleanup = cp_stack.database.query_one(
         "SELECT * FROM provisioning_jobs WHERE kind = 'cleanup'"
+        " AND provider = 'fake-email'"
     )
     assert cleanup is not None and cleanup["status"] == "pending"
-    assert worker.run_once().status == "outcome_unknown"
+    cleanup_statuses = {worker.run_once().status, worker.run_once().status}
+    assert cleanup_statuses == {"succeeded", "outcome_unknown"}
 
     fake.allow_delete = True
     recovered = worker.reconcile(cleanup["id"])

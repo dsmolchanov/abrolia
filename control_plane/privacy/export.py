@@ -149,6 +149,64 @@ class HouseholdExporter:
                 "created_at": row["created_at"],
                 "activated_at": row["activated_at"],
             })
+        email_identities = []
+        for row in self.accounts.db.query(
+            "SELECT * FROM email_identities WHERE household_id = ? ORDER BY created_at",
+            (household_id,),
+        ):
+            address = None
+            provider_subject = None
+            if row["address_ciphertext"] is not None:
+                address = self.onboarding.decrypt_json(
+                    "email_identities",
+                    row["id"],
+                    "address",
+                    row["address_ciphertext"],
+                    row["encryption_key_version"],
+                )
+            if row["provider_subject_ciphertext"] is not None:
+                provider_subject = self.onboarding.decrypt_json(
+                    "email_identities",
+                    row["id"],
+                    "provider_subject",
+                    row["provider_subject_ciphertext"],
+                    row["encryption_key_version"],
+                )
+            email_identities.append({
+                "id": row["id"],
+                "option": row["option"],
+                "status": row["status"],
+                "address": address,
+                "address_masked": row["address_masked"],
+                "provider_subject": provider_subject,
+                "provider_resource_refs": self.onboarding.parse_public_json(
+                    row["provider_resource_refs_json"]
+                ),
+                "secret_binding_ref": row["secret_binding_ref"],
+                "granted_scopes": self.onboarding.parse_public_json(
+                    row["granted_scopes_json"] or "[]"
+                ),
+                "version": row["version"],
+                "verified_at": row["verified_at"],
+                "activated_at": row["activated_at"],
+                "disconnected_at": row["disconnected_at"],
+            })
+        email_reservations = self._rows(
+            "email_address_reservations",
+            "SELECT id, normalized_domain, normalized_local_part, email_identity_id,"
+            " status, expires_at, created_at, consumed_at"
+            " FROM email_address_reservations WHERE household_id = ? ORDER BY created_at",
+            (household_id,),
+        )
+        email_activation_receipts = self._rows(
+            "email_activation_receipts",
+            "SELECT email_identity_id, desired_revision, runtime_ref, provider,"
+            " inbound_check, outbound_check, checked_at, receipt_digest, status"
+            " FROM email_activation_receipts WHERE email_identity_id IN"
+            " (SELECT id FROM email_identities WHERE household_id = ?)"
+            " ORDER BY desired_revision",
+            (household_id,),
+        )
         transitions = self._rows(
             "onboarding_transitions",
             "SELECT id, workflow_version, command, from_state, to_state, step_kind,"
@@ -215,6 +273,9 @@ class HouseholdExporter:
             "jobs": jobs,
             "external_resources": resources,
             "config_revisions": revisions,
+            "email_identities": email_identities,
+            "email_address_reservations": email_reservations,
+            "email_activation_receipts": email_activation_receipts,
             "consent_receipts": consents,
             "runtime": {
                 "status": runtime_status,

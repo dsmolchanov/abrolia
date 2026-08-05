@@ -12,7 +12,7 @@ PR**, что и код.
 |---|---|---|---|---|---|
 | S1 | SQLite (WAL) dedicated runtime на Fly volume | `events`, runtime-`jobs`/`effects`, домен (todos, reminders, memory, transcripts, actions journal); физически одна семья | Fly.io `ams` (EU, NL) | шифрование диска провайдера | Fly |
 | S2 | Content-addressed blob store (тот же volume) | вложения, фото, голосовые, ICS | Fly.io `ams` | шифрование диска провайдера | Fly |
-| S3 | Fly secrets, раздельные namespaces | runtime-токены household (Telegram bot, Nerve runtime key, OAuth refresh token отдельного Gmail агента, Evolution apikey, relay-HMAC, per-runtime DSAR bearer); control-plane Fly/provider/encryption/HMAC keys; одноразовый bootstrap token существует только до durable runtime receipt ack | Fly.io | secrets-стор провайдера | оператор |
+| S3 | Fly apps как раздельные secret namespaces | deterministic app создаётся после profile без volume/Machine; runtime-токены household (Telegram bot, Nerve runtime key, OAuth refresh token отдельного Gmail агента, Evolution apikey, relay-HMAC, per-runtime DSAR bearer) передаются прямо через `SecretSink`; control-plane Fly/provider/encryption/HMAC keys хранятся отдельно; одноразовый bootstrap token появляется только при финальной runtime activation и живёт до durable runtime receipt ack | Fly.io | secrets-стор провайдера | оператор |
 | S4 | Бэкапы SQLite (Litestream/снапшоты) | копии S1 и отдельная копия S14; runtime и control plane имеют разные ключи и restore-процедуры | EU object storage | AES-256, отдельный ключ per-household/control-plane | оператор |
 | S5 | Nerve inbox (email-опции a/c) | `@abrolia.com` или домен семьи: входящие письма, треды, метаданные вложений | Fly.io `iad` (US) | провайдер | оператор (тот же владелец) |
 | S6 | Resend | доставка исходящих; логи/метаданные | US (независимо от sending region) | провайдер | Resend |
@@ -34,6 +34,9 @@ S14 содержит только account/onboarding/provisioning metadata: се
 email, rate-limit buckets и idempotency keys использует отдельный keyed HMAC.
 Raw IP/network bucket, email, idempotency key и token/session/bootstrap plaintext
 в S14 не хранятся.
+Raw Nerve keys, Gmail refresh tokens и webhook secrets также не входят в S14,
+job payload/result или runtime manifest: control plane хранит только encrypted
+provider refs, secret refs/digests и redacted public state.
 
 ## 2. Классы данных
 
@@ -52,6 +55,8 @@ Raw IP/network bucket, email, idempotency key и token/session/bootstrap plainte
 | Web sessions (`sessions`) | session-token hash, CSRF-secret hash, account, idle/absolute expiry, revoked time, coarse security metadata — без raw IP/UA | control plane | S14 | idle 24 ч., absolute 30 дн.; запись удаляется **30 дн. после revoke/expiry** | частично: lifecycle metadata без hashes | ✔ |
 | Rate-limit buckets (`rate_limit_buckets`) | keyed-HMAC от network/address/token bucket, kind, начало окна, attempts, timestamps; без raw IP/email/token | control plane | S14 | **24 ч.** | ✖ | ✔ |
 | Onboarding workflow/steps (`onboarding_workflows`, `onboarding_steps`) | current step, safe selection/result refs, status/version/attempt | account owner + provider projector | S14 | жизнь household/account + **30 дн.** | ✔ | ✔ |
+| Email identity/reservation/activation (`email_identities`, `email_address_reservations`, `email_activation_receipts`) | encrypted address/provider subject, masked address, provider/secret refs and digests, scopes, state/version, local-part reservation, runtime health receipt; без provider credential | owner, email provider projector, runtime activation | S14 | identity/receipt: жизнь account + **30 дн.**; released/expired reservation: **24 ч.** | ✔ | ✔ |
+| OAuth transaction (`oauth_transactions`) | state hash, encrypted short-lived PKCE verifier, requested scopes, owner session/workflow binding; без authorization code/refresh token | owner OAuth start/callback | S14 | consume/expiry + **24 ч.** | ✖ | ✔ |
 | Onboarding transitions (`onboarding_transitions`) | append-only from/to, command, account/session/request/job IDs, redacted metadata | control plane | S14 | жизнь household/account + **30 дн.** | ✔, кроме session hash/secret | ✔ |
 | Idempotency records (`idempotency_requests`) | account+route+keyed-HMAC от idempotency key, SHA-256 запроса, safe response snapshot; raw key не хранится | control plane | S14 | **24 ч.** | ✖ | ✔ |
 | Provisioning jobs (`provisioning_jobs`) | encrypted typed intent/result/provider ref, safe status/error/attempt/lease metadata; без secret material/provider body | control-plane worker | S14 | encrypted payload **30 дн. после settled**; техническая metadata **90 дн.** | ✔ без internal idempotency/lease и secret fields | ✔ |

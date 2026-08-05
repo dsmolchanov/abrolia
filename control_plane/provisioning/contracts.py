@@ -73,6 +73,23 @@ class Provisioner(Protocol):
     def deprovision(self, external_ref: str) -> InspectResult: ...
 
 
+class RuntimeProvisioner(Provisioner, Protocol):
+    """Runtime adapter with an app-only namespace stage before activation."""
+
+    def ensure_secret_namespace(
+        self, household_id: str, idempotency_key: str
+    ) -> ProvisionResult: ...
+
+    def prepare(self, intent: dict[str, Any], idempotency_key: str) -> ProvisionResult: ...
+
+    def launch(
+        self,
+        intent: dict[str, Any],
+        prepared: ProvisionResult,
+        idempotency_key: str,
+    ) -> ProvisionResult: ...
+
+
 class SecretSink(Protocol):
     def install(self, runtime_ref: str, material: SecretMaterial) -> None: ...
 

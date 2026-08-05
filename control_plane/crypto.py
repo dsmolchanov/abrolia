@@ -33,6 +33,8 @@ SECRET_FIELD_NAMES = frozenset({
     "access_token",
     "bootstrap_token",
     "client_secret",
+    "nerve_bootstrap_key",
+    "nerve_runtime_key",
     "password",
     "refresh_token",
     "secret",

@@ -8,6 +8,7 @@ from typing import Any
 from pydantic import TypeAdapter
 
 from control_plane.crypto import canonical_json
+from control_plane.email.service import EmailIdentityService
 from control_plane.models import (
     EmailSelection,
     OnboardingSnapshot,
@@ -39,10 +40,17 @@ class OnboardingService:
         households: HouseholdsRepository,
         onboarding: OnboardingRepository,
         jobs: JobsRepository,
+        *,
+        runtime_provider: str = "dry-run-runtime",
+        email_provider: str = "fake-email",
+        email_identities: EmailIdentityService | None = None,
     ) -> None:
         self.households = households
         self.onboarding = onboarding
         self.jobs = jobs
+        self.runtime_provider = runtime_provider
+        self.email_provider = email_provider
+        self.email_identities = email_identities
 
     @staticmethod
     def _request_sha(body: dict[str, Any]) -> str:
@@ -163,6 +171,17 @@ class OnboardingService:
             self.households.save_profile(
                 household_id, profile, now=now, connection=connection
             )
+            namespace_job_id, _ = self.jobs.create(
+                connection,
+                household_id=household_id,
+                workflow_id=row["id"],
+                kind="runtime",
+                operation="ensure_secret_namespace",
+                intent_key=f"{household_id}:secret-namespace",
+                request={"household_id": household_id},
+                provider=self.runtime_provider,
+                now=now,
+            )
             connection.execute(
                 "UPDATE onboarding_steps SET status = ?, public_status_json = ?,"
                 " updated_at = ? WHERE workflow_id = ? AND kind = 'profile'",
@@ -189,6 +208,7 @@ class OnboardingService:
                 session_id=context.session_id,
                 request_id=context.request_id,
                 step_kind="profile",
+                related_job_id=namespace_job_id,
                 from_step_status=step["status"],
                 to_step_status=new_status.value,
                 now=now,
@@ -214,10 +234,9 @@ class OnboardingService:
             raise InvalidTransition(f"{kind.value} is not a selectable user step")
         return adapters[kind].validate_python(selection).model_dump(mode="json")
 
-    @staticmethod
-    def _provider_for(kind: StepKind, selection_kind: str) -> str:
+    def _provider_for(self, kind: StepKind, selection_kind: str) -> str:
         return {
-            StepKind.EMAIL: "fake-email",
+            StepKind.EMAIL: self.email_provider,
             StepKind.WHATSAPP: "fake-whatsapp",
             StepKind.PRIMARY_CHANNEL: "fake-channel",
         }[kind]
@@ -313,6 +332,14 @@ class OnboardingService:
                     locale=household_row["family_language"] or "en",
                     now=now,
                 )
+            email_identity = None
+            if kind is StepKind.EMAIL and self.email_identities is not None:
+                email_identity = self.email_identities.select(
+                    connection,
+                    household_id=household_id,
+                    selection=parsed,
+                    now=now,
+                )
             new_status = next_status(kind, StepStatus(step["status"]), SELECT)
             attempt = step["attempt"] + 1
             selection_kind = parsed["kind"]
@@ -320,6 +347,21 @@ class OnboardingService:
                 "onboarding_steps", f"{row['id']}:{kind.value}", "selection", parsed
             )
             intent_key = f"{household_id}:{kind.value}:{selection_kind}:{attempt}"
+            job_request = {
+                "step_kind": kind.value,
+                "selection": parsed,
+                "attempt": attempt,
+            }
+            if email_identity is not None:
+                intent_key = (
+                    f"{household_id}:{kind.value}:{email_identity.id}:"
+                    f"{selection_kind}:{attempt}"
+                )
+                job_request.update({
+                    "email_identity_id": email_identity.id,
+                    "household_id": household_id,
+                    "option": email_identity.option.value,
+                })
             job_id, _ = self.jobs.create(
                 connection,
                 household_id=household_id,
@@ -327,7 +369,7 @@ class OnboardingService:
                 kind=("channel_binding" if kind is StepKind.PRIMARY_CHANNEL else kind.value),
                 operation="ensure",
                 intent_key=intent_key,
-                request={"step_kind": kind.value, "selection": parsed, "attempt": attempt},
+                request=job_request,
                 provider=self._provider_for(kind, selection_kind),
                 now=now,
             )
@@ -451,6 +493,21 @@ class OnboardingService:
                 " updated_at = ? WHERE id = ? AND status = 'waiting_user'",
                 (now, now, waiting_job["id"]),
             )
+            inspect_request = {
+                "step_kind": kind.value,
+                "stable_ref": stable_ref,
+                "attempt": step["attempt"],
+            }
+            if kind is StepKind.EMAIL and self.email_identities is not None:
+                identity = self.email_identities.repository.current_for_household(
+                    household_id
+                )
+                if identity is None:
+                    raise InvalidTransition("email check has no durable identity")
+                inspect_request.update({
+                    "email_identity_id": identity.id,
+                    "household_id": household_id,
+                })
             inspect_id, _ = self.jobs.create(
                 connection,
                 household_id=household_id,
@@ -460,11 +517,7 @@ class OnboardingService:
                 intent_key=(
                     f"{household_id}:{kind.value}:inspect:{step['attempt']}:{row['version'] + 1}"
                 ),
-                request={
-                    "step_kind": kind.value,
-                    "stable_ref": stable_ref,
-                    "attempt": step["attempt"],
-                },
+                request=inspect_request,
                 provider=waiting_job["provider"],
                 now=now,
             )
@@ -538,6 +591,29 @@ class OnboardingService:
             new_status = next_status(kind, StepStatus(step["status"]), RETRY)
             attempt = step["attempt"] + 1
             intent_key = f"{household_id}:{kind.value}:{parsed['kind']}:{attempt}"
+            job_request = {
+                "step_kind": kind.value,
+                "selection": parsed,
+                "attempt": attempt,
+            }
+            if kind is StepKind.EMAIL and self.email_identities is not None:
+                identity = self.email_identities.repository.current_for_household(
+                    household_id
+                )
+                if identity is None:
+                    raise InvalidTransition("email retry has no durable identity")
+                self.email_identities.repository.retry_provisioning(
+                    connection, identity.id, now=now
+                )
+                intent_key = (
+                    f"{household_id}:{kind.value}:{identity.id}:{parsed['kind']}:"
+                    f"{attempt}"
+                )
+                job_request.update({
+                    "email_identity_id": identity.id,
+                    "household_id": household_id,
+                    "option": identity.option.value,
+                })
             job_id, _ = self.jobs.create(
                 connection,
                 household_id=household_id,
@@ -545,7 +621,7 @@ class OnboardingService:
                 kind=("channel_binding" if kind is StepKind.PRIMARY_CHANNEL else kind.value),
                 operation="ensure",
                 intent_key=intent_key,
-                request={"step_kind": kind.value, "selection": parsed, "attempt": attempt},
+                request=job_request,
                 provider=self._provider_for(kind, parsed["kind"]),
                 now=now,
             )
@@ -736,6 +812,10 @@ class OnboardingService:
                 reason="reset",
                 now=now,
             )
+            if kind is StepKind.EMAIL and self.email_identities is not None:
+                self.email_identities.repository.begin_disconnect(
+                    connection, household_id, now=now
+                )
             for index, downstream in enumerate(order[start:]):
                 connection.execute(
                     "UPDATE onboarding_steps SET status = ?, selection_kind = NULL,"
@@ -831,6 +911,10 @@ class OnboardingService:
                 reason="cancel",
                 now=now,
             )
+            if self.email_identities is not None:
+                self.email_identities.repository.begin_disconnect(
+                    connection, household_id, now=now
+                )
             connection.execute(
                 "UPDATE onboarding_steps SET status = 'cancelled', updated_at = ?"
                 " WHERE workflow_id = ? AND status != 'verified'",

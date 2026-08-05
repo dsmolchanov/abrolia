@@ -243,4 +243,12 @@ TABLE_CLASSIFICATION: dict[str, TableClassification] = {
     "bootstrap_tokens": TableClassification(False, True, "payload-30d;metadata-90d", "token hash"),
     "consent_receipts": TableClassification(True, False, "withdrawal+3y", "accountability"),
     "deletion_tombstones": TableClassification(True, False, "3y", "anti-resurrection"),
+    "email_identities": TableClassification(True, True, "account+30d"),
+    "email_address_reservations": TableClassification(
+        True, True, "released-or-expired+24h"
+    ),
+    "oauth_transactions": TableClassification(
+        False, True, "consumed-or-expired+24h", "ephemeral OAuth security metadata"
+    ),
+    "email_activation_receipts": TableClassification(True, True, "account+30d"),
 }

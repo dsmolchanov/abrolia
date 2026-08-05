@@ -116,6 +116,15 @@ class DesiredSpecPlanner:
             email=EmailV1(
                 agent_inbox=email_public["agent_inbox"],
                 fallback=account.recovery_email,
+                provider_kind=str(
+                    email_public.get("provider", email_public.get("mode", "synthetic"))
+                ),
+                provider_binding_ref=email_result["external_ref"],
+                secret_binding_ref=(
+                    str(email_public["secret_binding_ref"])
+                    if email_public.get("secret_binding_ref")
+                    else None
+                ),
             ),
             consent=ConsentAuthorityV1(
                 required_purposes=tuple(required_purposes),

@@ -251,7 +251,9 @@ def cmd_gmail_poll(args: argparse.Namespace) -> int:
     config = load_config()
     if not config.has_gmail:
         print(
-            "не заданы HERMES_GMAIL_ADDRESS / HERMES_GMAIL_APP_PASSWORD",
+            "legacy IMAP выключен: для синтетического compatibility-теста нужны "
+            "HERMES_LEGACY_IMAP_TEST_ONLY=1, HERMES_GMAIL_ADDRESS и "
+            "HERMES_GMAIL_APP_PASSWORD; provisioned runtime его не поддерживает",
             file=sys.stderr,
         )
         return 1

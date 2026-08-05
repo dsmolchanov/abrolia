@@ -58,6 +58,20 @@ Control plane multi-tenant только по metadata: он не принима�
 не вызывает модель/tools и не читает runtime SQLite. Landing не является
 backend; onboarding живёт только на `app.abrolia.com`.
 
+После сохранения profile durable job создаёт только deterministic Fly app —
+ранний household secret namespace. В этот момент нет volume, Machine, image или
+bootstrap token. One-time Nerve/Gmail credentials в следующих construction
+units должны передаваться прямо в этот namespace через `SecretSink`; plaintext
+запрещён в browser, control-plane SQLite, job request/result, manifest и logs.
+Поздний runtime `prepare` идемпотентно переиспользует app, создаёт volume, а
+Machine запускается только после staging секретов и трёх verified steps.
+
+Исторические `HERMES_GMAIL_ADDRESS`/`HERMES_GMAIL_APP_PASSWORD` и IMAP/SMTP
+adapter — только compatibility seam для синтетических тестов. Он требует
+`HERMES_LEGACY_IMAP_TEST_ONLY=1` и отключён в provisioned runtime даже при
+наличии переменных. Production Gmail path — отдельный agent account через OAuth;
+личный Gmail и app passwords не являются поддерживаемым вариантом.
+
 ```
 недоверенное                     полудоверенное                доверенное
 ─────────────────────────────────────────────────────────────────────────

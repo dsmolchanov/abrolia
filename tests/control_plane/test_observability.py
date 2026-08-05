@@ -64,7 +64,11 @@ def test_telemetry_phone_canary_does_not_match_numeric_uuid_fragments() -> None:
         {"error_code": "pii-owner@family.test"},
         {"error_code": "+999 555 0101"},
         {"error_code": "x" * 48},
-        {"refresh_token": "credential-canary"},
+        {"client_secret": "GOCSPX-" + "oauth-client-secret-canary"},
+        {"refresh_token": "1" + "//refresh-token-canary-0123456789"},
+        {"nerve_bootstrap_key": "nrv_" + "live_bootstrap-canary-0123456789"},
+        {"nerve_runtime_key": "nrv_" + "live_runtime-canary-0123456789"},
+        {"webhook_secret": "webhook-secret-canary"},
         {"provider_body": {"status": "rejected"}},
     ],
 )
@@ -78,7 +82,11 @@ def test_telemetry_rejects_unknown_pii_phone_and_credential_canaries(fields) -> 
             assert value not in message
     assert "pii-owner@family.test" not in message
     assert "+999 555 0101" not in message
-    assert "credential-canary" not in message
+    assert "oauth-client-secret-canary" not in message
+    assert "refresh-token-canary" not in message
+    assert "bootstrap-canary" not in message
+    assert "runtime-canary" not in message
+    assert "webhook-secret-canary" not in message
     assert canaries not in message
 
 

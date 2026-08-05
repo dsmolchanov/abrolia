@@ -29,6 +29,7 @@ ENV_CALENDAR = "HERMES_CALENDAR_ID"
 ENV_GMAIL_ADDRESS = "HERMES_GMAIL_ADDRESS"
 ENV_GMAIL_PASSWORD = "HERMES_GMAIL_APP_PASSWORD"
 ENV_GMAIL_LABEL = "HERMES_GMAIL_LABEL"
+ENV_LEGACY_IMAP_TEST_ONLY = "HERMES_LEGACY_IMAP_TEST_ONLY"
 ENV_SMTP_HOST = "HERMES_SMTP_HOST"
 ENV_SMTP_PORT = "HERMES_SMTP_PORT"
 ENV_VERTEX_EU_ENABLED = "HERMES_VERTEX_EU_ENABLED"
@@ -72,6 +73,7 @@ class Config:
     gmail_address: str
     gmail_app_password: str | None
     gmail_label: str
+    legacy_imap_test_only: bool
     smtp_host: str
     smtp_port: int
     telegram_token: str | None
@@ -89,7 +91,12 @@ class Config:
 
     @property
     def has_gmail(self) -> bool:
-        return bool(self.gmail_address and self.gmail_app_password)
+        return bool(
+            self.legacy_imap_test_only
+            and self.manifest_path is None
+            and self.gmail_address
+            and self.gmail_app_password
+        )
 
     @property
     def has_calendar(self) -> bool:
@@ -124,6 +131,9 @@ def load_config(
         )
     thread_raw = source.get(ENV_THREAD, "").strip()
     effort = source.get(ENV_EFFORT, "").strip()
+    legacy_imap_test_only = (
+        source.get(ENV_LEGACY_IMAP_TEST_ONLY) or ""
+    ).strip().casefold() in {"1", "true", "yes", "on"}
     return Config(
         database_path=Path(source.get(ENV_DB) or DEFAULT_DB_PATH),
         chat=manifest.primary_chat_id if manifest else source.get(ENV_CHAT, "").strip(),
@@ -140,8 +150,13 @@ def load_config(
             manifest.email.agent_inbox
             if manifest else (source.get(ENV_GMAIL_ADDRESS) or "").strip()
         ),
-        gmail_app_password=source.get(ENV_GMAIL_PASSWORD) or None,
+        gmail_app_password=(
+            source.get(ENV_GMAIL_PASSWORD) or None
+            if legacy_imap_test_only and manifest is None
+            else None
+        ),
         gmail_label=source.get(ENV_GMAIL_LABEL) or DEFAULT_GMAIL_LABEL,
+        legacy_imap_test_only=legacy_imap_test_only,
         smtp_host=source.get(ENV_SMTP_HOST) or DEFAULT_SMTP_HOST,
         smtp_port=int(source.get(ENV_SMTP_PORT) or DEFAULT_SMTP_PORT),
         timezone=manifest.timezone if manifest else None,

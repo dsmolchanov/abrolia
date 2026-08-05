@@ -20,6 +20,11 @@ and token-HMAC keys and fails closed if they or the synthetic-only gates are
 missing. See [`docs/onboarding-runbook.md`](docs/onboarding-runbook.md) for the
 complete deployment and bootstrap procedure.
 
+After the household profile is saved, the control plane durably ensures the
+household's deterministic Fly app as an empty secret namespace. This early step
+does not create a volume or Machine. Runtime storage, bootstrap material and the
+Machine remain gated on all three verified onboarding choices.
+
 ```bash
 export ABROLIA_ENCRYPTION_KEY_VERSION=v1
 export ABROLIA_ENCRYPTION_KEY='<32-byte urlsafe-base64 test key>'
@@ -45,6 +50,7 @@ export HERMES_OWNER=990000001         # who may export/delete household data
 export HERMES_FAMILY_ACTORS=990000002 # who may confirm actions (comma-separated)
 export HERMES_GUEST_ACTORS=990000003  # optional: read-only actors (nanny, grandparent)
 export TELEGRAM_BOT_TOKEN=...         # optional: without it messages print to the console
+export HERMES_LEGACY_IMAP_TEST_ONLY=1 # required only for the deprecated fixture seam below
 
 python3 -m hermes_cloud.cli inject-eml tests/fixtures/email/forwarded_school_de.eml
 python3 -m hermes_cloud.cli gmail-poll --baseline  # synthetic legacy-IMAP seam: initialise cursor

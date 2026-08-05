@@ -72,7 +72,7 @@ bootstrap проверяет tombstone до любого write.
 |---|---|---|---|
 | 1 | Nerve org/inbox | удалить inbox и org household'а, отозвать runtime-ключ | письма в исходящем журнале Nerve — по его retention |
 | 2 | Resend | запросить удаление; логи доставки | метаданные доставки у Resend — по их политике (US) |
-| 3 | Google | удалить события ассистента; для email-опции b отозвать Gmail OAuth grant отдельного agent account и удалить encrypted refresh token | события/письма, которые семья или получатели сохранили, остаются у них |
+| 3 | Google | удалить события ассистента; для email-опции b отозвать Gmail OAuth grant отдельного agent account и удалить refresh token из exact household Fly secret namespace | события/письма, которые семья или получатели сохранили, остаются у них |
 | 4 | Telegram | удалить сообщения бота, где это возможно; удалить бота household'а | копии в чатах у членов семьи и их собеседников — **вне нашего контроля**, сообщается заявителю прямо |
 | 5 | Shared WhatsApp gateway | удалить sender→household binding, relay key и queued payload; delayed webhook получает tombstone deny | копии в WhatsApp у участников — вне нашего контроля; technical gateway metadata — до 90 дней по pilot policy |
 | 6 | Dedicated Evolution (WhatsApp) | logout linked-device session, удалить instance, apikey и relay-HMAC | сообщения на телефонах участников — вне нашего контроля |

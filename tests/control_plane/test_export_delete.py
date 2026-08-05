@@ -71,7 +71,15 @@ def test_export_contains_classified_domain_rows_but_no_credentials_or_ciphertext
     assert payload["account"]["recovery_email"] == cp_stack.account.recovery_email
     assert payload["profile"]["first_name"] == "Test"
     assert payload["steps"][1]["selection"] == EMAIL_SELECTION
-    assert payload["jobs"][0]["request"]["selection"] == EMAIL_SELECTION
+    email_job = next(job for job in payload["jobs"] if job["kind"] == "email_identity")
+    assert email_job["request"]["selection"] == EMAIL_SELECTION
+    assert payload["email_identities"][0]["address"] == "export-agent@" + "abrolia.com"
+    assert payload["email_identities"][0]["status"] == "provisioning"
+    assert payload["email_address_reservations"][0]["normalized_local_part"] == (
+        "export-agent"
+    )
+    assert "address_lookup_hmac" not in payload["email_identities"][0]
+    assert "oauth_transactions" not in payload
     assert payload["consent_receipts"][0]["id"] == receipt_id
     assert payload["retention_exceptions"]["consent_receipts"]
     for credential in (

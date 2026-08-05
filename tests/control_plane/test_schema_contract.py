@@ -34,7 +34,19 @@ def test_schema_constraints_reject_impossible_states(cp_stack) -> None:
         )
 
 
-def test_secret_shaped_job_payload_is_rejected_before_insert(cp_stack) -> None:
+@pytest.mark.parametrize(
+    ("secret_field", "secret_value"),
+    (
+        ("client_secret", "GOCSPX-" + "oauth-client-secret-canary"),
+        ("refresh_token", "1" + "//refresh-token-canary-0123456789"),
+        ("nerve_bootstrap_key", "nrv_" + "live_bootstrap-canary-0123456789"),
+        ("nerve_runtime_key", "nrv_" + "live_runtime-canary-0123456789"),
+        ("webhook_secret", "webhook-secret-canary"),
+    ),
+)
+def test_secret_shaped_job_payload_is_rejected_before_insert(
+    cp_stack, secret_field: str, secret_value: str
+) -> None:
     workflow = cp_stack.onboarding.workflow_for_household(cp_stack.household.id)
     with pytest.raises(SecretFieldError), cp_stack.database.write() as connection:
         cp_stack.jobs.create(
@@ -44,12 +56,13 @@ def test_secret_shaped_job_payload_is_rejected_before_insert(cp_stack) -> None:
             kind="email_identity",
             operation="ensure",
             intent_key="secret-boundary-test",
-            request={"provider": {"refresh_token": "secret-canary"}},
+            request={"provider": {secret_field: secret_value}},
             provider="fake-email",
         )
     assert cp_stack.database.query(
         "SELECT id FROM provisioning_jobs WHERE intent_key = 'secret-boundary-test'"
     ) == []
+    assert secret_value.encode() not in Path(cp_stack.database.path).read_bytes()
 
 
 def test_direct_identifiers_and_credentials_are_absent_from_sqlite_bytes(

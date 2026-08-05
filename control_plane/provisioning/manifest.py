@@ -33,6 +33,9 @@ class EmailV1(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     agent_inbox: str
     fallback: str
+    provider_kind: str = "synthetic"
+    provider_binding_ref: str | None = None
+    secret_binding_ref: str | None = None
 
 
 class ConsentReceiptV1(BaseModel):
@@ -100,21 +103,22 @@ class DesiredHouseholdSpecV1(BaseModel):
         return self
 
     def with_hash(self) -> DesiredHouseholdSpecV1:
-        payload = self.model_dump(mode="json")
+        payload = self.model_dump(mode="json", exclude_none=True)
         payload.pop("config_sha256", None)
         digest = hashlib.sha256(canonical_json(payload)).hexdigest()
         return self.model_copy(update={"config_sha256": digest})
 
     def canonical_bytes(self) -> bytes:
-        return canonical_json(self.model_dump(mode="json"))
+        return canonical_json(self.model_dump(mode="json", exclude_none=True))
 
 
 def manifest_sha256(value: DesiredHouseholdSpecV1 | dict[str, Any]) -> str:
-    payload = (
-        value.model_dump(mode="json")
+    spec = (
+        value
         if isinstance(value, DesiredHouseholdSpecV1)
-        else dict(value)
+        else DesiredHouseholdSpecV1.model_validate(dict(value))
     )
+    payload = spec.model_dump(mode="json", exclude_none=True)
     claimed = payload.pop("config_sha256", "")
     digest = hashlib.sha256(canonical_json(payload)).hexdigest()
     if claimed and claimed != digest:
