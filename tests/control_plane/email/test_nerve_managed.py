@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from control_plane.email.models import EmailOption, EmailProvisionIntent
 from control_plane.models import StepKind
 from control_plane.providers.email.nerve_managed import (
@@ -12,15 +14,45 @@ from control_plane.provisioning.contracts import (
     InspectState,
     OutcomeUnknown,
     ProviderRegistry,
+    ProviderWaiting,
 )
 from control_plane.provisioning.secrets import InMemorySecretSink
 
 
 class FakeNerveAdmin:
-    def __init__(self, *, replay_credentials: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        replay_credentials: bool = False,
+        attachments_enabled: bool = True,
+        attachment_probe_error: Exception | None = None,
+    ) -> None:
         self.replay_credentials = replay_credentials
+        self.attachments_enabled = attachments_enabled
+        self.attachment_probe_error = attachment_probe_error
+        self.attachment_probe_calls: list[tuple[str, str]] = []
         self.key_calls = 0
         self.deleted: list[tuple[str, str | None]] = []
+        self.grants = [
+            {"id": "grant-1", "external_ref": "arbolia:email:identity-1:grant"}
+        ]
+        self.inboxes = [{
+            "id": "inbox-1",
+            "address": "family-agent@" + "abrolia.com",
+            "external_ref": "arbolia:email:identity-1:inbox",
+        }]
+        self.keys = [
+            {"id": "key-old", "external_ref": "arbolia:email:identity-1:key"}
+        ]
+        self.webhooks = [{
+            "id": "webhook-1",
+            "external_ref": "arbolia:email:identity-1:webhook",
+        }]
+
+    @staticmethod
+    def _replace(items, value):
+        items[:] = [item for item in items if item["external_ref"] != value["external_ref"]]
+        items.append(value)
 
     def ensure_org(self, *, household_id):
         return {"org_id": f"org-{household_id}"}
@@ -29,31 +61,39 @@ class FakeNerveAdmin:
         return {"org_id": f"org-{household_id}"}
 
     def ensure_grant(self, *, org_id, external_ref):
-        return {"id": "grant-1", "external_ref": external_ref}
+        result = {"id": "grant-1", "external_ref": external_ref}
+        self._replace(self.grants, result)
+        return result
 
     def ensure_inbox(self, *, org_id, address, external_ref):
-        return {
+        result = {
             "inbox": {
                 "id": "inbox-1",
                 "address": address,
                 "external_ref": external_ref,
             }
         }
+        self._replace(self.inboxes, result["inbox"])
+        return result
 
     def issue_key(self, *, org_id, external_ref):
         self.key_calls += 1
         if self.replay_credentials and self.key_calls == 1:
-            return {
+            result = {
                 "id": "key-old",
                 "external_ref": external_ref,
                 "secret_available": False,
             }
-        return {
+            self._replace(self.keys, result)
+            return result
+        result = {
             "id": "key-1",
             "key": "synthetic-nerve-key",
             "external_ref": external_ref,
             "secret_available": True,
         }
+        self._replace(self.keys, result)
+        return result
 
     def ensure_webhook(self, *, org_id, url, external_ref):
         result = {
@@ -64,35 +104,35 @@ class FakeNerveAdmin:
         }
         if not self.replay_credentials:
             result["secret"] = "synthetic-signing-key"
+        self._replace(self.webhooks, result)
         return result
 
     def rotate_webhook(self, *, org_id, webhook_id):
         return {"id": webhook_id, "secret": "synthetic-rotated-signing-key"}
 
+    def attachment_feature_enabled(self, *, api_key, expected_org_id):
+        self.attachment_probe_calls.append((api_key, expected_org_id))
+        if self.attachment_probe_error is not None:
+            raise self.attachment_probe_error
+        return self.attachments_enabled
+
     def list_grants(self, *, org_id):
-        return [{"id": "grant-1", "external_ref": "arbolia:email:identity-1:grant"}]
+        return list(self.grants)
 
     def list_inboxes(self, *, org_id):
-        return [{
-            "id": "inbox-1",
-            "address": "family-agent@" + "abrolia.com",
-            "external_ref": "arbolia:email:identity-1:inbox",
-        }]
+        return list(self.inboxes)
 
     def list_keys(self, *, org_id):
-        return [{
-            "id": "key-old",
-            "external_ref": "arbolia:email:identity-1:key",
-        }]
+        return list(self.keys)
 
     def list_webhooks(self, *, org_id):
-        return [{
-            "id": "webhook-1",
-            "external_ref": "arbolia:email:identity-1:webhook",
-        }]
+        return list(self.webhooks)
 
     def delete(self, path, *, org_id=None):
         self.deleted.append((path, org_id))
+        if path.startswith("/v1/keys/"):
+            key_id = path.rsplit("/", 1)[-1]
+            self.keys[:] = [item for item in self.keys if item["id"] != key_id]
 
 
 class LostInboxResponseNerveAdmin(FakeNerveAdmin):
@@ -138,6 +178,69 @@ def test_managed_provider_builds_isolated_resources_and_one_secret_bundle() -> N
     assert result.secret_material.items()[0][0] == NERVE_SECRET_BINDING
     assert "synthetic-nerve-key" not in result.external_ref
     assert "synthetic-signing-key" not in repr(result.public_result)
+    assert client.attachment_probe_calls == [
+        ("synthetic-nerve-key", "org-household-1")
+    ]
+
+
+def test_managed_provider_waits_for_audited_attachment_activation() -> None:
+    client = FakeNerveAdmin(attachments_enabled=False)
+
+    with pytest.raises(ProviderWaiting) as raised:
+        NerveManagedEmailProvisioner(client).ensure(
+            _intent(), "household-1:email_identity:identity-1:abrolia_managed:1"
+        )
+
+    assert raised.value.code == "nerve_attachment_flag_pending"
+    assert raised.value.public_result == {
+        "readiness": "attachments_flag_pending",
+        "nerve_org_id": "org-household-1",
+        "operator_action": {
+            "tool": "nerve-flags",
+            "arguments": [
+                "set",
+                "attachments",
+                "--org",
+                "org-household-1",
+                "--enabled=true",
+            ],
+            "audit_actor_required": True,
+        },
+        "next_action": "enable the flag, wait for convergence, then check again",
+    }
+    assert raised.value.external_ref is not None
+    assert "synthetic-nerve-key" not in raised.value.external_ref
+
+
+def test_managed_provider_converges_from_flag_off_to_ready() -> None:
+    client = FakeNerveAdmin(attachments_enabled=False)
+    provider = NerveManagedEmailProvisioner(client)
+    with pytest.raises(ProviderWaiting) as raised:
+        provider.ensure(
+            _intent(), "household-1:email_identity:identity-1:abrolia_managed:1"
+        )
+
+    client.attachments_enabled = True
+    inspected = provider.inspect(str(raised.value.external_ref))
+
+    assert inspected.state is InspectState.READY
+    assert inspected.result is not None
+    assert not inspected.result.secret_material.is_empty
+    assert client.attachment_probe_calls[-1] == (
+        "synthetic-nerve-key",
+        "org-household-1",
+    )
+
+
+def test_managed_provider_probe_errors_fail_closed() -> None:
+    client = FakeNerveAdmin(
+        attachment_probe_error=OutcomeUnknown("synthetic probe unavailable")
+    )
+
+    with pytest.raises(OutcomeUnknown):
+        NerveManagedEmailProvisioner(client).ensure(
+            _intent(), "household-1:email_identity:identity-1:abrolia_managed:1"
+        )
 
 
 def test_replayed_one_time_credentials_are_revoked_or_rotated() -> None:
@@ -230,6 +333,59 @@ def test_managed_provider_runs_through_durable_worker_and_secret_sink(cp_stack) 
     assert cleaned is not None and cleaned.status == "succeeded"
     assert sink.get(runtime_ref, NERVE_SECRET_BINDING) is None
     assert all("/v1/domains/" not in path for path, _ in client.deleted)
+
+
+def test_worker_keeps_onboarding_pending_until_attachment_flag_converges(
+    cp_stack,
+) -> None:
+    cp_stack.complete_profile()
+    cp_stack.service.email_provider = "nerve-managed"
+    client = FakeNerveAdmin(attachments_enabled=False)
+    cp_stack.service.select(
+        cp_stack.household.id,
+        StepKind.EMAIL,
+        {"kind": "abrolia_managed", "local_part": "family-agent"},
+        context=cp_stack.context(),
+    )
+    registry = ProviderRegistry()
+    registry.register("nerve-managed", NerveManagedEmailProvisioner(client))
+    sink = InMemorySecretSink()
+    worker = cp_stack.make_worker(providers=registry, secret_sink=sink)
+
+    waiting = worker.run_once()
+
+    assert waiting is not None and waiting.status == "waiting_user"
+    assert waiting.error_code == "nerve_attachment_flag_pending"
+    snapshot = cp_stack.onboarding.snapshot(cp_stack.household.id)
+    step = next(step for step in snapshot.steps if step.kind is StepKind.EMAIL)
+    assert step.public_status["readiness"] == "attachments_flag_pending"
+    assert step.public_status["nerve_org_id"] == f"org-{cp_stack.household.id}"
+    namespace = cp_stack.database.query_one(
+        "SELECT id, external_id_ciphertext, encryption_key_version"
+        " FROM external_resources WHERE resource_type = 'secret_namespace'"
+    )
+    runtime_ref = cp_stack.jobs.decrypt_json(
+        "external_resources",
+        namespace["id"],
+        "external_id",
+        namespace["external_id_ciphertext"],
+        namespace["encryption_key_version"],
+    )
+    assert sink.get(runtime_ref, NERVE_SECRET_BINDING) is None
+
+    client.attachments_enabled = True
+    cp_stack.service.check(
+        cp_stack.household.id,
+        StepKind.EMAIL,
+        context=cp_stack.context(),
+    )
+    converged = worker.run_once()
+
+    assert converged is not None and converged.status == "succeeded"
+    identity = cp_stack.email_identities.current_for_household(cp_stack.household.id)
+    assert identity is not None
+    assert identity.address == "family-agent@" + "abrolia.com"
+    assert sink.get(runtime_ref, NERVE_SECRET_BINDING) is not None
 
 
 def test_worker_reconciles_lost_create_response_from_durable_intent(cp_stack) -> None:

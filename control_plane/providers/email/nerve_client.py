@@ -220,6 +220,46 @@ class NerveAdminClient:
             params={"org_id": org_id},
         )
 
+    def attachment_feature_enabled(
+        self, *, api_key: str, expected_org_id: str
+    ) -> bool:
+        """Resolve the attachment gate as the household runtime principal."""
+        try:
+            response = self.client.get(
+                f"{self.settings.base_url.rstrip('/')}/internal/feature-flags/attachments",
+                headers={"X-Nerve-Cloud-Key": api_key},
+            )
+        except (httpx.TimeoutException, httpx.TransportError) as error:
+            raise OutcomeUnknown("Nerve attachment readiness is unknown") from error
+        if response.status_code == 429:
+            try:
+                retry_after = float(response.headers.get("Retry-After", "30"))
+            except ValueError:
+                retry_after = 30.0
+            raise ProviderRateLimited(max(1.0, retry_after))
+        if response.status_code >= 500:
+            raise OutcomeUnknown("Nerve attachment readiness is unknown")
+        if response.status_code in {401, 403}:
+            raise ProviderRejected("Nerve rejected the household readiness probe")
+        if response.status_code != 200:
+            raise ProviderRejected(
+                f"Nerve readiness probe failed with HTTP {response.status_code}"
+            )
+        try:
+            payload = response.json()
+        except ValueError as error:
+            raise OutcomeUnknown("Nerve returned unreadable attachment readiness") from error
+        if (
+            not isinstance(payload, dict)
+            or payload.get("flag") != "attachments"
+            or payload.get("org_id") != expected_org_id
+            or not isinstance(payload.get("enabled"), bool)
+            or not isinstance(payload.get("cache_ttl_seconds"), int)
+            or payload["cache_ttl_seconds"] <= 0
+        ):
+            raise OutcomeUnknown("Nerve returned mismatched attachment readiness")
+        return payload["enabled"]
+
     def delete(self, path: str, *, org_id: str | None = None) -> None:
         params = {"org_id": org_id} if org_id else None
         self.request("DELETE", path, params=params, allow_not_found=True)

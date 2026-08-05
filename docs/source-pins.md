@@ -56,12 +56,15 @@ provisioning, но ещё не содержит полный live consumer-suite
 upstream production contract и локальный provisioning suite записываются как
 два разных доказательства; локальные тесты нельзя называть staging/live smoke.
 
-**Открытый activation gate:** managed provisioning создаёт и проверяет domain
-grant, но пока не оркестрирует и не проверяет org-scoped `attachments` flag.
-До закрытия [abrolia#6](https://github.com/dsmolchanov/abrolia/issues/6)
-перепин фиксирует совместимую Nerve release baseline, но не означает, что новый
-household объявляется attachment-ready. Онбординг обязан оставаться
-fail-closed/pending до успешного effective-state probe.
+**Activation gate реализован:** managed provisioning создаёт и проверяет domain
+grant, но не объявляет household готовым только по наличию inbox/key. Оно
+проверяет org-scoped `attachments` flag через household runtime key и оставляет
+шаг `waiting_user` до точного effective-state `enabled=true`. Публичный статус
+выдаёт `nerve_org_id` для существующего аудируемого `nerve-flags`; после
+операторского включения действие Check восстанавливает one-time credentials и
+повторяет probe. Ошибка, неверный org и `enabled=false` остаются fail-closed.
+Контракт и resumable worker-путь покрывают
+[abrolia#6](https://github.com/dsmolchanov/abrolia/issues/6).
 
 Consumer verification на `abrolia@1596310502f7127de2ef83512e4ffa9ca71ffa42`:
 
