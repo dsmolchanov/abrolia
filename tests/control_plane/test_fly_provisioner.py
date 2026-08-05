@@ -540,6 +540,25 @@ def test_deprovision_waits_for_post_delete_404_and_uses_exact_ids() -> None:
     assert third.state is InspectState.ABSENT
 
 
+def test_runtime_deprovision_preserves_app_secret_namespace() -> None:
+    spec = _spec()
+    fly = StatefulFly()
+    provisioner = _provisioner(fly)
+    runtime = provisioner.ensure(
+        {"manifest": spec.model_dump(mode="json")}, "intent"
+    )
+
+    result = provisioner.deprovision_runtime(runtime.public_result)
+
+    assert result.state is InspectState.ABSENT
+    assert fly.app == {"name": runtime.external_ref}
+    assert fly.machine is None
+    assert fly.volume is None
+    assert ("DELETE", f"/v1/apps/{runtime.external_ref}") not in [
+        (method, path) for method, path, _body in fly.calls
+    ]
+
+
 def test_inspect_and_deprovision_do_not_claim_unknown_cleanup_complete() -> None:
     spec = _spec()
     fly = StatefulFly()

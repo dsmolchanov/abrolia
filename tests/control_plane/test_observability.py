@@ -64,6 +64,8 @@ def test_telemetry_phone_canary_does_not_match_numeric_uuid_fragments() -> None:
         {"error_code": "pii-owner@family.test"},
         {"error_code": "+999 555 0101"},
         {"error_code": "x" * 48},
+        {"error_code": "GOCSPX-" + "short-secret-canary"},
+        {"error_code": "nrv_" + "live_" + "a" * 32},
         {"client_secret": "GOCSPX-" + "oauth-client-secret-canary"},
         {"refresh_token": "1" + "//refresh-token-canary-0123456789"},
         {"nerve_bootstrap_key": "nrv_" + "live_bootstrap-canary-0123456789"},

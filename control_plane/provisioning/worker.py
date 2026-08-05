@@ -1,14 +1,24 @@
 from __future__ import annotations
 
+import json
 import secrets
 import time
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any
+from uuid import UUID
 
-from control_plane.crypto import SecretMaterial
+from control_plane.crypto import SecretFieldError, SecretMaterial, normalize_email
 from control_plane.db import new_id
-from control_plane.email.models import EmailIdentityStatus
+from control_plane.email.contracts import EmailFailureKind, EmailProviderError
+from control_plane.email.domain_policy import canonicalize_domain
+from control_plane.email.models import (
+    EmailDnsPublicStatus,
+    EmailIdentityStatus,
+    EmailNerveAttachmentPublicStatus,
+    EmailOption,
+    EmailPublicBinding,
+)
 from control_plane.email.repository import EmailIdentityRepository
 from control_plane.models import StepKind, StepStatus
 from control_plane.observability import StructuredLogger
@@ -128,6 +138,22 @@ class ProvisioningWorker:
                     error_code="telemetry_redacted",
                 )
 
+    def _durable_work_result(
+        self,
+        job_id: str,
+        *,
+        fallback_status: str,
+        fallback_error: str,
+    ) -> WorkResult:
+        current = self.jobs.get(job_id)
+        if current is None:
+            return WorkResult(job_id, "cancelled", "job_missing")
+        return WorkResult(
+            job_id,
+            current.status or fallback_status,
+            current.error_code or fallback_error,
+        )
+
     def _run_once(self) -> WorkResult | None:
         now = self.clock()
         job = self.jobs.lease(self.worker_id, now=now)
@@ -164,8 +190,10 @@ class ProvisioningWorker:
                         error_code="secret_namespace_not_ready",
                         now=self.clock(),
                     )
-                    return WorkResult(
-                        job.id, "pending", "secret_namespace_not_ready"
+                    return self._durable_work_result(
+                        job.id,
+                        fallback_status="pending",
+                        fallback_error="secret_namespace_not_ready",
                     )
                 provider_request = (
                     {
@@ -253,20 +281,22 @@ class ProvisioningWorker:
                 error_code=error.code,
                 now=self.clock(),
             )
-            current = self.jobs.get(job.id)
-            return WorkResult(
+            return self._durable_work_result(
                 job.id,
-                current.status if current is not None else "cancelled",
-                error.code,
+                fallback_status="pending",
+                fallback_error=error.code,
             )
         except ProviderWaiting as error:
+            return self._handle_provider_waiting(job, request, error)
+        except EmailProviderError as error:
+            return self._handle_email_provider_error(job, request, error)
+        except SecretFieldError:
+            if job.kind == "email_identity":
+                return self._mark_step_problem(
+                    job, request, "outcome_unknown", "provider_result_invalid"
+                )
             return self._mark_step_problem(
-                job,
-                request,
-                "waiting_user",
-                error.code,
-                public_result=error.public_result,
-                external_ref=error.external_ref,
+                job, request, "failed", "provider_rejected"
             )
         except ProviderRejected as error:
             return self._mark_step_problem(job, request, "failed", error.code)
@@ -274,6 +304,118 @@ class ProvisioningWorker:
             return self._mark_step_problem(
                 job, request, "outcome_unknown", "outcome_unknown"
             )
+
+    def _handle_email_provider_error(
+        self,
+        job: JobRecord,
+        request: dict,
+        error: EmailProviderError,
+    ) -> WorkResult:
+        if error.kind in {
+            EmailFailureKind.SAFE_RETRY,
+            EmailFailureKind.PROVIDER_DEGRADED,
+        }:
+            if job.attempts >= self.max_safe_attempts:
+                return self._mark_step_problem(
+                    job, request, "failed", "email_retry_exhausted"
+                )
+            self.jobs.retry_later(
+                job.id,
+                not_before=self.clock() + 30,
+                error_code="email_retry_scheduled",
+                now=self.clock(),
+            )
+            return self._durable_work_result(
+                job.id,
+                fallback_status="pending",
+                fallback_error="email_retry_scheduled",
+            )
+        status, code = {
+            EmailFailureKind.USER_ACTION: ("waiting_user", "email_user_action_required"),
+            EmailFailureKind.DEFINITIVE_FAILURE: ("failed", "email_provider_rejected"),
+            EmailFailureKind.AUTH_REVOKED: ("failed", "email_auth_revoked"),
+            EmailFailureKind.OUTCOME_UNKNOWN: (
+                "outcome_unknown",
+                "email_outcome_unknown",
+            ),
+        }[error.kind]
+        return self._mark_step_problem(job, request, status, code)
+
+    def _handle_provider_waiting(
+        self,
+        job: JobRecord,
+        request: dict[str, Any],
+        error: ProviderWaiting,
+    ) -> WorkResult:
+        public_result = error.public_result
+        external_ref = error.external_ref
+        if job.kind == "email_identity":
+            try:
+                public_result, external_ref = self._validated_email_waiting_result(
+                    job,
+                    request,
+                    public_result=public_result,
+                    external_ref=external_ref,
+                )
+            except (SecretFieldError, TypeError, ValueError):
+                return self._mark_step_problem(
+                    job, request, "outcome_unknown", "provider_result_invalid"
+                )
+            if external_ref is not None:
+                cleanup = self._schedule_cancelled_waiting_cleanup(
+                    job, request, external_ref
+                )
+                if cleanup is not None:
+                    return cleanup
+        return self._mark_step_problem(
+            job,
+            request,
+            "waiting_user",
+            error.code,
+            public_result=public_result,
+            external_ref=external_ref,
+        )
+
+    def _schedule_cancelled_waiting_cleanup(
+        self, job: JobRecord, request: dict[str, Any], external_ref: str
+    ) -> WorkResult | None:
+        current = self.jobs.db.query_one(
+            "SELECT status, error_code FROM provisioning_jobs WHERE id = ?", (job.id,)
+        )
+        if (
+            current is None
+            or current["status"] != "outcome_unknown"
+            or current["error_code"]
+            not in {"cancel_requires_reconciliation", "reset_requires_reconciliation"}
+        ):
+            return None
+        with self.jobs.db.write() as connection:
+            resource_id = self._external_resource(
+                connection,
+                job,
+                external_ref,
+                status="deleting",
+                revision=job.desired_revision,
+            )
+            self.jobs.create(
+                connection,
+                household_id=job.household_id,
+                workflow_id=job.workflow_id,
+                kind="cleanup",
+                operation="deprovision",
+                intent_key=f"{job.household_id}:late-waiting-cleanup:{job.id}",
+                desired_revision=job.desired_revision,
+                request={
+                    "resource_id": resource_id,
+                    "resource_type": "email_identity",
+                    "external_ref": external_ref,
+                    "email_identity_id": request.get("email_identity_id"),
+                    "parent_job_id": job.id,
+                },
+                provider=job.provider,
+                now=self.clock(),
+            )
+        return WorkResult(job.id, "outcome_unknown", current["error_code"])
 
     @staticmethod
     def _reject_identity_secret(result: ProvisionResult) -> None:
@@ -283,11 +425,19 @@ class ProvisioningWorker:
                 "identity adapter returned a secret before runtime secret handoff existed"
             )
 
-    def _secret_namespace_ref(self, household_id: str) -> str | None:
+    def _secret_namespace_ref(
+        self, household_id: str, *, include_deleting: bool = False
+    ) -> str | None:
+        status_clause = (
+            "status IN ('ready','deleting','outcome_unknown')"
+            if include_deleting
+            else "status = 'ready'"
+        )
         row = self.jobs.db.query_one(
             "SELECT * FROM external_resources WHERE household_id = ?"
-            " AND resource_type = 'secret_namespace' AND status = 'ready'"
-            " ORDER BY updated_at DESC, id DESC LIMIT 1",
+            " AND resource_type = 'secret_namespace' AND "
+            + status_clause
+            + " ORDER BY updated_at DESC, id DESC LIMIT 1",
             (household_id,),
         )
         if row is None:
@@ -301,6 +451,101 @@ class ProvisioningWorker:
         )
         return value if isinstance(value, str) and value else None
 
+    def _secret_namespace_state(
+        self, household_id: str, runtime_ref: str | None = None
+    ) -> tuple[str, str | None] | None:
+        rows = self.jobs.db.query(
+            "SELECT * FROM external_resources WHERE household_id = ?"
+            " AND resource_type = 'secret_namespace'"
+            " ORDER BY updated_at DESC, id DESC",
+            (household_id,),
+        )
+        if not rows or (runtime_ref is None and len(rows) != 1):
+            return None
+        for row in rows:
+            value = self.jobs.decrypt_json(
+                "external_resources",
+                row["id"],
+                "external_id",
+                row["external_id_ciphertext"],
+                row["encryption_key_version"],
+            )
+            value = value if isinstance(value, str) and value else None
+            if runtime_ref is None or value == runtime_ref:
+                return row["status"], value
+        return None
+
+    def _email_cleanup_pending(self, household_id: str) -> bool:
+        disconnecting = self.jobs.db.query_one(
+            "SELECT 1 FROM email_identities WHERE household_id = ?"
+            " AND status = 'disconnecting' LIMIT 1",
+            (household_id,),
+        )
+        if disconnecting is None:
+            return False
+        provider_cleanup = self.jobs.db.query_one(
+            "SELECT 1 FROM external_resources WHERE household_id = ?"
+            " AND resource_type = 'email_identity' AND status != 'deleted' LIMIT 1",
+            (household_id,),
+        )
+        if provider_cleanup is not None:
+            return True
+        unresolved_provider_job = self.jobs.db.query_one(
+            "SELECT 1 FROM provisioning_jobs WHERE household_id = ?"
+            " AND kind = 'email_identity'"
+            " AND status IN ('pending','running','waiting_user','outcome_unknown') LIMIT 1",
+            (household_id,),
+        )
+        if unresolved_provider_job is not None:
+            return True
+        secret_cleanup = self.jobs.db.query_one(
+            "SELECT 1 FROM provisioning_jobs WHERE household_id = ?"
+            " AND kind = 'bootstrap_cleanup' AND operation = 'delete_email_secret'"
+            " AND status != 'succeeded' LIMIT 1",
+            (household_id,),
+        )
+        return secret_cleanup is not None
+
+    def _defer_runtime_cleanup(
+        self, job: JobRecord, request: dict[str, Any]
+    ) -> WorkResult | None:
+        if request.get("resource_type") not in {"runtime", "secret_namespace"}:
+            return None
+        if not self._email_cleanup_pending(job.household_id):
+            return None
+        self.jobs.retry_later(
+            job.id,
+            not_before=self.clock() + 5,
+            error_code="email_cleanup_pending",
+            now=self.clock(),
+        )
+        return self._durable_work_result(
+            job.id,
+            fallback_status="pending",
+            fallback_error="email_cleanup_pending",
+        )
+
+    def _settle_cancelled_parent(
+        self, connection, parent_job_id: Any
+    ) -> None:
+        if not isinstance(parent_job_id, str):
+            return
+        parent = connection.execute(
+            "SELECT status FROM provisioning_jobs WHERE id = ?", (parent_job_id,)
+        ).fetchone()
+        if parent is not None and parent["status"] in {
+            "running",
+            "outcome_unknown",
+            "cancelled",
+        }:
+            self.jobs.settle(
+                connection,
+                parent_job_id,
+                status="cancelled",
+                error_code="cancelled_and_compensated",
+                now=self.clock(),
+            )
+
     def _stage_email_secret(
         self,
         job: JobRecord,
@@ -308,15 +553,270 @@ class ProvisioningWorker:
         result: ProvisionResult,
         namespace_ref: str,
     ) -> bool:
-        del job, request
+        try:
+            public_result = self._validated_email_public_result(job, request, result)
+        except ProviderRejected as error:
+            result.secret_material.clear()
+            raise OutcomeUnknown("email provider result is not safely attributable") from error
+        binding_ref = public_result.get("secret_binding_ref")
         if result.secret_material.is_empty:
-            return True
+            return not isinstance(binding_ref, str) or not binding_ref
+        material_names = [name for name, _value in result.secret_material.items()]
+        if not isinstance(binding_ref, str) or material_names != [binding_ref]:
+            result.secret_material.clear()
+            raise OutcomeUnknown(
+                "email secret material does not match its public binding"
+            )
         try:
             self.secret_sink.install(namespace_ref, result.secret_material)
         except Exception:
             result.secret_material.clear()
             return False
         return True
+
+    def _validated_email_public_result(
+        self,
+        job: JobRecord,
+        request: dict[str, Any],
+        result: ProvisionResult,
+    ) -> dict[str, Any]:
+        try:
+            public_result = EmailPublicBinding.model_validate(
+                result.public_result
+            ).model_dump(mode="json", exclude_none=True)
+        except (TypeError, ValueError) as error:
+            raise ProviderRejected(
+                "email provider returned an invalid public binding"
+            ) from error
+        expected_provider = self._expected_email_public_provider(job)
+        if public_result["provider"] != expected_provider:
+            raise ProviderRejected(
+                "email provider identity does not match the configured adapter"
+            )
+        identity_id = request.get("email_identity_id")
+        if self.email_identities is not None and isinstance(identity_id, str):
+            identity = self.email_identities.get(identity_id)
+            if identity is None:
+                raise ProviderRejected("email provider returned an unknown identity")
+            if identity.address is not None and normalize_email(
+                identity.address
+            ) != normalize_email(public_result["agent_inbox"]):
+                raise ProviderRejected(
+                    "email provider address does not match the selected mailbox"
+                )
+        self._validate_email_external_ref(job, request, result.external_ref, public_result)
+        return public_result
+
+    def _expected_email_public_provider(self, job: JobRecord) -> str:
+        provider = self.providers.get(job.provider)
+        expected = getattr(provider, "email_public_provider", None)
+        if expected not in {"synthetic", "nerve", "gmail"}:
+            raise ProviderRejected(
+                "email adapter does not declare its public provider identity"
+            )
+        return expected
+
+    @staticmethod
+    def _canonical_uuid(value: Any) -> bool:
+        if not isinstance(value, str):
+            return False
+        try:
+            return str(UUID(value)) == value
+        except ValueError:
+            return False
+
+    def _validate_email_external_ref(
+        self,
+        job: JobRecord,
+        request: dict[str, Any],
+        external_ref: str,
+        public_result: dict[str, Any],
+    ) -> None:
+        provider = public_result["provider"]
+        identity_id = request.get("email_identity_id")
+        provider_refs = public_result.get("provider_refs", {})
+        if provider == "synthetic":
+            if not isinstance(identity_id, str) or external_ref != (
+                f"synthetic-email:{identity_id}"
+            ):
+                raise ProviderRejected("synthetic email reference does not match intent")
+            if provider_refs and provider_refs.get("identity_id") != identity_id:
+                raise ProviderRejected("synthetic email identity reference drifted")
+            return
+        if provider == "gmail":
+            raise ProviderRejected("Gmail email provider is not implemented")
+        try:
+            reference = json.loads(external_ref)
+        except (TypeError, ValueError) as error:
+            raise ProviderRejected("Nerve returned an invalid resource reference") from error
+        if external_ref != json.dumps(
+            reference, sort_keys=True, separators=(",", ":")
+        ):
+            raise ProviderRejected("Nerve returned a non-canonical resource reference")
+        option = request.get("option")
+        if option == EmailOption.MANAGED_ABROLIA.value:
+            resource_key = "grant_id"
+            exact_keys = {
+                "household_id",
+                "stable_ref",
+                "org_id",
+                resource_key,
+                "inbox_id",
+                "key_id",
+                "webhook_id",
+                "address",
+            }
+        elif option == EmailOption.OWN_DOMAIN.value:
+            resource_key = "domain_id"
+            exact_keys = {
+                "household_id",
+                "stable_ref",
+                "org_id",
+                resource_key,
+                "domain",
+                "inbox_id",
+                "key_id",
+                "webhook_id",
+                "address",
+            }
+        else:
+            raise ProviderRejected("Nerve provider does not match the selected option")
+        if not isinstance(reference, dict) or set(reference) != exact_keys:
+            raise ProviderRejected("Nerve returned an unexpected resource reference")
+        expected = {
+            "household_id": job.household_id,
+            "stable_ref": request.get("stable_ref", job.intent_key),
+            "org_id": provider_refs.get("org_id"),
+            resource_key: provider_refs.get(resource_key),
+            "inbox_id": provider_refs.get("inbox_id"),
+            "key_id": provider_refs.get("key_id"),
+            "webhook_id": provider_refs.get("webhook_id"),
+            "address": public_result["agent_inbox"],
+        }
+        if option == EmailOption.OWN_DOMAIN.value:
+            expected["domain"] = canonicalize_domain(
+                str(request.get("selection", {}).get("domain", "")),
+                allow_test=True,
+            )
+        if reference != expected or not all(
+            self._canonical_uuid(reference[key])
+            for key in ("org_id", resource_key, "inbox_id", "key_id", "webhook_id")
+        ):
+            raise ProviderRejected("Nerve resource reference does not match intent")
+
+    def _validated_email_waiting_result(
+        self,
+        job: JobRecord,
+        request: dict[str, Any],
+        *,
+        public_result: dict[str, Any],
+        external_ref: str | None,
+    ) -> tuple[dict[str, Any], str | None]:
+        expected_provider = self._expected_email_public_provider(job)
+        if not public_result:
+            if expected_provider != "synthetic" or external_ref is not None:
+                raise ValueError("untyped email waiting reference")
+            return {}, None
+        if expected_provider != "nerve":
+            raise ValueError("waiting state does not match the configured adapter")
+        option = request.get("option")
+        if option == EmailOption.MANAGED_ABROLIA.value:
+            typed_readiness = EmailNerveAttachmentPublicStatus.model_validate(
+                public_result
+            )
+            if external_ref is None:
+                raise ValueError("managed Nerve waiting state has no durable reference")
+            try:
+                reference = json.loads(external_ref)
+            except (TypeError, ValueError) as error:
+                raise ValueError("invalid pending managed Nerve reference") from error
+            if external_ref != json.dumps(
+                reference, sort_keys=True, separators=(",", ":")
+            ):
+                raise ValueError("non-canonical pending managed Nerve reference")
+            exact_keys = {
+                "household_id",
+                "stable_ref",
+                "org_id",
+                "grant_id",
+                "inbox_id",
+                "key_id",
+                "webhook_id",
+                "address",
+            }
+            expected_address = normalize_email(
+                f"{request.get('selection', {}).get('local_part', '')}@abrolia.com"
+            )
+            if (
+                not isinstance(reference, dict)
+                or set(reference) != exact_keys
+                or reference["household_id"] != job.household_id
+                or reference["stable_ref"] != request.get("stable_ref", job.intent_key)
+                or reference["org_id"] != typed_readiness.nerve_org_id
+                or normalize_email(str(reference["address"])) != expected_address
+                or not all(
+                    self._canonical_uuid(reference[key])
+                    for key in (
+                        "org_id",
+                        "grant_id",
+                        "inbox_id",
+                        "key_id",
+                        "webhook_id",
+                    )
+                )
+            ):
+                raise ValueError("pending managed Nerve reference does not match intent")
+            return (
+                typed_readiness.model_dump(mode="json", exclude_none=True),
+                external_ref,
+            )
+        if option != EmailOption.OWN_DOMAIN.value:
+            raise ValueError("DNS waiting state does not match the selected option")
+        typed = EmailDnsPublicStatus.model_validate(public_result)
+        expected_domain = canonicalize_domain(
+            str(request.get("selection", {}).get("domain", "")), allow_test=True
+        )
+        if canonicalize_domain(typed.domain, allow_test=True) != expected_domain:
+            raise ValueError("DNS waiting state does not match the selected domain")
+        normalized = typed.model_dump(mode="json", exclude_none=True)
+        if external_ref is not None:
+            try:
+                reference = json.loads(external_ref)
+            except (TypeError, ValueError) as error:
+                raise ValueError("invalid pending Nerve reference") from error
+            if external_ref != json.dumps(
+                reference, sort_keys=True, separators=(",", ":")
+            ):
+                raise ValueError("non-canonical pending Nerve reference")
+            exact_keys = {
+                "household_id",
+                "stable_ref",
+                "org_id",
+                "domain_id",
+                "domain",
+                "inbox_id",
+                "key_id",
+                "webhook_id",
+                "address",
+            }
+            if not isinstance(reference, dict) or set(reference) != exact_keys:
+                raise ValueError("unexpected pending Nerve reference")
+            if not isinstance(reference["address"], str):
+                raise ValueError("pending Nerve address is invalid")
+            expected_address = normalize_email(
+                f"{request.get('selection', {}).get('local_part', '')}@{expected_domain}"
+            )
+            if (
+                reference["household_id"] != job.household_id
+                or reference["stable_ref"] != request.get("stable_ref", job.intent_key)
+                or reference["domain"] != expected_domain
+                or normalize_email(reference["address"]) != expected_address
+                or not self._canonical_uuid(reference["org_id"])
+                or not self._canonical_uuid(reference["domain_id"])
+                or any(reference[key] for key in ("inbox_id", "key_id", "webhook_id"))
+            ):
+                raise ValueError("pending Nerve reference does not match intent")
+        return normalized, external_ref
 
     def _inspect_job(
         self,
@@ -344,12 +844,30 @@ class ProvisioningWorker:
                 self._reject_identity_secret(inspected.result)
             return self._finish_step(job, request, inspected.result)
         if inspected.state is InspectState.PENDING:
+            public_result = inspected.public_result
+            waiting_external_ref = None
+            if job.kind == "email_identity":
+                try:
+                    waiting_external_ref = self.jobs.external_ref(job.id)
+                    public_result, waiting_external_ref = (
+                        self._validated_email_waiting_result(
+                        job,
+                        request,
+                        public_result=public_result,
+                        external_ref=waiting_external_ref,
+                        )
+                    )
+                except (SecretFieldError, TypeError, ValueError) as error:
+                    raise OutcomeUnknown(
+                        "email provider returned an invalid waiting result"
+                    ) from error
             return self._mark_step_problem(
                 job,
                 request,
                 "waiting_user",
                 "waiting_user",
-                public_result=inspected.public_result,
+                public_result=public_result,
+                external_ref=waiting_external_ref,
             )
         if inspected.state in {InspectState.UNKNOWN, InspectState.READY}:
             return self._mark_step_problem(
@@ -367,6 +885,22 @@ class ProvisioningWorker:
     ) -> WorkResult:
         result.secret_material.clear()
         current = self.jobs.get(job.id)
+        original_request = self.jobs.request(job.id)
+        if job.kind == "email_identity":
+            try:
+                self._validated_email_public_result(job, original_request, result)
+            except ProviderRejected:
+                return self._mark_step_problem(
+                    job,
+                    original_request,
+                    "outcome_unknown",
+                    "cancelled_provider_result_invalid",
+                )
+        email_identity_id = (
+            original_request.get("email_identity_id")
+            if job.kind == "email_identity"
+            else None
+        )
         resource_id = None
         exact_ref: Any = (
             result.public_result if job.kind == "runtime" else result.external_ref
@@ -404,6 +938,44 @@ class ProvisioningWorker:
                             provider="internal-secret-sink",
                             now=self.clock(),
                         )
+        elif job.kind == "email_identity":
+            binding_ref = result.public_result.get("secret_binding_ref")
+            namespace_ref = self._secret_namespace_ref(
+                job.household_id, include_deleting=True
+            )
+            if isinstance(binding_ref, str) and binding_ref:
+                if namespace_ref is None:
+                    secret_cleanup_unknown = True
+                else:
+                    try:
+                        self.secret_sink.delete(namespace_ref, binding_ref)
+                    except Exception:
+                        secret_cleanup_unknown = True
+                if secret_cleanup_unknown and current is not None:
+                    with self.jobs.db.write() as connection:
+                        self.jobs.create(
+                            connection,
+                            household_id=job.household_id,
+                            workflow_id=job.workflow_id,
+                            kind="bootstrap_cleanup",
+                            operation="delete_email_secret",
+                            intent_key=(
+                                f"{job.household_id}:late-email-secret-cleanup:"
+                                f"{job.id}"
+                            ),
+                            request={
+                                "runtime_ref": namespace_ref,
+                                "name": binding_ref,
+                                "parent_job_id": job.id,
+                                "resource_id": resource_id,
+                                "email_identity_id": email_identity_id,
+                                "cleanup_authorization": (
+                                    "email_identity_cancelled"
+                                ),
+                            },
+                            provider="internal-secret-sink",
+                            now=self.clock(),
+                        )
         try:
             inspected = provider.deprovision(exact_ref)
         except Exception:
@@ -436,6 +1008,14 @@ class ProvisioningWorker:
                             error_code="cancelled_and_compensated",
                             now=self.clock(),
                         )
+                    if (
+                        job.kind == "email_identity"
+                        and self.email_identities is not None
+                        and isinstance(email_identity_id, str)
+                    ):
+                        self.email_identities.finish_disconnect(
+                            connection, email_identity_id, now=self.clock()
+                        )
                 if resource_status != "deleted":
                     self.jobs.create(
                         connection,
@@ -448,6 +1028,8 @@ class ProvisioningWorker:
                             "resource_id": resource_id,
                             "resource_type": job.kind,
                             "external_ref": exact_ref,
+                            "email_identity_id": email_identity_id,
+                            "parent_job_id": job.id,
                         },
                         provider=job.provider,
                         now=self.clock(),
@@ -470,6 +1052,54 @@ class ProvisioningWorker:
         return results
 
     def reconcile(self, job_id: str) -> WorkResult:
+        try:
+            return self._reconcile(job_id)
+        except EmailProviderError as error:
+            job = self.jobs.get(job_id)
+            if job is None:
+                raise KeyError(job_id) from None
+            return self._handle_email_provider_error(
+                job, self.jobs.request(job.id), error
+            )
+        except SecretFieldError:
+            job = self.jobs.get(job_id)
+            if job is None:
+                raise KeyError(job_id) from None
+            if job.kind == "email_identity":
+                return self._mark_step_problem(
+                    job,
+                    self.jobs.request(job.id),
+                    "outcome_unknown",
+                    "provider_result_invalid",
+                )
+            return self._mark_step_problem(
+                job,
+                self.jobs.request(job.id),
+                "failed",
+                "provider_rejected",
+            )
+        except ProviderRejected as error:
+            job = self.jobs.get(job_id)
+            if job is None:
+                raise KeyError(job_id) from None
+            return self._mark_step_problem(
+                job,
+                self.jobs.request(job.id),
+                "failed",
+                error.code,
+            )
+        except (OutcomeUnknown, TimeoutError, ConnectionError):
+            job = self.jobs.get(job_id)
+            if job is None:
+                raise KeyError(job_id) from None
+            return self._mark_step_problem(
+                job,
+                self.jobs.request(job.id),
+                "outcome_unknown",
+                "reconcile_inconclusive",
+            )
+
+    def _reconcile(self, job_id: str) -> WorkResult:
         job = self.jobs.get(job_id)
         if job is None or job.status != "outcome_unknown":
             raise ValueError("only an outcome_unknown job can be reconciled")
@@ -478,16 +1108,28 @@ class ProvisioningWorker:
             return self._cleanup_bootstrap(job, request)
         provider = self.providers.get(job.provider)
         if job.kind == "cleanup":
+            deferred = self._defer_runtime_cleanup(job, request)
+            if deferred is not None:
+                return deferred
             external_ref = request.get("external_ref")
             if not external_ref:
                 return self._mark_step_problem(
                     job, request, "failed", "missing_external_ref"
                 )
+            if request.get("resource_type") == "runtime":
+                # Inspecting the shared app cannot distinguish an absent
+                # workload from its intentionally retained secret namespace.
+                # Re-run the exact idempotent workload cleanup instead.
+                return self._cleanup(job, request, provider)
             inspected = provider.inspect(external_ref)
             if inspected.state is InspectState.ABSENT:
+                email_identity_id = request.get("email_identity_id")
                 if (
                     request.get("resource_type") == "email_identity"
-                    and not self._delete_email_binding_secret(job.household_id)
+                    and (
+                        not isinstance(email_identity_id, str)
+                        or not self._delete_email_binding_secret(email_identity_id)
+                    )
                 ):
                     return WorkResult(
                         job.id, "outcome_unknown", "secret_cleanup_unknown"
@@ -505,9 +1147,13 @@ class ProvisioningWorker:
                     if (
                         request.get("resource_type") == "email_identity"
                         and self.email_identities is not None
+                        and isinstance(email_identity_id, str)
                     ):
+                        self._settle_cancelled_parent(
+                            connection, request.get("parent_job_id")
+                        )
                         self.email_identities.finish_disconnect(
-                            connection, job.household_id, now=self.clock()
+                            connection, email_identity_id, now=self.clock()
                         )
                 return WorkResult(job.id, "succeeded")
             if inspected.state is InspectState.READY:
@@ -610,7 +1256,10 @@ class ProvisioningWorker:
                 "secret_namespace_ref": namespace_ref,
             }
             try:
-                result = reconcile_email(provider_request, job.intent_key)
+                result = reconcile_email(
+                    provider_request,
+                    request.get("stable_ref", job.intent_key),
+                )
                 if (
                     job.error_code == "secret_handoff_unknown"
                     and result.secret_material.is_empty
@@ -634,21 +1283,18 @@ class ProvisioningWorker:
                     error_code=error.code,
                     now=self.clock(),
                 )
-                return WorkResult(job.id, "pending", error.code)
-            except ProviderWaiting as error:
-                return self._mark_step_problem(
-                    job,
-                    request,
-                    "waiting_user",
-                    error.code,
-                    public_result=error.public_result,
-                    external_ref=error.external_ref,
+                return self._durable_work_result(
+                    job.id,
+                    fallback_status="pending",
+                    fallback_error=error.code,
                 )
+            except ProviderWaiting as error:
+                return self._handle_provider_waiting(job, request, error)
             except ProviderRejected as error:
                 return self._mark_step_problem(job, request, "failed", error.code)
             except (OutcomeUnknown, TimeoutError, ConnectionError):
                 return WorkResult(job.id, "outcome_unknown", "reconcile_inconclusive")
-        inspected = provider.inspect(job.intent_key)
+        inspected = provider.inspect(request.get("stable_ref", job.intent_key))
         if inspected.state is InspectState.READY and inspected.result:
             try:
                 if job.kind == "email_identity":
@@ -678,6 +1324,13 @@ class ProvisioningWorker:
                 return self._cleanup_cancelled_result(
                     job, inspected.result, self.providers.get(job.provider)
                 )
+        if inspected.state is InspectState.FAILED:
+            return self._mark_step_problem(
+                job,
+                request,
+                "failed",
+                inspected.error_code or "provider_rejected",
+            )
         if inspected.state is InspectState.ABSENT:
             return self._mark_step_problem(
                 job, request, "failed", "provider_absent"
@@ -762,6 +1415,9 @@ class ProvisioningWorker:
                     request["email_identity_id"],
                     status=problem_status,
                     now=now,
+                )
+                self.email_identities.finish_disconnect(
+                    connection, request["email_identity_id"], now=now
                 )
             step_kind = request.get("step_kind")
             if step_kind in {item.value for item in StepKind if item is not StepKind.RUNTIME}:
@@ -981,9 +1637,12 @@ class ProvisioningWorker:
     ) -> WorkResult:
         now = self.clock()
         step_kind = StepKind(request["step_kind"])
+        public_result = result.public_result
+        if step_kind is StepKind.EMAIL:
+            public_result = self._validated_email_public_result(job, request, result)
         durable_result = {
             "external_ref": result.external_ref,
-            "public_result": result.public_result,
+            "public_result": public_result,
             "verified": True,
         }
         with self.jobs.db.write() as connection:
@@ -1018,39 +1677,44 @@ class ProvisioningWorker:
                 and self.email_identities is not None
                 and request.get("email_identity_id")
             ):
-                address = result.public_result.get("agent_inbox")
+                address = public_result.get("agent_inbox")
                 if not isinstance(address, str) or not address:
                     raise ProviderRejected("email provider returned no verified address")
-                raw_refs = result.public_result.get("provider_refs")
+                raw_refs = public_result.get("provider_refs")
                 provider_refs = (
                     {str(key): str(value) for key, value in raw_refs.items()}
                     if isinstance(raw_refs, dict)
                     else {"external_ref": result.external_ref}
                 )
-                raw_scopes = result.public_result.get("granted_scopes", [])
+                raw_scopes = public_result.get("granted_scopes", [])
                 scopes = (
                     [str(scope) for scope in raw_scopes]
                     if isinstance(raw_scopes, (list, tuple))
                     else []
                 )
-                self.email_identities.mark_verified(
-                    connection,
-                    request["email_identity_id"],
-                    address=address,
-                    provider_subject=(
-                        str(result.public_result["provider_subject"])
-                        if result.public_result.get("provider_subject")
-                        else None
-                    ),
-                    provider_refs=provider_refs,
-                    secret_binding_ref=(
-                        str(result.public_result["secret_binding_ref"])
-                        if result.public_result.get("secret_binding_ref")
-                        else None
-                    ),
-                    granted_scopes=scopes,
-                    now=now,
-                )
+                try:
+                    self.email_identities.mark_verified(
+                        connection,
+                        request["email_identity_id"],
+                        address=address,
+                        provider_subject=(
+                            str(public_result["provider_subject"])
+                            if public_result.get("provider_subject")
+                            else None
+                        ),
+                        provider_refs=provider_refs,
+                        secret_binding_ref=(
+                            str(public_result["secret_binding_ref"])
+                            if public_result.get("secret_binding_ref")
+                            else None
+                        ),
+                        granted_scopes=scopes,
+                        now=now,
+                    )
+                except ValueError as error:
+                    raise ProviderRejected(
+                        "email provider returned a mismatched identity"
+                    ) from error
             desired = next_status(step_kind, StepStatus(step["status"]), VERIFY_RESULT)
             encrypted = self.onboarding.encrypt_json(
                 "onboarding_steps",
@@ -1068,7 +1732,7 @@ class ProvisioningWorker:
                     encrypted.ciphertext,
                     self.onboarding.public_json({
                         "state": "verified",
-                        **result.public_result,
+                        **public_result,
                     }),
                     now,
                     job.workflow_id,
@@ -1379,22 +2043,47 @@ class ProvisioningWorker:
         return WorkResult(job.id, "succeeded")
 
     def _cleanup(self, job: JobRecord, request: dict, provider) -> WorkResult:
+        deferred = self._defer_runtime_cleanup(job, request)
+        if deferred is not None:
+            return deferred
         external_ref = request.get("external_ref") or request.get("result", {}).get(
             "external_ref"
         )
         if not external_ref:
             self._mark_step_problem(job, request, "failed", "missing_external_ref")
             return WorkResult(job.id, "failed", "missing_external_ref")
-        inspected = provider.deprovision(external_ref)
+        if request.get("resource_type") == "runtime":
+            # A runtime reset tears down the Machine and volume but must retain
+            # the dedicated app: provider credentials live in that app's
+            # secret namespace and upstream verified steps may still own them.
+            deprovision_runtime = getattr(provider, "deprovision_runtime", None)
+            if not callable(deprovision_runtime):
+                self._mark_step_problem(
+                    job,
+                    request,
+                    "outcome_unknown",
+                    "runtime_cleanup_unsupported",
+                )
+                return WorkResult(
+                    job.id, "outcome_unknown", "runtime_cleanup_unsupported"
+                )
+            deprovision = deprovision_runtime
+        else:
+            deprovision = provider.deprovision
+        inspected = deprovision(external_ref)
         if inspected.state is InspectState.FAILED:
             self._mark_step_problem(job, request, "failed", "cleanup_rejected")
             return WorkResult(job.id, "failed", "cleanup_rejected")
         if inspected.state is not InspectState.ABSENT:
             self._mark_step_problem(job, request, "outcome_unknown", "cleanup_unknown")
             return WorkResult(job.id, "outcome_unknown", "cleanup_unknown")
+        email_identity_id = request.get("email_identity_id")
         if (
             request.get("resource_type") == "email_identity"
-            and not self._delete_email_binding_secret(job.household_id)
+            and (
+                not isinstance(email_identity_id, str)
+                or not self._delete_email_binding_secret(email_identity_id)
+            )
         ):
             self._mark_step_problem(
                 job, request, "outcome_unknown", "secret_cleanup_unknown"
@@ -1411,25 +2100,34 @@ class ProvisioningWorker:
             if (
                 request.get("resource_type") == "email_identity"
                 and self.email_identities is not None
+                and isinstance(email_identity_id, str)
             ):
+                self._settle_cancelled_parent(
+                    connection, request.get("parent_job_id")
+                )
                 self.email_identities.finish_disconnect(
-                    connection, job.household_id, now=self.clock()
+                    connection, email_identity_id, now=self.clock()
                 )
         return WorkResult(job.id, "succeeded")
 
-    def _delete_email_binding_secret(self, household_id: str) -> bool:
+    def _delete_email_binding_secret(self, identity_id: str) -> bool:
         if self.email_identities is None:
             return True
         identity_row = self.jobs.db.query_one(
-            "SELECT secret_binding_ref FROM email_identities WHERE household_id = ?"
-            " AND status = 'disconnecting' ORDER BY updated_at DESC LIMIT 1",
-            (household_id,),
+            "SELECT household_id, secret_binding_ref FROM email_identities WHERE id = ?"
+            " AND status = 'disconnecting'",
+            (identity_id,),
         )
-        if identity_row is None or not identity_row["secret_binding_ref"]:
-            return True
-        namespace_ref = self._secret_namespace_ref(household_id)
-        if namespace_ref is None:
+        if identity_row is None:
             return False
+        if not identity_row["secret_binding_ref"]:
+            return True
+        namespace_ref = self._secret_namespace_ref(
+            identity_row["household_id"], include_deleting=True
+        )
+        if namespace_ref is None:
+            namespace_state = self._secret_namespace_state(identity_row["household_id"])
+            return namespace_state is not None and namespace_state[0] == "deleted"
         try:
             self.secret_sink.delete(namespace_ref, identity_row["secret_binding_ref"])
         except Exception:
@@ -1438,6 +2136,7 @@ class ProvisioningWorker:
 
     def _cleanup_bootstrap(self, job: JobRecord, request: dict) -> WorkResult:
         if request.get("cleanup_authorization") not in {
+            "email_identity_cancelled",
             "runtime_receipt_acknowledged",
             "runtime_cancelled",
         }:
@@ -1450,9 +2149,21 @@ class ProvisioningWorker:
                     now=self.clock(),
                 )
             return WorkResult(job.id, "failed", "bootstrap_cleanup_unauthorized")
-        try:
-            self.secret_sink.delete(request["runtime_ref"], request["name"])
-        except Exception:
+        runtime_ref = request.get("runtime_ref")
+        namespace_state = None
+        if (
+            request.get("cleanup_authorization") == "email_identity_cancelled"
+        ):
+            namespace_state = self._secret_namespace_state(
+                job.household_id,
+                runtime_ref if isinstance(runtime_ref, str) else None,
+            )
+            if not runtime_ref and namespace_state is not None:
+                runtime_ref = namespace_state[1]
+        namespace_absent = (
+            namespace_state is not None and namespace_state[0] == "deleted"
+        )
+        if (not isinstance(runtime_ref, str) or not runtime_ref) and not namespace_absent:
             with self.jobs.db.write() as connection:
                 self.jobs.settle(
                     connection,
@@ -1462,6 +2173,49 @@ class ProvisioningWorker:
                     now=self.clock(),
                 )
             return WorkResult(job.id, "outcome_unknown", "bootstrap_cleanup_unknown")
+        if not namespace_absent:
+            try:
+                self.secret_sink.delete(runtime_ref, request["name"])
+            except Exception:
+                current_namespace = self._secret_namespace_state(
+                    job.household_id,
+                    runtime_ref if isinstance(runtime_ref, str) else None,
+                )
+                if not (
+                    request.get("cleanup_authorization")
+                    == "email_identity_cancelled"
+                    and current_namespace is not None
+                    and current_namespace[0] == "deleted"
+                ):
+                    with self.jobs.db.write() as connection:
+                        self.jobs.settle(
+                            connection,
+                            job.id,
+                            status="outcome_unknown",
+                            error_code="bootstrap_cleanup_unknown",
+                            now=self.clock(),
+                        )
+                    return WorkResult(
+                        job.id, "outcome_unknown", "bootstrap_cleanup_unknown"
+                    )
         with self.jobs.db.write() as connection:
             self.jobs.settle(connection, job.id, status="succeeded", now=self.clock())
+            if request.get("cleanup_authorization") == "email_identity_cancelled":
+                resource = connection.execute(
+                    "SELECT status FROM external_resources WHERE id = ?",
+                    (request.get("resource_id"),),
+                ).fetchone()
+                if (
+                    resource is not None
+                    and resource["status"] == "deleted"
+                    and self.email_identities is not None
+                ):
+                    identity_id = request.get("email_identity_id")
+                    if isinstance(identity_id, str):
+                        self._settle_cancelled_parent(
+                            connection, request.get("parent_job_id")
+                        )
+                        self.email_identities.finish_disconnect(
+                            connection, identity_id, now=self.clock()
+                        )
         return WorkResult(job.id, "succeeded")

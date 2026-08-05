@@ -6,6 +6,7 @@ import time
 
 from control_plane.crypto import normalize_email, reject_secret_fields
 from control_plane.db import new_id
+from control_plane.email.domain_policy import canonicalize_domain
 from control_plane.email.local_part import normalize_local_part
 from control_plane.email.models import EmailIdentityRecord, EmailIdentityStatus, EmailOption
 from control_plane.repositories.base import Repository
@@ -80,11 +81,21 @@ class EmailIdentityRepository(Repository):
         now: float | None = None,
     ) -> EmailIdentityRecord:
         now = time.time() if now is None else now
+        if option is EmailOption.OWN_DOMAIN and address is None:
+            raise ValueError("owned-domain identities require a mailbox address")
+        disconnecting = connection.execute(
+            "SELECT 1 FROM email_identities WHERE household_id = ?"
+            " AND status = 'disconnecting' LIMIT 1",
+            (household_id,),
+        ).fetchone()
+        if disconnecting is not None:
+            raise ValueError("email cleanup must finish before reconnect")
         identity_id = new_id()
         encrypted_address = None
         address_hmac = None
         address_masked = None
         normalized_address = None
+        domain_lookup_hmac = None
         if address is not None:
             normalized_address = normalize_email(address)
             encrypted_address = self.encrypt_json(
@@ -92,6 +103,21 @@ class EmailIdentityRepository(Repository):
             )
             address_hmac = self.lookup.email(normalized_address)
             address_masked = _mask_email(normalized_address)
+            if option is EmailOption.OWN_DOMAIN:
+                domain = canonicalize_domain(
+                    normalized_address.rsplit("@", 1)[1],
+                    allow_test=True,
+                )
+                domain_lookup_hmac = self.lookup.digest(f"email-domain:{domain}")
+                legacy_claim = connection.execute(
+                    "SELECT 1 FROM email_address_reservations r"
+                    " JOIN email_identities i ON i.id = r.email_identity_id"
+                    " WHERE r.normalized_domain = ? AND i.option = 'own_domain'"
+                    " AND i.status != 'deleted' LIMIT 1",
+                    (domain,),
+                ).fetchone()
+                if legacy_claim is not None:
+                    raise sqlite3.IntegrityError("email domain is already claimed")
         key_version = (
             encrypted_address.key_version
             if encrypted_address is not None
@@ -99,9 +125,9 @@ class EmailIdentityRepository(Repository):
         )
         connection.execute(
             "INSERT INTO email_identities (id, household_id, option, status,"
-            " address_ciphertext, address_lookup_hmac, address_masked,"
+            " address_ciphertext, address_lookup_hmac, address_masked, domain_lookup_hmac,"
             " encryption_key_version, created_at, updated_at)"
-            " VALUES (?, ?, ?, 'selected', ?, ?, ?, ?, ?, ?)",
+            " VALUES (?, ?, ?, 'selected', ?, ?, ?, ?, ?, ?, ?)",
             (
                 identity_id,
                 household_id,
@@ -109,6 +135,7 @@ class EmailIdentityRepository(Repository):
                 encrypted_address.ciphertext if encrypted_address else None,
                 address_hmac,
                 address_masked,
+                domain_lookup_hmac,
                 key_version,
                 now,
                 now,
@@ -150,6 +177,14 @@ class EmailIdentityRepository(Repository):
         now = time.time() if now is None else now
         local_part = normalize_local_part(local_part)
         domain = domain.strip().casefold().rstrip(".")
+        address_hmac = self.lookup.email(f"{local_part}@{domain}")
+        live_identity = self.db.query_one(
+            "SELECT 1 FROM email_identities WHERE address_lookup_hmac = ?"
+            " AND status != 'deleted' LIMIT 1",
+            (address_hmac,),
+        )
+        if live_identity is not None:
+            return False
         row = self.db.query_one(
             "SELECT status, expires_at FROM email_address_reservations"
             " WHERE normalized_domain = ? AND normalized_local_part = ?",
@@ -218,6 +253,26 @@ class EmailIdentityRepository(Repository):
             "granted_scopes": list(granted_scopes),
         })
         normalized = normalize_email(address)
+        current = connection.execute(
+            "SELECT address_lookup_hmac, domain_lookup_hmac FROM email_identities"
+            " WHERE id = ?",
+            (identity_id,),
+        ).fetchone()
+        if current is None:
+            raise ValueError("email identity does not exist")
+        if (
+            current["address_lookup_hmac"] is not None
+            and current["address_lookup_hmac"] != self.lookup.email(normalized)
+        ):
+            raise ValueError("provider address does not match the selected mailbox")
+        if current["domain_lookup_hmac"] is not None:
+            domain = canonicalize_domain(
+                normalized.rsplit("@", 1)[1], allow_test=True
+            )
+            if current["domain_lookup_hmac"] != self.lookup.digest(
+                f"email-domain:{domain}"
+            ):
+                raise ValueError("provider address does not match the claimed domain")
         address_field = self.encrypt_json(
             "email_identities", identity_id, "address", normalized
         )
@@ -334,19 +389,50 @@ class EmailIdentityRepository(Repository):
         return status
 
     def finish_disconnect(
-        self, connection: sqlite3.Connection, household_id: str, *, now: float
-    ) -> None:
-        connection.execute(
-            "UPDATE email_identities SET status = 'deleted', disconnected_at = ?,"
-            " version = version + 1, updated_at = ? WHERE household_id = ?"
+        self, connection: sqlite3.Connection, identity_id: str, *, now: float
+    ) -> bool:
+        identity = connection.execute(
+            "SELECT household_id FROM email_identities WHERE id = ?"
             " AND status = 'disconnecting'",
-            (now, now, household_id),
+            (identity_id,),
+        ).fetchone()
+        if identity is None:
+            return False
+        pending_secret_cleanup = connection.execute(
+            "SELECT 1 FROM provisioning_jobs WHERE household_id = ?"
+            " AND kind = 'bootstrap_cleanup'"
+            " AND operation = 'delete_email_secret' AND status != 'succeeded' LIMIT 1",
+            (identity["household_id"],),
+        ).fetchone()
+        if pending_secret_cleanup is not None:
+            return False
+        unresolved_provider_job = connection.execute(
+            "SELECT 1 FROM provisioning_jobs WHERE household_id = ?"
+            " AND kind = 'email_identity'"
+            " AND status IN ('pending','running','waiting_user','outcome_unknown') LIMIT 1",
+            (identity["household_id"],),
+        ).fetchone()
+        if unresolved_provider_job is not None:
+            return False
+        pending_provider_cleanup = connection.execute(
+            "SELECT 1 FROM external_resources WHERE household_id = ?"
+            " AND resource_type = 'email_identity' AND status != 'deleted' LIMIT 1",
+            (identity["household_id"],),
+        ).fetchone()
+        if pending_provider_cleanup is not None:
+            return False
+        updated = connection.execute(
+            "UPDATE email_identities SET status = 'deleted', disconnected_at = ?,"
+            " version = version + 1, updated_at = ? WHERE id = ?"
+            " AND status = 'disconnecting'",
+            (now, now, identity_id),
         )
         connection.execute(
             "UPDATE email_address_reservations SET status = 'released'"
-            " WHERE household_id = ? AND status IN ('held','consumed')",
-            (household_id,),
+            " WHERE email_identity_id = ? AND status IN ('held','consumed')",
+            (identity_id,),
         )
+        return updated.rowcount == 1
 
     def expire_reservations(self, *, now: float | None = None) -> int:
         now = time.time() if now is None else now

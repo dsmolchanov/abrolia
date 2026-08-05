@@ -27,7 +27,11 @@ def test_migrations_are_ordered_and_idempotent(tmp_path: Path) -> None:
     try:
         applied = database.migrate()
         assert applied == sorted(applied)
-        assert applied == ["0001_control_plane.sql", "0002_email_identity.sql"]
+        assert applied == [
+            "0001_control_plane.sql",
+            "0002_email_identity.sql",
+            "0003_email_domain_claims.sql",
+        ]
         assert database.migrate() == []
         assert database.pragma() == {
             "journal_mode": "wal",

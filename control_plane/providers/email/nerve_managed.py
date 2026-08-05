@@ -5,7 +5,12 @@ from dataclasses import dataclass
 from typing import Any
 
 from control_plane.crypto import SecretMaterial
-from control_plane.email.models import EmailOption, EmailProvisionIntent
+from control_plane.email.models import (
+    NERVE_EMAIL_SCOPES,
+    NERVE_EMAIL_SECRET_BINDING,
+    EmailOption,
+    EmailProvisionIntent,
+)
 from control_plane.providers.email.nerve_client import NerveAdminClient
 from control_plane.provisioning.contracts import (
     InspectResult,
@@ -16,8 +21,8 @@ from control_plane.provisioning.contracts import (
     ProvisionResult,
 )
 
-NERVE_SECRET_BINDING = "ABROLIA_NERVE_EMAIL_CREDENTIALS"
-NERVE_SCOPES = ("nerve:email.read", "nerve:email.send")
+NERVE_SECRET_BINDING = NERVE_EMAIL_SECRET_BINDING
+NERVE_SCOPES = NERVE_EMAIL_SCOPES
 
 
 class AttachmentFlagPending(ProviderWaiting):
@@ -48,6 +53,8 @@ class _Refs:
 
 
 class NerveManagedEmailProvisioner:
+    email_public_provider = "nerve"
+
     def __init__(self, client: NerveAdminClient) -> None:
         self.client = client
 

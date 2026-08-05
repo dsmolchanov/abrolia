@@ -17,7 +17,16 @@ def test_domain_policy_canonicalizes_idna_and_recommends_subdomain_for_apex() ->
 
 @pytest.mark.parametrize(
     "domain",
-    ["co.uk", "localhost", "127.0.0.1", "abrolia.com", "mail.abrolia.com"],
+    [
+        "co.uk",
+        "localhost",
+        "127.0.0.1",
+        "abrolia.com",
+        "mail.abrolia.com",
+        "family.example.test",
+        "bad_label.example.com",
+        "пример.рф",
+    ],
 )
 def test_domain_policy_rejects_suffixes_and_controlled_or_local_domains(domain) -> None:
     with pytest.raises(ValueError):
@@ -38,6 +47,15 @@ def test_real_apex_requires_explicit_mx_ack_but_rollout_gate_is_separate() -> No
         context={"allow_real_email_domains": True},
     )
     assert accepted.domain == "example.com"
+    with pytest.raises(ValidationError):
+        adapter.validate_python(
+            {
+                "kind": "family_domain",
+                "domain": "family.example.test",
+                "local_part": "assistant",
+            },
+            context={"allow_real_email_domains": True},
+        )
     with pytest.raises(ValidationError):
         adapter.validate_python(
             {**body, "mx_change_acknowledged": True},

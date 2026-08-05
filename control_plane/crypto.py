@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -30,17 +31,46 @@ class SecretFieldError(ValueError):
 SECRET_FIELD_NAMES = frozenset({
     "api_key",
     "apikey",
+    "authorization",
     "access_token",
     "bootstrap_token",
     "client_secret",
+    "cookie",
+    "credential",
+    "credentials",
     "nerve_bootstrap_key",
     "nerve_runtime_key",
     "password",
+    "private_key",
     "refresh_token",
     "secret",
     "secret_material",
+    "signing_key",
     "token",
 })
+
+_SECRET_VALUE_PATTERNS = (
+    re.compile(r"sk-ant-[A-Za-z0-9_-]{16,}"),
+    re.compile(r"\bsk-[A-Za-z0-9]{32,}\b"),
+    re.compile(r"\bnrv_(?:[a-z]+_)?[A-Za-z0-9]{24,}\b"),
+    re.compile(r"\bGOCSPX-[A-Za-z0-9_-]{10,}\b"),
+    re.compile(r"\b1//[A-Za-z0-9._~-]{20,}\b"),
+    re.compile(r"\b\d{8,10}:[A-Za-z0-9_-]{35,}\b"),
+    re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{30,}\b"),
+    re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
+    re.compile(r"\bxox[abposr]-[A-Za-z0-9-]{10,}\b"),
+    re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |PGP )?PRIVATE KEY-----"),
+)
+_UNTAGGED_HIGH_ENTROPY = re.compile(r"[A-Za-z0-9_-]{48,}")
+_OPEN_VALUE_CHANNELS = (
+    ".error_code",
+    ".external_ref",
+    ".provider_refs",
+    ".provider_binding_ref",
+    ".provider_subject",
+    ".granted_scopes",
+)
+_SECRET_BINDING_REF = re.compile(r"[A-Z][A-Z0-9_]{0,127}")
 
 
 def _normalise_key(value: object) -> str:
@@ -48,7 +78,7 @@ def _normalise_key(value: object) -> str:
 
 
 def reject_secret_fields(value: Any, *, path: str = "$") -> None:
-    """Reject secret-shaped keys recursively before any durable serialization."""
+    """Reject secret-shaped keys and credential values before serialization."""
     if isinstance(value, Mapping):
         for key, item in value.items():
             normalised = _normalise_key(key)
@@ -57,6 +87,29 @@ def reject_secret_fields(value: Any, *, path: str = "$") -> None:
             if normalised.endswith("_token") or normalised.endswith("_secret"):
                 raise SecretFieldError(f"secret-like field is forbidden at {path}.{key}")
             reject_secret_fields(item, path=f"{path}.{key}")
+        return
+    if isinstance(value, str):
+        open_value_channel = any(channel in path for channel in _OPEN_VALUE_CHANNELS)
+        if (
+            path.endswith(".secret_binding_ref")
+            and value
+            and not _SECRET_BINDING_REF.fullmatch(value)
+        ):
+            raise SecretFieldError(f"invalid secret binding reference at {path}")
+        if any(pattern.search(value) for pattern in _SECRET_VALUE_PATTERNS) or (
+            open_value_channel and _UNTAGGED_HIGH_ENTROPY.fullmatch(value)
+        ):
+            raise SecretFieldError(f"credential-like value is forbidden at {path}")
+        if open_value_channel and value[:1] in {"{", "["}:
+            try:
+                nested = json.loads(value)
+            except (TypeError, ValueError):
+                nested = None
+            if isinstance(nested, (Mapping, list)):
+                # Provider references are often encoded as canonical JSON strings.
+                # Keep the parent channel in the path so nested opaque values receive
+                # the same credential-shape checks as a normal structured result.
+                reject_secret_fields(nested, path=f"{path}.$json")
         return
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         for index, item in enumerate(value):

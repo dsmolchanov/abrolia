@@ -27,6 +27,10 @@ class DeterministicFakeProvisioner:
     ensure_calls: int = 0
     pending: set[str] = field(default_factory=set)
 
+    @property
+    def email_public_provider(self) -> str | None:
+        return "synthetic" if self.kind == "email" else None
+
     def ensure(self, intent: dict[str, Any], idempotency_key: str) -> ProvisionResult:
         self.ensure_calls += 1
         if idempotency_key in self.resources:
@@ -51,9 +55,17 @@ class DeterministicFakeProvisioner:
         option = selection.get("kind", self.kind)
         external_ref = _ref(self.kind, key)
         if self.kind == "email":
+            identity_id = intent.get("identity_id") or intent.get("email_identity_id")
+            if not identity_id and ":email_identity:" in key:
+                identity_id = key.split(":email_identity:", 1)[1].split(":", 1)[0]
+            if not isinstance(identity_id, str) or not identity_id:
+                raise ProviderRejected("synthetic email identity is missing")
+            external_ref = f"synthetic-email:{identity_id}"
             local = selection.get("local_part", "family.assistant")
             public = {
                 "agent_inbox": f"{local}@abrolia.com",
+                "provider": "synthetic",
+                "provider_refs": {"identity_id": identity_id},
                 "mode": option,
                 "masked_external_ref": external_ref[-8:],
             }
@@ -133,6 +145,22 @@ class DryRunRuntimeProvisioner(DeterministicFakeProvisioner):
                 "planned_writes": ["app", "volume", "staged-secrets", "machine"],
             },
         )
+
+    def deprovision_runtime(self, external_ref: Any) -> InspectResult:
+        target_ref = (
+            external_ref.get("runtime_ref") or external_ref.get("app_ref")
+            if isinstance(external_ref, dict)
+            else external_ref
+        )
+        runtime_keys = [
+            key
+            for key, value in self.resources.items()
+            if value.external_ref == target_ref
+            and value.public_result.get("stage") != "secret_namespace_ready"
+        ]
+        for key in runtime_keys:
+            self.resources.pop(key, None)
+        return InspectResult(InspectState.ABSENT)
 
 
 def synthetic_provider_registry() -> ProviderRegistry:

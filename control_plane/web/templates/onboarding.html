@@ -63,7 +63,8 @@
         {{ command_fields() }}<input type="hidden" name="kind" value="family_domain">
         <label>Mail domain<input name="domain" value="family.example.test" autocomplete="off" required></label>
         <label>Assistant address<input name="local_part" value="assistant" autocomplete="off" required></label>
-        <label class="consent"><input type="checkbox" name="mx_change_acknowledged" value="yes">
+        <p id="domain-guidance" aria-live="polite">Use a dedicated mail subdomain when the root domain already receives family mail.</p>
+        <label id="mx-change-warning" class="consent"><input type="checkbox" name="mx_change_acknowledged" value="yes">
           I understand that changing apex MX records can interrupt existing family mail; a dedicated subdomain is recommended.</label>
         <button class="card" data-select="email_identity" data-kind="family_domain">
           <strong>Your family domain</strong><span>Use a dedicated assistant address on a domain you control.</span>
@@ -110,9 +111,12 @@
     </div>
   </section>
 
-  {% set current = namespace(status='') %}
+  {% set current = namespace(status='', public_status={}) %}
   {% for step in snapshot.steps %}
-    {% if step.kind.value == snapshot.current_step.value %}{% set current.status = step.status.value %}{% endif %}
+    {% if step.kind.value == snapshot.current_step.value %}
+      {% set current.status = step.status.value %}
+      {% set current.public_status = step.public_status %}
+    {% endif %}
   {% endfor %}
   <section class="status-panel" aria-live="polite">
     {% if snapshot.state.value == 'runtime_provisioning' %}
@@ -140,6 +144,22 @@
       <h2 id="status-title">Resume setup</h2>
       <p id="status-copy">Loading the durable control-plane state…</p>
     {% endif %}
+    <div id="dns-record-panel"{% if not current.public_status.get('dns_records') %} hidden{% endif %}>
+      <h3>DNS records to add</h3>
+      <ul id="dns-records">
+        {% for record in current.public_status.get('dns_records', []) %}
+        <li><code>{{ record.get('type', '') }} {{ record.get('host', '') }}{% if record.get('priority') is not none %} {{ record.get('priority') }}{% endif %} {{ record.get('value', '') }}</code>{% if record.get('purpose') %} — {{ record.get('purpose') }}{% endif %}</li>
+        {% endfor %}
+      </ul>
+    </div>
+    <div id="dns-status-panel"{% if not current.public_status.get('record_status') %} hidden{% endif %}>
+      <h3>DNS verification status</h3>
+      <ul id="dns-record-status">
+        {% for name, verified in current.public_status.get('record_status', {}) | dictsort %}
+        <li>{{ name }}: {% if verified %}verified{% else %}pending{% endif %}</li>
+        {% endfor %}
+      </ul>
+    </div>
     <form method="post" action="/onboarding/retry/{{ snapshot.current_step.value }}">
       {{ command_fields() }}<button id="retry-step" type="submit"{% if current.status != 'failed' %} hidden{% endif %}>Try again</button>
     </form>

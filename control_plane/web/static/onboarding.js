@@ -88,6 +88,10 @@ if (page === "onboarding") {
     const copy = document.querySelector("#status-copy");
     const retry = document.querySelector("#retry-step");
     const check = document.querySelector("#check-step");
+    const dnsPanel = document.querySelector("#dns-record-panel");
+    const dnsRecords = document.querySelector("#dns-records");
+    const dnsStatusPanel = document.querySelector("#dns-status-panel");
+    const dnsRecordStatus = document.querySelector("#dns-record-status");
     const labels = {
       available: ["Ready", "Choose an option to continue."],
       selected: ["Selection saved", "The durable worker will begin this setup."],
@@ -107,6 +111,26 @@ if (page === "onboarding") {
     const message = workflows[snapshot.state] || labels[current?.status]
       || ["Ready", "Choose an option to continue."];
     title.textContent = message[0]; copy.textContent = message[1];
+    const records = current?.public_status?.dns_records || [];
+    dnsRecords.replaceChildren(...records.map((record) => {
+      const item = document.createElement("li");
+      const value = document.createElement("code");
+      const parts = [record.type, record.host];
+      if (record.priority !== undefined && record.priority !== null) parts.push(String(record.priority));
+      parts.push(record.value);
+      value.textContent = parts.filter(Boolean).join(" ");
+      item.append(value);
+      if (record.purpose) item.append(document.createTextNode(` — ${record.purpose}`));
+      return item;
+    }));
+    dnsPanel.hidden = records.length === 0;
+    const recordStatus = current?.public_status?.record_status || {};
+    dnsRecordStatus.replaceChildren(...Object.entries(recordStatus).sort().map(([name, ready]) => {
+      const item = document.createElement("li");
+      item.textContent = `${name}: ${ready ? "verified" : "pending"}`;
+      return item;
+    }));
+    dnsStatusPanel.hidden = Object.keys(recordStatus).length === 0;
     retry.hidden = workflowOwnsView || current?.status !== "failed";
     retry.dataset.kind = current?.kind || "";
     check.hidden = workflowOwnsView || current?.status !== "waiting_user";
@@ -184,6 +208,32 @@ if (page === "onboarding") {
     if (["telegram", "whatsapp", "web"].includes(option)) selection = {kind: option, actor_id: "synthetic-owner", chat_id: "synthetic-chat"};
     command(`/api/v1/onboarding/steps/${kind}/select`, selection);
   }));
+  const domainInput = document.querySelector('input[name="domain"]');
+  const domainGuidance = document.querySelector("#domain-guidance");
+  const mxWarning = document.querySelector("#mx-change-warning");
+  let guidanceRequest = 0;
+  async function refreshDomainGuidance() {
+    if (!domainInput || !domainGuidance || !mxWarning) return;
+    const request = ++guidanceRequest;
+    try {
+      const response = await fetch(`/api/v1/email/domain/guidance?domain=${encodeURIComponent(domainInput.value)}`);
+      if (request !== guidanceRequest) return;
+      if (!response.ok) {
+        domainGuidance.textContent = "Enter a supported domain you control.";
+        return;
+      }
+      const guidance = await response.json();
+      domainGuidance.textContent = guidance.apex_mx_risk
+        ? `Recommended mail subdomain: ${guidance.recommended_domain}`
+        : `Mail domain: ${guidance.domain}`;
+      mxWarning.hidden = !guidance.apex_mx_risk;
+      mxWarning.querySelector("input").required = guidance.apex_mx_risk;
+    } catch (_error) {
+      domainGuidance.textContent = "Domain guidance is temporarily unavailable.";
+    }
+  }
+  domainInput?.addEventListener("change", refreshDomainGuidance);
+  domainInput?.addEventListener("blur", refreshDomainGuidance);
   document.querySelector("#retry-step")?.addEventListener("click", (event) => {
     event.preventDefault();
     command(`/api/v1/onboarding/steps/${event.currentTarget.dataset.kind}/retry`);
@@ -196,6 +246,7 @@ if (page === "onboarding") {
     event.preventDefault();
     command(`/api/v1/onboarding/reset/${button.dataset.reset}`);
   }));
+  refreshDomainGuidance();
   refresh();
   window.setInterval(() => {
     const current = state?.steps.find((step) => step.kind === state.current_step);

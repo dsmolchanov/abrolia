@@ -89,14 +89,29 @@ def test_waiting_user_has_check_action_and_verifying_has_checking_copy(api_harne
             (workflow["id"],),
         )
         connection.execute(
-            "UPDATE onboarding_steps SET status = 'waiting_user'"
+            "UPDATE onboarding_steps SET status = 'waiting_user',"
+            " public_status_json = ?"
             " WHERE workflow_id = ? AND kind = 'email_identity'",
-            (workflow["id"],),
+            (
+                '{"dns_records":[{"host":"_nerve.family.example.test",'
+                '"type":"MX","priority":10,"purpose":"mail-routing",'
+                '"value":"synthetic-domain-proof"}],'
+                '"record_status":{"mx":false,"ownership":true}}',
+                workflow["id"],
+            ),
         )
     waiting = api_harness.client.get("/onboarding")
     assert "Complete the synthetic verification, then check again." in waiting.text
     assert 'action="/onboarding/check/email_identity"' in waiting.text
     assert '<button id="check-step" type="submit">Check again</button>' in waiting.text
+    assert "DNS records to add" in waiting.text
+    assert "_nerve.family.example.test" in waiting.text
+    assert "MX _nerve.family.example.test 10 synthetic-domain-proof" in waiting.text
+    assert "mail-routing" in waiting.text
+    assert "synthetic-domain-proof" in waiting.text
+    assert "DNS verification status" in waiting.text
+    assert "mx: pending" in waiting.text
+    assert "ownership: verified" in waiting.text
 
     with api_harness.container.database.write() as connection:
         connection.execute(
@@ -110,6 +125,11 @@ def test_waiting_user_has_check_action_and_verifying_has_checking_copy(api_harne
     script = api_harness.client.get("/static/onboarding.js").text
     assert "/api/v1/onboarding/steps/${event.currentTarget.dataset.kind}/check" in script
     assert '["provisioning", "verifying"]' in script
+    assert "current?.public_status?.dns_records" in script
+    assert "current?.public_status?.record_status" in script
+    assert 'ready ? "verified" : "pending"' in script
+    assert "/api/v1/email/domain/guidance?domain=" in script
+    assert "Recommended mail subdomain:" in script
 
 
 def test_verified_choice_changes_require_an_explicit_reset_control(api_harness) -> None:

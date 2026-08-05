@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ipaddress
+import re
 from dataclasses import dataclass
 
 import tldextract
@@ -9,6 +10,7 @@ from control_plane.email.local_part import normalize_local_part
 
 _EXTRACT = tldextract.TLDExtract(suffix_list_urls=())
 _RESERVED_SUFFIXES = (".example", ".invalid", ".localhost", ".test")
+_DNS_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
 
 
 @dataclass(frozen=True)
@@ -39,9 +41,14 @@ def canonicalize_domain(value: str, *, allow_test: bool = True) -> str:
         or len(label) > 63
         or label.startswith("-")
         or label.endswith("-")
+        or not _DNS_LABEL.fullmatch(label)
         for label in labels
     ):
         raise ValueError("domain labels are invalid")
+    if labels[-1].startswith("xn--"):
+        raise ValueError(
+            "internationalized top-level domains are not supported by the provider"
+        )
     if canonical == "abrolia.com" or canonical.endswith(".abrolia.com"):
         raise ValueError("Abrolia-controlled domains cannot be claimed")
     if canonical == "localhost" or canonical.endswith(".localhost"):

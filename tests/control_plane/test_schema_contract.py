@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import sqlite3
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -8,6 +10,17 @@ import pytest
 from control_plane.crypto import SecretFieldError
 from control_plane.db import ControlPlaneDatabase
 from control_plane.models import TABLE_CLASSIFICATION
+
+
+def test_root_contracts_import_in_a_clean_interpreter() -> None:
+    project_root = Path(__file__).parents[2]
+    subprocess.run(
+        [sys.executable, "-c", "import control_plane.models"],
+        cwd=project_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
 
 
 def test_every_control_plane_table_has_an_explicit_privacy_classification(cp_stack) -> None:

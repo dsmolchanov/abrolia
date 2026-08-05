@@ -122,6 +122,21 @@ class JobsRepository(Repository):
             row["encryption_key_version"],
         )
 
+    def external_ref(self, job_id: str) -> str | None:
+        row = self.db.query_one("SELECT * FROM provisioning_jobs WHERE id = ?", (job_id,))
+        if row is None:
+            raise KeyError(job_id)
+        if row["external_ref_ciphertext"] is None:
+            return None
+        value = self.decrypt_json(
+            "provisioning_jobs",
+            job_id,
+            "external_ref",
+            row["external_ref_ciphertext"],
+            row["encryption_key_version"],
+        )
+        return value if isinstance(value, str) else None
+
     def lease(
         self,
         worker_id: str,
@@ -213,8 +228,11 @@ class JobsRepository(Repository):
         with self.db.write() as connection:
             connection.execute(
                 "UPDATE provisioning_jobs SET status = 'pending', not_before = ?,"
-                " error_code = ?, lease_until = NULL, leased_by = NULL, updated_at = ?"
-                " WHERE id = ? AND status = 'running'",
+                " error_code = ?, lease_until = NULL, leased_by = NULL, settled_at = NULL,"
+                " updated_at = ?"
+                " WHERE id = ? AND status IN ('running','outcome_unknown')"
+                " AND NOT (status = 'outcome_unknown' AND COALESCE(error_code, '') IN"
+                " ('cancel_requires_reconciliation','reset_requires_reconciliation'))",
                 (not_before, error_code, now, job_id),
             )
 

@@ -3,14 +3,19 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
+from control_plane.crypto import SecretMaterial
+from control_plane.email.contracts import EmailFailureKind, EmailProviderError
+from control_plane.email.models import EmailIdentityStatus
 from control_plane.models import StepKind, StepStatus
 from control_plane.provisioning.contracts import (
     InspectResult,
     InspectState,
+    ProviderRateLimited,
     ProviderRegistry,
     ProviderRejected,
     ProviderWaiting,
@@ -111,6 +116,26 @@ def test_profile_queues_and_worker_ensures_app_only_secret_namespace(cp_stack) -
     assert tuple(resource) == ("secret_namespace", "ready", None)
     assert cp_stack.households.get(cp_stack.household.id).runtime_ref is None
     assert cp_stack.database.query("SELECT id FROM config_revisions") == []
+
+
+def test_dry_run_runtime_cleanup_preserves_namespace_until_full_deprovision() -> None:
+    household_id = "00000000-0000-4000-8000-000000000042"
+    provider = DryRunRuntimeProvisioner()
+    namespace = provider.ensure_secret_namespace(household_id, "namespace-intent")
+    runtime = provider.ensure(
+        {"manifest": {"household_id": household_id}}, "runtime-intent"
+    )
+    assert namespace.external_ref == runtime.external_ref
+
+    runtime_cleanup = provider.deprovision_runtime(runtime.external_ref)
+
+    assert runtime_cleanup.state is InspectState.ABSENT
+    assert set(provider.resources) == {"namespace-intent"}
+
+    namespace_cleanup = provider.deprovision(namespace.external_ref)
+
+    assert namespace_cleanup.state is InspectState.ABSENT
+    assert provider.resources == {}
 
 
 def test_cancel_during_namespace_creation_persists_recoverable_cleanup(cp_stack) -> None:
@@ -230,6 +255,36 @@ def test_lease_is_exclusive_and_expired_running_job_is_reclaimed(cp_stack) -> No
     )
     assert row["leased_by"] == "worker-two"
     assert row["status"] == "running"
+
+
+def test_retry_later_reopens_non_quarantined_unknown_and_clears_settlement(
+    cp_stack,
+) -> None:
+    job_id = _create_job(cp_stack, intent_key="retry-known-safe-unknown")
+    leased = cp_stack.jobs.lease("worker-one", now=BASE_TIME + 1)
+    assert leased is not None and leased.id == job_id
+    with cp_stack.database.write() as connection:
+        cp_stack.jobs.settle(
+            connection,
+            job_id,
+            status="outcome_unknown",
+            error_code="provider_degraded",
+            now=BASE_TIME + 2,
+        )
+
+    cp_stack.jobs.retry_later(
+        job_id,
+        not_before=BASE_TIME + 30,
+        error_code="retry_scheduled",
+        now=BASE_TIME + 3,
+    )
+    row = cp_stack.database.query_one(
+        "SELECT status, error_code, not_before, settled_at"
+        " FROM provisioning_jobs WHERE id = ?",
+        (job_id,),
+    )
+
+    assert tuple(row) == ("pending", "retry_scheduled", BASE_TIME + 30, None)
 
 
 def test_job_intent_key_is_unique_even_if_command_is_replayed(cp_stack) -> None:
@@ -428,6 +483,81 @@ def test_sigkill_after_lease_recovers_by_inspect_before_ensure(
     assert cp_stack.jobs.get(job["id"]).attempts == 2
 
 
+def test_sigkill_after_one_time_secret_response_never_falsely_verifies(
+    cp_stack, tmp_path: Path
+) -> None:
+    cp_stack.complete_profile()
+    cp_stack.service.select(
+        cp_stack.household.id,
+        StepKind.EMAIL,
+        EMAIL_SELECTION,
+        context=cp_stack.context(),
+        now=BASE_TIME + 2,
+    )
+    job = cp_stack.database.query_one(
+        "SELECT * FROM provisioning_jobs WHERE kind = 'email_identity'"
+    )
+    email_identity_id = cp_stack.jobs.request(job["id"])["email_identity_id"]
+    marker = tmp_path / "one-time-secret-consumed.marker"
+    helper = Path(__file__).with_name("chaos_child.py")
+    project_root = Path(__file__).parents[2]
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            str(helper),
+            str(cp_stack.database.path),
+            "lease-and-accept",
+            job["id"],
+            str(marker),
+        ],
+        cwd=project_root,
+        env={
+            **os.environ,
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONPATH": str(project_root),
+        },
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert child.stdout is not None
+        assert child.stdout.readline().strip() == "crash-window-open"
+        child.kill()
+        assert child.wait(timeout=5) < 0
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=5)
+
+    class ConsumedOneTimeSecret(DeterministicFakeProvisioner):
+        def inspect(self, stable_ref):
+            assert marker.exists()
+            return InspectResult(
+                InspectState.READY,
+                ProvisionResult(
+                    external_ref=f"synthetic-email:{email_identity_id}",
+                    public_result={
+                        "agent_inbox": "family-agent@" + "abrolia.com",
+                        "provider": "synthetic",
+                        "provider_refs": {"identity_id": email_identity_id},
+                        "secret_binding_ref": "ABROLIA_EMAIL_PROVIDER_KEY",
+                    },
+                    secret_material=SecretMaterial(),
+                ),
+            )
+
+    registry = ProviderRegistry()
+    registry.register("fake-email", ConsumedOneTimeSecret("email"))
+    recovered = cp_stack.make_worker(
+        providers=registry, now=BASE_TIME + 5
+    ).run_once()
+
+    assert recovered.status == "outcome_unknown"
+    assert recovered.error_code == "secret_handoff_unknown"
+    assert cp_stack.jobs.get(job["id"]).status == "outcome_unknown"
+
+
 def test_provider_rejection_after_cancel_cannot_reopen_terminal_projection(cp_stack) -> None:
     cp_stack.complete_profile()
     cp_stack.service.select(
@@ -505,6 +635,126 @@ def test_late_waiting_response_after_cancel_stays_reconcilable(cp_stack) -> None
     assert cp_stack.onboarding.workflow_for_household(
         cp_stack.household.id
     ).state == "cancelled"
+    identity = cp_stack.database.query_one(
+        "SELECT id, status FROM email_identities WHERE household_id = ?",
+        (cp_stack.household.id,),
+    )
+    assert identity["status"] == EmailIdentityStatus.DELETED.value
+    reservation = cp_stack.database.query_one(
+        "SELECT status FROM email_address_reservations WHERE email_identity_id = ?",
+        (identity["id"],),
+    )
+    assert reservation["status"] == "released"
+
+
+@pytest.mark.parametrize(
+    "retry_error",
+    [
+        pytest.param(
+            lambda: ProviderRateLimited(retry_after=15),
+            id="provider-rate-limited",
+        ),
+        pytest.param(
+            lambda: EmailProviderError(
+                EmailFailureKind.SAFE_RETRY, "provider-private-safe-retry"
+            ),
+            id="email-safe-retry",
+        ),
+    ],
+)
+def test_late_initial_retry_signal_after_cancel_preserves_quarantine(
+    cp_stack, retry_error: Callable[[], Exception]
+) -> None:
+    cp_stack.complete_profile()
+    cp_stack.service.select(
+        cp_stack.household.id,
+        StepKind.EMAIL,
+        EMAIL_SELECTION,
+        context=cp_stack.context(),
+        now=BASE_TIME + 2,
+    )
+
+    class CancelThenRetry(DeterministicFakeProvisioner):
+        def ensure(self, intent, idempotency_key):
+            del intent, idempotency_key
+            cp_stack.service.cancel(
+                cp_stack.household.id,
+                context=cp_stack.context(),
+                now=BASE_TIME + 3,
+            )
+            raise retry_error()
+
+    registry = ProviderRegistry()
+    registry.register("fake-email", CancelThenRetry("email"))
+
+    result = cp_stack.make_worker(
+        providers=registry, now=BASE_TIME + 3
+    ).run_once()
+    stored = cp_stack.jobs.get(result.job_id)
+
+    assert result.status == "outcome_unknown"
+    assert result.error_code == "cancel_requires_reconciliation"
+    assert stored is not None
+    assert stored.status == "outcome_unknown"
+    assert stored.error_code == "cancel_requires_reconciliation"
+
+
+@pytest.mark.parametrize(
+    "retry_error",
+    [
+        pytest.param(
+            lambda: ProviderRateLimited(retry_after=15),
+            id="provider-rate-limited",
+        ),
+        pytest.param(
+            lambda: EmailProviderError(
+                EmailFailureKind.SAFE_RETRY, "provider-private-safe-retry"
+            ),
+            id="email-safe-retry",
+        ),
+    ],
+)
+def test_reconcile_retry_signal_after_reset_preserves_quarantine(
+    cp_stack, retry_error: Callable[[], Exception]
+) -> None:
+    cp_stack.complete_profile()
+    cp_stack.service.select(
+        cp_stack.household.id,
+        StepKind.EMAIL,
+        EMAIL_SELECTION,
+        context=cp_stack.context(),
+        now=BASE_TIME + 2,
+    )
+
+    class WaitThenRetry(DeterministicFakeProvisioner):
+        def ensure(self, intent, idempotency_key):
+            del intent, idempotency_key
+            raise ProviderWaiting("synthetic owner action required")
+
+        def reconcile(self, intent, idempotency_key):
+            del intent, idempotency_key
+            raise retry_error()
+
+    registry = ProviderRegistry()
+    registry.register("fake-email", WaitThenRetry("email"))
+    worker = cp_stack.make_worker(providers=registry, now=BASE_TIME + 3)
+    waiting = worker.run_once()
+    assert waiting.status == "waiting_user"
+    cp_stack.service.reset_from(
+        cp_stack.household.id,
+        StepKind.EMAIL,
+        context=cp_stack.context(),
+        now=BASE_TIME + 4,
+    )
+
+    reconciled = worker.reconcile(waiting.job_id)
+    stored = cp_stack.jobs.get(waiting.job_id)
+
+    assert reconciled.status == "outcome_unknown"
+    assert reconciled.error_code == "reset_requires_reconciliation"
+    assert stored is not None
+    assert stored.status == "outcome_unknown"
+    assert stored.error_code == "reset_requires_reconciliation"
 
 
 def test_late_success_with_unknown_compensation_creates_recoverable_cleanup(
@@ -548,15 +798,163 @@ def test_late_success_with_unknown_compensation_creates_recoverable_cleanup(
     )
     assert cleanup is not None and cleanup["status"] == "pending"
     cleanup_statuses = {worker.run_once().status, worker.run_once().status}
-    assert cleanup_statuses == {"succeeded", "outcome_unknown"}
+    assert cleanup_statuses == {"pending", "outcome_unknown"}
 
     fake.allow_delete = True
     recovered = worker.reconcile(cleanup["id"])
     assert recovered.status == "succeeded"
-    assert cp_stack.database.query_one(
-        "SELECT status FROM external_resources"
-    )["status"] == "deleted"
+    namespace_cleanup = cp_stack.make_worker(
+        providers=registry, now=BASE_TIME + 10
+    ).run_once()
+    assert namespace_cleanup.status == "succeeded"
+    assert {
+        row["status"]
+        for row in cp_stack.database.query("SELECT status FROM external_resources")
+    } == {"deleted"}
     assert not fake.resources
+
+
+def test_email_reset_runtime_cleanup_preserves_namespace_for_reconnect(
+    cp_stack,
+) -> None:
+    cp_stack.complete_profile(provision_namespace=False)
+    runtime_provider = DryRunRuntimeProvisioner()
+    email_provider = DeterministicFakeProvisioner("email")
+    registry = ProviderRegistry()
+    registry.register("dry-run-runtime", runtime_provider)
+    registry.register("fake-email", email_provider)
+    registry.register("fake-whatsapp", DeterministicFakeProvisioner("whatsapp"))
+    registry.register("fake-channel", DeterministicFakeProvisioner("channel"))
+    worker = cp_stack.make_worker(providers=registry, now=BASE_TIME + 20)
+
+    namespace = worker.run_once()
+    assert namespace is not None and namespace.status == "succeeded"
+    for kind, selection in (
+        (StepKind.EMAIL, EMAIL_SELECTION),
+        (StepKind.WHATSAPP, WHATSAPP_SELECTION),
+        (StepKind.PRIMARY_CHANNEL, CHANNEL_SELECTION),
+    ):
+        cp_stack.service.select(
+            cp_stack.household.id,
+            kind,
+            selection,
+            context=cp_stack.context(),
+            now=BASE_TIME + 21,
+        )
+        assert worker.run_once().status == "succeeded"
+    assert worker.run_once().status == "succeeded"
+
+    cp_stack.service.reset_from(
+        cp_stack.household.id,
+        StepKind.EMAIL,
+        context=cp_stack.context(),
+        now=BASE_TIME + 30,
+    )
+    cleanup_jobs = cp_stack.database.query(
+        "SELECT id FROM provisioning_jobs WHERE kind = 'cleanup'"
+        " ORDER BY created_at, id"
+    )
+    assert [
+        cp_stack.jobs.request(row["id"])["resource_type"] for row in cleanup_jobs
+    ] == ["email_identity", "whatsapp_identity", "channel_binding", "runtime"]
+    assert [worker.run_once().status for _ in cleanup_jobs] == [
+        "succeeded",
+        "succeeded",
+        "succeeded",
+        "succeeded",
+    ]
+
+    resources = {
+        row["resource_type"]: row["status"]
+        for row in cp_stack.database.query(
+            "SELECT resource_type, status FROM external_resources"
+        )
+    }
+    assert resources["runtime"] == "deleted"
+    assert resources["secret_namespace"] == "ready"
+    assert set(runtime_provider.resources) == {
+        f"{cp_stack.household.id}:secret-namespace"
+    }
+
+    cp_stack.service.select(
+        cp_stack.household.id,
+        StepKind.EMAIL,
+        EMAIL_SELECTION,
+        context=cp_stack.context(),
+        now=BASE_TIME + 40,
+    )
+    reconnected = worker.run_once()
+
+    assert reconnected is not None and reconnected.status == "succeeded"
+    assert email_provider.ensure_calls == 2
+
+
+def test_cancel_runtime_cleanup_deletes_namespace_only_after_workload(
+    cp_stack,
+) -> None:
+    cp_stack.complete_profile(provision_namespace=False)
+    runtime_provider = DryRunRuntimeProvisioner()
+    registry = ProviderRegistry()
+    registry.register("dry-run-runtime", runtime_provider)
+    registry.register("fake-email", DeterministicFakeProvisioner("email"))
+    registry.register("fake-whatsapp", DeterministicFakeProvisioner("whatsapp"))
+    registry.register("fake-channel", DeterministicFakeProvisioner("channel"))
+    worker = cp_stack.make_worker(providers=registry, now=BASE_TIME + 20)
+
+    assert worker.run_once().status == "succeeded"
+    for kind, selection in (
+        (StepKind.EMAIL, EMAIL_SELECTION),
+        (StepKind.WHATSAPP, WHATSAPP_SELECTION),
+        (StepKind.PRIMARY_CHANNEL, CHANNEL_SELECTION),
+    ):
+        cp_stack.service.select(
+            cp_stack.household.id,
+            kind,
+            selection,
+            context=cp_stack.context(),
+            now=BASE_TIME + 21,
+        )
+        assert worker.run_once().status == "succeeded"
+    assert worker.run_once().status == "succeeded"
+
+    cp_stack.service.cancel(
+        cp_stack.household.id,
+        context=cp_stack.context(),
+        now=BASE_TIME + 30,
+    )
+    cleanup_jobs = cp_stack.database.query(
+        "SELECT id FROM provisioning_jobs WHERE kind = 'cleanup'"
+        " ORDER BY created_at, id"
+    )
+    assert [
+        cp_stack.jobs.request(row["id"])["resource_type"] for row in cleanup_jobs
+    ] == [
+        "email_identity",
+        "whatsapp_identity",
+        "channel_binding",
+        "runtime",
+        "secret_namespace",
+    ]
+
+    assert [worker.run_once().status for _ in range(3)] == [
+        "succeeded",
+        "succeeded",
+        "succeeded",
+    ]
+    runtime_cleanup = worker.run_once()
+    assert runtime_cleanup.status == "succeeded"
+    assert set(runtime_provider.resources) == {
+        f"{cp_stack.household.id}:secret-namespace"
+    }
+
+    namespace_cleanup = worker.run_once()
+
+    assert namespace_cleanup.status == "succeeded"
+    assert runtime_provider.resources == {}
+    assert {
+        row["status"]
+        for row in cp_stack.database.query("SELECT status FROM external_resources")
+    } == {"deleted"}
 
 
 def test_runtime_worker_stages_bootstrap_between_prepare_and_launch(cp_stack) -> None:

@@ -154,11 +154,11 @@ class FamilyDomainSelection(DurableContract):
     @field_validator("domain")
     @classmethod
     def _canonical_domain(cls, value: str, info: ValidationInfo) -> str:
-        canonical = canonicalize_domain(value)
         allow_real = bool(
             isinstance(info.context, dict)
             and info.context.get("allow_real_email_domains")
         )
+        canonical = canonicalize_domain(value, allow_test=not allow_real)
         if not allow_real and not canonical.endswith(".test"):
             raise ValueError("real email domains are disabled by the rollout gate")
         return canonical
