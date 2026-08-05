@@ -599,6 +599,9 @@ flags остаются false до provider-specific gates.
 - Domain cannot be claimed by two households through race or normalization trick.
 - Delete/reconnect tests cover DNS still present, provider unavailable and lost
   response.
+- [x] BYO DNS inspection resumes automatically from durable `waiting_user` jobs
+  with bounded 30/60/120/240-second backoff; after the fifth total job attempt,
+  polling stops and explicit `CHECK` remains available.
 - [x] Production composition registers both Nerve providers only when the
   fail-closed real-email config and household allowlist are complete.
 - [x] Cleanup followed by reconnect of the same household creates a new org, while

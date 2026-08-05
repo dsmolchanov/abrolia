@@ -151,9 +151,11 @@ class JobsRepository(Repository):
             row = connection.execute(
                 "SELECT * FROM provisioning_jobs WHERE"
                 " ((status = 'pending' AND (not_before IS NULL OR not_before <= ?))"
-                "  OR (status = 'running' AND lease_until <= ?))"
+                "  OR (status = 'running' AND lease_until <= ?)"
+                "  OR (status = 'waiting_user' AND operation = 'inspect'"
+                "      AND not_before IS NOT NULL AND not_before <= ?))"
                 " ORDER BY created_at, id LIMIT 1",
-                (now, now),
+                (now, now, now),
             ).fetchone()
             if row is None:
                 return None
@@ -167,6 +169,48 @@ class JobsRepository(Repository):
         )
         assert current is not None
         return self._record(current, reclaimed=row["status"] == "running")
+
+    def schedule_waiting_inspect(
+        self,
+        connection: sqlite3.Connection,
+        job_id: str,
+        *,
+        request: dict[str, Any],
+        not_before: float | None,
+        error_code: str,
+        now: float | None = None,
+    ) -> None:
+        """Turn a waiting provider intent into a bounded durable inspect job."""
+
+        now = time.time() if now is None else now
+        row = connection.execute(
+            "SELECT encryption_key_version FROM provisioning_jobs WHERE id = ?",
+            (job_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(job_id)
+        encrypted = self.encrypt_json(
+            "provisioning_jobs",
+            job_id,
+            "request",
+            request,
+            key_version=row["encryption_key_version"],
+        )
+        request_sha = hashlib.sha256(canonical_json(request)).hexdigest()
+        connection.execute(
+            "UPDATE provisioning_jobs SET operation = 'inspect', request_sha = ?,"
+            " request_ciphertext = ?, status = 'waiting_user', not_before = ?,"
+            " error_code = ?, lease_until = NULL, leased_by = NULL, settled_at = NULL,"
+            " updated_at = ? WHERE id = ?",
+            (
+                request_sha,
+                encrypted.ciphertext,
+                not_before,
+                error_code,
+                now,
+                job_id,
+            ),
+        )
 
     def settle(
         self,

@@ -22,6 +22,7 @@ DOMAIN_ID = "10000000-0000-4000-8000-000000000002"
 INBOX_ID = "10000000-0000-4000-8000-000000000003"
 KEY_ID = "10000000-0000-4000-8000-000000000004"
 WEBHOOK_ID = "10000000-0000-4000-8000-000000000005"
+BASE_TIME = 1_800_000_000.0
 
 
 class FakeByoNerveAdmin:
@@ -216,6 +217,77 @@ def test_dns_records_resume_until_all_checks_are_active(cp_stack) -> None:
         namespace["encryption_key_version"],
     )
     assert sink.get(runtime_ref, NERVE_SECRET_BINDING) is not None
+
+
+def test_dns_status_polls_automatically_with_bounded_backoff(cp_stack) -> None:
+    cp_stack.complete_profile()
+    _select(cp_stack)
+    client = FakeByoNerveAdmin()
+    registry = ProviderRegistry()
+    registry.register("nerve-byo-domain", NerveByoDomainProvisioner(client))
+    sink = InMemorySecretSink()
+
+    waiting = cp_stack.make_worker(
+        providers=registry, secret_sink=sink, now=BASE_TIME + 100
+    ).run_once()
+    assert waiting.status == "waiting_user"
+    scheduled = cp_stack.database.query_one(
+        "SELECT operation, status, attempts, not_before FROM provisioning_jobs"
+        " WHERE id = ?",
+        (waiting.job_id,),
+    )
+    assert tuple(scheduled) == ("inspect", "waiting_user", 1, BASE_TIME + 130)
+    assert cp_stack.make_worker(
+        providers=registry, secret_sink=sink, now=BASE_TIME + 129
+    ).run_once() is None
+
+    partial = cp_stack.make_worker(
+        providers=registry, secret_sink=sink, now=BASE_TIME + 130
+    ).run_once()
+    assert partial.status == "waiting_user"
+    scheduled = cp_stack.database.query_one(
+        "SELECT attempts, not_before FROM provisioning_jobs WHERE id = ?",
+        (waiting.job_id,),
+    )
+    assert tuple(scheduled) == (2, BASE_TIME + 190)
+    snapshot = cp_stack.onboarding.snapshot(cp_stack.household.id)
+    email_step = next(step for step in snapshot.steps if step.kind is StepKind.EMAIL)
+    assert email_step.public_status["record_status"]["mx"] is False
+
+    client.active = True
+    client.checks = {"ownership": True, "mx": True, "spf": True, "dkim": True}
+    assert cp_stack.make_worker(
+        providers=registry, secret_sink=sink, now=BASE_TIME + 189
+    ).run_once() is None
+    verified = cp_stack.make_worker(
+        providers=registry, secret_sink=sink, now=BASE_TIME + 190
+    ).run_once()
+    assert verified.status == "succeeded"
+    assert client.inbox_calls == 1
+
+
+def test_dns_automatic_polling_stops_after_bounded_attempts(cp_stack) -> None:
+    cp_stack.complete_profile()
+    _select(cp_stack)
+    client = FakeByoNerveAdmin()
+    registry = ProviderRegistry()
+    registry.register("nerve-byo-domain", NerveByoDomainProvisioner(client))
+
+    first = cp_stack.make_worker(providers=registry, now=BASE_TIME + 100).run_once()
+    assert first.status == "waiting_user"
+    for due_at in (BASE_TIME + 130, BASE_TIME + 190, BASE_TIME + 310, BASE_TIME + 550):
+        result = cp_stack.make_worker(providers=registry, now=due_at).run_once()
+        assert result.status == "waiting_user"
+
+    stopped = cp_stack.database.query_one(
+        "SELECT operation, status, attempts, not_before FROM provisioning_jobs"
+        " WHERE id = ?",
+        (first.job_id,),
+    )
+    assert tuple(stopped) == ("inspect", "waiting_user", 5, None)
+    assert cp_stack.make_worker(
+        providers=registry, now=BASE_TIME + 10_000
+    ).run_once() is None
 
 
 def test_provider_cannot_verify_a_mailbox_outside_selected_domain(cp_stack) -> None:
@@ -527,9 +599,11 @@ def test_lost_manual_inspect_reconciles_with_original_stable_reference(
     )
     assert worker.run_once().status == "waiting_user"
     original = cp_stack.database.query_one(
-        "SELECT intent_key FROM provisioning_jobs WHERE kind = 'email_identity'"
-        " AND operation = 'ensure'"
+        "SELECT id, intent_key FROM provisioning_jobs WHERE kind = 'email_identity'"
+        " AND operation = 'inspect'"
     )
+    original_request = cp_stack.jobs.request(original["id"])
+    assert original_request["stable_ref"] == original["intent_key"]
     client.active = verified_during_response_loss
     cp_stack.service.check(
         cp_stack.household.id, StepKind.EMAIL, context=cp_stack.context()
