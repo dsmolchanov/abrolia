@@ -8,6 +8,7 @@ from typing import Any
 from pydantic import TypeAdapter
 
 from control_plane.crypto import canonical_json
+from control_plane.email.models import SYNTHETIC_EMAIL_SECRET_BINDING
 from control_plane.email.service import EmailIdentityService
 from control_plane.models import (
     EmailSelection,
@@ -763,6 +764,16 @@ class OnboardingService:
                 request["email_identity_id"] = email_identity["id"]
                 if waiting_email_job is not None:
                     request["parent_job_id"] = waiting_email_job["id"]
+            elif (
+                resource["resource_type"] == "email_identity"
+                and resource["provider"] == "fake-email"
+            ):
+                # Phase-1 rows can predate durable email identities. They used
+                # one fixed synthetic binding, so cleanup can still prove the
+                # provider absent and idempotently remove that exact secret.
+                request["legacy_secret_binding_ref"] = (
+                    SYNTHETIC_EMAIL_SECRET_BINDING
+                )
             job_id, _ = self.jobs.create(
                 connection,
                 household_id=household_id,
@@ -891,6 +902,32 @@ class OnboardingService:
                 reason="reset",
                 now=now,
             )
+            if kind is StepKind.EMAIL:
+                namespace = connection.execute(
+                    "SELECT 1 FROM external_resources WHERE household_id = ?"
+                    " AND resource_type = 'secret_namespace'"
+                    " AND status IN ('creating','ready','outcome_unknown') LIMIT 1",
+                    (household_id,),
+                ).fetchone()
+                if namespace is None:
+                    # A pre-namespace production baseline can have a live Fly
+                    # app/runtime resource but no durable namespace row. Queue
+                    # this after superseding old work so the repair itself is
+                    # not cancelled by the reset transaction.
+                    self.jobs.create(
+                        connection,
+                        household_id=household_id,
+                        workflow_id=row["id"],
+                        kind="runtime",
+                        operation="ensure_secret_namespace",
+                        intent_key=(
+                            f"{household_id}:secret-namespace:reset:"
+                            f"{row['version'] + 1}"
+                        ),
+                        request={"household_id": household_id},
+                        provider=self.runtime_provider,
+                        now=now + (len(cleanup_jobs) + 1) * 0.000001,
+                    )
             if kind is StepKind.EMAIL and self.email_identities is not None:
                 self.email_identities.repository.begin_disconnect(
                     connection, household_id, now=now

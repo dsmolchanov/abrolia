@@ -867,6 +867,11 @@ def test_email_reset_strips_runtime_manifest_digest_from_cleanup_reference(
             " encryption_key_version = ? WHERE id = ?",
             (encrypted.ciphertext, encrypted.key_version, runtime["id"]),
         )
+        connection.execute(
+            "DELETE FROM external_resources WHERE household_id = ?"
+            " AND resource_type = 'secret_namespace'",
+            (cp_stack.household.id,),
+        )
 
     cp_stack.service.reset_from(
         cp_stack.household.id,
@@ -884,6 +889,15 @@ def test_email_reset_strips_runtime_manifest_digest_from_cleanup_reference(
         "app_ref": original_ref,
         "machine_ref": "machine-phase24",
         "volume_ref": "volume-phase24",
+    }
+    namespace_job = cp_stack.database.query_one(
+        "SELECT id, status FROM provisioning_jobs"
+        " WHERE operation = 'ensure_secret_namespace'"
+        " ORDER BY created_at DESC, id DESC LIMIT 1"
+    )
+    assert namespace_job["status"] == "pending"
+    assert cp_stack.jobs.request(namespace_job["id"]) == {
+        "household_id": cp_stack.household.id
     }
 
 
