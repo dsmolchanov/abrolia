@@ -31,9 +31,9 @@ type: implementation_strategy
   bounded backoff intervals and stops after five total attempts.
 - **Complete — Nerve V-01.** Cross-org service-token issuance is denied and the
   fix is deployed in production release 69.
-- **Open, external Phase 2.4 gate — live BYO DNS.** The operator-owned DNS
-  matrix cannot run until a disposable authoritative zone and mutation access
-  are supplied.
+- **Complete — live BYO DNS.** `test.axiomatlas.llc` passed production DNS
+  publication, bounded inspection, persisted reload, cleanup with DNS retained,
+  and same-household reconnect.
 
 ## Critical References
 
@@ -99,8 +99,30 @@ type: implementation_strategy
   `sha256:7406baea1ea524f0b9de43ff4e5d40ae9d407f3e316f70f10dafa44851229d08`
 - Abrolia release 15 image digest
   `sha256:82134117d06cbd53841850e7511c08385b97d872e55fed2874fb59f7b9cc699c`
-- Current Abrolia release 16 image digest
+- Abrolia releases 16–18 image digest
   `sha256:2aa6100eda56f3cce124e4cf928519b3ca1fee74d6b8a66d317b71868604c92f`
+- Live BYO domain: `test.axiomatlas.llc`; all six supplied MX/TXT records were
+  visible through Google Public DNS.
+- First live BYO identity/job/org/domain/inbox/key/webhook:
+  `ca113cc4-538c-42bf-9c3b-8d7b97a25e4a` /
+  `c219963d-bc64-4bd6-ab91-b77e886f96d9` /
+  `494ae0a0-93a6-4557-a154-45200b4e2d62` /
+  `7a859589-8739-4487-abd1-a87f94b38021` /
+  `f05e056b-33e5-418c-8abe-41440a8287f5` /
+  `cf903550-77cb-4948-a113-1e9b8f0c01fa` /
+  `b56e59f3-d8df-4584-b8fb-29c63bca87c3`. The job succeeded on attempt five.
+- Live cleanup job `f85095e5-dae0-4325-b3a8-f76465f3a182` succeeded while DNS
+  remained published; the first identity is `deleted`.
+- Reconnect identity/job/org/domain/inbox/key/webhook:
+  `6b73a64c-b595-44b1-9852-53e01b6a8a73` /
+  `43b658e5-8c45-41cc-beaf-5b73cef3ff21` /
+  `82062f74-8a2c-4bd9-b42c-ac4b9cbda19d` /
+  `4c8d9265-a253-4e77-aff5-3b132f8d19be` /
+  `bf978c48-5cc7-49f3-b7e9-2a16affae82f` /
+  `77545070-fc67-4888-9426-03f22d0ad587` /
+  `b489ac1b-0c91-4cc8-aed9-c01972d6fd28`. The job succeeded on attempt three.
+- Abrolia release 18 restored the standard API on the same immutable release-16
+  digest; Fly service check and `/healthz` pass.
 - Generation A identity/org:
   `a51cb145-63fb-4277-96eb-ef2e28e4907f` /
   `70d15c36-3ab4-40d6-9c58-ae35744d8db5`
@@ -115,14 +137,10 @@ type: implementation_strategy
 
 ## Action Items & Next Steps
 
-1. Obtain an operator-owned disposable domain and authoritative DNS mutation
-   access, then run the live BYO matrix:
-   wrong/partial DNS, record-level persistence across login/reload, one-time
-   verification advance, cleanup with DNS still present, and reconnect.
-2. Wire a production mailer if login must be verified through public delivery;
+1. Wire a production mailer if login must be verified through public delivery;
    this rehearsal used the documented maintenance operator path and immediately
    revoked the test session.
-3. Review the older runtime cleanup job
+2. Review the older runtime cleanup job
    `6a0d040d-bfb9-4671-b2c5-e6ee681bdc6b` separately if it remains
    `outcome_unknown`; its Machine and volume are already absent and it did not
    block the email lifecycle.
@@ -132,10 +150,10 @@ type: implementation_strategy
 - Real family data, Gmail, WhatsApp and primary-channel gates remained disabled.
 - Only synthetic household `06137360-ec42-4c93-9e11-f66551f27681` was allowed
   onto the production Nerve email path.
-- Generation B remains active as the canary. Its org-scoped attachment flag is
-  enabled; generation A and the diagnostic orphan are tombstoned.
-- Abrolia release 16 passed its Fly service check and `/healthz`; generation B
-  remained `verified` after deployment. `/readyz` remains 503 only because the
+- The live BYO reconnect generation is the active canary; its predecessor is
+  deleted and its five Nerve resource IDs are distinct from the replacement.
+- Abrolia release 18 passed its Fly service check and `/healthz`; the reconnect
+  identity remained `verified`. `/readyz` remains 503 only because the
   older cleanup job above is still `outcome_unknown`; PR #22's fix is deployed,
   but the quarantined job still needs one explicit operator reconcile.
 - Resume with:

@@ -594,10 +594,10 @@ flags остаются false до provider-specific gates.
 
 #### Acceptance
 
-- Reload/login resumes the same DNS records and state.
-- Wrong/partial DNS stays waiting; verified DNS advances once.
-- Domain cannot be claimed by two households through race or normalization trick.
-- Delete/reconnect tests cover DNS still present, provider unavailable and lost
+- [x] Reload/login resumes the same DNS records and state.
+- [x] Wrong/partial DNS stays waiting; verified DNS advances once.
+- [x] Domain cannot be claimed by two households through race or normalization trick.
+- [x] Delete/reconnect tests cover DNS still present, provider unavailable and lost
   response.
 - [x] BYO DNS inspection resumes automatically from durable `waiting_user` jobs
   with bounded 30/60/120/240-second backoff; after the fifth total job attempt,
@@ -606,6 +606,21 @@ flags остаются false до provider-specific gates.
   fail-closed real-email config and household allowlist are complete.
 - [x] Cleanup followed by reconnect of the same household creates a new org, while
   a delayed ensure for the deleted email identity remains rejected.
+
+#### Status — complete and live-accepted (2026-08-05)
+
+- The operator-owned `test.axiomatlas.llc` subdomain completed the production
+  BYO flow using six provider-supplied DNS records and no real family data.
+- The first durable inspect job stayed pending through four checks and advanced
+  exactly once on attempt five. Login and two reloads retained the same verified
+  identity and DNS state.
+- Cleanup succeeded while the DNS records remained published. Reconnect of the
+  same household/domain created a distinct identity and complete Nerve graph,
+  then verified through the same durable job on attempt three.
+- The live run captured missing/unrecognized records followed by the complete
+  record set. A particular partial-record combination was not separately
+  snapshotted; the identical pending branch remains covered by the hermetic
+  record-level matrix.
 
 ### Phase 2.5 — Provider-neutral runtime email core
 

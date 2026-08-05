@@ -10,19 +10,61 @@
 **PR integration base:** `f3d8c8f` (`origin/main` after Nerve attachment readiness)
 **Scope:** Phase 2.0–2.4; Phase 2.5 runtime-email work is explicitly excluded
 **Current status:** the production wiring, generation-safe cleanup/reconnect,
-bounded BYO-domain polling, and V-01 tenant isolation gates are **accepted and
-deployed**. Full Phase 2.4 remains **partial / not accepted** only until the
-operator-owned live-DNS matrix runs.
+bounded BYO-domain polling, V-01 tenant isolation, and operator-owned live-DNS
+gates are **accepted and deployed**. Phase 2.4 is complete.
 
 > The path in the original request used `Programs/arbolia`; the active repository
 > is `Programs/abrolia`. Phase 2.5 advanced the shared checkout while this work
 > was running. No `hermes_cloud/**`, runtime-email, landing, or Phase 2.5 plan
 > files were edited by this remediation.
 
-The production rehearsal used only the allowlisted synthetic household
+The production rehearsals used only the allowlisted synthetic household
 `06137360-ec42-4c93-9e11-f66551f27681` and reserved recovery address
 `owner@example.test`. It mutated live Nerve and Abrolia provider state, but used
-no real family data and made no live DNS change.
+no real family data. The final BYO rehearsal published records only below the
+operator-owned disposable subdomain `test.axiomatlas.llc`.
+
+## Operator-owned live-DNS closure — 2026-08-05
+
+The remaining Phase 2.4 gate passed against production Nerve and Abrolia:
+
+- Namecheap BasicDNS published the exact six provider records below
+  `test.axiomatlas.llc`: inbound MX and SPF, `send` MX and SPF, DKIM, and DMARC.
+  Google Public DNS returned all six authoritative values after propagation.
+- First identity `ca113cc4-538c-42bf-9c3b-8d7b97a25e4a` used durable inspect job
+  `c219963d-bc64-4bd6-ab91-b77e886f96d9`. It stayed `waiting_user` through four
+  checks, then the same job reached `succeeded` on attempt five at
+  `2026-08-05T22:39:28Z`; the identity advanced once to `verified`.
+- The verified graph was org `494ae0a0-93a6-4557-a154-45200b4e2d62`, domain
+  `7a859589-8739-4487-abd1-a87f94b38021`, inbox
+  `f05e056b-33e5-418c-8abe-41440a8287f5`, key
+  `cf903550-77cb-4948-a113-1e9b8f0c01fa`, and webhook
+  `b56e59f3-d8df-4584-b8fb-29c63bca87c3`.
+- A maintenance login and two consecutive onboarding reads returned the same
+  verified snapshot. No raw magic-link token or session value was logged.
+- Reset left the DNS records in place. Cleanup job
+  `f85095e5-dae0-4325-b3a8-f76465f3a182` succeeded on its first attempt at
+  `2026-08-05T22:41:06Z`, and the first identity became `deleted`.
+- Reconnecting the same household and domain created identity
+  `6b73a64c-b595-44b1-9852-53e01b6a8a73` and durable inspect job
+  `43b658e5-8c45-41cc-beaf-5b73cef3ff21`. The job succeeded on attempt three at
+  `2026-08-05T22:43:33Z` and the identity became `verified`.
+- The reconnect graph is wholly generation-distinct: org
+  `82062f74-8a2c-4bd9-b42c-ac4b9cbda19d`, domain
+  `4c8d9265-a253-4e77-aff5-3b132f8d19be`, inbox
+  `bf978c48-5cc7-49f3-b7e9-2a16affae82f`, key
+  `77545070-fc67-4888-9426-03f22d0ad587`, and webhook
+  `b489ac1b-0c91-4cc8-aed9-c01972d6fd28`.
+- Abrolia release 18 restored the normal API on the unchanged immutable image
+  digest `sha256:2aa6100eda56f3cce124e4cf928519b3ca1fee74d6b8a66d317b71868604c92f`.
+  Its Fly service check and `/healthz` pass with workers running.
+
+The live run observed the real provider remain pending while records were
+missing or not yet recognized, followed by the complete record set. It did not
+retain a separate snapshot of one exact partial-record combination; partial
+record-level behavior remains covered by the hermetic matrix exercising the
+same pending projection. This evidence limitation does not weaken the live
+provider, persistence, cleanup, or reconnect results.
 
 ## Production wiring and reconnect closure — 2026-08-05
 
@@ -102,10 +144,11 @@ DNS acceptance matrix.
 | V-02 — false verification after one-time-secret loss | **Safety fixed / convergence partial** | False verification is eliminated; crash-after-install still needs a durable non-secret receipt/inspection contract |
 | V-03 — provider secret in allowed values | **Fixed locally for durable/public email paths** | Provider outputs are typed, credential-shaped values are rejected, and external error codes are normalized |
 | V-04 — expired hold reported claimable while identity is live | **Fixed fail-closed locally** | Availability stays false until the owning identity is terminal; automatic TTL ownership transfer remains deferred |
-| Phase 2.4 — family-owned domain | **Partial / not accepted** | Production composition, managed cleanup/reconnect and bounded BYO polling pass; the live DNS matrix remains |
+| Phase 2.4 — family-owned domain | **Accepted and deployed** | Operator-owned DNS, bounded polling, persistence, cleanup with DNS retained, and same-household reconnect pass in production |
 
-The fixes and managed-path rehearsal restore the cleanup/reconnect safety
-boundary. They do not make the full BYO-domain or Gmail rollout ready.
+The fixes and live rehearsals restore the cleanup/reconnect safety boundary and
+close the BYO-domain Phase 2.4 gate. They do not make the Gmail or broader
+real-family-data rollout ready.
 
 ## Remediation applied
 
@@ -249,16 +292,16 @@ not a reason to weaken the current reserved set.
 | 3. Durable typed DNS result | **Pass locally** | A non-empty typed record set retains type, host, value, priority, purpose and required flag; server and JS render exact records and record-level status after reload |
 | 4. Bounded poll/inspect backoff | **Pass locally** | The durable job becomes an `inspect` intent, leases only when `not_before` is due, backs off at 30/60/120/240 seconds, stops after five total attempts, and retains manual `CHECK` |
 | 5. Create inbox/key/webhook only after verification | **Partial** | Hermetic path advances once and never creates an inbox while DNS is pending; lost original-and-recovery key response remains unproved |
-| 6. Ordered cleanup with explicit unknown | **Pass for managed live path / BYO live pending** | Nerve PR #64 made the graph deletable and PR #66 retained generation tombstones; production generation A cleanup and generation B reconnect passed |
+| 6. Ordered cleanup with explicit unknown | **Pass live for managed and BYO paths** | Nerve PR #64 made the graph deletable and PR #66 retained generation tombstones; managed and operator-owned BYO cleanup/reconnect passed in production |
 
 ### Acceptance criteria
 
 | Criterion | Result |
 |---|---|
-| Reload/login resumes the same DNS records and state | **Pass hermetically; managed live pass / BYO live pending** — production login and two reloads retained generation B, but no live DNS records were created |
-| Wrong/partial DNS waits; verified DNS advances once | **Pass hermetically** — partial checks remain waiting and inbox creation occurs once |
+| Reload/login resumes the same DNS records and state | **Pass live** — production login and two reloads retained the same verified `test.axiomatlas.llc` identity and DNS state |
+| Wrong/partial DNS waits; verified DNS advances once | **Pass live with noted evidence limit** — the provider stayed pending while records were missing/unrecognized and advanced once after the complete set; a specific partial combination is covered hermetically but was not separately snapshotted live |
 | One canonical domain cannot be claimed by two households | **Pass locally** — domain HMAC uniqueness, legacy-row fallback, address/domain binding, and different-local-part collision tests pass; there is no claim-specific two-connection concurrent-writer test |
-| Delete/reconnect covers DNS present, provider unavailable and lost response | **Partial** — managed production cleanup/reconnect now passes; BYO live DNS-present and post-delete response-loss cases remain unexercised |
+| Delete/reconnect covers DNS present, provider unavailable and lost response | **Pass** — BYO cleanup and reconnect passed with DNS still published; provider-unavailable and lost-response branches remain covered by the hermetic failure matrix |
 
 ### Phase 2.4 issues fixed during this review
 
@@ -288,13 +331,9 @@ not a reason to weaken the current reserved set.
 
 ### Remaining Phase 2.4 blockers
 
-1. Run the live BYO-domain DNS matrix with an operator-owned test domain,
-   including wrong/partial records, verified advance, persisted DNS state,
-   cleanup while DNS remains present, and reconnect. The managed-domain live
-   rehearsal above does not exercise DNS mutation. This is externally blocked
-   until an authoritative DNS zone and mutation access are supplied.
-2. Wire a production mailer if repeated login must be validated through public
-   delivery rather than the documented maintenance-window operator link.
+None. Public delivery of repeated login links remains a later production-mailer
+rollout concern; the bounded maintenance login used here is sufficient for the
+Phase 2.4 persistence criterion.
 
 ## Automated verification
 
@@ -313,7 +352,8 @@ not a reason to weaken the current reserved set.
   replaying A remains rejected, and reconnecting the same household as generation
   B receives a distinct org. No Nerve tombstone is restored or reused.
 - The managed Nerve cleanup/reconnect and logout/login/reload rehearsal passed
-  in production. The live BYO DNS portion remains a separate manual gate.
+  in production. The operator-owned BYO DNS rehearsal subsequently passed on
+  `test.axiomatlas.llc`.
 
 | Check | Current result |
 |---|---|
@@ -321,7 +361,7 @@ not a reason to weaken the current reserved set.
 | Nerve production release 68 | **pass** — digest-pinned image, service check healthy |
 | Nerve PR #67 and production release 69 | **pass** — cross-org service-token request denied, own-org request preserved; immutable digest healthy |
 | Abrolia PR #21 CI | **pass** — complete non-live suite, lint, fixtures, contracts and secret scan |
-| Abrolia production release 16 | **pass** — current main including PRs #21–#23 is deployed on an immutable digest; Fly service check and `/healthz` are healthy; generation B remains verified |
+| Abrolia production release 18 | **pass** — current main is deployed on the unchanged immutable digest; Fly service check and `/healthz` are healthy; the BYO reconnect identity is verified |
 | Managed generation A cleanup and old replay | **pass** — empty diagnostic orphan tombstoned; delayed generation-A ensure returned 409 |
 | Managed generation B reconnect | **pass** — fresh identity/org/inbox verified at workflow version 17 |
 | Logout/login/two reloads/logout | **pass** — 200, stable verified state, 204, then 401 |
@@ -359,15 +399,8 @@ The normal-path baseline suites were green, which is why the new negative,
 hard-process-loss, cross-household, malformed-provider, and cancellation tests
 are part of the remediation rather than relying on the previous suite alone.
 
-## Remaining manual release gate
+## Manual release gate result
 
-Before Phase 2.4 is fully accepted:
-
-1. nominate an operator-owned disposable domain and provide authoritative DNS
-   mutation access;
-2. run the staged manual/live matrix with synthetic households and no real
-   family data;
-3. keep broader real-family-data gates off until that matrix passes.
-
-Phase 2.5 may continue independently, but it must not be used as evidence that
-Phase 2.4 is accepted.
+The operator-owned live-DNS gate passed on `test.axiomatlas.llc`. Broader
+real-family-data, Gmail, WhatsApp and primary-channel gates remain independently
+closed; Phase 2.4 acceptance does not activate them.
