@@ -5,21 +5,63 @@
 **Original Abrolia baseline:** `a5dd303c6a2170d09bb5baa9c1e570e27fbd967f`
 **Phase 2.4 baseline:** `bc1b3cf`
 **Original Nerve baseline:** `2b8608f486f8117ded53f49e0551a058e4ebe0d4`
-**Latest inspected Nerve main:** `5e994c09d0c4a381c959fe3c88286bb444878956`
+**Latest deployed Nerve main:** `56826658a69423136b45f3bd575744e7e1511699`
 **Original remediation worktree base:** `ff93f31`
 **PR integration base:** `f3d8c8f` (`origin/main` after Nerve attachment readiness)
 **Scope:** Phase 2.0–2.4; Phase 2.5 runtime-email work is explicitly excluded
-**Current status:** local V-02, V-03 and V-04 safety failures are remediated;
-Phase 2.4 is still **partial / not accepted** because of upstream Nerve and
-missing bounded-poll/live evidence
+**Current status:** the production wiring and generation-safe cleanup/reconnect
+gate is **accepted**. Full Phase 2.4 remains **partial / not accepted** until the
+BYO-domain bounded-poll/live-DNS gate and the unrelated V-01 tenant token issue
+are closed.
 
 > The path in the original request used `Programs/arbolia`; the active repository
 > is `Programs/abrolia`. Phase 2.5 advanced the shared checkout while this work
 > was running. No `hermes_cloud/**`, runtime-email, landing, or Phase 2.5 plan
 > files were edited by this remediation.
 
-All probes and tests use synthetic data. No production credential, real family
-mailbox, live DNS mutation, or live provider mutation was used.
+The production rehearsal used only the allowlisted synthetic household
+`06137360-ec42-4c93-9e11-f66551f27681` and reserved recovery address
+`owner@example.test`. It mutated live Nerve and Abrolia provider state, but used
+no real family data and made no live DNS change.
+
+## Production wiring and reconnect closure — 2026-08-05
+
+The two blockers discovered after Nerve PR #64 are closed in production:
+
+- Abrolia PRs #15, #17 and #18 register the Nerve providers behind the
+  fail-closed allowlist, preserve runtime cleanup references, and converge
+  resets that originated on the legacy synthetic provider. Abrolia release 12
+  is healthy on image digest
+  `sha256:d2762fdba1e272257966adfb71b9813e8ebb8a768feb4dc1ffa0003d041394cc`.
+- Nerve PR #66 retains each generation-scoped org `external_ref` on the deleted
+  org tombstone. Production release 68 is healthy on image digest
+  `sha256:693aefba5d6fa319523bf2d8215b9c568f0054cc1fb5da9d706493edd46ea6a4`.
+- Generation A (`a51cb145-63fb-4277-96eb-ef2e28e4907f`, org
+  `70d15c36-3ab4-40d6-9c58-ae35744d8db5`) provisioned, verified and cleaned
+  up. Its webhook, key, inbox and domain grant were removed/revoked in order.
+- A diagnostic replay made before PR #66 exposed the old release behavior and
+  created empty orphan org `b32fea34-bb3d-4527-acc5-9ab6805d59f9`. After release
+  68, the rehearsal verified that all five child collections were empty,
+  tombstoned the orphan, observed the retained generation-A reference, and
+  received HTTP 409 from a delayed ensure using that reference.
+- Generation B (`2265aaea-83a3-4138-bf54-2af0a4909bb9`) created fresh org
+  `d9509937-6ac0-4e6f-9788-981d3e8c0cd0` and inbox
+  `phase24-reconnect-b@abrolia.com`; it did not revive generation A. The
+  org-scoped attachment flag was enabled with audit replay
+  `bd4ccb08-9a94-4fae-88be-b67647f27673`, after which the identity reached
+  `verified` at workflow version 17.
+- The persistence rehearsal logged out the original session, issued a bounded
+  maintenance login link without printing its token, consumed it through the
+  public API, loaded the onboarding state twice, and observed the same verified
+  generation-B org. It then logged out and confirmed the session returned 401.
+- Legacy job `b9260b08-27b8-42dc-80e2-34df52690d1b` was changed from
+  `outcome_unknown` to `cancelled` only after replacement job
+  `36d86b13-1987-47d0-80f8-6470be02a55f` was `succeeded` and its resource was
+  `deleted`.
+
+This closes the production composition and same-household reconnect blockers.
+It does not substitute a managed-domain rehearsal for the Phase 2.4 BYO-domain
+DNS acceptance matrix.
 
 ## Executive verdict
 
@@ -29,16 +71,16 @@ mailbox, live DNS mutation, or live provider mutation was used.
 | V-02 — false verification after one-time-secret loss | **Safety fixed / convergence partial** | False verification is eliminated; crash-after-install still needs a durable non-secret receipt/inspection contract |
 | V-03 — provider secret in allowed values | **Fixed locally for durable/public email paths** | Provider outputs are typed, credential-shaped values are rejected, and external error codes are normalized |
 | V-04 — expired hold reported claimable while identity is live | **Fixed fail-closed locally** | Availability stays false until the owning identity is terminal; automatic TTL ownership transfer remains deferred |
-| Phase 2.4 — family-owned domain | **Partial / not accepted** | Hermetic normal paths pass, but bounded polling, verified cleanup against current Nerve, recovery-loss, and live evidence remain |
+| Phase 2.4 — family-owned domain | **Partial / not accepted** | Production composition and managed cleanup/reconnect pass; bounded BYO polling and the live DNS matrix remain |
 
-The local fixes restore the safety boundary needed to continue synthetic
-development. They do not make the real Nerve/Gmail rollout ready.
+The fixes and managed-path rehearsal restore the cleanup/reconnect safety
+boundary. They do not make the full BYO-domain or Gmail rollout ready.
 
 ## Remediation applied
 
 ### V-01 — still open in `nerve-cloud`
 
-The finding remains reproducible on inspected Nerve main `5e994c0`:
+The finding remains present on deployed Nerve main `5682665`:
 
 - `internal/cloudapi/handler_keys.go` passes the requested `org_id` to service
   token issuance without resolving it against the authenticated tenant;
@@ -183,16 +225,16 @@ not a reason to weaken the current reserved set.
 | 3. Durable typed DNS result | **Pass locally** | A non-empty typed record set retains type, host, value, priority, purpose and required flag; server and JS render exact records and record-level status after reload |
 | 4. Bounded poll/inspect backoff | **Fail / open** | Durable manual `CHECK` inspection and response-loss reconciliation use the original stable reference, but `waiting_user` is not scheduled for bounded automatic polling |
 | 5. Create inbox/key/webhook only after verification | **Partial** | Hermetic path advances once and never creates an inbox while DNS is pending; lost original-and-recovery key response remains unproved |
-| 6. Ordered cleanup with explicit unknown | **Fail upstream** | Abrolia order, repeated-outage handling, and reconnect quarantine are covered; current Nerve cannot delete a verified graph because inbox delete only disables the row while domain/org deletion refuses any remaining inbox row |
+| 6. Ordered cleanup with explicit unknown | **Pass for managed live path / BYO live pending** | Nerve PR #64 made the graph deletable and PR #66 retained generation tombstones; production generation A cleanup and generation B reconnect passed |
 
 ### Acceptance criteria
 
 | Criterion | Result |
 |---|---|
-| Reload/login resumes the same DNS records and state | **Pass hermetically / live pending** — durable `public_status` is rendered server-side and refreshed by JS; staged logout/login was not run |
+| Reload/login resumes the same DNS records and state | **Pass hermetically; managed live pass / BYO live pending** — production login and two reloads retained generation B, but no live DNS records were created |
 | Wrong/partial DNS waits; verified DNS advances once | **Pass hermetically** — partial checks remain waiting and inbox creation occurs once |
 | One canonical domain cannot be claimed by two households | **Pass locally** — domain HMAC uniqueness, legacy-row fallback, address/domain binding, and different-local-part collision tests pass; there is no claim-specific two-connection concurrent-writer test |
-| Delete/reconnect covers DNS present, provider unavailable and lost response | **Partial** — local outage/reconnect behavior passes, but verified cleanup cannot converge against current Nerve and BYO loss after the provider actually deletes the graph is not modeled |
+| Delete/reconnect covers DNS present, provider unavailable and lost response | **Partial** — managed production cleanup/reconnect now passes; BYO live DNS-present and post-delete response-loss cases remain unexercised |
 
 ### Phase 2.4 issues fixed during this review
 
@@ -222,15 +264,16 @@ not a reason to weaken the current reserved set.
 
 ### Remaining Phase 2.4 blockers
 
-1. Merge and deploy the Nerve bootstrap hard-delete change from PR #64.
-2. Install the Nerve admin secret and non-secret platform/allowlist settings,
-   deploy this Abrolia remediation with the flag still off, then enable only the
-   operator-owned staging household.
-3. Run staging/live DNS, Nerve, logout/login/reload, cleanup, rejected old replay,
-   and fresh reconnect tests. These manual checks are intentionally not marked
-   complete here.
-4. Wire a production mailer if repeated login is to be validated through public
-   delivery rather than the documented maintenance-window operator invite.
+1. Implement bounded BYO-domain DNS polling/backoff and lost-recovery-response
+   handling; the current flow remains explicit user-driven `CHECK` inspection.
+2. Run the live BYO-domain DNS matrix with an operator-owned test domain,
+   including wrong/partial records, verified advance, persisted DNS state,
+   cleanup while DNS remains present, and reconnect. The managed-domain live
+   rehearsal above does not exercise DNS mutation.
+3. Fix and negatively test the unrelated cross-org service-token issue V-01 in
+   Nerve before declaring the whole real-provider release surface accepted.
+4. Wire a production mailer if repeated login must be validated through public
+   delivery rather than the documented maintenance-window operator link.
 
 ## Automated verification
 
@@ -248,12 +291,16 @@ not a reason to weaken the current reserved set.
 - Hermetic lifecycle coverage proves that cleanup tombstones generation A,
   replaying A remains rejected, and reconnecting the same household as generation
   B receives a distinct org. No Nerve tombstone is restored or reused.
-- The live DNS/logout/login/cleanup/reconnect rehearsal remains the manual gate;
-  it also requires the Nerve bootstrap hard-delete change from PR #64 to be
-  merged and deployed first.
+- The managed Nerve cleanup/reconnect and logout/login/reload rehearsal passed
+  in production. The live BYO DNS portion remains a separate manual gate.
 
 | Check | Current result |
 |---|---|
+| Nerve PR #66 CI | **pass** — cloud-e2e, go-checks, unit, integration, lint, coverage, SDK, dashboard, exact mirror and vulnerability checks |
+| Nerve production release 68 | **pass** — digest-pinned image, service check healthy |
+| Managed generation A cleanup and old replay | **pass** — empty diagnostic orphan tombstoned; delayed generation-A ensure returned 409 |
+| Managed generation B reconnect | **pass** — fresh identity/org/inbox verified at workflow version 17 |
+| Logout/login/two reloads/logout | **pass** — 200, stable verified state, 204, then 401 |
 | `python3 -m pytest -q -p no:cacheprovider tests/control_plane` | **pass** — 349 tests |
 | `python3 -m pytest -m "not live" -q -p no:cacheprovider` | **pass** — 824 tests after rebasing production-wiring/reconnect remediation over Gmail lifecycle main |
 | `python3 -m pytest -q -p no:cacheprovider tests/control_plane/email` | **pass** — 93 tests |
