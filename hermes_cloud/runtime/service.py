@@ -19,6 +19,7 @@ import httpx
 from hermes_cloud.core.config import DEFAULT_DB_PATH, ENV_DB
 from hermes_cloud.core.db import open_database
 from hermes_cloud.core.dsar import export_household, is_deleted, wipe_household
+from hermes_cloud.core.events import EventStore
 from hermes_cloud.core.runtime_manifest import (
     ENV_CONFIG_REVISION,
     ENV_HOUSEHOLD_FILE,
@@ -44,6 +45,11 @@ from hermes_cloud.ingest.nerve_webhook import (
     NerveWebhookRejected,
     NerveWebhookStore,
 )
+from hermes_cloud.ingest.whatsapp_webhook import (
+    MAX_WHATSAPP_WEBHOOK_BYTES,
+    WhatsAppWebhookReceiver,
+    WhatsAppWebhookRejected,
+)
 from hermes_cloud.runtime.bootstrap import (
     DEFAULT_ACTIVATION_STATE,
     DEFAULT_MANIFEST_PATH,
@@ -67,6 +73,8 @@ ENV_RUNTIME_DELETION_MARKER = "HERMES_RUNTIME_DELETION_MARKER"
 ENV_NERVE_RUNTIME_URL = "ABROLIA_NERVE_RUNTIME_URL"
 ENV_NERVE_REST_URL = "ABROLIA_NERVE_REST_URL"
 ENV_NERVE_WORKER_SECONDS = "ABROLIA_NERVE_WORKER_SECONDS"
+ENV_WHATSAPP_INSTANCE = "HERMES_WHATSAPP_INSTANCE"
+ENV_WHATSAPP_RELAY_SECRET = "HERMES_WHATSAPP_RELAY_SECRET"
 
 
 class RuntimeNotReady(RuntimeError):
@@ -87,6 +95,12 @@ class NerveRuntimeConfig:
     webhook_signing_key: str
     runtime_url: str
     rest_url: str
+
+
+@dataclass(frozen=True)
+class WhatsAppRuntimeConfig:
+    instance: str
+    relay_secret: str
 
 
 class RuntimeService:
@@ -387,12 +401,33 @@ class RuntimeService:
                 if close is not None:
                     close()
 
+    def _whatsapp_config(self, manifest: RuntimeManifest) -> WhatsAppRuntimeConfig:
+        if not any(binding.channel == "whatsapp" for binding in manifest.verified_bindings):
+            raise RuntimeNotReady("WhatsApp is not bound to this household")
+        instance = self.env.get(ENV_WHATSAPP_INSTANCE, "").strip()
+        relay_secret = self.env.get(ENV_WHATSAPP_RELAY_SECRET, "").strip()
+        if not instance or not relay_secret:
+            raise RuntimeNotReady("WhatsApp runtime configuration is incomplete")
+        return WhatsAppRuntimeConfig(instance=instance, relay_secret=relay_secret)
+
+    def receive_whatsapp_webhook(self, payload: bytes, signature: str):
+        manifest = self.require_ready()
+        config = self._whatsapp_config(manifest)
+        with open_database(self.database_path) as database:
+            return WhatsAppWebhookReceiver(
+                EventStore(database),
+                signing_secret=config.relay_secret,
+                instance=config.instance,
+            ).receive(payload, signature)
+
     def __call__(self, environ: Mapping[str, Any], start_response: Callable) -> list[bytes]:
         """Health probes plus an authenticated private DSAR boundary."""
         path = str(environ.get("PATH_INFO") or "")
         method = str(environ.get("REQUEST_METHOD") or "GET").upper()
         if path == "/v1/email/nerve/webhook" and method == "POST":
             probe = self._nerve_webhook(environ)
+        elif path in {"/v1/whatsapp/webhook", "/webhooks/whatsapp"} and method == "POST":
+            probe = self._whatsapp_webhook(environ)
         elif path in {"/internal/v1/dsar/export", "/internal/v1/dsar/delete"}:
             probe = self._dsar(path, method, str(environ.get("HTTP_AUTHORIZATION") or ""))
         elif path == "/internal/v1/email/google/revoke":
@@ -442,6 +477,38 @@ class RuntimeService:
         try:
             accepted = self.receive_nerve_webhook(payload, signature)
         except NerveWebhookRejected as error:
+            return Probe(error.status_code, {"status": error.code})
+        except RuntimeNotReady:
+            return Probe(503, {"status": "runtime_not_ready"})
+        except Exception:
+            return Probe(503, {"status": "webhook_unavailable"})
+        return Probe(
+            200,
+            {
+                "status": "accepted" if accepted.created else "duplicate",
+                "event_id": accepted.event.id,
+            },
+        )
+
+    def _whatsapp_webhook(self, environ: Mapping[str, Any]) -> Probe:
+        try:
+            length = int(str(environ.get("CONTENT_LENGTH") or "0"))
+        except ValueError:
+            return Probe(400, {"status": "invalid_request"})
+        if length < 1:
+            return Probe(400, {"status": "invalid_request"})
+        if length > MAX_WHATSAPP_WEBHOOK_BYTES:
+            return Probe(413, {"status": "payload_too_large"})
+        stream = environ.get("wsgi.input")
+        if stream is None or not hasattr(stream, "read"):
+            return Probe(400, {"status": "invalid_request"})
+        payload = stream.read(length)
+        if not isinstance(payload, bytes) or len(payload) != length:
+            return Probe(400, {"status": "invalid_request"})
+        signature = str(environ.get("HTTP_X_RELAY_SIGNATURE") or "")
+        try:
+            accepted = self.receive_whatsapp_webhook(payload, signature)
+        except WhatsAppWebhookRejected as error:
             return Probe(error.status_code, {"status": error.code})
         except RuntimeNotReady:
             return Probe(503, {"status": "runtime_not_ready"})

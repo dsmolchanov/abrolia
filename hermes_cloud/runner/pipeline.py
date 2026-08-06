@@ -36,6 +36,8 @@ from hermes_cloud.core.runcontext import (
     WRITE_EMAIL,
     WRITE_MEMORY,
     WRITE_REMINDER,
+    WRITE_WHATSAPP,
+    Household,
     RunContext,
 )
 from hermes_cloud.execute.email_send import (
@@ -51,8 +53,16 @@ from hermes_cloud.execute.gcal import (
 )
 from hermes_cloud.execute.ics import build_event, filename_for, render_ics
 from hermes_cloud.execute.reminder import ReminderStore, due_timestamp
+from hermes_cloud.execute.whatsapp import (
+    OutgoingWhatsApp,
+    WhatsAppOutcomeUnknown,
+    WhatsAppSender,
+)
 from hermes_cloud.ingest.eml import parse_eml
+from hermes_cloud.ingest.whatsapp_webhook import trusted_run_context
 from hermes_cloud.runner.bundle import (
+    Item,
+    bundle_payload,
     enabled_items,
     item_line,
     items_for,
@@ -75,6 +85,7 @@ from hermes_cloud.runner.card import (
     KIND_ICS,
     KIND_MEMORY,
     KIND_REMINDER,
+    KIND_WHATSAPP,
     header_lines,
     render_info,
 )
@@ -114,6 +125,7 @@ CAPABILITY_FOR_KIND = {
     KIND_ICS: WRITE_CALENDAR,
     KIND_MEMORY: WRITE_MEMORY,
     KIND_EMAIL: WRITE_EMAIL,
+    KIND_WHATSAPP: WRITE_WHATSAPP,
     KIND_EXPORT: DATA_EXPORT,
     KIND_DELETE: DATA_DELETE,
 }
@@ -214,6 +226,8 @@ class Pipeline:
         loop: ToolLoop | None = None,
         calendar: Calendar | None = None,
         mail: EmailSender | None = None,
+        whatsapp: WhatsAppSender | None = None,
+        household: Household | None = None,
     ) -> None:
         self.approvals = approvals
         self.reminders = reminders
@@ -233,6 +247,8 @@ class Pipeline:
         # Исходящая почта. Её отсутствие — не деградация, а выключенный тракт:
         # предложить письмо можно, отправить — нет.
         self.mail = mail
+        self.whatsapp = whatsapp
+        self.household = household
         # Онтологический слой: провенанс, обязательства, память. Живёт в той же
         # базе — иначе «откуда эта сумма» пришлось бы собирать из двух мест.
         self.evidence = EvidenceStore(approvals.db)
@@ -243,6 +259,10 @@ class Pipeline:
 
     def handle_event(self, event: Event) -> Handled:
         """Обработчик воркера: письмо → карточка. Наружу отсюда ничего не уходит."""
+        if event.source == "whatsapp" and self.household is not None:
+            context = trusted_run_context(event.raw, self.household)
+            if context.is_known:
+                return self._handle_whatsapp_dialogue(event, context)
         parsed = parse_eml(event.raw)
         extraction = self.extractor.extract_email(parsed)
         result = extraction.result
@@ -329,6 +349,40 @@ class Pipeline:
             buttons=tuple((button.label, button.callback_data) for button in card.buttons),
         )
         logger.info("staged approval %s for event %s", staged.id, event.id)
+        return Handled(approval_id=staged.id, message=card.text)
+
+    def _handle_whatsapp_dialogue(self, event: Event, context: RunContext) -> Handled:
+        """Known family dialogue becomes a staged reply, never a direct WA send."""
+        parsed = parse_eml(event.raw)
+        if self.loop is None or not parsed.text.strip():
+            return Handled()
+        answer = self.loop.run(context, parsed.text)
+        payload = bundle_payload(
+            [Item(payload={"kind": KIND_WHATSAPP, "to": context.actor_id, "text": answer.text})],
+            header=f"Ответ в WhatsApp для {context.actor_id}",
+        )
+        staged = self.approvals.stage(
+            kind=KIND_BUNDLE,
+            payload=payload,
+            chat=self.chat,
+            thread=self.thread,
+            actor=context.actor_id,
+            context_key=event.context_key,
+            event_id=event.id,
+        )
+        card = render_bundle(
+            None,
+            items_of(payload),
+            approval_id=staged.id,
+            code=staged.code,
+            header=payload["header"],
+        )
+        self.transport.send_message(
+            chat=self.chat,
+            text=card.text,
+            thread=self.thread,
+            buttons=tuple((button.label, button.callback_data) for button in card.buttons),
+        )
         return Handled(approval_id=staged.id, message=card.text)
 
     # --- подтверждение ------------------------------------------------------
@@ -474,6 +528,8 @@ class Pipeline:
                 text = self._execute_delete(approval, now=now)
             elif payload["kind"] == KIND_EMAIL:
                 text = self._execute_email(approval, payload, effect_id=effect.id)
+            elif payload["kind"] == KIND_WHATSAPP:
+                text = self._execute_whatsapp(payload, effect_id=effect.id)
             elif payload["kind"] == KIND_BUNDLE:
                 text = self._execute_bundle(approval, payload, now=now)
             else:
@@ -490,7 +546,12 @@ class Pipeline:
                 chat=approval.chat, text=str(partial), thread=approval.thread
             )
             return Handled(approval_id=approval.id, message=str(partial))
-        except (SendOutcomeUnknown, CalendarOutcomeUnknown, EmailOutcomeUnknown) as error:
+        except (
+            SendOutcomeUnknown,
+            CalendarOutcomeUnknown,
+            EmailOutcomeUnknown,
+            WhatsAppOutcomeUnknown,
+        ) as error:
             # Отправка могла дойти. Повторять нельзя, молчать — тем более.
             self.effects.outcome_unknown(effect.id, f"{type(error).__name__}: {error}", now=now)
             self.approvals.mark(
@@ -658,7 +719,12 @@ class Pipeline:
                     effect_id=effect.id,
                     now=now,
                 )
-            except (SendOutcomeUnknown, CalendarOutcomeUnknown, EmailOutcomeUnknown) as error:
+            except (
+                SendOutcomeUnknown,
+                CalendarOutcomeUnknown,
+                EmailOutcomeUnknown,
+                WhatsAppOutcomeUnknown,
+            ) as error:
                 # «Не получилось» здесь было бы враньём: письмо могло уйти.
                 failures += 1
                 self.effects.outcome_unknown(
@@ -708,6 +774,8 @@ class Pipeline:
             return self._execute_ics(approval, payload)
         if kind == KIND_EMAIL:
             return self._execute_email(approval, payload, effect_id=effect_id)
+        if kind == KIND_WHATSAPP:
+            return self._execute_whatsapp(payload, effect_id=effect_id)
         raise ValueError(f"неизвестный вид пункта: {kind!r}")
 
     def _toggle_item(
@@ -793,6 +861,14 @@ class Pipeline:
             "email effect %s accepted as %s", effect_id, receipt.message_id
         )
         return f"Готово: письмо для {letter.to} отправлено."
+
+    def _execute_whatsapp(self, payload: dict, *, effect_id: str) -> str:
+        if self.whatsapp is None:
+            raise ValueError("WhatsApp не настроен")
+        message = OutgoingWhatsApp.from_payload(payload)
+        receipt = self.whatsapp.send(message, effect_id=effect_id)
+        logger.info("WhatsApp effect %s accepted as %s", effect_id, receipt.message_id)
+        return f"Готово: WhatsApp для {message.to} отправлен."
 
     def _execute_ics(self, approval, payload: dict) -> str:
         start = datetime.fromisoformat(payload["start"])

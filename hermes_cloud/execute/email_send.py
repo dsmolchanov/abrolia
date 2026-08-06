@@ -25,6 +25,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import logging
 import os
@@ -57,6 +59,15 @@ MESSAGE_ID_DOMAIN = "hermes-cloud.invalid"
 
 MAX_SUBJECT = 200
 MAX_BODY = 20_000
+MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024
+MAX_ATTACHMENT_TOTAL_BYTES = 20 * 1024 * 1024
+MAX_ATTACHMENT_COUNT = 10
+ALLOWED_ATTACHMENT_TYPES = frozenset({
+    "application/pdf",
+    "image/jpeg",
+    "image/png",
+    "text/plain",
+})
 
 _ADDRESS = re.compile(r"^[^@\s,;<>]+@[^@\s,;<>]+\.[A-Za-z]{2,}$")
 
@@ -78,6 +89,34 @@ class EmailBindingChanged(BindingRevisionChanged):
 
 
 @dataclass(frozen=True)
+class OutgoingAttachment:
+    filename: str
+    content_type: str
+    content_base64: str
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> OutgoingAttachment:
+        return cls(
+            filename=str(payload.get("filename") or ""),
+            content_type=str(payload.get("content_type") or "").casefold(),
+            content_base64=str(payload.get("content_base64") or ""),
+        )
+
+    def content(self) -> bytes:
+        try:
+            return base64.b64decode(self.content_base64, validate=True)
+        except (ValueError, binascii.Error) as error:
+            raise EmailRejected("вложение не является корректным base64") from error
+
+    def to_payload(self) -> dict[str, str]:
+        return {
+            "filename": self.filename,
+            "content_type": self.content_type,
+            "content_base64": self.content_base64,
+        }
+
+
+@dataclass(frozen=True)
 class Outgoing:
     """Письмо, каким его подтвердил человек."""
 
@@ -89,9 +128,15 @@ class Outgoing:
     from_identity_id: str | None = None
     binding_revision: int | None = None
     from_address: str | None = None
+    attachments: tuple[OutgoingAttachment, ...] = ()
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> Outgoing:
+        raw_attachments = payload.get("attachments", ())
+        if not isinstance(raw_attachments, (list, tuple)) or any(
+            not isinstance(item, dict) for item in raw_attachments
+        ):
+            raise EmailRejected("негодный список вложений")
         return cls(
             to=str(payload.get("to") or ""),
             subject=str(payload.get("subject") or ""),
@@ -105,6 +150,10 @@ class Outgoing:
                 else None
             ),
             from_address=payload.get("from_address") or None,
+            attachments=tuple(
+                OutgoingAttachment.from_payload(item)
+                for item in raw_attachments
+            ),
         )
 
 
@@ -126,6 +175,27 @@ def validate(letter: Outgoing) -> None:
         raise EmailRejected("пустое тело письма")
     if len(letter.body) > MAX_BODY:
         raise EmailRejected(f"тело длиннее {MAX_BODY} символов")
+    if len(letter.attachments) > MAX_ATTACHMENT_COUNT:
+        raise EmailRejected("слишком много вложений")
+    total = 0
+    for attachment in letter.attachments:
+        if (
+            not attachment.filename
+            or attachment.filename in {".", ".."}
+            or "/" in attachment.filename
+            or "\\" in attachment.filename
+            or "\r" in attachment.filename
+            or "\n" in attachment.filename
+        ):
+            raise EmailRejected("негодное имя вложения")
+        if attachment.content_type not in ALLOWED_ATTACHMENT_TYPES:
+            raise EmailRejected("тип вложения не разрешён")
+        content = attachment.content()
+        if not content or len(content) > MAX_ATTACHMENT_BYTES:
+            raise EmailRejected("негодный размер вложения")
+        total += len(content)
+    if total > MAX_ATTACHMENT_TOTAL_BYTES:
+        raise EmailRejected("общий размер вложений превышен")
 
 
 def message_id_for(approval_id: str) -> str:
@@ -146,6 +216,14 @@ def build_message(letter: Outgoing, *, sender: str, approval_id: str) -> EmailMe
         message["In-Reply-To"] = letter.in_reply_to
         message["References"] = letter.references or letter.in_reply_to
     message.set_content(letter.body)
+    for attachment in letter.attachments:
+        maintype, subtype = attachment.content_type.split("/", 1)
+        message.add_attachment(
+            attachment.content(),
+            maintype=maintype,
+            subtype=subtype,
+            filename=attachment.filename,
+        )
     return message
 
 

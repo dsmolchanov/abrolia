@@ -111,6 +111,12 @@ tool, не описанный в матрице, роняет тест.
 где-то раньше по пути; оборванная связь называется `outcome_unknown` и не
 повторяется никогда (`hermes_cloud/execute/email_send.py`).
 
+**Исходящий WhatsApp** проходит тот же `ApprovalStore.claim`: модель может
+только создать proposal. Relay ingress отклоняется без корректного
+per-household HMAC и точного Evolution instance. Redirect/ConnectError означают
+явный отказ, а ReadTimeout — `outcome_unknown`; неизвестный исход автоматически
+не повторяется (`hermes_cloud/execute/whatsapp.py`).
+
 **Границы:**
 
 1. **Landing → account surface.** `abrolia.com` статичен; его CSP оставляет

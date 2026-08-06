@@ -30,6 +30,7 @@ from hermes_cloud.core.runcontext import (
     WRITE_EMAIL,
     WRITE_MEMORY,
     WRITE_REMINDER,
+    WRITE_WHATSAPP,
     CapabilityDenied,
     Household,
     build_run_context,
@@ -204,6 +205,7 @@ EXPECTED_CAPABILITY = {
     "propose_reminder": WRITE_REMINDER,
     "memory_append": WRITE_MEMORY,
     "propose_email": WRITE_EMAIL,
+    "propose_whatsapp": WRITE_WHATSAPP,
 }
 
 VALID_ARGUMENTS = {
@@ -217,6 +219,10 @@ VALID_ARGUMENTS = {
         "to": "sekretariat@grundschule.example",
         "subject": "Klassenfahrt 3b",
         "body": "Guten Tag, wir nehmen teil.",
+    },
+    "propose_whatsapp": {
+        "to": "+999123456",
+        "text": "Bitte Termin bestätigen.",
     },
 }
 

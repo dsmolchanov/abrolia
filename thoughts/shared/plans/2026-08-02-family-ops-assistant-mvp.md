@@ -260,11 +260,14 @@ Google Calendar write и исходящий email с доказанной сем
 
 #### Automated Verification:
 - [x] Идемпотентность calendar: повторное исполнение того же action не создаёт второе событие — `tests/test_gcal.py` (мок): тот же id, `get` перед записью, 409 читается как «уже наше», доигрывание после падения обновляет, а не создаёт; live-smoke — при подключённом Google-аккаунте
-- [x] Compose: получатель в payload обязан совпасть с подтверждённым в карточке — `tests/test_email_send.py::test_swapping_the_recipient_after_the_card_invalidates_the_confirmation`; плюс kill-switch, header-injection и `outcome_unknown` без повтора
+- [x] Compose: получатель в payload обязан совпасть с подтверждённым в карточке — `tests/test_email_send.py::test_swapping_the_recipient_after_the_card_invalidates_the_confirmation`; PDF-вложение видно в карточке и попадает в MIME только после ✅ — `test_staged_pdf_is_visible_and_only_attached_after_confirmation`; плюс kill-switch, header-injection и `outcome_unknown` без повтора
 - [x] Bundle: частичный фейл → корректные статусы каждого дочернего эффекта — `tests/test_bundle.py::test_a_failing_item_does_not_undo_the_others`; неизвестный исход пункта отражается отдельно от отказа
 - [x] Суперсессия e2e (мок-gcal) — `tests/test_supersession.py`: reconcile-карточка со строками «что изменилось», обновление того же события (id от корня цепочки версий), v1 в `superseded`, второго insert нет; напоминание прежней версии отменяется
 - [x] gmail_poll и inject-eml дают идентичный pipeline-результат на одном .eml — `tests/test_gmail_poll.py::test_the_same_letter_gives_the_same_result_whichever_door_it_came_through` (отличается только одноразовый код). Webhook-вход — после Фазы 3
 - [x] gmail_poll: курсор по Message-ID, защита от UIDVALIDITY-replay, baseline первого запуска, письмо без ярлыка не запрашивается вовсе — `tests/test_gmail_poll.py` (16 тестов на FakeIMAP-шве; донорский набор не копировался построчно — инварианты перенесены, тесты написаны под наш шов)
+- [x] WhatsApp: per-household HMAC fail-closed, durable dedupe, trusted `RunContext` для семейного диалога, staged-only reply и транспортная таксономия redirect/ConnectError/ReadTimeout — `tests/test_whatsapp.py`
+- [x] Фото/голос: bounded MIME/size ingress, vision и faster-whisper adapter seams, канонический `events` payload — `tests/test_media_ingest.py`
+- [x] SchedulerConfig: созревшие напоминания и не более одного digest в локальный день с durable reservation — `tests/test_scheduler.py`
 
 #### Manual Verification:
 - [ ] Синтетика end-to-end: письмо «экскурсия 12.09, взнос 15€» → бандл (событие+задача) → ✅ → событие в шаренном календаре, задача в списке; затем письмо «перенесена на 19.09» → reconcile-карточка → ✅ → событие обновлено, не продублировано

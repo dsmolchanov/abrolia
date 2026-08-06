@@ -42,6 +42,8 @@ KIND_DELETE = "delete"
 KIND_BUNDLE = "bundle"
 # Исходящее письмо — единственное действие, которое нельзя отозвать.
 KIND_EMAIL = "email"
+# WhatsApp is irreversible too and therefore uses the same staged bundle path.
+KIND_WHATSAPP = "whatsapp"
 
 
 @dataclass(frozen=True)

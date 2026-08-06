@@ -36,6 +36,7 @@ from hermes_cloud.runner.card import (
     KIND_EMAIL,
     KIND_ICS,
     KIND_REMINDER,
+    KIND_WHATSAPP,
     LOW_CONFIDENCE,
     Button,
     Card,
@@ -216,10 +217,15 @@ def item_line(item: Item) -> str:
         # Получатель — отдельной строкой и всегда: подтверждают не «письмо
         # вообще», а письмо этому адресу.
         sender = payload.get("from_address") or "не настроен"
-        return (
+        line = (
             f"Письмо\n   От: {sender}\n   Кому: {payload['to']}\n"
             f"   Тема: {payload['subject']}"
         )
+        names = [str(item.get("filename") or "") for item in payload.get("attachments", ())]
+        names = [name for name in names if name]
+        return f"{line}\n   Вложения: {', '.join(names)}" if names else line
+    if kind == KIND_WHATSAPP:
+        return f"WhatsApp\n   Кому: {payload['to']}\n   Текст: {payload['text']}"
     return f"{kind}: {payload.get('title') or payload.get('text') or ''}"
 
 
