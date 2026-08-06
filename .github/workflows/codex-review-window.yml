@@ -5,7 +5,8 @@ on:
     types: [opened, reopened, synchronize, ready_for_review]
 
 # This workflow is a required status check. It accepts only a Codex review of
-# the current PR head and fails closed if the review never arrives.
+# the current PR head. A time-bounded operator exception permits unavailable
+# reviews until the subscription resets; P1/[BLOCKER] findings never bypass.
 jobs:
   codex-review-window:
     if: ${{ !github.event.pull_request.draft }}
@@ -19,6 +20,7 @@ jobs:
       PR: ${{ github.event.pull_request.number }}
       HEAD_SHA: ${{ github.event.pull_request.head.sha }}
       CODEX_BOT: chatgpt-codex-connector[bot]
+      REVIEW_FAIL_OPEN_UNTIL_EPOCH: "1786237200" # 2026-08-09T01:00:00Z
     steps:
       - name: Gate on Codex verdict for this commit
         run: |
@@ -28,6 +30,15 @@ jobs:
           review_id_for_head() {
             gh api "repos/${REPO}/pulls/${PR}/reviews" --paginate \
               --jq "[.[] | select(.user.login == \"${CODEX_BOT}\" and .commit_id == \"${HEAD_SHA}\")] | (last | .id) // empty"
+          }
+
+          fail_open_is_active() {
+            [ "$(date -u +%s)" -lt "${REVIEW_FAIL_OPEN_UNTIL_EPOCH}" ]
+          }
+
+          codex_limit_reported() {
+            gh api "repos/${REPO}/issues/${PR}/comments" --paginate \
+              --jq "[.[] | select(.user.login == \"${CODEX_BOT}\" and (.body | contains(\"usage limits for code reviews\")))] | length"
           }
 
           # Opening/readying is covered by Codex Automatic Reviews. A push
@@ -42,10 +53,18 @@ jobs:
           while [ ${SECONDS} -lt ${DEADLINE} ]; do
             RID="$(review_id_for_head)"
             [ -n "${RID}" ] && break
+            if fail_open_is_active && [ "$(codex_limit_reported)" -gt 0 ]; then
+              echo "::warning::Codex reported exhausted review limits. Review is temporarily advisory until 2026-08-09T01:00:00Z; CI remains required."
+              exit 0
+            fi
             sleep 20
           done
 
           if [ -z "${RID}" ]; then
+            if fail_open_is_active; then
+              echo "::warning::No Codex review arrived. Review is temporarily advisory until 2026-08-09T01:00:00Z; CI remains required."
+              exit 0
+            fi
             echo "::error::No Codex review arrived for ${HEAD_SHA}. Verify that Codex Automatic Reviews is enabled; merge remains blocked."
             exit 1
           fi
