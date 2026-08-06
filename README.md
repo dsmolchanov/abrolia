@@ -112,6 +112,7 @@ Model benchmark and the extraction-model decision: [`bench/README.md`](bench/REA
 - [`docs/ontology.md`](docs/ontology.md) — the operational vocabulary: journals vs. statements, status model, competency questions
 - [`docs/restore.md`](docs/restore.md) — backup format, restore procedure, what a restore cannot bring back
 - [`docs/source-pins.md`](docs/source-pins.md) — pinned donor revisions
+- [`docs/nerve-phase3-live-contract.md`](docs/nerve-phase3-live-contract.md) — operator runbook for the synthetic Nerve Phase 3 live contract
 - [`docs/roadmap-channels.md`](docs/roadmap-channels.md) — post-MVP channels and voice
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — fixture sanitisation rules, secrets policy, working order
 
