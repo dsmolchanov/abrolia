@@ -36,11 +36,22 @@ def household_id_hash(household_id: str, hmac_key: bytes) -> str:
 class RuntimeStructuredLogger:
     """Emit only allowlisted JSON fields; content never enters output."""
 
-    ALLOWED_ROUTE_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/_-.")
+    ALLOWED_ROUTE_CHARS = frozenset(
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/_-."
+    )
+    FORBIDDEN_SUBSTRINGS = ("prompt", "secret", "token", "content", "email", "password", "key")
 
-    def __init__(self, stream: TextIO, *, hmac_key: bytes | None = None) -> None:
+    def __init__(self, stream: TextIO, *, hmac_key: bytes) -> None:
+        if not hmac_key or len(hmac_key) < 16:
+            raise ValueError("hmac_key must be provided (>=16 bytes) — no synthetic default")
         self.stream = stream
-        self.hmac_key = hmac_key or b"synthetic-hmac-key-for-tests"
+        self.hmac_key = hmac_key
+
+    def _reject_forbidden(self, value: str, field: str) -> None:
+        lowered = value.casefold()
+        for needle in self.FORBIDDEN_SUBSTRINGS:
+            if needle in lowered:
+                raise ValueError(f"forbidden substring {needle!r} in {field}")
 
     def emit(
         self,
@@ -56,6 +67,7 @@ class RuntimeStructuredLogger:
         for ch in route:
             if ch not in self.ALLOWED_ROUTE_CHARS and ch != "/":
                 raise ValueError(f"unsafe route char {ch!r}")
+        self._reject_forbidden(route, "route")
         payload: dict[str, Any] = {
             "timestamp": time.time(),
             "level": level,
@@ -64,18 +76,21 @@ class RuntimeStructuredLogger:
             "latency_ms": latency_ms,
         }
         if household_id is not None:
+            self._reject_forbidden(household_id, "household_id")
             payload["household_id_hash"] = household_id_hash(household_id, self.hmac_key)
         if request_id is not None:
+            self._reject_forbidden(str(request_id), "request_id")
+            self._reject_forbidden(str(status), "status")
             payload["request_id"] = request_id
-        # Never log content, prompt, secret, token — enforce by allowlist.
+        else:
+            self._reject_forbidden(str(status), "status")
+        # Final line must not contain forbidden substrings in raw JSON.
         line = json.dumps(payload, sort_keys=True)
-        # Safety: ensure no secret-like substrings leak via caller misuse.
         lowered = line.casefold()
-        for needle in ("prompt", "secret", "token", "content", "email"):
+        for needle in self.FORBIDDEN_SUBSTRINGS:
             if needle in lowered:
-                # route may contain those words? Only status/latency should not.
-                # If household_id_hash contains, it's hex — safe. So check raw fields.
-                pass
+                # Only level/route/status may contain, but we already checked — fail closed.
+                raise ValueError(f"forbidden content {needle!r} in log line")
         print(line, file=self.stream)
 
 

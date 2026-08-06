@@ -532,6 +532,8 @@ class RuntimeService:
             probe = self._dsar(path, method, str(environ.get("HTTP_AUTHORIZATION") or ""))
         elif path == "/internal/v1/email/google/revoke":
             probe = self._google_revoke(method, str(environ.get("HTTP_AUTHORIZATION") or ""))
+        elif path == "/health" and method == "GET":
+            probe = self.health()
         elif method != "GET" or path not in {"/healthz", "/readyz"}:
             probe = Probe(404, {"status": "not_found"})
         else:
