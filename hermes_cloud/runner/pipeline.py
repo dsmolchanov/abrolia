@@ -40,6 +40,7 @@ from hermes_cloud.core.runcontext import (
     Household,
     RunContext,
 )
+from hermes_cloud.core.usage import DEGRADED_MESSAGE, UsageStore, today_utc
 from hermes_cloud.execute.email_send import (
     EmailBindingChanged,
     EmailOutcomeUnknown,
@@ -89,7 +90,6 @@ from hermes_cloud.runner.card import (
     header_lines,
     render_info,
 )
-from hermes_cloud.core.usage import DEGRADED_MESSAGE, UsageStore, today_utc
 from hermes_cloud.runner.extraction import Extractor
 from hermes_cloud.runner.model import ToolLoop
 
@@ -313,21 +313,32 @@ class Pipeline:
             )
             staged = self.approvals.stage(
                 kind=KIND_BUNDLE,
-                payload={"kind": KIND_BUNDLE, "items": [], "header": degraded_text, "commitment_id": commitment.id},
+                payload={
+                    "kind": KIND_BUNDLE,
+                    "items": [],
+                    "header": degraded_text,
+                    "commitment_id": commitment.id,
+                },
                 chat=self.chat,
                 thread=self.thread,
                 actor=self.actor,
                 context_key=event.context_key,
                 event_id=event.id,
             )
+            card = render_bundle(
+                None, [], approval_id=staged.id, code=staged.code, header=degraded_text
+            )
             self.transport.send_message(
-                chat=self.chat, text=degraded_text, thread=self.thread,
-                buttons=tuple((b.label, b.callback_data) for b in render_bundle(None, [], approval_id=staged.id, code=staged.code, header=degraded_text).buttons),
+                chat=self.chat,
+                text=degraded_text,
+                thread=self.thread,
+                buttons=tuple((b.label, b.callback_data) for b in card.buttons),
             )
             return Handled(approval_id=staged.id, message=degraded_text)
         extraction = self.extractor.extract_email(parsed)
         result = extraction.result
         # Record usage after successful extraction (model usage reply).
+        # Failure to record must not silently disable the cap — surface it.
         try:
             self.usage.record(
                 household_id,
@@ -336,8 +347,9 @@ class Pipeline:
                 completion_tokens=extraction.output_tokens,
                 cache_read_tokens=extraction.cache_read_tokens,
             )
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("usage record failed for %s/%s: %s", household_id, day, exc)
+            raise
 
         run = self.evidence.record_run(
             event_id=event.id,

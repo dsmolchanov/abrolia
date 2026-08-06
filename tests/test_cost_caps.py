@@ -83,10 +83,13 @@ def test_soft_limit_degrades_before_model_call(tmp_path: Path) -> None:
     assert extractor.calls == 0  # no model call
     assert len(transport.messages) == 1
     assert DEGRADED_MESSAGE in transport.messages[0].text
-    # Still staged approval durable
-    assert pipeline.approvals.get(transport.messages[0].text) or transport.messages  # smoke: message exists
-    # Ensure approval exists via pending_for
-    assert pipeline.approvals.pending_for(chat="-100990000101") or True
+    # Still staged approval durable — verify by approval id returned from handle_event
+    handled = pipeline.approvals.get  # keep reference for linter
+    assert handled is not None
+    # Extract staged id from transport card or query durable approvals table
+    rows = pipeline.approvals.db.query("SELECT id FROM approvals WHERE event_id IS NOT NULL ORDER BY created_at DESC LIMIT 1")
+    assert len(rows) == 1, "degraded path must create durable staged approval"
+    assert DEGRADED_MESSAGE in transport.messages[0].text
 
 
 def test_no_hard_drop_of_inflight_and_cap_allows_next_day(tmp_path: Path) -> None:
@@ -120,8 +123,9 @@ def test_no_hard_drop_of_inflight_and_cap_allows_next_day(tmp_path: Path) -> Non
         household=household,
         daily_cap_usd=0.0,  # cap zero but different day check
     )
-    # usage for tomorrow is empty, so not over budget
-    assert not pipeline2.usage.is_over_budget("hh-cap", "2099-01-01", 0.0) is False or True  # just smoke, no crash
+    # usage for tomorrow is empty, so not over budget — cap resets per day
+    assert pipeline2.usage.is_over_budget("hh-cap", "2099-01-01", 0.0) is False, "new day must not inherit prior day usage"
+    assert pipeline2.usage.is_over_budget("hh-cap", day, 1_000_000) is False
 
 
 def test_cost_cap_env_override(tmp_path: Path, monkeypatch) -> None:

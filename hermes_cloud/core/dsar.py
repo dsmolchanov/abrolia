@@ -107,6 +107,7 @@ NOT_EXPORTED = {
         "зашифрованный provider credential; в DSAR не выдаётся и удаляется целиком"
     ),
     "nerve_webhook_signatures": "служебные replay-дигесты без содержимого письма",
+    "usage_daily": "операционные счётчики токенов per-household/day, без содержимого писем; retention 90д",
 }
 
 # То, что нельзя удалить у себя, потому что оно не у нас.
