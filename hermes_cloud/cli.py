@@ -138,6 +138,29 @@ def _email_binding(config, database) -> EmailBinding | None:
 
 def _mail(config, database, binding: EmailBinding | None):
     """Исходящая почта. Нет учётных данных — нет и отправки, но предложить можно."""
+    if binding is not None and binding.provider == "gmail":
+        from hermes_cloud.email.google_client import (
+            GmailConfigurationError,
+            build_gmail_client,
+            load_gmail_credential_bundle,
+        )
+        from hermes_cloud.execute.email_send import EmailSender
+        from hermes_cloud.execute.gmail_api_send import GmailSendProvider
+
+        try:
+            bundle = load_gmail_credential_bundle(binding, os.environ)
+            client = build_gmail_client(database, binding, bundle)
+        except GmailConfigurationError:
+            return None
+        return EmailSender(
+            GmailSendProvider(client),
+            sender=binding.address,
+            identity_id=binding.identity_id,
+            binding_revision=binding.revision,
+            provider=binding.provider,
+            binding_store=EmailBindingStore(database),
+            send_store=EmailSendStore(database),
+        )
     if binding is not None and binding.provider.startswith("nerve"):
         from hermes_cloud.email.nerve_client import (
             DEFAULT_REST_URL,

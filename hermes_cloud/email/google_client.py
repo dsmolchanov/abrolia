@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
+import base64
+import json
 import time
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
 
+from hermes_cloud.core.db import Database
+from hermes_cloud.email.contracts import EmailBinding
 from hermes_cloud.email.google_grant import (
+    GoogleGrantError,
     GoogleGrantStore,
     RefreshedAccess,
 )
@@ -20,6 +27,123 @@ from hermes_cloud.ingest.gmail_api import (
 
 TOKEN_URL = "https://oauth2.googleapis.com/token"
 GMAIL_URL = "https://gmail.googleapis.com/gmail/v1/users/me"
+GMAIL_REQUIRED_SCOPES = frozenset({
+    "openid",
+    "email",
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.send",
+})
+
+
+class GmailConfigurationError(RuntimeError):
+    """The provisioned Gmail secret bundle is absent or malformed."""
+
+
+@dataclass(frozen=True, repr=False)
+class GmailCredentialBundle:
+    client_id: str
+    client_secret: str
+    refresh_credential: str
+    provider_subject: str
+    scopes: tuple[str, ...]
+    wrapping_key: bytes
+
+
+def load_gmail_credential_bundle(
+    binding: EmailBinding,
+    env: Mapping[str, str],
+) -> GmailCredentialBundle:
+    if len(binding.secret_names) != 1:
+        raise GmailConfigurationError("Gmail credential binding is invalid")
+    try:
+        payload = json.loads(env.get(binding.secret_names[0], ""))
+    except (TypeError, json.JSONDecodeError) as error:
+        raise GmailConfigurationError("Gmail credential bundle is unavailable") from error
+    required = {
+        "client_id",
+        "client_secret",
+        "refresh_credential",
+        "provider_subject",
+        "scopes",
+        "wrapping_key",
+    }
+    if not isinstance(payload, dict) or set(payload) != required:
+        raise GmailConfigurationError("Gmail credential bundle is invalid")
+    scopes = payload.get("scopes")
+    if not isinstance(scopes, list) or not scopes or not all(
+        isinstance(item, str) and item for item in scopes
+    ) or set(scopes) != GMAIL_REQUIRED_SCOPES:
+        raise GmailConfigurationError("Gmail scope bundle is invalid")
+    encoded_key = payload.get("wrapping_key")
+    try:
+        wrapping_key = base64.urlsafe_b64decode(
+            str(encoded_key) + "=" * (-len(str(encoded_key)) % 4)
+        )
+    except (ValueError, TypeError) as error:
+        raise GmailConfigurationError("Gmail grant key is invalid") from error
+    values = {
+        name: payload.get(name)
+        for name in ("client_id", "client_secret", "refresh_credential", "provider_subject")
+    }
+    if len(wrapping_key) != 32 or any(
+        not isinstance(value, str) or not value for value in values.values()
+    ):
+        raise GmailConfigurationError("Gmail credential bundle is invalid")
+    return GmailCredentialBundle(
+        client_id=values["client_id"],
+        client_secret=values["client_secret"],
+        refresh_credential=values["refresh_credential"],
+        provider_subject=values["provider_subject"],
+        scopes=tuple(scopes),
+        wrapping_key=wrapping_key,
+    )
+
+
+def ensure_gmail_grant(
+    database: Database,
+    binding: EmailBinding,
+    bundle: GmailCredentialBundle,
+) -> GoogleGrantStore:
+    store = GoogleGrantStore(database, {1: bundle.wrapping_key}, active_version=1)
+    row = database.query_one(
+        "SELECT revoked_at FROM oauth_grants WHERE binding_identity_id = ?"
+        " AND binding_revision = ?",
+        (binding.identity_id, binding.revision),
+    )
+    if row is None:
+        store.put(
+            identity_id=binding.identity_id,
+            revision=binding.revision,
+            refresh_credential=bundle.refresh_credential,
+            provider_subject=bundle.provider_subject,
+            scopes=bundle.scopes,
+        )
+    else:
+        # A revoked or corrupted durable grant must never be resurrected merely
+        # because the original Fly secret still exists during cleanup.
+        try:
+            store.load(binding.identity_id, binding.revision)
+        except GoogleGrantError as error:
+            raise GmailConfigurationError("Gmail grant is unavailable") from error
+    return store
+
+
+def build_gmail_client(
+    database: Database,
+    binding: EmailBinding,
+    bundle: GmailCredentialBundle,
+    *,
+    client_factory: Callable[..., Any] | None = None,
+):
+    store = ensure_gmail_grant(database, binding, bundle)
+    factory = client_factory or GmailHttpClient
+    return factory(
+        store,
+        identity_id=binding.identity_id,
+        revision=binding.revision,
+        client_id=bundle.client_id,
+        client_secret=bundle.client_secret,
+    )
 
 
 class GoogleRefreshClient:
@@ -78,6 +202,9 @@ class GmailHttpClient:
         self.refresher = GoogleRefreshClient(client_id, client_secret, self.http)
         self.clock = clock
         self._access: RefreshedAccess | None = None
+
+    def close(self) -> None:
+        self.http.close()
 
     def _token(self) -> str:
         if self._access is None or self._access.expires_at <= self.clock() + 30:

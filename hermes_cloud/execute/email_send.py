@@ -382,16 +382,18 @@ class EmailSender:
                                 status="outcome_unknown",
                             )
                         except Exception as error:
-                            failed = EmailDeliveryReceipt(
+                            unknown = EmailDeliveryReceipt(
                                 effect_id=effect_id,
                                 approval_id=approval_id,
                                 message_id=str(message["Message-ID"]),
                                 provider_ref=None,
                                 accepted_at=None,
-                                status="failed",
+                                status="outcome_unknown",
                             )
-                            self.send_store.settle(failed, error_code=type(error).__name__)
-                            raise
+                            self.send_store.settle(unknown, error_code=type(error).__name__)
+                            raise EmailOutcomeUnknown(
+                                "provider reconciliation could not determine send outcome"
+                            ) from error
                         if (
                             reconciled.effect_id != effect_id
                             or reconciled.approval_id != approval_id
@@ -453,7 +455,42 @@ class EmailSender:
                     accepted_at=time.time(),
                     status="accepted",
                 )
-        except EmailOutcomeUnknown:
+        except EmailOutcomeUnknown as send_error:
+            if (
+                provider_request is not None
+                and getattr(self.backend, "supports_idempotent_reconcile", False)
+                and hasattr(self.backend, "reconcile")
+            ):
+                try:
+                    reconciled = self.backend.reconcile(provider_request)  # type: ignore[attr-defined]
+                    if (
+                        reconciled.effect_id != effect_id
+                        or reconciled.approval_id != approval_id
+                        or reconciled.message_id != str(message["Message-ID"])
+                        or reconciled.status != "accepted"
+                    ):
+                        raise EmailOutcomeUnknown(
+                            "provider reconciliation returned no exact accepted receipt"
+                        )
+                except Exception as reconcile_error:
+                    if self.send_store is not None:
+                        self.send_store.settle(
+                            EmailDeliveryReceipt(
+                                effect_id=effect_id,
+                                approval_id=approval_id,
+                                message_id=str(message["Message-ID"]),
+                                provider_ref=None,
+                                accepted_at=None,
+                                status="outcome_unknown",
+                            ),
+                            error_code=type(reconcile_error).__name__,
+                        )
+                    raise EmailOutcomeUnknown(
+                        "provider reconciliation could not determine send outcome"
+                    ) from reconcile_error
+                if self.send_store is not None:
+                    self.send_store.settle(reconciled)
+                return reconciled
             if self.send_store is not None:
                 self.send_store.settle(
                     EmailDeliveryReceipt(
@@ -466,7 +503,7 @@ class EmailSender:
                     ),
                     error_code="transport_unknown",
                 )
-            raise
+            raise send_error
         except Exception as error:
             if self.send_store is not None:
                 self.send_store.settle(

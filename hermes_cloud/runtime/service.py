@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import base64
 import hmac
 import json
 import os
@@ -29,7 +28,13 @@ from hermes_cloud.core.runtime_manifest import (
     load_runtime_manifest,
 )
 from hermes_cloud.email.contracts import EmailBinding
-from hermes_cloud.email.google_client import GmailHttpClient
+from hermes_cloud.email.google_client import (
+    GmailConfigurationError,
+    GmailHttpClient,
+    build_gmail_client,
+    ensure_gmail_grant,
+    load_gmail_credential_bundle,
+)
 from hermes_cloud.email.google_grant import GoogleGrantError, GoogleGrantStore
 from hermes_cloud.email.nerve_client import (
     DEFAULT_REST_URL,
@@ -38,6 +43,7 @@ from hermes_cloud.email.nerve_client import (
 )
 from hermes_cloud.email.receipts import EmailBindingStore
 from hermes_cloud.email.service import EmailRuntimeService
+from hermes_cloud.ingest.gmail_api import GmailHistorySource
 from hermes_cloud.ingest.nerve_webhook import (
     MAX_WEBHOOK_BYTES,
     NerveAttachmentWorker,
@@ -73,6 +79,7 @@ ENV_RUNTIME_DELETION_MARKER = "HERMES_RUNTIME_DELETION_MARKER"
 ENV_NERVE_RUNTIME_URL = "ABROLIA_NERVE_RUNTIME_URL"
 ENV_NERVE_REST_URL = "ABROLIA_NERVE_REST_URL"
 ENV_NERVE_WORKER_SECONDS = "ABROLIA_NERVE_WORKER_SECONDS"
+ENV_GMAIL_WORKER_SECONDS = "ABROLIA_GMAIL_WORKER_SECONDS"
 ENV_WHATSAPP_INSTANCE = "HERMES_WHATSAPP_INSTANCE"
 ENV_WHATSAPP_RELAY_SECRET = "HERMES_WHATSAPP_RELAY_SECRET"
 
@@ -112,6 +119,7 @@ class RuntimeService:
         runtime_ref: str | None = None,
         env: Mapping[str, str] | None = None,
         nerve_client_factory: Callable[..., Any] = NerveEmailClient,
+        gmail_client_factory: Callable[..., Any] = GmailHttpClient,
     ) -> None:
         self.env = dict(os.environ if env is None else env)
         self.manifest_path = Path(manifest_path or self.env.get(ENV_HOUSEHOLD_FILE) or DEFAULT_MANIFEST_PATH)
@@ -120,11 +128,16 @@ class RuntimeService:
         )
         self.runtime_ref = runtime_ref or self.env.get(ENV_RUNTIME_REF) or ""
         self.nerve_client_factory = nerve_client_factory
+        self.gmail_client_factory = gmail_client_factory
         self.database_path = Path(self.env.get(ENV_DB) or DEFAULT_DB_PATH)
         self.deletion_marker = Path(
             self.env.get(ENV_RUNTIME_DELETION_MARKER)
             or self.activation_path.with_name("runtime-deleted.json")
         )
+        self._gmail_runtime: EmailRuntimeService | None = None
+        self._gmail_client: Any | None = None
+        self._gmail_database: Any | None = None
+        self._gmail_binding_key: tuple[str, int] | None = None
 
     def healthz(self) -> Probe:
         # Liveness deliberately does not depend on bootstrap/control-plane state.
@@ -215,10 +228,21 @@ class RuntimeService:
         return manifest
 
     def _sync_email_binding(self, manifest: RuntimeManifest) -> EmailBinding | None:
+        binding = self._email_binding_from_manifest(manifest)
+        if binding is None:
+            return None
+        with open_database(self.database_path) as database:
+            active = EmailBindingStore(database).activate(binding)
+            if active.provider == "gmail":
+                self._install_gmail_grant(database, active)
+            return active
+
+    @staticmethod
+    def _email_binding_from_manifest(manifest: RuntimeManifest) -> EmailBinding | None:
         identity_id = manifest.email.provider_binding_ref
         if not identity_id:
             return None
-        binding = EmailBinding(
+        return EmailBinding(
             identity_id=identity_id,
             revision=manifest.config_revision,
             provider=manifest.email.provider_kind,
@@ -226,69 +250,37 @@ class RuntimeService:
             provider_ref=identity_id,
             secret_names=((manifest.email.secret_binding_ref,) if manifest.email.secret_binding_ref else ()),
         )
-        with open_database(self.database_path) as database:
-            active = EmailBindingStore(database).activate(binding)
-            if active.provider == "gmail":
-                self._install_gmail_grant(database, active, manifest)
-            return active
 
-    def _gmail_bundle(self, manifest: RuntimeManifest) -> dict[str, Any]:
-        secret_name = manifest.email.secret_binding_ref or ""
+    def _gmail_bundle(self, binding: EmailBinding):
         try:
-            bundle = json.loads(self.env.get(secret_name, ""))
-        except (TypeError, json.JSONDecodeError) as error:
+            return load_gmail_credential_bundle(binding, self.env)
+        except GmailConfigurationError as error:
             raise RuntimeNotReady("Gmail credential bundle is unavailable") from error
-        required = {
-            "client_id",
-            "client_secret",
-            "refresh_credential",
-            "provider_subject",
-            "scopes",
-            "wrapping_key",
-        }
-        if not isinstance(bundle, dict) or set(bundle) != required:
-            raise RuntimeNotReady("Gmail credential bundle is invalid")
-        return bundle
 
-    @staticmethod
-    def _grant_key(bundle: dict[str, Any]) -> bytes:
-        value = str(bundle.get("wrapping_key") or "")
+    def _install_gmail_grant(self, database, binding: EmailBinding) -> None:
         try:
-            key = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
-        except (ValueError, TypeError) as error:
-            raise RuntimeNotReady("Gmail grant key is invalid") from error
-        if len(key) != 32:
-            raise RuntimeNotReady("Gmail grant key is invalid")
-        return key
-
-    def _install_gmail_grant(self, database, binding: EmailBinding, manifest: RuntimeManifest) -> None:
-        bundle = self._gmail_bundle(manifest)
-        store = GoogleGrantStore(database, {1: self._grant_key(bundle)}, active_version=1)
-        try:
-            store.load(binding.identity_id, binding.revision)
-        except GoogleGrantError as error:
-            scopes = bundle.get("scopes")
-            if not isinstance(scopes, list) or not all(isinstance(item, str) for item in scopes):
-                raise RuntimeNotReady("Gmail scope bundle is invalid") from error
-            store.put(
-                identity_id=binding.identity_id,
-                revision=binding.revision,
-                refresh_credential=str(bundle["refresh_credential"]),
-                provider_subject=str(bundle["provider_subject"]),
-                scopes=tuple(scopes),
-            )
+            ensure_gmail_grant(database, binding, self._gmail_bundle(binding))
+        except GmailConfigurationError as error:
+            raise RuntimeNotReady("Gmail grant is unavailable") from error
 
     def _revoke_google_credential(self, manifest: RuntimeManifest) -> bool:
-        binding = self._sync_email_binding(manifest)
+        binding = self._email_binding_from_manifest(manifest)
         if binding is None or binding.provider != "gmail":
             return True
-        bundle = self._gmail_bundle(manifest)
+        bundle = self._gmail_bundle(binding)
         with open_database(self.database_path) as database:
-            store = GoogleGrantStore(database, {1: self._grant_key(bundle)}, active_version=1)
+            store = GoogleGrantStore(database, {1: bundle.wrapping_key}, active_version=1)
+            row = database.query_one(
+                "SELECT revoked_at FROM oauth_grants WHERE binding_identity_id = ?"
+                " AND binding_revision = ?",
+                (binding.identity_id, binding.revision),
+            )
+            if row is None or row["revoked_at"] is not None:
+                return True
             try:
                 grant = store.load(binding.identity_id, binding.revision)
             except GoogleGrantError:
-                return True
+                return False
             try:
                 response = httpx.post(
                     "https://oauth2.googleapis.com/revoke",
@@ -300,6 +292,7 @@ class RuntimeService:
             if response.status_code not in {200, 400}:
                 return False
             store.revoke(binding.identity_id, binding.revision)
+        self._close_gmail_runtime()
         return True
 
     def email_activation_health(self, manifest: RuntimeManifest) -> tuple[str, str]:
@@ -325,21 +318,28 @@ class RuntimeService:
             binding = self._sync_email_binding(manifest)
             if binding is None:
                 return "failed", "failed"
-            bundle = self._gmail_bundle(manifest)
+            bundle = self._gmail_bundle(binding)
             with open_database(self.database_path) as database:
-                store = GoogleGrantStore(database, {1: self._grant_key(bundle)}, active_version=1)
-                client = GmailHttpClient(
-                    store,
-                    identity_id=binding.identity_id,
-                    revision=binding.revision,
-                    client_id=str(bundle["client_id"]),
-                    client_secret=str(bundle["client_secret"]),
+                client = build_gmail_client(
+                    database,
+                    binding,
+                    bundle,
+                    client_factory=self.gmail_client_factory,
                 )
-                profile = client.profile()
-                inbound = "healthy" if profile.get("historyId") else "failed"
-                scopes = {str(item) for item in bundle.get("scopes", [])}
-                outbound = "healthy" if "https://www.googleapis.com/auth/gmail.send" in scopes else "failed"
-                return inbound, outbound
+                try:
+                    profile = client.profile()
+                    inbound = "healthy" if profile.get("historyId") else "failed"
+                    scopes = set(bundle.scopes)
+                    outbound = (
+                        "healthy"
+                        if "https://www.googleapis.com/auth/gmail.send" in scopes
+                        else "failed"
+                    )
+                    return inbound, outbound
+                finally:
+                    close = getattr(client, "close", None)
+                    if close is not None:
+                        close()
         return "failed", "failed"
 
     def _nerve_config(self, manifest: RuntimeManifest) -> NerveRuntimeConfig:
@@ -400,6 +400,49 @@ class RuntimeService:
                 close = getattr(client, "close", None)
                 if close is not None:
                     close()
+
+    def _close_gmail_runtime(self) -> None:
+        close = getattr(self._gmail_client, "close", None)
+        if close is not None:
+            close()
+        if self._gmail_database is not None:
+            self._gmail_database.close()
+        self._gmail_runtime = None
+        self._gmail_client = None
+        self._gmail_database = None
+        self._gmail_binding_key = None
+
+    def run_gmail_once(self) -> int:
+        manifest = self.require_ready()
+        binding = self._sync_email_binding(manifest)
+        if binding is None or binding.provider != "gmail":
+            self._close_gmail_runtime()
+            raise RuntimeNotReady("runtime email provider is not Gmail")
+        binding_key = (binding.identity_id, binding.revision)
+        if self._gmail_runtime is None or self._gmail_binding_key != binding_key:
+            self._close_gmail_runtime()
+            database = open_database(self.database_path)
+            try:
+                bundle = self._gmail_bundle(binding)
+                client = build_gmail_client(
+                    database,
+                    binding,
+                    bundle,
+                    client_factory=self.gmail_client_factory,
+                )
+                source = GmailHistorySource(database, binding, client)
+                runtime = EmailRuntimeService(database, (source,))
+            except Exception:
+                database.close()
+                raise
+            self._gmail_database = database
+            self._gmail_client = client
+            self._gmail_runtime = runtime
+            self._gmail_binding_key = binding_key
+        return self._gmail_runtime.run_once()
+
+    def close(self) -> None:
+        self._close_gmail_runtime()
 
     def _whatsapp_config(self, manifest: RuntimeManifest) -> WhatsAppRuntimeConfig:
         if not any(binding.channel == "whatsapp" for binding in manifest.verified_bindings):
@@ -535,7 +578,9 @@ class RuntimeService:
                 return Probe(200, {"state": "absent"})
             return Probe(410, {"status": "runtime_deleted"})
         try:
-            self.require_ready()
+            manifest, _reason = self._ready_manifest()
+            if manifest is None:
+                raise RuntimeNotReady("runtime is not active")
             with open_database(self.database_path) as database:
                 if is_deleted(database):
                     atomic_write(
@@ -547,7 +592,6 @@ class RuntimeService:
                     return Probe(410, {"status": "runtime_deleted"})
                 if path.endswith("/export"):
                     return Probe(200, export_household(database))
-                manifest = self.require_ready()
                 if manifest.email.provider_kind == "gmail" and not self._revoke_google_credential(manifest):
                     return Probe(503, {"status": "provider_cleanup_unknown"})
                 wipe_household(database)
@@ -565,7 +609,9 @@ class RuntimeService:
         if not supplied or not hmac.compare_digest(supplied, expected):
             return Probe(401, {"status": "unauthorized"})
         try:
-            manifest = self.require_ready()
+            manifest, _reason = self._ready_manifest()
+            if manifest is None:
+                raise RuntimeNotReady("runtime is not active")
             if not self._revoke_google_credential(manifest):
                 return Probe(503, {"status": "provider_cleanup_unknown"})
         except Exception:
@@ -658,6 +704,29 @@ def _nerve_worker_until_stopped(
         stop.wait(interval)
 
 
+def _gmail_worker_until_stopped(
+    service: RuntimeService,
+    source: Mapping[str, str],
+    stop: threading.Event,
+) -> None:
+    try:
+        interval = max(float(source.get(ENV_GMAIL_WORKER_SECONDS, "60")), 0.1)
+    except ValueError:
+        interval = 60.0
+    while not stop.is_set():
+        if service.can_start_workers:
+            try:
+                service.run_gmail_once()
+            except RuntimeNotReady:
+                pass
+            except Exception as error:
+                print(
+                    f"Gmail ingress pending ({error.__class__.__name__})",
+                    file=sys.stderr,
+                )
+        stop.wait(interval)
+
+
 class _QuietRequestHandler(WSGIRequestHandler):
     def log_message(self, _format: str, *args: object) -> None:
         """Health requests are intentionally absent from application logs."""
@@ -688,14 +757,23 @@ def serve_runtime(*, env: Mapping[str, str] | None = None) -> None:
         name="nerve-ingress",
         daemon=True,
     )
+    gmail_worker = threading.Thread(
+        target=_gmail_worker_until_stopped,
+        args=(service, source, stop),
+        name="gmail-history",
+        daemon=True,
+    )
     worker.start()
     nerve_worker.start()
+    gmail_worker.start()
     try:
         server.serve_forever()
     finally:
         stop.set()
         worker.join(timeout=1.0)
         nerve_worker.join(timeout=1.0)
+        gmail_worker.join(timeout=1.0)
+        service.close()
         server.server_close()
 
 

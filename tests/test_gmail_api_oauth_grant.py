@@ -6,6 +6,12 @@ import pytest
 
 from hermes_cloud.cli import main
 from hermes_cloud.core.db import open_database
+from hermes_cloud.email.contracts import EmailBinding
+from hermes_cloud.email.google_client import (
+    GmailConfigurationError,
+    GmailCredentialBundle,
+    ensure_gmail_grant,
+)
 from hermes_cloud.email.google_grant import (
     GoogleGrantError,
     GoogleGrantStore,
@@ -65,6 +71,38 @@ def test_ciphertext_is_bound_to_identity_and_revision(tmp_path: Path) -> None:
         )
     with pytest.raises(GoogleGrantError):
         store.load("identity-2", 1)
+
+
+def test_revoked_grant_is_not_reinstalled_from_stale_runtime_secret(
+    tmp_path: Path,
+) -> None:
+    database = open_database(tmp_path / "runtime.db")
+    binding = EmailBinding(
+        "identity-1",
+        1,
+        "gmail",
+        "agent@example.test",
+        secret_names=("ABROLIA_GMAIL_OAUTH_GRANT",),
+    )
+    bundle = GmailCredentialBundle(
+        client_id="client-id",
+        client_secret="client-secret-canary",
+        refresh_credential="refresh-secret-canary",
+        provider_subject="subject-1",
+        scopes=(
+            "openid",
+            "email",
+            "https://www.googleapis.com/auth/gmail.readonly",
+            "https://www.googleapis.com/auth/gmail.send",
+        ),
+        wrapping_key=b"k" * 32,
+    )
+    store = ensure_gmail_grant(database, binding, bundle)
+    store.revoke(binding.identity_id, binding.revision)
+
+    with pytest.raises(GmailConfigurationError):
+        ensure_gmail_grant(database, binding, bundle)
+    assert database.query_one("SELECT revoked_at FROM oauth_grants")["revoked_at"] is not None
 
 
 @pytest.mark.parametrize(("status", "expected"), [(200, 0), (400, 0), (500, 4)])
