@@ -164,7 +164,7 @@ def wipe_household(database: Database, *, now: float | None = None) -> dict[str,
         "oauth_grants", "email_sync_state", "email_bindings",
         "evidence_refs", "extraction_runs", "effects", "commitments",
         "memory_statements", "reminders", "approval_attempts", "approvals",
-        "jobs", "events", "channel_state",
+        "jobs", "events", "channel_state", "usage_daily",
     )
     removed: dict[str, int] = {}
     with database.write() as connection:

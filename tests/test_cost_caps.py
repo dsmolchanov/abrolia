@@ -15,7 +15,7 @@ from hermes_cloud.core.usage import DEGRADED_MESSAGE, UsageStore, estimate_usd, 
 from hermes_cloud.execute.reminder import ReminderStore
 from hermes_cloud.ingest.inject import ingest_file
 from hermes_cloud.ingest.worker import Worker
-from hermes_cloud.runner.extraction import Extraction, ExtractionResult, Money
+from hermes_cloud.runner.extraction import Extraction, ExtractionResult
 from hermes_cloud.runner.pipeline import Pipeline
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "email"
