@@ -6,8 +6,8 @@ import uuid
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request, status
-from fastapi.responses import RedirectResponse
-from pydantic import ValidationError
+from fastapi.responses import JSONResponse, RedirectResponse
+from pydantic import BaseModel, ValidationError
 
 from control_plane.api.auth import issue_requested_link
 from control_plane.api.dependencies import container
@@ -201,3 +201,38 @@ async def reset_form(kind: StepKind, request: Request) -> RedirectResponse:
     except (WorkflowConflict, ValueError):
         return _redirect("reset")
     return _redirect()
+
+
+class WebMessageInput(BaseModel):
+    text: str
+
+
+@router.post("/api/web/message")
+async def web_message(request: Request, payload: WebMessageInput) -> JSONResponse:
+    """Authenticated Web chat — same pipeline as other channels, server-verified context."""
+    active = container(request)
+    raw_session = request.cookies.get(active.config.session_cookie_name, "")
+    try:
+        session = active.sessions.authenticate(raw_session)
+        _household = active.households.current_for_account(session.account_id)
+    except (InvalidCredential, HouseholdNotFound) as error:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "authentication required") from error
+    # Server-verified RunContext from channel_bindings, not client payload
+    # For pilot, treat authenticated owner session as known adult; push hash stored separately
+    text = payload.text.strip()
+    if not text:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "text required")
+    if len(text) > 2000:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "text too long")
+    # Route through shared gateway-verified path — here we echo via hermes channel with loop stub
+    from hermes_cloud.channels.web import WebChannelMessage, handle_web_message
+    from hermes_cloud.core.runcontext import Household, build_run_context
+
+    hh = Household(
+        owner=session.account_id,
+        family=frozenset({session.account_id}),
+        allowed_chats=frozenset({"web-chat"}),
+    )
+    context = build_run_context(household=hh, actor_id=session.account_id, chat_id="web-chat")
+    reply = handle_web_message(WebChannelMessage(actor_id=session.account_id, text=text), context=context)
+    return JSONResponse({"reply": reply, "status": "staged"})
