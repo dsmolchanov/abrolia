@@ -139,6 +139,63 @@ class RuntimeService:
         self._gmail_database: Any | None = None
         self._gmail_binding_key: tuple[str, int] | None = None
 
+    def health(self) -> Probe:
+        """Public /health for pilot observability (E7): no content, safe for logs."""
+        try:
+            with open_database(self.database_path) as database:
+                db_ok = database.query_one("SELECT 1") is not None  # type: ignore[attr-defined]
+        except Exception:
+            db_ok = False
+        # Provider checks are best-effort and do not leak secrets.
+        nerve_key_ok = bool(self.env.get("HERMES_NERVE_RUNTIME_KEY") or self.env.get("ABROLIA_NERVE_RUNTIME_KEY"))
+        telegram_ok = bool(self.env.get("TELEGRAM_BOT_TOKEN"))
+        wa_ok = bool(self.env.get("HERMES_WHATSAPP_INSTANCE") or self.env.get("HERMES_WHATSAPP_RELAY_SECRET"))
+        google_grant_ok: bool | None = None
+        try:
+            manifest, _ = self._ready_manifest()
+            if manifest is not None:
+                # gmail grant presence check
+                google_grant_ok = self._gmail_grant_ok()
+        except Exception:
+            google_grant_ok = None
+        # backup age via control-plane marker if runtime db has backup info? pilot uses control-plane db.
+        backup_age_hours: float | None = None
+        try:
+            from control_plane.db import ControlPlaneDatabase
+            from control_plane.observability import HealthReporter
+
+            cp_db_path = self.env.get("ABROLIA_CONTROL_PLANE_DB")
+            if cp_db_path:
+                cp_db = ControlPlaneDatabase(cp_db_path)
+                reporter = HealthReporter(cp_db)
+                latest = reporter.latest_backup_completed_at()
+                if latest is not None:
+                    import time as _t
+
+                    backup_age_hours = (_t.time() - latest) / 3600.0
+        except Exception:
+            pass
+        payload: dict[str, Any] = {
+            "status": "ok" if db_ok else "degraded",
+            "nerve_key_ok": nerve_key_ok,
+            "telegram_ok": telegram_ok,
+            "wa_instance_ok": wa_ok,
+            "google_grant_ok": google_grant_ok,
+            "db_ok": db_ok,
+            "backup_age_hours": backup_age_hours,
+        }
+        if backup_age_hours is not None and backup_age_hours > 30 * 24:
+            payload["needs_attention"] = True
+        return Probe(200 if db_ok else 503, payload)
+
+    def _gmail_grant_ok(self) -> bool | None:
+        try:
+            with open_database(self.database_path) as database:
+                row = database.query_one("SELECT COUNT(*) as c FROM oauth_grants WHERE revoked_at IS NULL")
+                return bool(row and row["c"] > 0) if row else False
+        except Exception:
+            return None
+
     def healthz(self) -> Probe:
         # Liveness deliberately does not depend on bootstrap/control-plane state.
         return Probe(200, {"status": "ok"})
