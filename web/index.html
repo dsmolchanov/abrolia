@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="manifest" href="/manifest.json">
+<title>Abrolia — Web chat</title>
+</head>
+<body>
+<main id="chat">
+<p>Web chat — authenticated via same pipeline. P11 push disabled in Phase E.</p>
+<form id="form"><input id="input" type="text" placeholder="Сообщение"><button>Отправить</button></form>
+</main>
+<script>
+if ('serviceWorker' in navigator) { navigator.serviceWorker.register('/sw.js').catch(()=>{}); }
+</script>
+</body>
+</html>
