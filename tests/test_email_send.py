@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 from pathlib import Path
 
 import pytest
@@ -165,6 +166,45 @@ def test_the_card_shows_the_recipient_on_its_own_line(world) -> None:
     staged = services.approvals.pending_for(chat=CHAT)[0]
     line = item_line(items_of(staged.payload)[0])
     assert f"Кому: {SCHOOL}" in line
+
+
+def test_staged_pdf_is_visible_and_only_attached_after_confirmation(world) -> None:
+    pipeline, transport, smtp = world
+    services = Services.on(pipeline.approvals.db)
+    content = b"%PDF-1.4\nsynthetic school form\n%%EOF"
+
+    result = REGISTRY.invoke(
+        context(),
+        "propose_email",
+        {
+            "to": SCHOOL,
+            "subject": "Klassenfahrt 3b",
+            "body": "Guten Tag, im Anhang ist das Formular.",
+            "attachments": [
+                {
+                    "filename": "formular.pdf",
+                    "content_type": "application/pdf",
+                    "content_base64": base64.b64encode(content).decode("ascii"),
+                }
+            ],
+        },
+        services=services,
+    )
+    approval = services.approvals.get(result["proposal_id"])
+    from hermes_cloud.runner.bundle import item_line, items_of
+
+    assert "formular.pdf" in item_line(items_of(approval.payload)[0])
+    assert smtp.sent == []
+
+    pipeline.handle_callback(
+        action=ACTION_CONFIRM, approval_id=approval.id, context=context()
+    )
+
+    assert len(smtp.sent) == 1
+    attachments = list(smtp.sent[0].iter_attachments())
+    assert len(attachments) == 1
+    assert attachments[0].get_filename() == "formular.pdf"
+    assert attachments[0].get_payload(decode=True) == content
 
 
 def test_swapping_the_recipient_after_the_card_invalidates_the_confirmation(world) -> None:

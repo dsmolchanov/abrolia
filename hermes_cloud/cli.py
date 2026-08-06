@@ -80,6 +80,8 @@ def _pipeline(args: argparse.Namespace, database) -> Pipeline:
     calendar = _calendar(config)
     email_binding = _email_binding(config, database)
     mail = _mail(config, database, email_binding)
+    whatsapp = _whatsapp()
+    household = _household()
     return Pipeline(
         approvals=approvals,
         reminders=reminders,
@@ -94,6 +96,8 @@ def _pipeline(args: argparse.Namespace, database) -> Pipeline:
         thread=config.thread,
         calendar=calendar,
         mail=mail,
+        whatsapp=whatsapp,
+        household=household,
         loop=ToolLoop(
             journal=EffectJournal(database),
             services=Services.on(
@@ -102,6 +106,20 @@ def _pipeline(args: argparse.Namespace, database) -> Pipeline:
             family_language=config.language,
         ),
     )
+
+
+def _whatsapp():
+    """Per-household Evolution sender; absent configuration disables execution."""
+    from hermes_cloud.execute.whatsapp import (
+        ENV_API_KEY,
+        ENV_API_URL,
+        ENV_INSTANCE,
+        WhatsAppSender,
+    )
+
+    if not all(os.environ.get(name, "").strip() for name in (ENV_API_URL, ENV_INSTANCE, ENV_API_KEY)):
+        return None
+    return WhatsAppSender.from_env()
 
 
 def _email_binding(config, database) -> EmailBinding | None:

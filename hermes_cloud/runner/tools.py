@@ -30,13 +30,14 @@ from hermes_cloud.core.runcontext import (
     WRITE_EMAIL,
     WRITE_MEMORY,
     WRITE_REMINDER,
+    WRITE_WHATSAPP,
     RunContext,
 )
 from hermes_cloud.email.contracts import EmailBinding
 from hermes_cloud.execute.gcal import Calendar
 from hermes_cloud.execute.reminder import ReminderStore, due_timestamp
 from hermes_cloud.runner.bundle import Item, bundle_payload
-from hermes_cloud.runner.card import KIND_BUNDLE, KIND_EMAIL, KIND_MEMORY
+from hermes_cloud.runner.card import KIND_BUNDLE, KIND_EMAIL, KIND_MEMORY, KIND_WHATSAPP
 
 
 class UnknownTool(LookupError):
@@ -448,6 +449,20 @@ def memory_append(
                 "type": "string",
                 "description": "Message-ID письма, на которое это ответ, если это ответ.",
             },
+            "attachments": {
+                "type": "array",
+                "description": "Подтверждаемые вложения из trusted attachment store.",
+                "maxItems": 10,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "filename": {"type": "string"},
+                        "content_type": {"type": "string"},
+                        "content_base64": {"type": "string"},
+                    },
+                    "required": ["filename", "content_type", "content_base64"],
+                },
+            },
         },
         "required": ["to", "subject", "body"],
     },
@@ -462,13 +477,27 @@ def propose_email(
     подтвердить то, что всё равно не уйдёт.
     """
     context.require(WRITE_EMAIL)
-    from hermes_cloud.execute.email_send import EmailRejected, Outgoing, validate
+    from hermes_cloud.execute.email_send import (
+        EmailRejected,
+        Outgoing,
+        OutgoingAttachment,
+        validate,
+    )
 
+    raw_attachments = arguments.get("attachments", ())
+    if not isinstance(raw_attachments, (list, tuple)) or any(
+        not isinstance(item, dict) for item in raw_attachments
+    ):
+        raise ToolInputError("attachments должен быть списком вложений")
     letter = Outgoing(
         to=str(arguments.get("to") or ""),
         subject=str(arguments.get("subject") or ""),
         body=str(arguments.get("body") or ""),
         in_reply_to=arguments.get("in_reply_to") or None,
+        attachments=tuple(
+            OutgoingAttachment.from_payload(item)
+            for item in raw_attachments
+        ),
     )
     try:
         validate(letter)
@@ -481,6 +510,7 @@ def propose_email(
             "subject": letter.subject,
             "body": letter.body,
             "in_reply_to": letter.in_reply_to,
+            "attachments": [item.to_payload() for item in letter.attachments],
     }
     if services.email_binding is not None:
         email_payload.update({
@@ -491,6 +521,52 @@ def propose_email(
     payload = bundle_payload(
         [Item(payload=email_payload)],
         header=f"Письмо для {letter.to}",
+    )
+    staged = services.approvals.stage(
+        kind=KIND_BUNDLE,
+        payload=payload,
+        chat=context.chat_id,
+        thread=context.thread_id,
+        actor=context.actor_id,
+        context_key=f"chat:{context.chat_id}",
+    )
+    return {"proposal_id": staged.id, "status": "ожидает подтверждения"}
+
+
+@REGISTRY.tool(
+    name="propose_whatsapp",
+    capability=WRITE_WHATSAPP,
+    description=(
+        "Предложить сообщение WhatsApp. Ничего не отправляет: получатель и "
+        "полный текст показываются семье и требуют отдельного подтверждения."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "to": {"type": "string", "description": "Номер получателя в формате E.164."},
+            "text": {"type": "string", "description": "Полный текст сообщения."},
+        },
+        "required": ["to", "text"],
+    },
+)
+def propose_whatsapp(
+    context: RunContext, services: Services, arguments: dict[str, Any]
+) -> dict[str, Any]:
+    context.require(WRITE_WHATSAPP)
+    from hermes_cloud.execute.whatsapp import OutgoingWhatsApp, WhatsAppRejected, validate
+
+    try:
+        message = validate(
+            OutgoingWhatsApp(
+                to=str(arguments.get("to") or ""),
+                text=str(arguments.get("text") or ""),
+            )
+        )
+    except WhatsAppRejected as error:
+        raise ToolInputError(str(error)) from error
+    payload = bundle_payload(
+        [Item(payload={"kind": KIND_WHATSAPP, "to": message.to, "text": message.text})],
+        header=f"WhatsApp для {message.to}",
     )
     staged = services.approvals.stage(
         kind=KIND_BUNDLE,

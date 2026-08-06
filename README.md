@@ -92,6 +92,13 @@ the recipient is shown on its own line and bound to the confirmation by
 payload_sha, `HERMES_EMAIL_SEND=1` is re-read immediately before transport, and
 a dropped connection is reported as an unknown outcome rather than retried.
 
+WhatsApp uses the same gate. A relay POSTs to `/v1/whatsapp/webhook` with
+`X-Relay-Signature` (HMAC-SHA256 from `HERMES_WHATSAPP_RELAY_SECRET`); the
+runtime accepts only its configured `HERMES_WHATSAPP_INSTANCE`. Delivery uses
+that household's `HERMES_WHATSAPP_API_URL` and `HERMES_WHATSAPP_API_KEY`, and
+stays disabled until `HERMES_WHATSAPP_SEND=1`. Every message—including a reply
+to a known family actor—is staged and shows its number and full text before ✅.
+
 Actor roles decide who may press it. The mapping comes from `household.toml`
 when the file exists and from the variables above otherwise; anyone not listed —
 and anyone writing from a chat outside `HERMES_CHAT` — gets zero capabilities,
