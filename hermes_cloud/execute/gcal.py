@@ -92,8 +92,8 @@ class CalendarEvent:
         """Разошлось ли то, что в календаре, с тем, что мы подтвердили."""
         return (
             (remote.get("summary") or None) != (self.title or None)
-            or _remote_moment(remote.get("start")) != _iso(self.start)
-            or _remote_moment(remote.get("end")) != _iso(self.end)
+            or _comparison_moment(remote.get("start")) != _comparison_datetime(self.start)
+            or _comparison_moment(remote.get("end")) != _comparison_datetime(self.end)
             or (remote.get("location") or None) != (self.location or None)
             or (remote.get("description") or None) != (self.description or None)
         )
@@ -131,6 +131,25 @@ def _remote_moment(value: Any) -> str | None:
     if isinstance(value, dict):
         return value.get("dateTime") or value.get("date")
     return None
+
+
+def _comparison_datetime(moment: datetime) -> str:
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=UTC)
+    return moment.astimezone(UTC).isoformat()
+
+
+def _comparison_moment(value: Any) -> str | None:
+    raw = _remote_moment(value)
+    if raw is None or "T" not in raw:
+        return raw
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return raw
+    if parsed.tzinfo is None:
+        return parsed.isoformat()
+    return parsed.astimezone(UTC).isoformat()
 
 
 class CalendarBackend(Protocol):
