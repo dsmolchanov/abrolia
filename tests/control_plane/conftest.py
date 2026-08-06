@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 from control_plane.api.app import create_app
 from control_plane.auth.mailer import MemoryMailer
 from control_plane.auth.sessions import IssuedSession, SessionService
+from control_plane.channel_preferences import ChannelPreferencesRepository
 from control_plane.config import ControlPlaneConfig
 from control_plane.container import ControlPlaneContainer
 from control_plane.crypto import FieldCipher, LookupHasher
@@ -22,7 +23,6 @@ from control_plane.onboarding.contracts import CommandContext
 from control_plane.onboarding.service import OnboardingService
 from control_plane.provisioning.contracts import ProviderRegistry
 from control_plane.provisioning.fakes import synthetic_provider_registry
-from control_plane.channel_preferences import ChannelPreferencesRepository
 from control_plane.provisioning.planner import DesiredSpecPlanner
 from control_plane.provisioning.secrets import InMemorySecretSink
 from control_plane.provisioning.worker import ProvisioningWorker
