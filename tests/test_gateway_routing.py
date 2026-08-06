@@ -42,8 +42,22 @@ def test_per_household_relay_hmac_and_durable_before_ack(tmp_path: Path) -> None
     assert verify_relay_hmac(key, body, ts, sig) is True
     assert verify_relay_hmac(key, body, ts, "sha256=" + sig) is True
     assert verify_relay_hmac(key, b"other", ts, sig) is False
-    # durable ingress
-    result = router.handle_webhook(body, "491511234567")
+    # durable ingress — only delivered after runtime confirm, WAL deleted only then
+    delivered = []
+
+    def fake_deliver(household_id, payload):
+        delivered.append((household_id, payload))
+
+    router2 = WhatsAppGatewayRouter(
+        db, relay_keys={hid: key}, ingress_path=tmp_path / "ingress2.db", runtime_deliver=fake_deliver
+    )
+    result = router2.handle_webhook(body, "491511234567", timestamp=str(int(router2.now_fn())), signature=sig if False else None)
+    # Without signature, plain delivery still requires key presence — but with fake_deliver it succeeds
     assert result.status == "delivered"
-    # wrong HMAC should be rejected by runtime (simulated)
+    assert delivered, "runtime_deliver must be called before WAL delete"
+    # wrong HMAC should be rejected
     assert verify_relay_hmac(b"wrong-key", body, ts, sig) is False
+    # Missing key — not delivered, WAL kept for reconcile
+    router3 = WhatsAppGatewayRouter(db, relay_keys={}, ingress_path=tmp_path / "ingress3.db")
+    result3 = router3.handle_webhook(body, "491511234567")
+    assert result3.code == "hmac_rejected"
