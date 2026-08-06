@@ -278,4 +278,8 @@ TABLE_CLASSIFICATION: dict[str, TableClassification] = {
         False, True, "consumed-or-expired+24h", "ephemeral OAuth security metadata"
     ),
     "email_activation_receipts": TableClassification(True, True, "account+30d"),
+    "email_secret_installs": TableClassification(
+        False, True, "account+30d", "non-secret install receipt (name + job id only)"
+    ),
+    "channel_preferences": TableClassification(True, True, "account+30d"),
 }
