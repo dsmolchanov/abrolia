@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 from hermes_cloud.channels.web import PUSH_ENABLED, endpoint_hash, handle_web_message
-from hermes_cloud.core.runcontext import build_run_context, Household
+from hermes_cloud.core.runcontext import Household, build_run_context
 
 
 def test_manifest_exists_and_is_installable() -> None:
