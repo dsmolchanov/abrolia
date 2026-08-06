@@ -147,9 +147,13 @@ class RuntimeService:
         except Exception:
             db_ok = False
         # Provider checks are best-effort and do not leak secrets.
-        nerve_key_ok = bool(self.env.get("HERMES_NERVE_RUNTIME_KEY") or self.env.get("ABROLIA_NERVE_RUNTIME_KEY"))
+        nerve_key_ok = bool(
+            self.env.get("HERMES_NERVE_RUNTIME_KEY") or self.env.get("ABROLIA_NERVE_RUNTIME_KEY")
+        )
         telegram_ok = bool(self.env.get("TELEGRAM_BOT_TOKEN"))
-        wa_ok = bool(self.env.get("HERMES_WHATSAPP_INSTANCE") or self.env.get("HERMES_WHATSAPP_RELAY_SECRET"))
+        wa_ok = bool(
+            self.env.get("HERMES_WHATSAPP_INSTANCE") or self.env.get("HERMES_WHATSAPP_RELAY_SECRET")
+        )
         google_grant_ok: bool | None = None
         try:
             manifest, _ = self._ready_manifest()
@@ -522,6 +526,11 @@ class RuntimeService:
 
     def __call__(self, environ: Mapping[str, Any], start_response: Callable) -> list[bytes]:
         """Health probes plus an authenticated private DSAR boundary."""
+        import time as _t
+
+        from hermes_cloud.core.observability import RuntimeStructuredLogger
+
+        start = _t.time()
         path = str(environ.get("PATH_INFO") or "")
         method = str(environ.get("REQUEST_METHOD") or "GET").upper()
         if path == "/v1/email/nerve/webhook" and method == "POST":
@@ -538,6 +547,23 @@ class RuntimeService:
             probe = Probe(404, {"status": "not_found"})
         else:
             probe = self.healthz() if path == "/healthz" else self.readyz()
+        # Structured observability: one JSON line per request, no content
+        try:
+            hmac_key = (
+                self.env.get("ABROLIA_HMAC_KEY") or self.env.get("HERMES_HOUSEHOLD_HMAC_KEY") or ""
+            ).encode()
+            if len(hmac_key) >= 16:
+                logger = RuntimeStructuredLogger(sys.stdout, hmac_key=hmac_key)
+                latency_ms = int((_t.time() - start) * 1000)
+                logger.emit(
+                    level="info",
+                    route=path,
+                    status=probe.status_code,
+                    latency_ms=latency_ms,
+                    request_id=environ.get("HTTP_X_REQUEST_ID"),
+                )
+        except Exception:
+            pass
         body = json.dumps(probe.payload, sort_keys=True, separators=(",", ":")).encode()
         status_text = {
             200: "200 OK",

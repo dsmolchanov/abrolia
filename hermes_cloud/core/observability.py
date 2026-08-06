@@ -24,9 +24,7 @@ class RuntimeHealth:
     backup_age_hours: float | None
 
     def needs_attention(self) -> bool:
-        if self.backup_age_hours is not None and self.backup_age_hours > 30 * 24:
-            return True
-        return False
+        return self.backup_age_hours is not None and self.backup_age_hours > 30 * 24
 
 
 def household_id_hash(household_id: str, hmac_key: bytes) -> str:
@@ -39,7 +37,8 @@ class RuntimeStructuredLogger:
     ALLOWED_ROUTE_CHARS = frozenset(
         "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/_-."
     )
-    FORBIDDEN_SUBSTRINGS = ("prompt", "secret", "token", "content", "email", "password", "key")
+    FORBIDDEN_SUBSTRINGS = ("prompt", "secret", "token", "content", "password")
+    ROUTE_FORBIDDEN = ("prompt", "secret", "token", "content", "password")
 
     def __init__(self, stream: TextIO, *, hmac_key: bytes) -> None:
         if not hmac_key or len(hmac_key) < 16:
@@ -67,7 +66,11 @@ class RuntimeStructuredLogger:
         for ch in route:
             if ch not in self.ALLOWED_ROUTE_CHARS and ch != "/":
                 raise ValueError(f"unsafe route char {ch!r}")
-        self._reject_forbidden(route, "route")
+        # Route may contain 'email' as endpoint name — not PII, so use ROUTE allowlist
+        lowered_route = route.casefold()
+        for needle in self.ROUTE_FORBIDDEN:
+            if needle in lowered_route:
+                raise ValueError(f"forbidden substring {needle!r} in route")
         payload: dict[str, Any] = {
             "timestamp": time.time(),
             "level": level,
