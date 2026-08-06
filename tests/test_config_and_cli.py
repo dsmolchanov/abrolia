@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import json
 from pathlib import Path
 
 import pytest
@@ -16,7 +18,9 @@ from hermes_cloud.execute.reminder import ReminderStore
 from hermes_cloud.runner.pipeline import Pipeline
 
 
-def runtime_manifest(*, residency_mode: str = "eu-app") -> str:
+def runtime_manifest(
+    *, residency_mode: str = "eu-app", email_provider: str = "nerve-managed"
+) -> str:
     body = f'''\
 schema_version = 1
 household_id = "22222222-2222-4222-8222-222222222222"
@@ -43,7 +47,7 @@ verified = true
 [email]
 agent_inbox = "agent@abrolia.test"
 fallback = "owner@example.test"
-provider_kind = "nerve-managed"
+provider_kind = "{email_provider}"
 provider_binding_ref = "email-identity-1"
 secret_binding_ref = "HERMES_EMAIL_BINDING"
 '''
@@ -216,6 +220,41 @@ def test_legacy_imap_requires_explicit_test_only_gate() -> None:
     assert disabled.gmail_app_password is None
     assert not disabled.has_gmail
     assert enabled.has_gmail
+
+
+def test_provisioned_gmail_selects_oauth_api_sender(tmp_path: Path, monkeypatch) -> None:
+    from hermes_cloud.execute.gmail_api_send import GmailSendProvider
+
+    manifest = tmp_path / "household.toml"
+    manifest.write_text(runtime_manifest(email_provider="gmail"), encoding="utf-8")
+    secret = json.dumps(
+        {
+            "client_id": "client-id.apps.googleusercontent.com",
+            "client_secret": "client-secret-canary",
+            "refresh_credential": "refresh-credential-canary",
+            "provider_subject": "google-subject-1",
+            "scopes": [
+                "openid",
+                "email",
+                "https://www.googleapis.com/auth/gmail.readonly",
+                "https://www.googleapis.com/auth/gmail.send",
+            ],
+            "wrapping_key": base64.urlsafe_b64encode(b"k" * 32).rstrip(b"=").decode(),
+        }
+    )
+    monkeypatch.setenv("HERMES_EMAIL_BINDING", secret)
+    config = load_config(manifest_path=manifest)
+    with open_database(tmp_path / "hermes.db") as database:
+        binding = cli._email_binding(config, database)
+        sender = cli._mail(config, database, binding)
+
+        assert sender is not None
+        assert isinstance(sender.backend, GmailSendProvider)
+        encrypted = bytes(
+            database.query_one("SELECT encrypted_refresh_credential FROM oauth_grants")[0]
+        )
+        assert b"refresh-credential-canary" not in encrypted
+        sender.backend.client.close()
 
 
 def test_config_repr_never_contains_provider_secrets() -> None:
