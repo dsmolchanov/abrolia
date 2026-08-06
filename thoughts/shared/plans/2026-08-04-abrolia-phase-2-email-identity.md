@@ -22,6 +22,15 @@ data_policy: synthetic-only-until-explicit-launch-gates
 > conflict, while a new email identity creates a fresh isolated org. Automatic
 > tombstone resurrection is forbidden because it could revive a delayed job and
 > expose retained org history to a newly issued runtime credential.
+>
+> **Revision 2026-08-06 — Gmail runtime execution closure.** The production
+> runtime now starts a bounded Gmail History worker and the provisioned sender
+> factory selects the OAuth Gmail API provider. Immediate timeout and
+> crash-left-pending sends reconcile by exact RFC Message-ID in Sent; absent or
+> ambiguous results remain `outcome_unknown` without resend. Process tests cover
+> initial baseline, durable ingest, restart/cursor continuity, encrypted grant
+> reuse and idempotent revoke. Live Google test-user acceptance remains a manual
+> release gate and does not enable the real-family/CASA flags.
 
 ## Overview
 
@@ -751,6 +760,10 @@ flags остаются false до provider-specific gates.
   append-before-cursor acknowledgement, bounded resync, health taxonomy and
   exact Sent Message-ID reconciliation are implemented and hermetically tested.
 - Real Gmail quota/cursor/restart smoke remains manual and opt-in.
+- Runtime execution wiring was completed on 2026-08-06: `serve_runtime()` owns
+  the Gmail History loop, the sender factory owns `GmailSendProvider`, and
+  timeout/restart reconciliation is process-tested. The immutable image deploy
+  and live Google test-user matrix remain open.
 
 #### Files
 
@@ -773,12 +786,12 @@ flags остаются false до provider-specific gates.
 
 #### Acceptance
 
-- Restart resumes cursor without gap or duplicate processing.
-- 404 expired history, 429 quota, revoked grant and malformed RAW fixtures are
+- [x] Restart resumes cursor without gap or duplicate processing.
+- [x] 404 expired history, 429 quota, revoked grant and malformed RAW fixtures are
   covered.
-- Sent messages are not re-ingested as incoming work.
-- Timeout-found-in-Sent resolves once; absent/ambiguous remains unknown.
-- Refresh/access tokens never reach volume plaintext, logs or exception text.
+- [x] Sent messages are not re-ingested as incoming work.
+- [x] Timeout-found-in-Sent resolves once; absent/ambiguous remains unknown.
+- [x] Refresh/access tokens never reach volume plaintext, logs or exception text.
 
 ### Phase 2.9 — UI activation, lifecycle, observability and rollout
 

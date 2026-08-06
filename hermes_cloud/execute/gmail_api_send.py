@@ -17,7 +17,7 @@ class GmailSendApi(Protocol):
 
 class GmailSendProvider:
     provider = "gmail"
-    supports_idempotent_reconcile = False
+    supports_idempotent_reconcile = True
 
     def __init__(self, client: GmailSendApi, *, clock=time.time) -> None:
         self.client = client
@@ -42,7 +42,10 @@ class GmailSendProvider:
         )
 
     def reconcile(self, request: EmailSendRequest) -> EmailDeliveryReceipt:
-        matches = self.client.search_sent(f"rfc822msgid:{request.message_id}")
+        try:
+            matches = self.client.search_sent(f"rfc822msgid:{request.message_id}")
+        except (TimeoutError, ConnectionError) as error:
+            raise EmailOutcomeUnknown("Gmail Sent reconciliation is unavailable") from error
         exact = [item for item in matches if str(item.get("rfc822_message_id")) == request.message_id]
         if len(exact) != 1 or not exact[0].get("id"):
             raise EmailOutcomeUnknown("Gmail Sent reconciliation is absent or ambiguous")

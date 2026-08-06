@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import stat
@@ -11,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from hermes_cloud.core.db import open_database
 from hermes_cloud.core.runtime_manifest import compute_config_sha256, parse_runtime_manifest
 from hermes_cloud.runtime import service as runtime_service_module
 from hermes_cloud.runtime.bootstrap import (
@@ -28,7 +30,11 @@ RUNTIME_REF = "fly:abrolia-hh-test"
 TOKEN = "synthetic-bootstrap-token-canary"
 
 
-def manifest_toml(*, with_email_binding: bool = False) -> str:
+def manifest_toml(
+    *,
+    with_email_binding: bool = False,
+    email_provider: str = "nerve-managed",
+) -> str:
     body = '''\
 schema_version = 1
 household_id = "33333333-3333-4333-8333-333333333333"
@@ -57,9 +63,14 @@ agent_inbox = "runtime@abrolia.test"
 fallback = "owner@example.test"
 '''
     if with_email_binding:
-        body += """\
-provider_kind = "nerve-managed"
-provider_binding_ref = '{"org_id":"org-1","inbox_id":"inbox-1"}'
+        binding_ref = (
+            "email-identity-1"
+            if email_provider == "gmail"
+            else '{"org_id":"org-1","inbox_id":"inbox-1"}'
+        )
+        body += f"""\
+provider_kind = "{email_provider}"
+provider_binding_ref = '{binding_ref}'
 secret_binding_ref = "HERMES_EMAIL_BINDING"
 """
     digest = compute_config_sha256(body)
@@ -369,6 +380,11 @@ def test_serve_runtime_starts_probe_server_while_bootstrap_is_pending(
         return FakeServer(application)
 
     monkeypatch.setattr(runtime_service_module, "make_server", fake_make_server)
+    monkeypatch.setattr(
+        runtime_service_module,
+        "_gmail_worker_until_stopped",
+        lambda _service, _source, _stop: seen.update(gmail_worker_started=True),
+    )
     runtime_service_module.serve_runtime(
         env={
             "HERMES_RUNTIME_HOST": "127.0.0.1",
@@ -383,7 +399,135 @@ def test_serve_runtime_starts_probe_server_while_bootstrap_is_pending(
     assert seen["host"] == "127.0.0.1" and seen["port"] == 8089
     assert seen["status"] == "200 OK"
     assert seen["body"] == {"status": "ok"}
+    assert seen["gmail_worker_started"] is True
     assert seen["closed"] is True
+
+
+class FakeRuntimeGmailClient:
+    def __init__(self) -> None:
+        self.profile_id = "100"
+        self.history_pages: list[dict] = []
+        self.messages: dict[str, dict] = {}
+        self.history_starts: list[str] = []
+        self.closed = False
+
+    def profile(self):
+        return {"historyId": self.profile_id}
+
+    def history(self, start_history_id, page_token=None):
+        self.history_starts.append(start_history_id)
+        if self.history_pages:
+            return self.history_pages.pop(0)
+        return {"historyId": start_history_id, "history": []}
+
+    def message(self, message_id):
+        return self.messages[message_id]
+
+    def list_inbox(self, page_token=None, *, max_results):
+        return {"messages": []}
+
+    def close(self):
+        self.closed = True
+
+
+def _gmail_secret_bundle() -> str:
+    return json.dumps(
+        {
+            "client_id": "client-id.apps.googleusercontent.com",
+            "client_secret": "client-secret-canary",
+            "refresh_credential": "refresh-credential-canary",
+            "provider_subject": "google-subject-1",
+            "scopes": [
+                "openid",
+                "email",
+                "https://www.googleapis.com/auth/gmail.readonly",
+                "https://www.googleapis.com/auth/gmail.send",
+            ],
+            "wrapping_key": base64.urlsafe_b64encode(b"k" * 32).rstrip(b"=").decode(),
+        }
+    )
+
+
+def test_runtime_gmail_worker_baselines_ingests_and_resumes_after_restart(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    content = manifest_toml(with_email_binding=True, email_provider="gmail")
+    manifest = parse_runtime_manifest(content)
+    manifest_path = atomic_write(tmp_path / "household.toml", content.encode())
+    activation_path = tmp_path / "activation.json"
+    write_activation_state(
+        activation_path,
+        ActivationState(
+            status="active",
+            runtime_ref=RUNTIME_REF,
+            household_id=manifest.household_id,
+            config_revision=manifest.config_revision,
+            config_sha256=manifest.config_sha256,
+            updated_at=1.0,
+        ),
+    )
+    env = {
+        "HERMES_DB": str(tmp_path / "hermes.db"),
+        "HERMES_EMAIL_BINDING": _gmail_secret_bundle(),
+    }
+    first_client = FakeRuntimeGmailClient()
+    first = RuntimeService(
+        manifest_path=manifest_path,
+        activation_path=activation_path,
+        runtime_ref=RUNTIME_REF,
+        env=env,
+        gmail_client_factory=lambda *_args, **_kwargs: first_client,
+    )
+
+    assert first.run_gmail_once() == 0
+    raw = (
+        b"From: school@example.test\r\nTo: runtime@abrolia.test\r\n"
+        b"Message-ID: <runtime-gmail-1@example.test>\r\nSubject: Test\r\n\r\nBody"
+    )
+    first_client.history_pages = [
+        {
+            "historyId": "102",
+            "history": [{"messagesAdded": [{"message": {"id": "gmail-message-1"}}]}],
+        }
+    ]
+    first_client.messages["gmail-message-1"] = {
+        "id": "gmail-message-1",
+        "labelIds": ["INBOX"],
+        "raw": base64.urlsafe_b64encode(raw).rstrip(b"=").decode(),
+    }
+    assert first.run_gmail_once() == 1
+    first.close()
+    assert first_client.closed is True
+
+    second_client = FakeRuntimeGmailClient()
+    second_client.profile_id = "102"
+    restarted = RuntimeService(
+        manifest_path=manifest_path,
+        activation_path=activation_path,
+        runtime_ref=RUNTIME_REF,
+        env=env,
+        gmail_client_factory=lambda *_args, **_kwargs: second_client,
+    )
+    assert restarted.run_gmail_once() == 0
+    assert second_client.history_starts == ["102"]
+    with open_database(tmp_path / "hermes.db") as database:
+        assert database.query_one("SELECT COUNT(*) AS n FROM events")["n"] == 1
+        assert database.query_one("SELECT cursor FROM email_sync_state")["cursor"] == "102"
+    revoke_calls = []
+
+    class Revoked:
+        status_code = 200
+
+    monkeypatch.setattr(
+        runtime_service_module.httpx,
+        "post",
+        lambda *_args, **_kwargs: revoke_calls.append(True) or Revoked(),
+    )
+    assert restarted._revoke_google_credential(manifest) is True
+    assert restarted._revoke_google_credential(manifest) is True
+    assert revoke_calls == [True]
+    restarted.close()
 
 
 def test_python_module_entrypoint_is_wired_without_exposing_configuration() -> None:
