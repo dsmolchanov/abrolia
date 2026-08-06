@@ -22,6 +22,7 @@ from control_plane.onboarding.contracts import CommandContext
 from control_plane.onboarding.service import OnboardingService
 from control_plane.provisioning.contracts import ProviderRegistry
 from control_plane.provisioning.fakes import synthetic_provider_registry
+from control_plane.channel_preferences import ChannelPreferencesRepository
 from control_plane.provisioning.planner import DesiredSpecPlanner
 from control_plane.provisioning.secrets import InMemorySecretSink
 from control_plane.provisioning.worker import ProvisioningWorker
@@ -49,6 +50,7 @@ class ControlPlaneStack:
     jobs: JobsRepository
     configs: ConfigRepository
     email_identities: EmailIdentityRepository
+    channel_prefs: ChannelPreferencesRepository
     sessions: SessionService
     service: OnboardingService
     account: AccountRecord
@@ -182,6 +184,7 @@ def cp_stack(tmp_path: Path) -> ControlPlaneStack:
     configs = ConfigRepository(database, cipher, lookup, token_hasher)
     email_identities = EmailIdentityRepository(database, cipher, lookup)
     email_identity_service = EmailIdentityService(email_identities)
+    channel_prefs = ChannelPreferencesRepository(database)
     sessions = SessionService(auth)
     account = accounts.create_verified("owner@family.test", now=BASE_TIME)
     household = households.create_for_owner(account.id, now=BASE_TIME)
@@ -199,6 +202,7 @@ def cp_stack(tmp_path: Path) -> ControlPlaneStack:
         jobs=jobs,
         configs=configs,
         email_identities=email_identities,
+        channel_prefs=channel_prefs,
         sessions=sessions,
         service=OnboardingService(
             households,
