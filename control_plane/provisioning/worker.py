@@ -554,6 +554,65 @@ class ProvisioningWorker:
                 now=self.clock(),
             )
 
+    def _email_secret_installed(
+        self, job: JobRecord, request: dict, namespace_ref: str
+    ) -> bool:
+        # Durable receipt or live sink proof that the expected binding is present.
+        binding_ref: str | None = None
+        identity_id = request.get("email_identity_id")
+        if isinstance(identity_id, str) and self.email_identities is not None:
+            identity = self.email_identities.get(identity_id)
+            if identity is not None:
+                binding_ref = identity.secret_binding_ref
+        if not isinstance(binding_ref, str) or not binding_ref:
+            raw_binding = request.get("secret_binding_ref")
+            binding_ref = raw_binding if isinstance(raw_binding, str) else None
+        if not isinstance(binding_ref, str) or not binding_ref:
+            pub = request.get("public_result")
+            public_ref = pub.get("secret_binding_ref") if isinstance(pub, dict) else None
+            if isinstance(public_ref, str):
+                binding_ref = public_ref
+        if not isinstance(binding_ref, str) or not binding_ref:  # noqa: SIM102
+            # Fall back to expected synthetic binding.
+            if job.provider == "fake-email" or job.provider == "synthetic":
+                binding_ref = "SYNTHETIC_EMAIL_CREDENTIAL"
+        if not isinstance(binding_ref, str) or not binding_ref:
+            return False
+        try:
+            row = self.jobs.db.query_one(
+                "SELECT 1 FROM email_secret_installs WHERE job_id = ?",
+                (job.id,),
+            )
+            if row is not None:
+                return True
+        except Exception:
+            pass
+        try:
+            contains = getattr(self.secret_sink, "contains", None)
+            if callable(contains) and contains(namespace_ref, binding_ref):
+                # Create receipt for future reclaim without needing live inspection.
+                try:
+                    with self.jobs.db.write() as connection:
+                        connection.execute(
+                            "INSERT OR IGNORE INTO email_secret_installs"
+                            " (job_id, household_id, secret_name, namespace_ref, installed_at, created_at)"
+                            " VALUES (?, ?, ?, ?, ?, ?)",
+                            (
+                                job.id,
+                                job.household_id,
+                                binding_ref,
+                                namespace_ref,
+                                self.clock(),
+                                self.clock(),
+                            ),
+                        )
+                except Exception:
+                    pass
+                return True
+        except Exception:
+            return False
+        return False
+
     def _stage_email_secret(
         self,
         job: JobRecord,
@@ -572,10 +631,11 @@ class ProvisioningWorker:
                 return True
             provider = self.providers.get(job.provider)
             verifier = getattr(provider, "pre_staged_secret_verified", None)
-            return bool(
-                callable(verifier)
-                and verifier(request, namespace_ref, binding_ref)
-            )
+            if callable(verifier) and verifier(request, namespace_ref, binding_ref):
+                return True
+            # Empty material but sink already contains the binding from a prior crash
+            # window: treat as installed if durable receipt or live sink proves it.
+            return self._email_secret_installed(job, request, namespace_ref)  # noqa: SIM103
         material_names = [name for name, _value in result.secret_material.items()]
         if not isinstance(binding_ref, str) or material_names != [binding_ref]:
             result.secret_material.clear()
@@ -587,6 +647,26 @@ class ProvisioningWorker:
         except Exception:
             result.secret_material.clear()
             return False
+        # Record durable non-secret receipt immediately after successful sink install.
+        try:
+            with self.jobs.db.write() as connection:
+                connection.execute(
+                    "INSERT OR IGNORE INTO email_secret_installs"
+                    " (job_id, household_id, secret_name, namespace_ref, installed_at, created_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        job.id,
+                        job.household_id,
+                        binding_ref,
+                        namespace_ref,
+                        self.clock(),
+                        self.clock(),
+                    ),
+                )
+        except Exception:
+            # If the receipt write fails, the live sink still proves installation;
+            # a later reclaim will reconstruct the receipt via contains().
+            pass
         return True
 
     def _validated_email_public_result(
@@ -1306,6 +1386,7 @@ class ProvisioningWorker:
                 if (
                     job.error_code == "secret_handoff_unknown"
                     and result.secret_material.is_empty
+                    and not self._email_secret_installed(job, request, namespace_ref)
                 ):
                     return WorkResult(
                         job.id, "outcome_unknown", "secret_handoff_unknown"
@@ -1345,11 +1426,15 @@ class ProvisioningWorker:
                         job.error_code == "secret_handoff_unknown"
                         and inspected.result.secret_material.is_empty
                     ):
-                        return WorkResult(
-                            job.id,
-                            "outcome_unknown",
-                            "secret_handoff_unknown",
-                        )
+                        namespace_ref_tmp = self._secret_namespace_ref(job.household_id)
+                        if namespace_ref_tmp is None or not self._email_secret_installed(
+                            job, request, namespace_ref_tmp
+                        ):
+                            return WorkResult(
+                                job.id,
+                                "outcome_unknown",
+                                "secret_handoff_unknown",
+                            )
                     namespace_ref = self._secret_namespace_ref(job.household_id)
                     if namespace_ref is None or not self._stage_email_secret(
                         job, request, inspected.result, namespace_ref
