@@ -20,6 +20,7 @@ from control_plane.onboarding.contracts import WorkflowConflict
 from control_plane.repositories.households import HouseholdNotFound
 
 WEB_ROOT = Path(__file__).resolve().parents[1] / "web"
+PWA_ROOT = Path(__file__).resolve().parents[2] / "web"
 MAXIMUM_BACKUP_AGE_SECONDS = 26 * 60 * 60
 SAFE_PROVIDER_STATUSES = frozenset({"configured", "disabled", "unavailable"})
 SECURITY_HEADERS = {
@@ -69,6 +70,14 @@ def create_app(
     app.state.owns_container = owns_container
     templates = Jinja2Templates(directory=str(WEB_ROOT / "templates"))
     app.mount("/static", StaticFiles(directory=WEB_ROOT / "static"), name="static")
+    # PWA shell from top-level web/ (Phase E E6) — serve manifest, sw, icons
+    if PWA_ROOT.is_dir():
+        app.mount("/pwa", StaticFiles(directory=str(PWA_ROOT)), name="pwa")
+        # Also serve PWA static at same place as control_plane static for manifest compat
+        pwa_static = PWA_ROOT / "static"
+        if pwa_static.is_dir():
+            # expose icons via same /static path via additional mount at /pwa-static
+            app.mount("/pwa-static", StaticFiles(directory=str(pwa_static)), name="pwa-static")
 
     @app.middleware("http")
     async def secure_response(request: Request, call_next):
