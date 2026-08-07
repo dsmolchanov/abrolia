@@ -282,4 +282,5 @@ TABLE_CLASSIFICATION: dict[str, TableClassification] = {
         False, True, "account+30d", "non-secret install receipt (name + job id only)"
     ),
     "channel_preferences": TableClassification(True, True, "account+30d"),
+    "channel_bindings": TableClassification(True, True, "account+30d"),
 }

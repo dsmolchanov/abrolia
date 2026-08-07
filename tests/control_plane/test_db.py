@@ -34,6 +34,7 @@ def test_migrations_are_ordered_and_idempotent(tmp_path: Path) -> None:
             "0004_google_oauth.sql",
             "0005_email_secret_installs.sql",
             "0006_channel_preferences.sql",
+            "0007_channel_bindings.sql",
         ]
         assert database.migrate() == []
         assert database.pragma() == {
