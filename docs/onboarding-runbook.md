@@ -276,3 +276,16 @@ rehearsal in [`control-plane-restore.md`](control-plane-restore.md).
 Do not enable real providers or real family data after a successful synthetic
 smoke. Each real integration has its own legal, processor, OAuth/CASA, consent,
 and implementation gate.
+
+## Observability and alerts (Phase E)
+
+Logs are JSON only: `timestamp, level, household_id_hash (HMAC), request_id, route, status, latency_ms` — no message content, raw email, prompt, or secret. See `hermes_cloud/core/observability.py` and `control_plane/observability.py`.
+
+`GET /health` (public runtime) reports `nerve_key_ok, telegram_ok, wa_instance_ok, google_grant_ok, db_ok, backup_age_hours`; `backup_age_hours > 30*24` → `needs_attention`. `GET /healthz` / `GET /readyz` (control plane) report `database, volume, workers, backup, providers` and blockers.
+
+Alerts (operator-visible, not auto-page in pilot):
+- `DLQ > 0` — provisioning jobs `failed` without reconcile
+- `sticky executing` — job `running` > 10 min without lease renewal
+- `primary unavailable` — routing fallback triggered
+- `backup stale` — `backup_age_hours > 26h`
+- `budget exceeded` — per-household/day cost cap hit (see `hermes_cloud/core/usage.py`)
