@@ -189,3 +189,42 @@ Use only synthetic identities and dedicated staging resources.
 
 The chaos and restore gates are complete. Remaining unchecked items are retained
 as operator regression drills; they do not broaden Phase 1 beyond synthetic data.
+
+---
+
+## Phase B Addendum — 2026-08-08 (abrolia-synthetic org)
+
+**Branch:** `codex/phase-B-foundation` from `b68095f` (after #39). Synthetic-only; `ABROLIA_SYNTHETIC_ONLY=1`, `ABROLIA_REAL_*=0`.
+
+**Fly topology change (B-11):**
+- `deploy/control-plane/fly.toml:17` — `ABROLIA_FLY_ORG = "abrolia-synthetic"` (was `personal`). App remains `abrolia-control-plane-synthetic`, `primary_region = ams`, 1× `shared-cpu-1x/512mb`, 1× `1GiB encrypted` volume, single `GET /healthz` check. `ABROLIA_INTERNAL_BOOTSTRAP_HOST = abrolia-control-plane-synthetic.flycast` unchanged (bare DNS).
+- No live `fly orgs create` executed in this hermetic run — `flyctl auth` not present in CI. Required live verification (operator):
+
+```bash
+fly orgs create abrolia-synthetic
+fly orgs show abrolia-synthetic
+fly deploy --config deploy/control-plane/fly.toml --org abrolia-synthetic --ha=false
+fly status -a abrolia-control-plane-synthetic --org abrolia-synthetic
+fly machines list -a abrolia-control-plane-synthetic --org abrolia-synthetic  # expect 1× ams started
+fly volumes list -a abrolia-control-plane-synthetic --org abrolia-synthetic  # expect 1× 1GiB encrypted ams
+fly image show -a abrolia-control-plane-synthetic --json | jq .Digest  # @sha256: pinned
+```
+
+Record org slug, app name, Machine ID, volume ID, image digest in this addendum after live run. `personal` org retains only `landing/` static if kept — documented.
+
+**Hermetic 8-window chaos matrix (B-09, dry-run-runtime):**
+- `pytest tests/control_plane/test_phase1_chaos_matrix.py -q` — **3 passed**
+- `pytest tests/control_plane/test_provisioning_jobs.py -q` — **38 passed** with parametrized lease windows
+- Windows: `transition → lease → provider → response → Sink → result → claim → activate → cleanup` — each SIGKILL proves no duplicate household/app/volume/Machine, no duplicate `provisioning_jobs` result, no secret in DB/log/API, `secret_handoff_unknown` stays pending without Sink commit.
+- `pytest tests/test_backup.py -q` — **9 passed** (`integrity_check=ok`, `foreign_key_check=0`, pause marker `0600`, smoke without leasing, resume + new onboarding rev 1).
+
+**Full non-live suite on this branch:**
+- `pytest -p no:cacheprovider -m "not live" -q` — **pass** (same 626+/215+ as Phase 1, plus Phase E/F and C1 remediation)
+- `ruff check .` — pass (Phase A content-restriction #40 is separate branch, not included here)
+- `gitleaks` / `check_fixtures --all` — pass (no secrets, no fixture content leaks)
+
+**Backup/restore rehearsal (hermetic):** `docs/control-plane-restore.md` steps exercised via `tests/test_backup.py` (integrity, FK, pause, smoke, resume). Live rehearsal on `abrolia-synthetic` remains operator-gated (see Phase B plan B5) — hermetic evidence recorded here, live IDs to be appended after `fly` auth.
+
+**Cost tag:** `shared-cpu-1x/512mb` + `1GiB` volume in `ams` ≈ `$5-7/mo` for synthetic org (from Fly pricing; exact billing line to be recorded after `fly orgs show`).
+
+**Gate:** B-09 hermetic green; B-11 topology change landed as config; live org creation + 1 synthetic onboarding + per-drill evidence remains operator step before Phase C live batteries (C2/C3). This addendum will be extended with live IDs after that step; Phase C branches from merged B.
