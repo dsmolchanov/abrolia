@@ -47,6 +47,8 @@
       <form method="post" action="/onboarding/select/email_identity">
         {{ command_fields() }}<input type="hidden" name="kind" value="abrolia_managed">
         <input type="hidden" name="local_part" value="family.assistant">
+        <label class="consent"><input type="checkbox" name="special_category_restriction_acknowledged" value="yes" required>
+          I will not send medical, health, allergy, religious, or other special-category personal data to the agent inbox or channels.</label>
         <button class="card recommended" data-select="email_identity" data-kind="abrolia_managed">
           <span class="badge">Recommended</span> <strong>@abrolia.com</strong>
           <span>Managed assistant inbox with a synthetic pilot identity.</span>
@@ -54,6 +56,8 @@
       </form>
       <form method="post" action="/onboarding/select/email_identity">
         {{ command_fields() }}<input type="hidden" name="kind" value="gmail_agent">
+        <label class="consent"><input type="checkbox" name="special_category_restriction_acknowledged" value="yes" required>
+          I will not send medical, health, allergy, religious, or other special-category personal data to the agent inbox or channels.</label>
         <button class="card" data-select="email_identity" data-kind="gmail_agent">
           <strong>Separate agent Gmail</strong>
           <span>A dedicated agent account with OAuth — never your personal Gmail or an app password.</span>
@@ -66,6 +70,8 @@
         <p id="domain-guidance" aria-live="polite">Use a dedicated mail subdomain when the root domain already receives family mail.</p>
         <label id="mx-change-warning" class="consent"><input type="checkbox" name="mx_change_acknowledged" value="yes">
           I understand that changing apex MX records can interrupt existing family mail; a dedicated subdomain is recommended.</label>
+        <label class="consent"><input type="checkbox" name="special_category_restriction_acknowledged" value="yes" required>
+          I will not send medical, health, allergy, religious, or other special-category personal data to the agent inbox or channels.</label>
         <button class="card" data-select="email_identity" data-kind="family_domain">
           <strong>Your family domain</strong><span>Use a dedicated assistant address on a domain you control.</span>
         </button>

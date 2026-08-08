@@ -138,11 +138,15 @@ class ProfileInput(DurableContract):
 class ManagedEmailSelection(DurableContract):
     kind: Literal["abrolia_managed"] = "abrolia_managed"
     local_part: str = Field(pattern=r"^[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?$")
+    special_category_restriction_acknowledged: Literal[True] | None = None
+    special_category_restriction_receipt_id: str | None = None
 
 
 class GmailAgentSelection(DurableContract):
     kind: Literal["gmail_agent"] = "gmail_agent"
     separate_agent_account_acknowledged: Literal[True]
+    special_category_restriction_acknowledged: Literal[True] | None = None
+    special_category_restriction_receipt_id: str | None = None
 
 
 class FamilyDomainSelection(DurableContract):
@@ -150,6 +154,8 @@ class FamilyDomainSelection(DurableContract):
     domain: str = Field(min_length=3, max_length=253)
     local_part: str = "assistant"
     mx_change_acknowledged: bool = False
+    special_category_restriction_acknowledged: Literal[True] | None = None
+    special_category_restriction_receipt_id: str | None = None
 
     @field_validator("domain")
     @classmethod

@@ -246,7 +246,7 @@ class OnboardingService:
         return adapters[kind].validate_python(
             selection,
             context={"allow_real_email_domains": self.allow_real_email_domains},
-        ).model_dump(mode="json")
+        ).model_dump(mode="json", exclude_none=True)
 
     def _provider_for(self, kind: StepKind, selection_kind: str) -> str:
         if kind is StepKind.EMAIL and selection_kind == "family_domain":
@@ -262,10 +262,65 @@ class OnboardingService:
     def _assert_email_rollout(self, household_id: str, selection: dict[str, Any]) -> None:
         if not self.real_email_enabled:
             return
-        if selection.get("kind") == "gmail_agent":
-            return
-        if household_id not in self.real_email_household_allowlist:
+        if (
+            selection.get("kind") != "gmail_agent"
+            and household_id not in self.real_email_household_allowlist
+        ):
             raise InvalidTransition("real email is not enabled for this household")
+        if (
+            selection.get("special_category_restriction_acknowledged") is not True
+            or not selection.get("special_category_restriction_receipt_id")
+        ):
+            raise InvalidTransition(
+                "real email requires the special-category content restriction receipt"
+            )
+
+    @staticmethod
+    def _record_email_content_restriction(
+        connection,
+        *,
+        parsed: dict[str, Any],
+        household_id: str,
+        account_id: str,
+        locale: str,
+        now: float,
+    ) -> None:
+        receipt_id = parsed.get("special_category_restriction_receipt_id")
+        if (
+            parsed.get("special_category_restriction_acknowledged") is not True
+            or not receipt_id
+        ):
+            return
+        purpose = "special_category_content_restriction"
+        existing = connection.execute(
+            "SELECT household_id, account_id, purpose FROM consent_receipts WHERE id = ?",
+            (receipt_id,),
+        ).fetchone()
+        if existing is not None:
+            if (
+                existing["household_id"] != household_id
+                or existing["account_id"] != account_id
+                or existing["purpose"] != purpose
+            ):
+                raise IdempotencyConflict("consent receipt belongs to another command")
+            return
+        text_version, text_sha = consent_version_and_sha(purpose)
+        connection.execute(
+            "INSERT INTO consent_receipts (id, household_id, account_id, purpose,"
+            " text_version, text_sha256, locale, accepted_at, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                receipt_id,
+                household_id,
+                account_id,
+                purpose,
+                text_version,
+                text_sha,
+                locale,
+                now,
+                now,
+            ),
+        )
 
     @staticmethod
     def _record_whatsapp_consents(
@@ -348,6 +403,18 @@ class OnboardingService:
                 "SELECT * FROM onboarding_steps WHERE workflow_id = ? AND kind = ?",
                 (row["id"], kind.value),
             ).fetchone()
+            if kind is StepKind.EMAIL:
+                household_row = connection.execute(
+                    "SELECT family_language FROM households WHERE id = ?", (household_id,)
+                ).fetchone()
+                self._record_email_content_restriction(
+                    connection,
+                    parsed=parsed,
+                    household_id=household_id,
+                    account_id=context.account_id,
+                    locale=household_row["family_language"] or "en",
+                    now=now,
+                )
             if kind is StepKind.WHATSAPP:
                 household_row = connection.execute(
                     "SELECT family_language FROM households WHERE id = ?", (household_id,)
@@ -375,9 +442,20 @@ class OnboardingService:
                 "onboarding_steps", f"{row['id']}:{kind.value}", "selection", parsed
             )
             intent_key = f"{household_id}:{kind.value}:{selection_kind}:{attempt}"
+            provider_selection = parsed
+            if kind is StepKind.EMAIL:
+                provider_selection = {
+                    key: value
+                    for key, value in parsed.items()
+                    if key
+                    not in {
+                        "special_category_restriction_acknowledged",
+                        "special_category_restriction_receipt_id",
+                    }
+                }
             job_request = {
                 "step_kind": kind.value,
-                "selection": parsed,
+                "selection": provider_selection,
                 "attempt": attempt,
             }
             if email_identity is not None:

@@ -28,6 +28,8 @@ def test_onboarding_page_has_canonical_options_and_privacy_copy(api_harness) -> 
     assert html.count("Beta") >= 2
     assert "QR linking requires explicit linked-device" in html
     assert "fallback contact only — never the agent inbox" in html
+    assert html.count('name="special_category_restriction_acknowledged"') == 3
+    assert "I will not send medical, health, allergy, religious" in html
     assert "u***@family.test" in html
     assert world.account.recovery_email not in html
 
@@ -159,6 +161,7 @@ def test_verified_choice_changes_require_an_explicit_reset_control(api_harness) 
             "version": "1",
             "kind": "abrolia_managed",
             "local_part": "reset-agent",
+            "special_category_restriction_acknowledged": "yes",
         },
         follow_redirects=False,
     ).status_code == 303
@@ -274,6 +277,7 @@ def test_no_js_whatsapp_duplicate_post_replays_same_consent_receipt(api_harness)
             "version": "1",
             "kind": "abrolia_managed",
             "local_part": "replay-agent",
+            "special_category_restriction_acknowledged": "yes",
         },
         follow_redirects=False,
     )
@@ -316,12 +320,73 @@ def test_no_js_whatsapp_duplicate_post_replays_same_consent_receipt(api_harness)
     assert len(api_harness.container.database.query(
         "SELECT id FROM consent_receipts WHERE household_id = ?",
         (world.household.id,),
-    )) == 1
+    )) == 2
     assert len(api_harness.container.database.query(
         "SELECT id FROM provisioning_jobs WHERE household_id = ?"
         " AND kind = 'whatsapp_identity'",
         (world.household.id,),
     )) == 1
+
+
+def test_no_js_email_requires_and_records_content_restriction(api_harness) -> None:
+    world = api_harness.create_principal("restriction-owner@family.test")
+    api_harness.authenticate(world)
+    origin = {"Origin": api_harness.config.public_origin}
+    profile = api_harness.client.post(
+        "/onboarding/profile",
+        headers=origin,
+        data={
+            "csrf_token": world.session.csrf_token,
+            "idempotency_key": "restriction-profile",
+            "version": "0",
+            "first_name": "Restriction",
+            "last_name": "Owner",
+            "family_language": "en",
+            "timezone": "Europe/Prague",
+            "country_code": "CZ",
+            "residency_mode": "eu-app",
+        },
+        follow_redirects=False,
+    )
+    assert profile.headers["location"] == "/onboarding"
+    shared = {
+        "csrf_token": world.session.csrf_token,
+        "version": "1",
+        "kind": "abrolia_managed",
+        "local_part": "restriction-agent",
+    }
+    rejected = api_harness.client.post(
+        "/onboarding/select/email_identity",
+        headers=origin,
+        data={**shared, "idempotency_key": "restriction-missing"},
+        follow_redirects=False,
+    )
+    assert rejected.headers["location"] == "/onboarding?error=selection"
+    assert api_harness.container.onboarding_repository.snapshot(
+        world.household.id
+    ).version == 1
+
+    accepted = api_harness.client.post(
+        "/onboarding/select/email_identity",
+        headers=origin,
+        data={
+            **shared,
+            "idempotency_key": "restriction-accepted",
+            "special_category_restriction_acknowledged": "yes",
+        },
+        follow_redirects=False,
+    )
+    assert accepted.headers["location"] == "/onboarding"
+    receipt = api_harness.container.database.query_one(
+        "SELECT purpose, text_version, revoked_at FROM consent_receipts"
+        " WHERE household_id = ?",
+        (world.household.id,),
+    )
+    assert dict(receipt) == {
+        "purpose": "special_category_content_restriction",
+        "text_version": "special-category-content-restriction-v1",
+        "revoked_at": None,
+    }
 
 
 @pytest.mark.parametrize(

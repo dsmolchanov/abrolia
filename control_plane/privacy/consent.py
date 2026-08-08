@@ -5,6 +5,14 @@ from __future__ import annotations
 import hashlib
 
 CONSENT_TEXTS = {
+    "special_category_content_restriction": (
+        "special-category-content-restriction-v1",
+        "Do not send or forward medical certificates, health or allergy data, "
+        "religious beliefs, or other special-category personal data about any "
+        "person to the agent inbox or channel. If such content is sent by "
+        "mistake, stop using it and request deletion at help@abrolia.com. This "
+        "acknowledgement does not transfer Abrolia's legal obligations.",
+    ),
     "whatsapp_channel_privacy": (
         "whatsapp-channel-privacy-v1",
         "Shared or dedicated WhatsApp participants may expose channel metadata "

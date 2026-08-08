@@ -114,15 +114,32 @@ def _selection(
 ) -> dict[str, Any]:
     option = form.get("kind", "")
     if kind is StepKind.EMAIL:
+        if form.get("special_category_restriction_acknowledged") != "yes":
+            raise ValueError("special-category content restriction acknowledgement required")
+        restriction_receipt_id = _receipt_id(
+            context, household_id, "special_category_content_restriction"
+        )
         if option == "abrolia_managed":
-            return {"kind": option, "local_part": form.get("local_part", "family.assistant")}
+            return {
+                "kind": option,
+                "local_part": form.get("local_part", "family.assistant"),
+                "special_category_restriction_acknowledged": True,
+                "special_category_restriction_receipt_id": restriction_receipt_id,
+            }
         if option == "gmail_agent":
-            return {"kind": option, "separate_agent_account_acknowledged": True}
+            return {
+                "kind": option,
+                "separate_agent_account_acknowledged": True,
+                "special_category_restriction_acknowledged": True,
+                "special_category_restriction_receipt_id": restriction_receipt_id,
+            }
         return {
             "kind": option,
             "domain": form.get("domain", "family.example.test"),
             "local_part": form.get("local_part", "assistant"),
             "mx_change_acknowledged": form.get("mx_change_acknowledged") == "yes",
+            "special_category_restriction_acknowledged": True,
+            "special_category_restriction_receipt_id": restriction_receipt_id,
         }
     if kind is StepKind.WHATSAPP:
         if form.get("privacy_notice_accepted") != "yes":

@@ -218,6 +218,10 @@ if (page === "onboarding") {
       local_part: form.elements.local_part.value,
       mx_change_acknowledged: form.elements.mx_change_acknowledged.checked,
     };
+    if (["abrolia_managed", "gmail_agent", "family_domain"].includes(option)) {
+      selection.special_category_restriction_acknowledged = true;
+      selection.special_category_restriction_receipt_id = crypto.randomUUID();
+    }
     if (option === "shared_abrolia") selection = {kind: option, member_phone_test_ref: "synthetic-phone:owner", privacy_notice_receipt_id: crypto.randomUUID()};
     if (option === "dedicated_number") selection = {kind: option, phone_test_ref: "synthetic-phone:owner", privacy_notice_receipt_id: crypto.randomUUID(), linked_device_risk_receipt_id: crypto.randomUUID()};
     if (["telegram", "whatsapp", "web"].includes(option)) selection = {kind: option, actor_id: "synthetic-owner", chat_id: "synthetic-chat"};
