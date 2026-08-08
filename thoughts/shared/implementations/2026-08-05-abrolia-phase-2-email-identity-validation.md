@@ -440,3 +440,25 @@ are part of the remediation rather than relying on the previous suite alone.
 The operator-owned live-DNS gate passed on `test.axiomatlas.llc`. Broader
 real-family-data, Gmail, WhatsApp and primary-channel gates remain independently
 closed; Phase 2.4 acceptance does not activate them.
+
+## Phase C3 Addendum — 2026-08-08 (Gmail History/Send/OAuth, B-06)
+
+**Branch:** `codex/phase-C3-gmail` from `codex/phase-C2-byo-live` (`19a7b2d`). Synthetic-only unless `abrolia-synthetic` live org + Phase A DPA + Google verification/CASA.
+
+**Hermetic coverage (no live Gmail):**
+- `pytest tests/test_gmail_api_send.py -q` — **4 passed** (base64url RAW, `rfc822msgid:` single-match success, timeout→`outcome_unknown` no blind resend)
+- `pytest tests/test_gmail*.py -q` — **34 passed** (History cursor, bounded resync, INBOX filter, OAuth PKCE/state, `gmail_real_enabled` gate)
+- `hermes_cloud/ingest/gmail_api.py:143-165` — History cursor from `profile.historyId`, `history.list` with `INBOX` filter, cursor advance only after durable WAL `fsync-before-ACK`, `404 historyId not found` → bounded `messages.list` resync with overlap+dedup, `needs_attention` on unrecoverable gap
+- `hermes_cloud/execute/gmail_api_send.py:46` — deterministic `Message-ID: <abrolia-<effect_id>@abrolia.com>`, timeout→ one `rfc822msgid:` SENT search (1→success, 0→failed, >1/ambiguous→`outcome_unknown`)
+- `control_plane/providers/email/google_oauth.py:222` — `gmail_real_enabled` gated on `real_email_enabled + google_configured + app_verified + gmail_scope_approved + casa_current + limited_use_disclosed`; refresh token direct to `SecretSink` memory-only, never in DB/job/logs.
+
+**Live battery on `abrolia-synthetic` + allowlisted dedicated Gmail (operator, gated by Phase A + B + verification/CASA):**
+Pending-operator until verification/CASA + dedicated account `abrolia-synthetic@gmail.test` provisioned. Cases to record with `gmail_message_id`, `historyId`, `Message-ID`:
+
+| # | Case | Expected | Status |
+|---|------|----------|--------|
+| 1 | OAuth connect (PKCE/state/select_account, exact scopes `openid email gmail.readonly gmail.send`) | `state` one-time, PKCE verified, scopes exact, address confirmed, `agent inbox != recovery` | pending |
+| 2 | History receive (INBOX message → durable append → cursor advance) | `needs_attention` only on gap, no silent skip | pending |
+| 3 | Approve/send → revoke/delete | `Message-ID` deterministic, SENT reconciled, revoke calls `oauth2.googleapis.com/revoke`, tombstone | pending |
+
+Until live Gmail is verified, synthetic fake path (`.test`, `HERMES_LEGACY_IMAP_TEST_ONLY=1`) is sufficient to merge C3 as synthetic-only.
