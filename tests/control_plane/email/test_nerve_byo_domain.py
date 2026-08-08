@@ -618,3 +618,66 @@ def test_lost_manual_inspect_reconciles_with_original_stable_reference(
     assert inspect_job.intent_key != inspect_request["stable_ref"]
     recovered = worker.reconcile(unknown.job_id)
     assert recovered.status == expected_status
+
+
+def test_byo_provisioner_never_calls_service_tokens() -> None:
+    """B-01 regression for BYO: real NerveAdminClient via MockTransport, no service-tokens."""
+    import httpx
+
+    from control_plane.email.models import EmailOption, EmailProvisionIntent
+    from control_plane.providers.email.nerve_byo_domain import NerveByoDomainProvisioner
+    from control_plane.providers.email.nerve_client import NerveAdminClient, NerveAdminSettings
+
+    captured: list[tuple[str, str, dict[str, str]]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        method = request.method
+        path = request.url.path
+        headers = {k.lower(): v for k, v in request.headers.items()}
+        captured.append((method, path, headers))
+        assert headers.get("x-api-key") == "synthetic-bootstrap-admin-key"
+        assert "service-tokens" not in path
+        if path == "/v1/orgs" and method == "POST":
+            return httpx.Response(200, json={"org_id": ORG_ID})
+        if path == "/v1/domains" and method == "POST":
+            return httpx.Response(
+                200,
+                json={"domain": {"id": DOMAIN_ID, "domain": "family.example.test", "external_ref": "ref", "status": "active"}},
+            )
+        if path == "/v1/domains/dns" and method == "GET":
+            return httpx.Response(200, json={"domain_id": DOMAIN_ID, "dns_records": []})
+        if path == "/v1/domains/verify" and method == "POST":
+            return httpx.Response(200, json={"domain": {"id": DOMAIN_ID, "status": "active"}, "checks": {"ownership": True, "mx": True, "spf": True, "dkim": True}})
+        if path == "/v1/inboxes" and method == "POST":
+            return httpx.Response(200, json={"inbox": {"id": INBOX_ID, "address": "assistant@family.example.test", "external_ref": "ref"}})
+        if path == "/v1/keys" and method == "POST":
+            return httpx.Response(200, json={"id": KEY_ID, "key": "synthetic-byo-key", "secret_available": True})
+        if path == "/v1/webhooks" and method == "POST":
+            return httpx.Response(200, json={"id": WEBHOOK_ID, "secret": "synthetic-byo-signing-key", "secret_available": True})
+        return httpx.Response(404, json={})
+
+    transport = httpx.MockTransport(handler)
+    client = httpx.Client(transport=transport)
+    settings = NerveAdminSettings(
+        base_url="https://nerve.example.test",
+        admin_key="synthetic-bootstrap-admin-key",
+        platform_org_id="20000000-0000-4000-8000-000000000001",
+        platform_domain_id="30000000-0000-4000-8000-000000000001",
+    )
+    nerve_client = NerveAdminClient(settings, client=client)
+    intent = EmailProvisionIntent(
+        identity_id="byo-identity-1",
+        household_id="household-1",
+        option=EmailOption.OWN_DOMAIN,
+        selection={"kind": "family_domain", "domain": "family.example.test", "local_part": "assistant"},
+        secret_namespace_ref="ns",
+    ).model_dump(mode="json")
+    result = NerveByoDomainProvisioner(nerve_client).ensure(intent, "household-1:email_identity:byo-identity-1:own_domain:1")
+    assert result is not None
+    bootstrap = [(m, p) for m, p, _ in captured if p.startswith("/v1/")]
+    assert ("POST", "/v1/orgs") in bootstrap
+    assert ("POST", "/v1/domains") in bootstrap
+    assert ("POST", "/v1/inboxes") in bootstrap
+    assert ("POST", "/v1/keys") in bootstrap
+    assert ("POST", "/v1/webhooks") in bootstrap
+    assert not any("service-tokens" in p for _, p, _ in captured)
