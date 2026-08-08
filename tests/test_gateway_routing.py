@@ -49,7 +49,8 @@ def test_unknown_and_ambiguous_senders_denied(tmp_path: Path) -> None:
     assert router.route(phone).household_id == hid
 
 
-def test_per_household_relay_hmac_and_durable_before_ack(tmp_path: Path) -> None:
+def test_per_household_relay_hmac_and_durable_before_ack(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("ABROLIA_WHATSAPP_SHARED_ENABLED", "1")
     db = open_control_plane_database(tmp_path / "cp.db")
     hid = "00000000-0000-4000-a000-000000000011"
     phone = "+999511234567"

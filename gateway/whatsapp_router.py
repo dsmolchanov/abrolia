@@ -142,6 +142,11 @@ class WhatsAppGatewayRouter:
         timestamp: str,
         signature: str,
     ) -> GatewayResult:
+        # Phase F fail-closed kill switch — read at call time, not startup
+        import os as _os
+
+        if _os.environ.get("ABROLIA_WHATSAPP_SHARED_ENABLED", "0") != "1":
+            return GatewayResult(status="denied", code="flag_disabled", household_id=None)
         # Durable before ACK — persist first, ACK only after persist succeeds
         if not timestamp or not signature:
             return GatewayResult(status="denied", code="hmac_rejected", household_id=None)
