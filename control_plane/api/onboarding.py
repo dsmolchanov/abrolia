@@ -16,6 +16,7 @@ from control_plane.api.dependencies import (
     current_household_mutation,
     request_id,
 )
+from control_plane.email.repository import EmailDomainAlreadyClaimed
 from control_plane.models import ProfileInput, StepKind
 from control_plane.onboarding.contracts import CommandContext, CommandResult
 
@@ -79,6 +80,11 @@ def select_step(
             selection,
             context=_context(request, current, headers),
         )
+    except EmailDomainAlreadyClaimed as error:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "domain_already_claimed",
+        ) from error
     except ValidationError as error:
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
