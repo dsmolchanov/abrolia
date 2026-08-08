@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 
 import pytest
 
 from control_plane.email.models import EmailIdentityStatus, EmailOption
+from control_plane.email.repository import EmailDomainAlreadyClaimed
 from control_plane.models import StepKind
 from control_plane.providers.email.nerve_byo_domain import NerveByoDomainProvisioner
-from control_plane.providers.email.nerve_managed import NERVE_SECRET_BINDING
+from control_plane.providers.email.nerve_managed import (
+    NERVE_SECRET_BINDING,
+    NerveManagedEmailProvisioner,
+)
 from control_plane.provisioning.contracts import (
     OutcomeUnknown,
     ProviderRegistry,
@@ -122,6 +125,57 @@ class LostDomainResponseNerveAdmin(FakeByoNerveAdmin):
         )
 
 
+class LostCommittedStepResponseNerveAdmin(FakeByoNerveAdmin):
+    def __init__(self, lost_step: str) -> None:
+        super().__init__()
+        self.lost_step = lost_step
+        self.step_calls: dict[str, int] = {}
+
+    def _commit_then_maybe_lose(self, step: str, result):
+        self.step_calls[step] = self.step_calls.get(step, 0) + 1
+        if step == self.lost_step and self.step_calls[step] == 1:
+            raise OutcomeUnknown(f"synthetic lost {step} response")
+        return result
+
+    def ensure_org(self, *, household_id, identity_id):
+        return self._commit_then_maybe_lose(
+            "org",
+            super().ensure_org(household_id=household_id, identity_id=identity_id),
+        )
+
+    def ensure_domain(self, *, org_id, domain, external_ref):
+        return self._commit_then_maybe_lose(
+            "domain",
+            super().ensure_domain(
+                org_id=org_id, domain=domain, external_ref=external_ref
+            ),
+        )
+
+    def ensure_inbox(self, *, org_id, address, external_ref, domain_id=None):
+        return self._commit_then_maybe_lose(
+            "inbox",
+            super().ensure_inbox(
+                org_id=org_id,
+                address=address,
+                external_ref=external_ref,
+                domain_id=domain_id,
+            ),
+        )
+
+    def issue_key(self, *, org_id, external_ref):
+        return self._commit_then_maybe_lose(
+            "key", super().issue_key(org_id=org_id, external_ref=external_ref)
+        )
+
+    def ensure_webhook(self, *, org_id, url, external_ref):
+        return self._commit_then_maybe_lose(
+            "webhook",
+            super().ensure_webhook(
+                org_id=org_id, url=url, external_ref=external_ref
+            ),
+        )
+
+
 class WrongMailboxNerveAdmin(FakeByoNerveAdmin):
     def ensure_inbox(self, *, org_id, address, external_ref, domain_id=None):
         envelope = super().ensure_inbox(
@@ -144,6 +198,45 @@ class LostVerifyResponseNerveAdmin(FakeByoNerveAdmin):
             self.lose_next_verify = False
             raise OutcomeUnknown("synthetic lost verification response")
         return super().verify_domain(org_id=org_id, domain_id=domain_id)
+
+
+class HardDeleteGrantNerveAdmin(FakeByoNerveAdmin):
+    def __init__(self) -> None:
+        super().__init__()
+        self.grant_generation = 0
+        self.current_grant_id = ""
+
+    def ensure_grant(self, *, org_id, external_ref):
+        del org_id, external_ref
+        if not self.current_grant_id:
+            self.grant_generation += 1
+            self.current_grant_id = f"synthetic-grant-{self.grant_generation}"
+        return {"id": self.current_grant_id}
+
+    def issue_key(self, *, org_id, external_ref):
+        result = super().issue_key(org_id=org_id, external_ref=external_ref)
+        result["secret_available"] = True
+        return result
+
+    def ensure_webhook(self, *, org_id, url, external_ref):
+        result = super().ensure_webhook(
+            org_id=org_id, url=url, external_ref=external_ref
+        )
+        result["secret_available"] = True
+        return result
+
+    def attachment_feature_enabled(self, *, api_key, expected_org_id):
+        del api_key, expected_org_id
+        return True
+
+    def list_keys(self, *, org_id):
+        del org_id
+        return []
+
+    def delete(self, path, *, org_id=None):
+        super().delete(path, org_id=org_id)
+        if path == f"/v1/domain-grants/{self.current_grant_id}":
+            self.current_grant_id = ""
 
 
 def _select(cp_stack) -> None:
@@ -219,6 +312,41 @@ def test_dns_records_resume_until_all_checks_are_active(cp_stack) -> None:
     assert sink.get(runtime_ref, NERVE_SECRET_BINDING) is not None
 
 
+def test_byo_reload_and_fresh_session_resume_same_dns_state(cp_stack) -> None:
+    cp_stack.complete_profile()
+    _select(cp_stack)
+    client = FakeByoNerveAdmin()
+    registry = ProviderRegistry()
+    registry.register("nerve-byo-domain", NerveByoDomainProvisioner(client))
+    worker = cp_stack.make_worker(providers=registry)
+    assert worker.run_once().status == "waiting_user"
+    before = cp_stack.onboarding.snapshot(cp_stack.household.id)
+    before_email = next(step for step in before.steps if step.kind is StepKind.EMAIL)
+    fresh_session = cp_stack.sessions.issue(cp_stack.account.id, now=BASE_TIME + 101)
+
+    cp_stack.service.check(
+        cp_stack.household.id,
+        StepKind.EMAIL,
+        context=cp_stack.context(
+            key="fresh-session-domain-check",
+            session_id=fresh_session.id,
+            expected_version=before.version,
+        ),
+    )
+    assert worker.run_once().status == "waiting_user"
+    after = cp_stack.onboarding.snapshot(cp_stack.household.id)
+    after_email = next(step for step in after.steps if step.kind is StepKind.EMAIL)
+
+    assert after_email.public_status["dns_records"] == before_email.public_status[
+        "dns_records"
+    ]
+    assert cp_stack.database.query_one(
+        "SELECT count(*) AS count FROM email_address_reservations"
+        " WHERE household_id = ?",
+        (cp_stack.household.id,),
+    )["count"] == 1
+
+
 def test_dns_status_polls_automatically_with_bounded_backoff(cp_stack) -> None:
     cp_stack.complete_profile()
     _select(cp_stack)
@@ -275,7 +403,13 @@ def test_dns_automatic_polling_stops_after_bounded_attempts(cp_stack) -> None:
 
     first = cp_stack.make_worker(providers=registry, now=BASE_TIME + 100).run_once()
     assert first.status == "waiting_user"
-    for due_at in (BASE_TIME + 130, BASE_TIME + 190, BASE_TIME + 310, BASE_TIME + 550):
+    for due_at in (
+        BASE_TIME + 130,
+        BASE_TIME + 190,
+        BASE_TIME + 310,
+        BASE_TIME + 610,
+        BASE_TIME + 1210,
+    ):
         result = cp_stack.make_worker(providers=registry, now=due_at).run_once()
         assert result.status == "waiting_user"
 
@@ -284,7 +418,7 @@ def test_dns_automatic_polling_stops_after_bounded_attempts(cp_stack) -> None:
         " WHERE id = ?",
         (first.job_id,),
     )
-    assert tuple(stopped) == ("inspect", "waiting_user", 5, None)
+    assert tuple(stopped) == ("inspect", "waiting_user", 6, None)
     assert cp_stack.make_worker(
         providers=registry, now=BASE_TIME + 10_000
     ).run_once() is None
@@ -463,7 +597,9 @@ def test_same_normalized_domain_cannot_be_claimed_by_another_household(cp_stack)
     other_account = cp_stack.accounts.create_verified("other-domain-owner@family.test")
     other_household = cp_stack.households.create_for_owner(other_account.id)
 
-    with cp_stack.database.write() as connection, pytest.raises(sqlite3.IntegrityError):
+    with cp_stack.database.write() as connection, pytest.raises(
+        EmailDomainAlreadyClaimed
+    ):
         cp_stack.email_identities.create_selected(
             connection,
             household_id=other_household.id,
@@ -486,7 +622,9 @@ def test_legacy_domain_claim_without_new_hmac_still_blocks_another_household(
     other_account = cp_stack.accounts.create_verified("legacy-domain-owner@family.test")
     other_household = cp_stack.households.create_for_owner(other_account.id)
 
-    with cp_stack.database.write() as connection, pytest.raises(sqlite3.IntegrityError):
+    with cp_stack.database.write() as connection, pytest.raises(
+        EmailDomainAlreadyClaimed
+    ):
         cp_stack.email_identities.create_selected(
             connection,
             household_id=other_household.id,
@@ -580,6 +718,62 @@ def test_lost_domain_create_response_reconciles_to_same_dns_intent(cp_stack) -> 
     assert email_step.public_status["dns_records"][0]["value"] == (
         "synthetic-domain-proof"
     )
+
+
+@pytest.mark.parametrize("lost_step", ["org", "domain", "inbox", "key", "webhook"])
+def test_byo_lost_committed_response_matrix_converges_without_duplicates(
+    cp_stack, lost_step: str
+) -> None:
+    cp_stack.complete_profile()
+    _select(cp_stack)
+    client = LostCommittedStepResponseNerveAdmin(lost_step)
+    client.active = True
+    registry = ProviderRegistry()
+    registry.register("nerve-byo-domain", NerveByoDomainProvisioner(client))
+    worker = cp_stack.make_worker(
+        providers=registry, secret_sink=InMemorySecretSink()
+    )
+
+    unknown = worker.run_once()
+    recovered = worker.reconcile(unknown.job_id)
+
+    assert unknown.status == "outcome_unknown"
+    assert recovered.status == "succeeded"
+    assert client.step_calls[lost_step] == 2
+    identity = cp_stack.email_identities.current_for_household(cp_stack.household.id)
+    assert identity.provider_resource_refs == {
+        "domain_id": DOMAIN_ID,
+        "inbox_id": INBOX_ID,
+        "key_id": KEY_ID,
+        "org_id": ORG_ID,
+        "webhook_id": WEBHOOK_ID,
+    }
+
+
+def test_byo_reconnect_contract_hard_deletes_old_domain_grant() -> None:
+    client = HardDeleteGrantNerveAdmin()
+    provider = NerveManagedEmailProvisioner(client)
+
+    def intent(identity_id: str) -> dict:
+        return {
+            "identity_id": identity_id,
+            "household_id": "synthetic-household",
+            "option": EmailOption.MANAGED_ABROLIA.value,
+            "selection": {
+                "kind": "abrolia_managed",
+                "local_part": f"agent-{identity_id}",
+            },
+            "secret_namespace_ref": "synthetic-runtime",
+        }
+
+    first = provider.ensure(intent("generation-a"), "stable-generation-a")
+    first_grant = first.public_result["provider_refs"]["grant_id"]
+    provider.deprovision(first.external_ref)
+    second = provider.ensure(intent("generation-b"), "stable-generation-b")
+    second_grant = second.public_result["provider_refs"]["grant_id"]
+
+    assert f"/v1/domain-grants/{first_grant}" in client.deleted
+    assert second_grant != first_grant
 
 
 @pytest.mark.parametrize(
