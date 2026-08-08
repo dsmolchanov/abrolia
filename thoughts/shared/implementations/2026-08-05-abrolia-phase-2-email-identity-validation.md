@@ -34,13 +34,22 @@ The remaining Phase 2.4 gate passed against production Nerve and Abrolia:
 
 ## Phase C2 Addendum — 2026-08-08 (BYO live battery, B-05)
 
-**Branch:** `codex/phase-C2-byo-live` from `codex/phase-B-foundation` (`34720f0`). Synthetic-only unless `abrolia-synthetic` live org available. Bounded backoff `30/60/120/300/600s` + manual `CHECK` is the live policy — no new code.
+**Branch:** `codex/phase-C2-byo-live` stacked on `codex/phase-B-foundation`.
+Synthetic-only unless the `abrolia-synthetic` live topology is evidenced. Bounded
+backoff `30/60/120/300/600s` + manual `CHECK` is the enforced policy.
 
 **Hermetic coverage (required, no live Nerve):**
-- `pytest tests/control_plane/email -k byo -q` — **18 passed** (`test_nerve_byo_domain.py` — reload/login resume, wrong DNS stays `waiting_user`, verified advance once, domain race via HMAC unique index, delete/reconnect, provider unavailable `outcome_unknown`, lost-response webhook/key/inbox/domain/org, tombstone)
-- No new `control_plane/providers/email/nerve_byo_domain.py` code — reuse C1 receipt (`email_secret_installs`) and `NerveByoDomainProvisioner` idempotency is sufficient for B-05 hermetic gates. Backoff `30/60/120/300/600` verified in `tests/control_plane/email/test_nerve_byo_domain.py` via fake Nerve timers.
+- `pytest tests/control_plane/email -k byo -q` — **26 passed**: fresh-session
+  reload/resume, wrong DNS remains `waiting_user`, verified advance, a real
+  two-client API race returning one `409 domain_already_claimed`, reconnect and
+  provider-unavailable quarantine, lost committed-response cases for
+  org/domain/inbox/key/webhook, and hard-delete/fresh-grant lifecycle.
+- `control_plane/provisioning/worker.py` now uses the explicit bounded sequence
+  `30/60/120/300/600`; the sixth inspection stops automatic polling while manual
+  `CHECK` remains available.
 
-**Live battery on `abrolia-synthetic` (operator, gated by Phase B org + Phase A DPA):**
+**Live battery on `abrolia-synthetic` (operator, gated by completed Phase B
+topology and operator credentials):**
 Each case to be recorded here with observed `domain_lookup_hmac`, `domain_id`, `org_id`, DNS `TXT`/`MX` values (no secrets). Until live run, status is `pending-operator`:
 
 | # | Case | Expected | Status |
@@ -54,7 +63,10 @@ Each case to be recorded here with observed `domain_lookup_hmac`, `domain_id`, `
 | 7 | Lost-response matrix (webhook/key/inbox/domain/org) | Each `outcome_unknown` explicit, no duplicate on reconcile, backoff observed | pending |
 | 8 | Nerve bootstrap hard-delete (PR #64) | Old `domain-grant` hard-deleted, fresh grant `200` | pending |
 
-Until `abrolia-synthetic` org is live and Phase A DPA permits real DNS mutation, live IDs remain `TBD` — hermetic gate is sufficient to merge C2 as synthetic-only and unblock C3. Live evidence will be appended after operator run.
+Until the authenticated live run records cases 1–8, IDs remain `TBD` and C2 must
+not merge or unblock C3. A synthetic operator-owned test domain does not enable
+real family data; Phase A remains independently required before any real-family
+email flag is enabled.
 - First identity `ca113cc4-538c-42bf-9c3b-8d7b97a25e4a` used durable inspect job
   `c219963d-bc64-4bd6-ab91-b77e886f96d9`. It stayed `waiting_user` through four
   checks, then the same job reached `succeeded` on attempt five at
