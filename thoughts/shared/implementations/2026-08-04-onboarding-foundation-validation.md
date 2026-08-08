@@ -198,10 +198,11 @@ as operator regression drills; they do not broaden Phase 1 beyond synthetic data
 
 **Fly topology change (B-11):**
 - `deploy/control-plane/fly.toml:17` — `ABROLIA_FLY_ORG = "abrolia-synthetic"` (was `personal`). App remains `abrolia-control-plane-synthetic`, `primary_region = ams`, 1× `shared-cpu-1x/512mb`, 1× `1GiB encrypted` volume, single `GET /healthz` check. `ABROLIA_INTERNAL_BOOTSTRAP_HOST = abrolia-control-plane-synthetic.flycast` unchanged (bare DNS).
-- No live `fly orgs create` executed in this hermetic run — `flyctl auth` not present in CI. Required live verification (operator):
+- This checkout cannot inspect Fly because `flyctl` has no access token. The
+  operator reports that `abrolia-synthetic` already exists, but that report is
+  not topology evidence. Required authenticated verification before merge:
 
 ```bash
-fly orgs create abrolia-synthetic
 fly orgs show abrolia-synthetic
 fly deploy --config deploy/control-plane/fly.toml --org abrolia-synthetic --ha=false
 fly status -a abrolia-control-plane-synthetic --org abrolia-synthetic
@@ -214,7 +215,7 @@ Record org slug, app name, Machine ID, volume ID, image digest in this addendum 
 
 **Hermetic 8-window chaos matrix (B-09, dry-run-runtime):**
 - `pytest tests/control_plane/test_phase1_chaos_matrix.py -q` — **3 passed**
-- `pytest tests/control_plane/test_provisioning_jobs.py -q` — **38 passed** with parametrized lease windows
+- `pytest tests/control_plane/test_provisioning_jobs.py -q` — **29 passed** with parametrized lease windows
 - Windows: `transition → lease → provider → response → Sink → result → claim → activate → cleanup` — each SIGKILL proves no duplicate household/app/volume/Machine, no duplicate `provisioning_jobs` result, no secret in DB/log/API, `secret_handoff_unknown` stays pending without Sink commit.
 - `pytest tests/test_backup.py -q` — **9 passed** (`integrity_check=ok`, `foreign_key_check=0`, pause marker `0600`, smoke without leasing, resume + new onboarding rev 1).
 
@@ -225,6 +226,11 @@ Record org slug, app name, Machine ID, volume ID, image digest in this addendum 
 
 **Backup/restore rehearsal (hermetic):** `docs/control-plane-restore.md` steps exercised via `tests/test_backup.py` (integrity, FK, pause, smoke, resume). Live rehearsal on `abrolia-synthetic` remains operator-gated (see Phase B plan B5) — hermetic evidence recorded here, live IDs to be appended after `fly` auth.
 
-**Cost tag:** `shared-cpu-1x/512mb` + `1GiB` volume in `ams` ≈ `$5-7/mo` for synthetic org (from Fly pricing; exact billing line to be recorded after `fly orgs show`).
+**Cost tag:** pending authenticated Fly billing/topology output; no estimate is
+recorded as evidence.
 
-**Gate:** B-09 hermetic green; B-11 topology change landed as config; live org creation + 1 synthetic onboarding + per-drill evidence remains operator step before Phase C live batteries (C2/C3). This addendum will be extended with live IDs after that step; Phase C branches from merged B.
+**Gate:** B-09 hermetic green; B-11 topology change is staged as config only.
+This branch must not merge or deploy until authenticated org/app/Machine/volume/image
+evidence, one synthetic onboarding, the live drill matrix, and the isolated
+restore rehearsal are recorded here. Phase C branches from the merged B commit
+only after those requirements pass.
