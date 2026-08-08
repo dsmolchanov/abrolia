@@ -289,3 +289,23 @@ Alerts (operator-visible, not auto-page in pilot):
 - `primary unavailable` — routing fallback triggered
 - `backup stale` — `backup_age_hours > 26h`
 - `budget exceeded` — per-household/day cost cap hit (see `hermes_cloud/core/usage.py`)
+
+## Phase F — Release gating & rollout order (per-provider kill switches)
+
+All provider flags are env-driven, `default 0`, fail-closed, read at call time (not only at startup). Toggling `1→0` blocks the next call; `0→1` allows it after health check.
+
+| Flag | Controls | Default |
+|------|----------|---------|
+| `ABROLIA_MANAGED_EMAIL_ENABLED` | Nerve `@abrolia.com` provisioning | `0` |
+| `ABROLIA_BYO_EMAIL_ENABLED` | Nerve BYO domain provisioning | `0` |
+| `ABROLIA_GMAIL_ENABLED` | Gmail agent via OAuth (implies `ABROLIA_REAL_EMAIL_ENABLED` + CASA) | `0` |
+| `ABROLIA_WHATSAPP_SHARED_ENABLED` | Shared WA gateway relay | `0` |
+| `ABROLIA_WHATSAPP_DEDICATED_ENABLED` | Dedicated Evolution WA | `0` |
+| `ABROLIA_WEB_PUSH_ENABLED` | Web Push (P11) | `0` |
+
+Rollout order, each transition gated:
+1. **Synthetic** (`abrolia-synthetic`, `owner@abrolia.test`, fake adapters) — requires `pytest -p no:cacheprovider -m "not live" -q` + `ruff check .` + `gitleaks` + no `TODO` in notices (Phase A docs).
+2. **Operator accounts** (owner's real mailbox on allowlist, `ABROLIA_REAL_EMAIL_HOUSEHOLD_ALLOWLIST` populated, `ABROLIA_REAL_EMAIL_ENABLED=1` in separate PR referencing Phase A+C evidence) — requires Phase A + C1 receipt + one manual live gate per provider (BYO DNS or Gmail History).
+3. **Invited pilot families** per provider (managed `@abrolia.com` first, then BYO, then Gmail — each `ABROLIA_*_ENABLED` flipped independently after operator-account soak and `go test ./...` + `pytest -p no:cacheprovider -m "not live" -q` green).
+
+Each flag flip PR must reference Phase A legal + `go test` + `pytest -p no:cacheprovider -m "not live" -q` + one manual live gate on `abrolia-synthetic`. `ABROLIA_GMAIL_ENABLED` additionally requires `ABROLIA_REAL_EMAIL_ENABLED=1` and CASA/Limited Use evidence.
