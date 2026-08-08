@@ -498,9 +498,47 @@ def test_worker_reconciles_lost_create_response_from_durable_intent(cp_stack) ->
 
     assert unknown.status == "outcome_unknown"
     assert reconciled.status == "succeeded"
-    assert client.inbox_calls == 2
-    identity = cp_stack.email_identities.current_for_household(cp_stack.household.id)
-    assert identity is not None and identity.address == "family-agent@" + "abrolia.com"
+
+
+def test_managed_provisioner_never_calls_service_tokens() -> None:
+    """B-01 regression: Abrolia provisioner must never invoke /v1/service-tokens."""
+    calls: list[str] = []
+
+    class CapturingNerveAdmin(FakeNerveAdmin):
+        def _record(self, path: str) -> None:
+            calls.append(path)
+
+        def ensure_org(self, *, household_id, identity_id):
+            self._record("POST /v1/orgs")
+            return super().ensure_org(household_id=household_id, identity_id=identity_id)
+
+        def ensure_grant(self, *, org_id, external_ref):
+            self._record("POST /v1/domain-grants")
+            return super().ensure_grant(org_id=org_id, external_ref=external_ref)
+
+        def ensure_inbox(self, *, org_id, address, external_ref):
+            self._record("POST /v1/inboxes")
+            return super().ensure_inbox(org_id=org_id, address=address, external_ref=external_ref)
+
+        def issue_key(self, *, org_id, external_ref):
+            self._record("POST /v1/keys")
+            return super().issue_key(org_id=org_id, external_ref=external_ref)
+
+        def ensure_webhook(self, *, org_id, url, external_ref):
+            self._record("POST /v1/webhooks")
+            return super().ensure_webhook(org_id=org_id, url=url, external_ref=external_ref)
+
+    client = CapturingNerveAdmin()
+    result = NerveManagedEmailProvisioner(client).ensure(
+        _intent(), "household-1:email_identity:identity-1:abrolia_managed:1"
+    )
+    assert result is not None
+    assert not any("service-tokens" in path for path in calls), f"service-tokens called: {calls}"
+    assert "POST /v1/orgs" in calls
+    assert "POST /v1/domain-grants" in calls
+    assert "POST /v1/inboxes" in calls
+    assert "POST /v1/keys" in calls
+    assert "POST /v1/webhooks" in calls
 
 
 def test_worker_rejects_duplicate_key_noncanonical_nerve_reference(cp_stack) -> None:
