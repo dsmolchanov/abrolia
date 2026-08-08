@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import html as html_module
+
 import pytest
+
+from control_plane.privacy.consent import consent_version_and_text
 
 
 def test_verify_page_moves_fragment_to_post_and_clears_browser_history(api_harness) -> None:
@@ -29,7 +33,10 @@ def test_onboarding_page_has_canonical_options_and_privacy_copy(api_harness) -> 
     assert "QR linking requires explicit linked-device" in html
     assert "fallback contact only — never the agent inbox" in html
     assert html.count('name="special_category_restriction_acknowledged"') == 3
-    assert "I will not send medical, health, allergy, religious" in html
+    version, text = consent_version_and_text("special_category_content_restriction")
+    assert version in html
+    assert text in html_module.unescape(html)
+    assert html.count('aria-describedby="special-category-content-restriction"') == 3
     assert "u***@family.test" in html
     assert world.account.recovery_email not in html
 

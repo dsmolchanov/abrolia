@@ -44,7 +44,12 @@ def test_local_part_api_returns_only_suggestion_or_availability(api_harness) -> 
     selected = api_harness.client.post(
         "/api/v1/onboarding/steps/email_identity/select",
         headers=_headers(api_harness, version=1, key="email-policy-select"),
-        json={"kind": "abrolia_managed", "local_part": "eva_novak"},
+        json={
+            "kind": "abrolia_managed",
+            "local_part": "eva_novak",
+            "special_category_restriction_acknowledged": True,
+            "special_category_restriction_receipt_id": "email-policy-restriction",
+        },
     )
     assert selected.status_code == 200
     reserved = api_harness.client.get(

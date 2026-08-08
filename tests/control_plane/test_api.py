@@ -163,10 +163,28 @@ def test_synthetic_selection_boundaries_fail_closed_at_api(api_harness) -> None:
     )
     assert profile.status_code == 200
 
+    missing_restriction = api_harness.client.post(
+        "/api/v1/onboarding/steps/email_identity/select",
+        headers=_command_headers(api_harness, version=1, key="restriction-required"),
+        json={"kind": "abrolia_managed", "local_part": "family-agent"},
+    )
+    assert missing_restriction.status_code == 422
+    assert missing_restriction.json() == {
+        "detail": "special-category content restriction acknowledgement required"
+    }
+    assert api_harness.container.onboarding_repository.snapshot(
+        world.household.id
+    ).version == 1
+
     real_domain = api_harness.client.post(
         "/api/v1/onboarding/steps/email_identity/select",
         headers=_command_headers(api_harness, version=1, key="real-domain-rejected"),
-        json={"kind": "family_domain", "domain": "family.example.com"},
+        json={
+            "kind": "family_domain",
+            "domain": "family.example.com",
+            "special_category_restriction_acknowledged": True,
+            "special_category_restriction_receipt_id": "real-domain-restriction",
+        },
     )
     assert real_domain.status_code == 422
     assert real_domain.json() == {"detail": "invalid synthetic selection"}
@@ -181,7 +199,12 @@ def test_synthetic_selection_boundaries_fail_closed_at_api(api_harness) -> None:
     managed = api_harness.client.post(
         "/api/v1/onboarding/steps/email_identity/select",
         headers=_command_headers(api_harness, version=1, key="managed-email-fake"),
-        json={"kind": "abrolia_managed", "local_part": "family-agent"},
+        json={
+            "kind": "abrolia_managed",
+            "local_part": "family-agent",
+            "special_category_restriction_acknowledged": True,
+            "special_category_restriction_receipt_id": "managed-email-restriction",
+        },
     )
     assert managed.status_code == 200
     assert api_harness.container.database.query_one(

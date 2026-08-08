@@ -29,3 +29,8 @@ CONSENT_TEXTS = {
 def consent_version_and_sha(purpose: str) -> tuple[str, str]:
     version, text = CONSENT_TEXTS[purpose]
     return version, hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def consent_version_and_text(purpose: str) -> tuple[str, str]:
+    """Return the exact versioned copy presented before a receipt is accepted."""
+    return CONSENT_TEXTS[purpose]

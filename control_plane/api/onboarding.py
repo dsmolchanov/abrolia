@@ -22,6 +22,22 @@ from control_plane.onboarding.contracts import CommandContext, CommandResult
 router = APIRouter()
 
 
+def _require_email_content_restriction(
+    kind: StepKind, selection: dict[str, Any]
+) -> None:
+    """Fail closed at the user-facing boundary in every rollout mode."""
+    if kind is not StepKind.EMAIL:
+        return
+    if (
+        selection.get("special_category_restriction_acknowledged") is not True
+        or not selection.get("special_category_restriction_receipt_id")
+    ):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "special-category content restriction acknowledgement required",
+        )
+
+
 def _response(result: CommandResult) -> JSONResponse:
     response = JSONResponse(result.snapshot.model_dump(mode="json"))
     response.headers["ETag"] = f'"{result.snapshot.version}"'
@@ -72,6 +88,7 @@ def select_step(
     current: Annotated[CurrentHousehold, Depends(current_household_mutation)],
     headers: Annotated[CommandHeaders, Depends(command_headers)],
 ) -> JSONResponse:
+    _require_email_content_restriction(kind, selection)
     try:
         result = container(request).onboarding.select(
             current.household.id,
