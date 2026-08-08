@@ -501,44 +501,74 @@ def test_worker_reconciles_lost_create_response_from_durable_intent(cp_stack) ->
 
 
 def test_managed_provisioner_never_calls_service_tokens() -> None:
-    """B-01 regression: Abrolia provisioner must never invoke /v1/service-tokens."""
-    calls: list[str] = []
+    """B-01 regression: exercise real NerveAdminClient with MockTransport, capture HTTP."""
+    import httpx
 
-    class CapturingNerveAdmin(FakeNerveAdmin):
-        def _record(self, path: str) -> None:
-            calls.append(path)
+    from control_plane.providers.email.nerve_client import NerveAdminClient, NerveAdminSettings
 
-        def ensure_org(self, *, household_id, identity_id):
-            self._record("POST /v1/orgs")
-            return super().ensure_org(household_id=household_id, identity_id=identity_id)
+    captured: list[tuple[str, str, dict[str, str]]] = []
+    org_counter = {"calls": 0}
 
-        def ensure_grant(self, *, org_id, external_ref):
-            self._record("POST /v1/domain-grants")
-            return super().ensure_grant(org_id=org_id, external_ref=external_ref)
+    def handler(request: httpx.Request) -> httpx.Response:
+        method = request.method
+        path = request.url.path
+        headers = {k.lower(): v for k, v in request.headers.items()}
+        captured.append((method, path, headers))
+        assert "service-tokens" not in path, f"service-tokens invoked: {method} {path}"
+        if path == "/internal/feature-flags/attachments" and method == "GET":
+            # Runtime probe uses X-Nerve-Cloud-Key, not X-API-Key, and is separate from bootstrap
+            assert "x-nerve-cloud-key" in headers
+            return httpx.Response(
+                200,
+                json={"flag": "attachments", "org_id": ORG_ID, "enabled": True, "cache_ttl_seconds": 60},
+            )
+        # Bootstrap admin must be used for all 5 calls, never tenant-delegated service-token flow
+        assert headers.get("x-api-key") == "synthetic-bootstrap-admin-key", f"wrong credential for {method} {path}"
+        if path == "/v1/orgs" and method == "POST":
+            org_counter["calls"] += 1
+            return httpx.Response(200, json={"org_id": ORG_ID})
+        if path == "/v1/domain-grants" and method == "POST":
+            return httpx.Response(200, json={"id": GRANT_ID, "external_ref": "arbolia:email:identity-1:grant"})
+        if path == "/v1/inboxes" and method == "POST":
+            return httpx.Response(
+                200,
+                json={"inbox": {"id": INBOX_ID, "address": "family-agent@" + "abrolia.com", "external_ref": "arbolia:email:identity-1:inbox"}},
+            )
+        if path == "/v1/keys" and method == "POST":
+            return httpx.Response(
+                200, json={"id": KEY_ID, "key": "synthetic-nerve-key", "secret_available": True, "external_ref": "arbolia:email:identity-1:key"}
+            )
+        if path == "/v1/webhooks" and method == "POST":
+            return httpx.Response(
+                200, json={"id": WEBHOOK_ID, "secret": "synthetic-signing-key", "secret_available": True, "external_ref": "arbolia:email:identity-1:webhook"}
+            )
+        return httpx.Response(404, json={})
 
-        def ensure_inbox(self, *, org_id, address, external_ref):
-            self._record("POST /v1/inboxes")
-            return super().ensure_inbox(org_id=org_id, address=address, external_ref=external_ref)
-
-        def issue_key(self, *, org_id, external_ref):
-            self._record("POST /v1/keys")
-            return super().issue_key(org_id=org_id, external_ref=external_ref)
-
-        def ensure_webhook(self, *, org_id, url, external_ref):
-            self._record("POST /v1/webhooks")
-            return super().ensure_webhook(org_id=org_id, url=url, external_ref=external_ref)
-
-    client = CapturingNerveAdmin()
-    result = NerveManagedEmailProvisioner(client).ensure(
+    transport = httpx.MockTransport(handler)
+    client = httpx.Client(transport=transport)
+    settings = NerveAdminSettings(
+        base_url="https://nerve.example.test",
+        admin_key="synthetic-bootstrap-admin-key",
+        platform_org_id="20000000-0000-4000-8000-000000000001",
+        platform_domain_id="30000000-0000-4000-8000-000000000001",
+    )
+    nerve_client = NerveAdminClient(settings, client=client)
+    result = NerveManagedEmailProvisioner(nerve_client).ensure(
         _intent(), "household-1:email_identity:identity-1:abrolia_managed:1"
     )
     assert result is not None
-    assert not any("service-tokens" in path for path in calls), f"service-tokens called: {calls}"
-    assert "POST /v1/orgs" in calls
-    assert "POST /v1/domain-grants" in calls
-    assert "POST /v1/inboxes" in calls
-    assert "POST /v1/keys" in calls
-    assert "POST /v1/webhooks" in calls
+    # Exact 5 bootstrap POSTs in order, no service-tokens, no duplicates
+    bootstrap = [(m, p) for m, p, _ in captured if p.startswith("/v1/")]
+    assert bootstrap == [
+        ("POST", "/v1/orgs"),
+        ("POST", "/v1/domain-grants"),
+        ("POST", "/v1/inboxes"),
+        ("POST", "/v1/keys"),
+        ("POST", "/v1/webhooks"),
+    ], f"unexpected bootstrap sequence: {bootstrap}"
+    assert not any("service-tokens" in p for _, p, _ in captured)
+    # Probe is separate and uses runtime key, not bootstrap admin duplication
+    assert any(p == "/internal/feature-flags/attachments" for _, p, _ in captured)
 
 
 def test_worker_rejects_duplicate_key_noncanonical_nerve_reference(cp_stack) -> None:
