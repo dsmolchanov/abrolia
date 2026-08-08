@@ -31,6 +31,30 @@ The remaining Phase 2.4 gate passed against production Nerve and Abrolia:
 - Namecheap BasicDNS published the exact six provider records below
   `test.axiomatlas.llc`: inbound MX and SPF, `send` MX and SPF, DKIM, and DMARC.
   Google Public DNS returned all six authoritative values after propagation.
+
+## Phase C2 Addendum — 2026-08-08 (BYO live battery, B-05)
+
+**Branch:** `codex/phase-C2-byo-live` from `codex/phase-B-foundation` (`34720f0`). Synthetic-only unless `abrolia-synthetic` live org available. Bounded backoff `30/60/120/300/600s` + manual `CHECK` is the live policy — no new code.
+
+**Hermetic coverage (required, no live Nerve):**
+- `pytest tests/control_plane/email -k byo -q` — **18 passed** (`test_nerve_byo_domain.py` — reload/login resume, wrong DNS stays `waiting_user`, verified advance once, domain race via HMAC unique index, delete/reconnect, provider unavailable `outcome_unknown`, lost-response webhook/key/inbox/domain/org, tombstone)
+- No new `control_plane/providers/email/nerve_byo_domain.py` code — reuse C1 receipt (`email_secret_installs`) and `NerveByoDomainProvisioner` idempotency is sufficient for B-05 hermetic gates. Backoff `30/60/120/300/600` verified in `tests/control_plane/email/test_nerve_byo_domain.py` via fake Nerve timers.
+
+**Live battery on `abrolia-synthetic` (operator, gated by Phase B org + Phase A DPA):**
+Each case to be recorded here with observed `domain_lookup_hmac`, `domain_id`, `org_id`, DNS `TXT`/`MX` values (no secrets). Until live run, status is `pending-operator`:
+
+| # | Case | Expected | Status |
+|---|------|----------|--------|
+| 1 | Reload/login resumes same DNS records/state | Same `domain_lookup_hmac`, same DNS records, `waiting_user`, no duplicate `email_address_reservations` | pending — requires live `abrolia-synthetic` + test domain |
+| 2 | Wrong/partial DNS stays `waiting_user` | `waiting_user` + `needs_attention` missing records | pending |
+| 3 | Verified DNS advances once | `waiting_user → verified` once, second `CHECK` idempotent | pending |
+| 4 | Two-connection race, same canonical domain | One `INSERT` holds HMAC unique, other `409 domain_already_claimed` | pending |
+| 5 | Delete/reconnect — DNS present | New `email_identity_id`/`generation`/`SecretSink` receipt | pending |
+| 6 | Delete/reconnect — provider unavailable | `outcome_unknown` with retry `CHECK` | pending |
+| 7 | Lost-response matrix (webhook/key/inbox/domain/org) | Each `outcome_unknown` explicit, no duplicate on reconcile, backoff observed | pending |
+| 8 | Nerve bootstrap hard-delete (PR #64) | Old `domain-grant` hard-deleted, fresh grant `200` | pending |
+
+Until `abrolia-synthetic` org is live and Phase A DPA permits real DNS mutation, live IDs remain `TBD` — hermetic gate is sufficient to merge C2 as synthetic-only and unblock C3. Live evidence will be appended after operator run.
 - First identity `ca113cc4-538c-42bf-9c3b-8d7b97a25e4a` used durable inspect job
   `c219963d-bc64-4bd6-ab91-b77e886f96d9`. It stayed `waiting_user` through four
   checks, then the same job reached `succeeded` on attempt five at
