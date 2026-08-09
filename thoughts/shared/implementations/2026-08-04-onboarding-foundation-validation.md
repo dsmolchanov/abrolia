@@ -248,17 +248,17 @@ the live drill matrix, and the isolated restore rehearsal are recorded here.
 | Control-plane ownership | `abrolia-control-plane-synthetic` is the only app in `abrolia-synthetic`; no `abrolia-control-plane-synthetic`, `abrolia-hh-*`, or Phase B restore app remains in `personal`. | **pass** |
 | Machine topology | Machine `85e649c449e9e8`, `ams`, `started`, shared CPU 1x, 512 MiB; one passing Fly health check. | **pass** |
 | Volume topology | Volume `vol_r1j6gpg2nq12x0zr`, `control_plane_data`, encrypted, 1 GiB, `ams`, attached to `85e649c449e9e8` at `/data`. | **pass** |
-| Immutable image | `registry.fly.io/abrolia-control-plane-synthetic:deployment-01KZJMAWT0XM42AX09RNDXBM6D@sha256:fabce417012e5de046fa7ba5588e467e2962d144b1a6807c99fddf3c54b05fb2`. | **pass** |
+| Immutable image | Current control-plane image `registry.fly.io/abrolia-control-plane-synthetic:deployment-01KZKZKDR8VG1BDDHP0CD6NY79@sha256:02bf403afff35f07a2c23aa52fe4270e0d1f20e65642ca8d04a7fcfb7e14b9c2`. | **pass** |
 | Effective gates | `ABROLIA_SYNTHETIC_ONLY=1`; family data, real email, real WhatsApp, real channel and magic-link delivery are all `0`; `ABROLIA_FLY_ORG=abrolia-synthetic`; bare Flycast host retained. The stale `ABROLIA_REAL_EMAIL_ENABLED` secret override was removed. | **pass** |
 | Primary probes | Public `/healthz` and `/readyz` both returned `200`; database/volume/workers were healthy, backup fresh, pending/stale/unknown/expired counters all zero. | **pass** |
 | Exact reconciliation | The one inherited `fly-runtime` cleanup job in `outcome_unknown` was inspected by exact job ID and reconciled to `succeeded`; the now-empty legacy runtime app had zero Machines and zero volumes before exact destruction. | **pass** |
 
-The current image was built and rolled out while the same app temporarily belonged
-to the paid `personal` organization, then the same Machine and volume were moved
-back to `abrolia-synthetic`. This was necessary because Fly rejects both Depot
-builds and existing-Machine updates in the new organization with HTTP 403 until a
-payment method is configured. No control-plane data or resource identity changed
-during either move.
+The first migration image was built while the app temporarily belonged to the
+paid `personal` organization, then the same Machine and volume were moved back to
+`abrolia-synthetic`. Billing was configured for `abrolia-synthetic` on 2026-08-09.
+The organization then accepted a native Depot build, rolling Machine update,
+household app/Machine/volume creation and deletion without moving the contour.
+No control-plane data or resource identity changed during the earlier move.
 
 **Backup and isolated restore rehearsal:** the primary produced
 `/data/backups/control-plane-20260809-phase-b-closure.cpb`, 421922 bytes, SHA-256
@@ -280,24 +280,75 @@ this report.
 | Explicit resume | `abrolia-control-plane resume-jobs` returned `resumed`. A new reserved `.test` household then completed email, WhatsApp, channel, runtime and bootstrap-cleanup jobs; workflow `complete`, household `active`, revision `1`, manifest SHA-256 `b49dec33c14a502e84da11fcdf74fedb97b3bc945a07e7405931b72508ab3e56`. | **pass** |
 | Cleanup | Exact temporary app, Machine and volume were destroyed and verified absent. | **pass** |
 
-**Automated gates on the deployed checkout:** full non-live suite **914 tests,
-pass**; `tests/control_plane` **401 tests, pass**; focused Phase B chaos,
-provisioning and backup set **47 tests, pass**; Ruff pass; fixture scan clean
-(private deny patterns were not loaded locally); gitleaks pass across 147 commits.
+#### Paid-org live household and B-09 drills — 2026-08-09
 
-**Cost tag:** current public Fly list prices put one always-on shared-cpu-1x/512
-MiB Machine plus one 1 GiB volume at approximately **US$3.34–3.47/month**, before
-snapshot storage and network usage. The organization currently has no billable
-plan/payment method, so this is a list-price estimate rather than invoice
-evidence.
+One new reserved-data household was provisioned directly in
+`abrolia-synthetic` after billing was enabled:
 
-**Remaining Phase B gate — do not mark complete:** configure billing for
-`abrolia-synthetic`, then run a new real Fly household onboarding directly in
-that organization, the live eight-window kill matrix, and every remaining B-09
-operator drill (invite replay/re-login, runtime manifest secret check, tamper,
-live cross-household IDOR, export/data-map comparison, delete+tombstone). The
-authenticated topology and isolated restore portions of B-11 are complete; B-09
-and the live runtime portion remain open.
+- household `c1bdb452-0228-42aa-8b0b-797a0b716f30`, workflow
+  `f9ec74fc-5410-4c6f-9219-f3195239b21b`, revision `1`, manifest SHA-256
+  `ea7ca990e8a6dc5ea9628af6ecf5eb46b89562a89ef52a08ef65a8ec72c96eb3`;
+- runtime app `abrolia-hh-yg63iuqcfbbkvcylpf5aw4lpga`, Machine
+  `784ed005c27128`, encrypted 1 GiB volume `vol_v8epo6d683l82gyv`, `ams`,
+  shared CPU 1x / 512 MiB;
+- runtime image
+  `registry.fly.io/abrolia-control-plane-synthetic:runtime-phase-b-20260809-r3@sha256:56f8fd7ce3627eb655292ff2a946599cb462e4f981a739183ddee655c2a1e6ad`;
+- profile `en`, `Europe/Prague`; manifest and activation receipt mode `0600`.
 
-Phase C hermetic work may remain in draft branches; its live execution stays
-blocked on this evidence.
+| Live drill | Observed evidence | Result |
+|---|---|---|
+| Invite replay and re-login | Both consumed invite tokens returned `401` on replay. A fresh invite for the owner selected the same household and preserved the exact profile. | **pass** |
+| Fly cardinality | During activation the household had exactly one app, one Machine and one encrypted volume. Reconcile/restart did not duplicate any of them. | **pass** |
+| Secret absence | The runtime secret namespace exposed only the DSAR secret name after activation; the bootstrap secret was removed. No secret value was written to manifest, API evidence, DB evidence or operator logs. | **pass** |
+| Health and private DSAR | Public control-plane `/healthz` and `/readyz` returned `200`. Runtime `/readyz` returned `200`; authenticated control-plane-to-runtime DSAR over Fly 6PN returned `200` and the combined export became `complete`. | **pass** |
+| Tamper fail-closed | Changing only the runtime manifest hash to zeros and restarting produced `/readyz=503`. Restoring the exact manifest, mode and owner returned `/readyz=200`; no downgrade was accepted. | **pass** |
+| Cross-household isolation | A second owner session could not select household A via a query parameter; its current household remained B and its export contained no A identifier or state. | **pass** |
+| Export vs data map | Final export returned `200 complete`; `token_hash`, `lookup_hmac`, `request_ciphertext` and `session_hash` were absent. | **pass** |
+| Delete and tombstone | Fresh re-auth delete returned `202 partial` while Fly converged, then tombstone became `complete`; the household, account, sessions, runtime app, Machine and volume became absent. No unused bootstrap token remained. | **pass** |
+
+The run exposed four live-only integration defects and closed each one on this
+branch: a terminal secret-namespace failure previously left the email job waiting
+forever; email retry did not create a fresh namespace intent; the runtime listened
+only on IPv4 while Fly `.internal` resolves over 6PN IPv6; and app deletion omitted
+the documented `force=true` query, leaving an empty app suspended. The deployed
+control-plane head includes all four fixes. A one-year, organization-scoped deploy
+token named `phase-b-control-plane-20260809` replaced the user token previously
+embedded for Machines API calls; no token value entered this report or repository.
+
+Provider rejection, namespace retry, app/volume/Machine creation, bootstrap
+outcome-unknown recovery, activation restart and cleanup all converged without a
+duplicate external resource. These are real provider-boundary recovery events,
+but they are not represented as eight deliberately timed Fly `SIGKILL` injections.
+The exact process-kill matrix remains the hermetic subprocess suite described
+above; the canonical B-09 live outcomes are evidenced by the operator table.
+
+Deletion cleanup also found one older reserved `.test` BYO-domain row created by
+a previous provider-enabled rehearsal. With an authenticated backup at
+`/data/phase-b-pre-legacy-cleanup.abrolia-backup` (mode `0600`), a one-pass Nerve
+adapter recovery proved every recorded external object absent before completing
+that tombstone. Final contour state is zero households, zero accounts, zero active
+sessions, zero pending/unknown jobs, zero unused bootstrap tokens and three
+`complete` tombstones. All temporary invite, session, script and log artifacts
+were removed; the Fly org contains only `abrolia-control-plane-synthetic`.
+
+**Automated gates on the final branch head:** full non-live suite **915 passed,
+2 live tests deselected**; `tests/control_plane` **401 passed**; focused Fly,
+email-identity and runtime regression set **86 passed**; Ruff pass; fixture scan
+clean with the fail-closed private-deny path loaded by a synthetic canary; gitleaks
+pass across **152 commits**; `git diff --check` pass.
+
+**Cost tag:** billing is configured for `abrolia-synthetic`. Current public Fly
+list prices put the retained always-on shared-cpu-1x/512 MiB control-plane Machine
+plus one 1 GiB volume at approximately **US$3.34–3.47/month**, before snapshot
+storage and network usage; household runtime resources used for the drill were
+deleted.
+
+**Gate status:** B-11 and the canonical Phase B acceptance items are complete:
+dedicated paid organization, exact topology/image evidence, isolated restore,
+new live household, B-09 operator outcomes, final deletion and cost tag are all
+recorded. The stricter additional Phase B plan wording still lacks eight
+deliberately timed Fly `SIGKILL` runs and a replay of the destroyed raw bootstrap
+credential (the plaintext was intentionally never retained). Those two claims
+must not be inferred from the equivalent live recovery events or the hermetic
+matrix; they remain explicit hardening evidence if literal additional-plan
+closure is required.
