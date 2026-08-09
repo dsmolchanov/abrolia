@@ -5,13 +5,14 @@ from __future__ import annotations
 import hmac
 import json
 import os
+import socket
 import sys
 import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from wsgiref.simple_server import WSGIRequestHandler, make_server
+from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
 import httpx
 
@@ -833,6 +834,22 @@ class _QuietRequestHandler(WSGIRequestHandler):
         """Health requests are intentionally absent from application logs."""
 
 
+class _DualStackWSGIServer(WSGIServer):
+    """Accept Fly 6PN IPv6 and local IPv4 traffic on one runtime socket."""
+
+    address_family = socket.AF_INET6
+
+    def server_bind(self) -> None:
+        self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        super().server_bind()
+
+
+def _runtime_server_binding(host: str) -> tuple[str, type[WSGIServer] | None]:
+    if host in {"0.0.0.0", "::"}:
+        return "::", _DualStackWSGIServer
+    return host, None
+
+
 def serve_runtime(*, env: Mapping[str, str] | None = None) -> None:
     """Serve probes immediately and bootstrap in the background until active."""
     source = dict(os.environ if env is None else env)
@@ -845,7 +862,22 @@ def serve_runtime(*, env: Mapping[str, str] | None = None) -> None:
     if not 0 <= port <= 65535:
         raise BootstrapError(f"{ENV_RUNTIME_PORT} is outside the valid range")
     stop = threading.Event()
-    server = make_server(host, port, service, handler_class=_QuietRequestHandler)
+    server_host, server_class = _runtime_server_binding(host)
+    if server_class is None:
+        server = make_server(
+            server_host,
+            port,
+            service,
+            handler_class=_QuietRequestHandler,
+        )
+    else:
+        server = make_server(
+            server_host,
+            port,
+            service,
+            server_class=server_class,
+            handler_class=_QuietRequestHandler,
+        )
     worker = threading.Thread(
         target=_bootstrap_until_active,
         args=(service, source, stop),

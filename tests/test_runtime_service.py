@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import socket
 import stat
 import subprocess
 import sys
@@ -484,6 +485,18 @@ def test_serve_runtime_starts_probe_server_while_bootstrap_is_pending(
     assert seen["body"] == {"status": "ok"}
     assert seen["gmail_worker_started"] is True
     assert seen["closed"] is True
+
+
+def test_fly_runtime_listener_is_dual_stack() -> None:
+    host, server_class = runtime_service_module._runtime_server_binding("0.0.0.0")
+
+    assert host == "::"
+    assert server_class is runtime_service_module._DualStackWSGIServer
+    assert server_class.address_family == socket.AF_INET6
+    assert runtime_service_module._runtime_server_binding("127.0.0.1") == (
+        "127.0.0.1",
+        None,
+    )
 
 
 class FakeRuntimeGmailClient:
