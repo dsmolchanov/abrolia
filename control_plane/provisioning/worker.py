@@ -575,7 +575,7 @@ class ProvisioningWorker:
         if not isinstance(binding_ref, str) or not binding_ref:  # noqa: SIM102
             # Fall back to expected synthetic binding.
             if job.provider == "fake-email" or job.provider == "synthetic":
-                binding_ref = SYNTHETIC_EMAIL_SECRET_BINDING
+                binding_ref = "SYNTHETIC_EMAIL_CREDENTIAL"
         if not isinstance(binding_ref, str) or not binding_ref:
             return False
         try:

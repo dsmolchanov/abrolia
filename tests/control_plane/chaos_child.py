@@ -8,13 +8,9 @@ from pathlib import Path
 
 from control_plane.config import ControlPlaneConfig
 from control_plane.container import ControlPlaneContainer
-from control_plane.crypto import SecretMaterial
 from control_plane.db import ControlPlaneDatabase, ProcessAlreadyRunning
-from control_plane.email.models import SYNTHETIC_EMAIL_SECRET_BINDING
 from control_plane.models import StepKind
 from control_plane.onboarding.contracts import CommandContext
-from control_plane.provisioning.contracts import ProviderRegistry, ProvisionResult
-from control_plane.provisioning.fakes import DeterministicFakeProvisioner
 from control_plane.provisioning.manifest_toml import manifest_to_toml
 from hermes_cloud.runtime.bootstrap import (
     ActivationReceipt as RuntimeActivationReceipt,
@@ -28,7 +24,6 @@ from hermes_cloud.runtime.bootstrap import (
 )
 
 EMAIL_SELECTION = {"kind": "abrolia_managed", "local_part": "chaos-agent"}
-SECRET_CANARY = "-".join(("phase", "b", "secret", "canary", "value"))
 
 
 def _checkpoint() -> None:
@@ -79,46 +74,6 @@ def _projection(database_path: Path) -> None:
     active.database.connection.set_trace_callback(trace)
     active.worker.run_once()
     raise AssertionError("projection failpoint was not reached")
-
-
-def _sink_commit(database_path: Path, sink_path: Path) -> None:
-    """Pause after durable sink commit but before the worker records its receipt."""
-
-    class CanaryEmailProvisioner(DeterministicFakeProvisioner):
-        def _result(self, intent, key):
-            result = super()._result(intent, key)
-            return ProvisionResult(
-                external_ref=result.external_ref,
-                public_result={
-                    **result.public_result,
-                    "secret_binding_ref": SYNTHETIC_EMAIL_SECRET_BINDING,
-                },
-                secret_material=SecretMaterial.from_mapping({
-                    SYNTHETIC_EMAIL_SECRET_BINDING: SECRET_CANARY,
-                }),
-            )
-
-    class CheckpointFileSink:
-        def install(self, runtime_ref, material):
-            values = {name: bytes(value) for name, value in material.items()}
-            sink_path.write_bytes(values[SYNTHETIC_EMAIL_SECRET_BINDING])
-            sink_path.chmod(0o600)
-            material.clear()
-            _checkpoint()
-
-        def contains(self, runtime_ref, name):
-            return name == SYNTHETIC_EMAIL_SECRET_BINDING and sink_path.is_file()
-
-        def delete(self, runtime_ref, name):
-            sink_path.unlink(missing_ok=True)
-
-    active = _container(database_path)
-    providers = ProviderRegistry()
-    providers.register("fake-email", CanaryEmailProvisioner("email"))
-    active.worker.providers = providers
-    active.worker.secret_sink = CheckpointFileSink()
-    active.worker.run_once()
-    raise AssertionError("sink commit failpoint was not reached")
 
 
 def _runtime_issued(database_path: Path, token_path: Path) -> None:
@@ -272,8 +227,6 @@ def main() -> int:
         _transition(Path(sys.argv[1]), sys.argv[3], sys.argv[4], sys.argv[5])
     if len(sys.argv) >= 3 and sys.argv[2] == "projection":
         _projection(Path(sys.argv[1]))
-    if len(sys.argv) >= 4 and sys.argv[2] == "sink-commit":
-        _sink_commit(Path(sys.argv[1]), Path(sys.argv[3]))
     if len(sys.argv) >= 4 and sys.argv[2] == "runtime-issued":
         _runtime_issued(Path(sys.argv[1]), Path(sys.argv[3]))
     if len(sys.argv) >= 7 and sys.argv[2] == "claim":

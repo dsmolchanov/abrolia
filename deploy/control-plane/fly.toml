@@ -14,7 +14,7 @@ primary_region = "ams"
   ABROLIA_REAL_EMAIL_ENABLED = "0"
   ABROLIA_REAL_WHATSAPP_ENABLED = "0"
   ABROLIA_REAL_CHANNEL_ENABLED = "0"
-  ABROLIA_FLY_ORG = "abrolia-synthetic"
+  ABROLIA_FLY_ORG = "personal"
   ABROLIA_INTERNAL_BOOTSTRAP_HOST = "abrolia-control-plane-synthetic.flycast"
 
 [http_service]
