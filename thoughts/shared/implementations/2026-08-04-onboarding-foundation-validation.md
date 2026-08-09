@@ -230,8 +230,11 @@ Record org slug, app name, Machine ID, volume ID, image digest in this addendum 
 **Cost tag:** pending authenticated Fly billing/topology output; no estimate is
 recorded as evidence.
 
-**Gate:** B-09 hermetic green; B-11 topology change is staged as config only.
-This branch must not merge or deploy until authenticated org/app/Machine/volume/image
-evidence, one synthetic onboarding, the live drill matrix, and the isolated
-restore rehearsal are recorded here. Phase C branches from the merged B commit
-only after those requirements pass.
+**Landing/gate status (2026-08-09):** PR #41 landed the hermetic fixes and the
+fail-closed `abrolia-synthetic` target configuration; it did not establish an
+authenticated Fly deployment or close B-11. Do not deploy this configuration,
+mark Phase B complete, enable real adapters, or run Phase C live batteries until
+authenticated org/app/Machine/volume/image evidence, one synthetic onboarding,
+the live drill matrix, and the isolated restore rehearsal are recorded here.
+Phase C hermetic work may remain in draft branches; its live execution stays
+blocked on this evidence.
