@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 from collections.abc import Callable
+from io import StringIO
 from pathlib import Path
 
 import pytest
@@ -11,8 +12,12 @@ import pytest
 from control_plane.api.onboarding import _response
 from control_plane.crypto import SecretMaterial
 from control_plane.email.contracts import EmailFailureKind, EmailProviderError
-from control_plane.email.models import EmailIdentityStatus
+from control_plane.email.models import (
+    SYNTHETIC_EMAIL_SECRET_BINDING,
+    EmailIdentityStatus,
+)
 from control_plane.models import StepKind, StepStatus
+from control_plane.observability import StructuredLogger
 from control_plane.onboarding.contracts import CommandResult
 from control_plane.provisioning.contracts import (
     InspectResult,
@@ -562,45 +567,107 @@ def test_sigkill_after_one_time_secret_response_never_falsely_verifies(
 
 
 def test_secret_canary_is_confined_to_sink_across_sink_crash_and_public_surfaces(
-    cp_stack, caplog
+    cp_stack, tmp_path: Path
 ) -> None:
-    """Exercise the real secret handoff and prove only the sink retains its value."""
-    canary = "phase-b-secret-canary-7f23c0bdb1"
-    binding = "ABROLIA_EMAIL_PROVIDER_KEY"
+    """SIGKILL after sink commit; reclaim using sink proof without leaking value."""
+    canary = "-".join(("phase", "b", "secret", "canary", "value"))
+    binding = SYNTHETIC_EMAIL_SECRET_BINDING
+    sink_path = tmp_path / "durable-secret-sink"
 
-    class CanaryEmailProvisioner(DeterministicFakeProvisioner):
-        def _result(self, intent, key):
-            result = super()._result(intent, key)
-            return ProvisionResult(
-                external_ref=result.external_ref,
-                public_result={**result.public_result, "secret_binding_ref": binding},
-                secret_material=SecretMaterial.from_mapping({binding: canary}),
-            )
+    cp_stack.complete_profile()
+    cp_stack.service.select(
+        cp_stack.household.id,
+        StepKind.EMAIL,
+        EMAIL_SELECTION,
+        context=cp_stack.context(),
+        now=BASE_TIME + 2,
+    )
+    job = cp_stack.database.query_one(
+        "SELECT id, intent_key FROM provisioning_jobs WHERE kind = 'email_identity'"
+    )
+    request = cp_stack.jobs.request(job["id"])
+    identity_id = request["email_identity_id"]
+
+    helper = Path(__file__).with_name("chaos_child.py")
+    project_root = Path(__file__).parents[2]
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            str(helper),
+            str(cp_stack.database.path),
+            "sink-commit",
+            str(sink_path),
+        ],
+        cwd=project_root,
+        env={
+            **os.environ,
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONPATH": str(project_root),
+        },
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert child.stdout is not None
+        assert child.stdout.readline().strip() == "crash-window-open"
+        child.kill()
+        _stdout, child_stderr = child.communicate(timeout=5)
+        assert child.returncode is not None and child.returncode < 0
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=5)
+
+    crashed = cp_stack.jobs.get(job["id"])
+    assert crashed.status == "running"
+    assert sink_path.read_bytes() == canary.encode()
+    assert canary not in child_stderr
+
+    class DurableFileSink(InMemorySecretSink):
+        def contains(self, runtime_ref, name):
+            if name == binding and sink_path.is_file():
+                return True
+            return super().contains(runtime_ref, name)
+
+        def get(self, runtime_ref, name):
+            if name == binding and sink_path.is_file():
+                return sink_path.read_bytes()
+            return super().get(runtime_ref, name)
+
+        def delete(self, runtime_ref, name):
+            if name == binding:
+                sink_path.unlink(missing_ok=True)
+            super().delete(runtime_ref, name)
+
+    recovered_email = DeterministicFakeProvisioner("email")
+    recovered_email.resources[job["intent_key"]] = ProvisionResult(
+        external_ref=f"synthetic-email:{identity_id}",
+        public_result={
+            "agent_inbox": "family-agent@" + "abrolia.com",
+            "provider": "synthetic",
+            "provider_refs": {"identity_id": identity_id},
+            "secret_binding_ref": binding,
+        },
+    )
 
     providers = ProviderRegistry()
-    providers.register("fake-email", CanaryEmailProvisioner("email"))
+    providers.register("fake-email", recovered_email)
     providers.register("fake-whatsapp", DeterministicFakeProvisioner("whatsapp"))
     providers.register("fake-channel", DeterministicFakeProvisioner("channel"))
     providers.register("fake-cleanup", DeterministicFakeProvisioner("cleanup"))
     providers.register("dry-run-runtime", DryRunRuntimeProvisioner())
-    class CrashAfterCanaryInstall(InMemorySecretSink):
-        crashed = False
-
-        def install(self, runtime_ref, material):
-            is_canary_handoff = any(name == binding for name, _value in material.items())
-            super().install(runtime_ref, material)
-            if is_canary_handoff and not self.crashed:
-                self.crashed = True
-                raise RuntimeError("synthetic crash after sink commit")
-
-    sink = CrashAfterCanaryInstall()
-
-    cp_stack.complete_profile()
+    sink = DurableFileSink()
+    log_stream = StringIO()
     worker = cp_stack.make_worker(
         providers=providers, secret_sink=sink, now=BASE_TIME + 10
     )
+    worker.logger = StructuredLogger(log_stream)
+    recovered = worker.run_once()
+    assert recovered is not None and recovered.status == "succeeded"
+    assert recovered_email.ensure_calls == 0
+
     for kind, selection in (
-        (StepKind.EMAIL, EMAIL_SELECTION),
         (StepKind.WHATSAPP, WHATSAPP_SELECTION),
         (StepKind.PRIMARY_CHANNEL, CHANNEL_SELECTION),
     ):
@@ -611,13 +678,7 @@ def test_secret_canary_is_confined_to_sink_across_sink_crash_and_public_surfaces
             context=cp_stack.context(),
             now=BASE_TIME + 3,
         )
-        result = worker.run_once()
-        if kind is StepKind.EMAIL:
-            assert result.status == "outcome_unknown"
-            assert result.error_code == "secret_handoff_unknown"
-            assert worker.reconcile(result.job_id).status == "succeeded"
-        else:
-            assert result.status == "succeeded"
+        assert worker.run_once().status == "succeeded"
 
     runtime = worker.run_once()
     assert runtime is not None and runtime.status == "succeeded"
@@ -643,7 +704,7 @@ def test_secret_canary_is_confined_to_sink_across_sink_crash_and_public_surfaces
     assert encoded not in api_body
     assert canary not in manifest
     assert canary not in job_json
-    assert canary not in caplog.text
+    assert canary not in log_stream.getvalue()
 
 
 def test_provider_rejection_after_cancel_cannot_reopen_terminal_projection(cp_stack) -> None:
