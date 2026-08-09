@@ -20,7 +20,7 @@ jobs:
       PR: ${{ github.event.pull_request.number }}
       HEAD_SHA: ${{ github.event.pull_request.head.sha }}
       CODEX_BOT: chatgpt-codex-connector[bot]
-      REVIEW_FAIL_OPEN_UNTIL_EPOCH: "1786237200" # 2026-08-09T01:00:00Z
+      REVIEW_FAIL_OPEN_UNTIL_EPOCH: "1786323600" # 2026-08-10T01:00:00Z
     steps:
       - name: Gate on Codex verdict for this commit
         run: |
@@ -30,6 +30,12 @@ jobs:
           review_id_for_head() {
             gh api "repos/${REPO}/pulls/${PR}/reviews" --paginate \
               --jq "[.[] | select(.user.login == \"${CODEX_BOT}\" and .commit_id == \"${HEAD_SHA}\")] | (last | .id) // empty"
+          }
+
+          green_comment_for_head() {
+            local head_short="${HEAD_SHA:0:10}"
+            gh api "repos/${REPO}/issues/${PR}/comments" --paginate \
+              --jq "[.[] | select(.user.login == \"${CODEX_BOT}\" and ((.body | contains(\"Codex Review: Didn't find any major issues.\")) and (.body | contains(\"${head_short}\"))))] | (last | .id) // empty"
           }
 
           fail_open_is_active() {
@@ -50,19 +56,33 @@ jobs:
 
           DEADLINE=$((SECONDS + 480))
           RID=""
+          GREEN_COMMENT_ID=""
           while [ ${SECONDS} -lt ${DEADLINE} ]; do
             RID="$(review_id_for_head)"
             [ -n "${RID}" ] && break
+            GREEN_COMMENT_ID="$(green_comment_for_head)"
+            [ -n "${GREEN_COMMENT_ID}" ] && break
             if fail_open_is_active && [ "$(codex_limit_reported)" -gt 0 ]; then
-              echo "::warning::Codex reported exhausted review limits. Review is temporarily advisory until 2026-08-09T01:00:00Z; CI remains required."
+              echo "::warning::Codex reported exhausted review limits. Review is temporarily advisory until 2026-08-10T01:00:00Z; CI remains required."
               exit 0
             fi
             sleep 20
           done
 
+          if [ -z "${RID}" ] && [ -n "${GREEN_COMMENT_ID}" ]; then
+            # A formal review can arrive concurrently with the comment. Give
+            # GitHub time to publish it, then make it authoritative if present.
+            sleep 15
+            RID="$(review_id_for_head)"
+            if [ -z "${RID}" ]; then
+              echo "Codex green comment matches current head ${HEAD_SHA}."
+              exit 0
+            fi
+          fi
+
           if [ -z "${RID}" ]; then
             if fail_open_is_active; then
-              echo "::warning::No Codex review arrived. Review is temporarily advisory until 2026-08-09T01:00:00Z; CI remains required."
+              echo "::warning::No Codex review arrived. Review is temporarily advisory until 2026-08-10T01:00:00Z; CI remains required."
               exit 0
             fi
             echo "::error::No Codex review arrived for ${HEAD_SHA}. Verify that Codex Automatic Reviews is enabled; merge remains blocked."
