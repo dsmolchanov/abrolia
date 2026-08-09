@@ -729,6 +729,32 @@ class OnboardingService:
                     "household_id": household_id,
                     "option": identity.option.value,
                 })
+                namespace = connection.execute(
+                    "SELECT 1 FROM external_resources WHERE household_id = ?"
+                    " AND resource_type = 'secret_namespace'"
+                    " AND status IN ('creating','ready','outcome_unknown') LIMIT 1",
+                    (household_id,),
+                ).fetchone()
+                unsettled_namespace = connection.execute(
+                    "SELECT 1 FROM provisioning_jobs WHERE household_id = ?"
+                    " AND operation = 'ensure_secret_namespace'"
+                    " AND status IN ('pending','running','outcome_unknown') LIMIT 1",
+                    (household_id,),
+                ).fetchone()
+                if namespace is None and unsettled_namespace is None:
+                    self.jobs.create(
+                        connection,
+                        household_id=household_id,
+                        workflow_id=row["id"],
+                        kind="runtime",
+                        operation="ensure_secret_namespace",
+                        intent_key=(
+                            f"{household_id}:secret-namespace:retry:{attempt}"
+                        ),
+                        request={"household_id": household_id},
+                        provider=self.runtime_provider,
+                        now=now,
+                    )
             job_id, _ = self.jobs.create(
                 connection,
                 household_id=household_id,
@@ -738,7 +764,7 @@ class OnboardingService:
                 intent_key=intent_key,
                 request=job_request,
                 provider=self._provider_for(kind, parsed["kind"]),
-                now=now,
+                now=now + (0.000001 if kind is StepKind.EMAIL else 0),
             )
             connection.execute(
                 "UPDATE onboarding_steps SET status = ?, error_code = NULL, attempt = ?,"

@@ -198,6 +198,19 @@ class ProvisioningWorker:
             if job.kind == "email_identity":
                 namespace_ref = self._secret_namespace_ref(job.household_id)
                 if namespace_ref is None:
+                    namespace_job = self.jobs.db.query_one(
+                        "SELECT status FROM provisioning_jobs WHERE household_id = ?"
+                        " AND operation = 'ensure_secret_namespace'"
+                        " ORDER BY created_at DESC, id DESC LIMIT 1",
+                        (job.household_id,),
+                    )
+                    if namespace_job is not None and namespace_job["status"] == "failed":
+                        return self._mark_step_problem(
+                            job,
+                            request,
+                            "failed",
+                            "secret_namespace_failed",
+                        )
                     self.jobs.retry_later(
                         job.id,
                         not_before=self.clock() + 5,
