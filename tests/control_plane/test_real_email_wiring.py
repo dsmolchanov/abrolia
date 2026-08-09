@@ -8,6 +8,7 @@ from control_plane.config import ControlPlaneConfig
 from control_plane.container import ControlPlaneContainer
 from control_plane.models import StepKind
 from control_plane.onboarding.contracts import InvalidTransition
+from control_plane.privacy.consent import consent_version_and_sha
 
 
 def test_production_container_registers_real_nerve_providers_fail_closed(
@@ -90,6 +91,9 @@ def test_real_email_rollout_does_not_route_gmail_to_nerve(cp_stack) -> None:
         cp_stack.household.id
     })
 
+    restriction_version, restriction_sha = consent_version_and_sha(
+        "special_category_content_restriction"
+    )
     cp_stack.service.select(
         cp_stack.household.id,
         StepKind.EMAIL,
@@ -98,6 +102,8 @@ def test_real_email_rollout_does_not_route_gmail_to_nerve(cp_stack) -> None:
             "separate_agent_account_acknowledged": True,
             "special_category_restriction_acknowledged": True,
             "special_category_restriction_receipt_id": "synthetic-restriction-receipt",
+            "special_category_restriction_text_version": restriction_version,
+            "special_category_restriction_text_sha256": restriction_sha,
         },
         context=cp_stack.context(),
     )

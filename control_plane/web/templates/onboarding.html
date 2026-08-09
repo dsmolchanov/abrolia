@@ -51,6 +51,8 @@
       <form method="post" action="/onboarding/select/email_identity">
         {{ command_fields() }}<input type="hidden" name="kind" value="abrolia_managed">
         <input type="hidden" name="local_part" value="family.assistant">
+        <input type="hidden" name="special_category_restriction_text_version" value="{{ special_category_restriction_version }}">
+        <input type="hidden" name="special_category_restriction_text_sha256" value="{{ special_category_restriction_sha256 }}">
         <label class="consent"><input type="checkbox" name="special_category_restriction_acknowledged" value="yes" aria-describedby="special-category-content-restriction" required>
           I acknowledge the exact special-category content restriction above.</label>
         <button class="card recommended" data-select="email_identity" data-kind="abrolia_managed">
@@ -60,6 +62,8 @@
       </form>
       <form method="post" action="/onboarding/select/email_identity">
         {{ command_fields() }}<input type="hidden" name="kind" value="gmail_agent">
+        <input type="hidden" name="special_category_restriction_text_version" value="{{ special_category_restriction_version }}">
+        <input type="hidden" name="special_category_restriction_text_sha256" value="{{ special_category_restriction_sha256 }}">
         <label class="consent"><input type="checkbox" name="special_category_restriction_acknowledged" value="yes" aria-describedby="special-category-content-restriction" required>
           I acknowledge the exact special-category content restriction above.</label>
         <button class="card" data-select="email_identity" data-kind="gmail_agent">
@@ -69,6 +73,8 @@
       </form>
       <form method="post" action="/onboarding/select/email_identity">
         {{ command_fields() }}<input type="hidden" name="kind" value="family_domain">
+        <input type="hidden" name="special_category_restriction_text_version" value="{{ special_category_restriction_version }}">
+        <input type="hidden" name="special_category_restriction_text_sha256" value="{{ special_category_restriction_sha256 }}">
         <label>Mail domain<input name="domain" value="family.example.test" autocomplete="off" required></label>
         <label>Assistant address<input name="local_part" value="assistant" autocomplete="off" required></label>
         <p id="domain-guidance" aria-live="polite">Use a dedicated mail subdomain when the root domain already receives family mail.</p>

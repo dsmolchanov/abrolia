@@ -140,6 +140,8 @@ class ManagedEmailSelection(DurableContract):
     local_part: str = Field(pattern=r"^[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?$")
     special_category_restriction_acknowledged: Literal[True] | None = None
     special_category_restriction_receipt_id: str | None = None
+    special_category_restriction_text_version: str | None = None
+    special_category_restriction_text_sha256: str | None = None
 
 
 class GmailAgentSelection(DurableContract):
@@ -147,6 +149,8 @@ class GmailAgentSelection(DurableContract):
     separate_agent_account_acknowledged: Literal[True]
     special_category_restriction_acknowledged: Literal[True] | None = None
     special_category_restriction_receipt_id: str | None = None
+    special_category_restriction_text_version: str | None = None
+    special_category_restriction_text_sha256: str | None = None
 
 
 class FamilyDomainSelection(DurableContract):
@@ -156,6 +160,8 @@ class FamilyDomainSelection(DurableContract):
     mx_change_acknowledged: bool = False
     special_category_restriction_acknowledged: Literal[True] | None = None
     special_category_restriction_receipt_id: str | None = None
+    special_category_restriction_text_version: str | None = None
+    special_category_restriction_text_sha256: str | None = None
 
     @field_validator("domain")
     @classmethod

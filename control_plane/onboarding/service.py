@@ -292,6 +292,14 @@ class OnboardingService:
         ):
             return
         purpose = "special_category_content_restriction"
+        text_version, text_sha = consent_version_and_sha(purpose)
+        if (
+            parsed.get("special_category_restriction_text_version") != text_version
+            or parsed.get("special_category_restriction_text_sha256") != text_sha
+        ):
+            raise InvalidTransition(
+                "special-category content restriction text version does not match"
+            )
         existing = connection.execute(
             "SELECT household_id, account_id, purpose FROM consent_receipts WHERE id = ?",
             (receipt_id,),
@@ -304,7 +312,6 @@ class OnboardingService:
             ):
                 raise IdempotencyConflict("consent receipt belongs to another command")
             return
-        text_version, text_sha = consent_version_and_sha(purpose)
         connection.execute(
             "INSERT INTO consent_receipts (id, household_id, account_id, purpose,"
             " text_version, text_sha256, locale, accepted_at, created_at)"
@@ -451,6 +458,8 @@ class OnboardingService:
                     not in {
                         "special_category_restriction_acknowledged",
                         "special_category_restriction_receipt_id",
+                        "special_category_restriction_text_version",
+                        "special_category_restriction_text_sha256",
                     }
                 }
             job_request = {

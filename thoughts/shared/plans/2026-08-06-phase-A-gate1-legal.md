@@ -123,7 +123,7 @@ to the user must be the text hashed in the durable receipt, the requirement must
 apply to every email selection including synthetic/default API flows, and all
 `ABROLIA_REAL_*` flags remain disabled. This mitigation does not select direction
 2, satisfy Art. 9(2), lower DPIA R7, complete any A3 checkbox, or authorize real
-family data. Owner authorization: `/s/ Dmitry Molchanov, CEO, 2026-08-08`.
+family data. Owner authorization: `/s/ Product owner (CEO), 2026-08-08`.
 
 **Files:** `docs/privacy/lawful-bases.md:92-162` (§3), `docs/privacy/dpia.md:48-57` (R7 row) + `docs/privacy/dpia.md:118-137` (§5 preconditions), `docs/privacy/privacy-notice-{en,ru}.md` (§ Other people's data / Children / legal bases para), onboarding copy `control_plane/onboarding/*` + `control_plane/api/*` if consent copy lives there.
 

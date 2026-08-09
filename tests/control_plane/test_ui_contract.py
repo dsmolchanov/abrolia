@@ -4,7 +4,17 @@ import html as html_module
 
 import pytest
 
-from control_plane.privacy.consent import consent_version_and_text
+from control_plane.privacy.consent import consent_version_and_sha, consent_version_and_text
+
+
+def _restriction_form_binding() -> dict[str, str]:
+    version, sha256 = consent_version_and_sha(
+        "special_category_content_restriction"
+    )
+    return {
+        "special_category_restriction_text_version": version,
+        "special_category_restriction_text_sha256": sha256,
+    }
 
 
 def test_verify_page_moves_fragment_to_post_and_clears_browser_history(api_harness) -> None:
@@ -36,6 +46,8 @@ def test_onboarding_page_has_canonical_options_and_privacy_copy(api_harness) -> 
     version, text = consent_version_and_text("special_category_content_restriction")
     assert version in html
     assert text in html_module.unescape(html)
+    _, sha256 = consent_version_and_sha("special_category_content_restriction")
+    assert html.count(f'value="{sha256}"') == 3
     assert html.count('aria-describedby="special-category-content-restriction"') == 3
     assert "u***@family.test" in html
     assert world.account.recovery_email not in html
@@ -168,7 +180,8 @@ def test_verified_choice_changes_require_an_explicit_reset_control(api_harness) 
             "version": "1",
             "kind": "abrolia_managed",
             "local_part": "reset-agent",
-            "special_category_restriction_acknowledged": "yes",
+                "special_category_restriction_acknowledged": "yes",
+                **_restriction_form_binding(),
         },
         follow_redirects=False,
     ).status_code == 303
@@ -285,6 +298,7 @@ def test_no_js_whatsapp_duplicate_post_replays_same_consent_receipt(api_harness)
             "kind": "abrolia_managed",
             "local_part": "replay-agent",
             "special_category_restriction_acknowledged": "yes",
+            **_restriction_form_binding(),
         },
         follow_redirects=False,
     )
@@ -380,6 +394,7 @@ def test_no_js_email_requires_and_records_content_restriction(api_harness) -> No
             **shared,
             "idempotency_key": "restriction-accepted",
             "special_category_restriction_acknowledged": "yes",
+            **_restriction_form_binding(),
         },
         follow_redirects=False,
     )

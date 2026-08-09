@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from control_plane.privacy.consent import consent_version_and_sha
+
 
 def _headers(api_harness, *, version: int, key: str) -> dict[str, str]:
     return {
@@ -49,6 +51,12 @@ def test_local_part_api_returns_only_suggestion_or_availability(api_harness) -> 
             "local_part": "eva_novak",
             "special_category_restriction_acknowledged": True,
             "special_category_restriction_receipt_id": "email-policy-restriction",
+            "special_category_restriction_text_version": consent_version_and_sha(
+                "special_category_content_restriction"
+            )[0],
+            "special_category_restriction_text_sha256": consent_version_and_sha(
+                "special_category_content_restriction"
+            )[1],
         },
     )
     assert selected.status_code == 200

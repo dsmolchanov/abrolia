@@ -17,7 +17,7 @@ from control_plane.container import ControlPlaneContainer
 from control_plane.db import new_id
 from control_plane.observability import HealthReporter, HealthSnapshot
 from control_plane.onboarding.contracts import WorkflowConflict
-from control_plane.privacy.consent import consent_version_and_text
+from control_plane.privacy.consent import consent_version_and_sha, consent_version_and_text
 from control_plane.repositories.households import HouseholdNotFound
 
 WEB_ROOT = Path(__file__).resolve().parents[1] / "web"
@@ -150,6 +150,9 @@ def create_app(
         restriction_version, restriction_text = consent_version_and_text(
             "special_category_content_restriction"
         )
+        _, restriction_sha = consent_version_and_sha(
+            "special_category_content_restriction"
+        )
         return templates.TemplateResponse(
             request,
             "onboarding.html",
@@ -162,6 +165,7 @@ def create_app(
                 "google_confirm": request.query_params.get("google") == "confirm",
                 "special_category_restriction_version": restriction_version,
                 "special_category_restriction_text": restriction_text,
+                "special_category_restriction_sha256": restriction_sha,
             },
         )
 

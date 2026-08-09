@@ -4,6 +4,7 @@ from urllib.parse import urlsplit
 
 import pytest
 
+from control_plane.privacy.consent import consent_version_and_sha, consent_version_and_text
 from control_plane.repositories.auth import InvalidCredential
 
 
@@ -34,6 +35,16 @@ def _profile(**changes: str) -> dict[str, str]:
     }
     payload.update(changes)
     return payload
+
+
+def _restriction_binding() -> dict[str, str]:
+    version, sha256 = consent_version_and_sha(
+        "special_category_content_restriction"
+    )
+    return {
+        "special_category_restriction_text_version": version,
+        "special_category_restriction_text_sha256": sha256,
+    }
 
 
 def test_request_link_response_is_generic_for_eligible_and_ineligible_addresses(
@@ -176,6 +187,35 @@ def test_synthetic_selection_boundaries_fail_closed_at_api(api_harness) -> None:
         world.household.id
     ).version == 1
 
+    contract = api_harness.client.get(
+        "/api/v1/onboarding/consent/special-category-content-restriction"
+    )
+    version, text = consent_version_and_text("special_category_content_restriction")
+    _, sha256 = consent_version_and_sha("special_category_content_restriction")
+    assert contract.json() == {
+        "purpose": "special_category_content_restriction",
+        "text_version": version,
+        "text": text,
+        "text_sha256": sha256,
+    }
+
+    stale_contract = api_harness.client.post(
+        "/api/v1/onboarding/steps/email_identity/select",
+        headers=_command_headers(api_harness, version=1, key="stale-restriction"),
+        json={
+            "kind": "abrolia_managed",
+            "local_part": "family-agent",
+            "special_category_restriction_acknowledged": True,
+            "special_category_restriction_receipt_id": "stale-restriction-receipt",
+            **_restriction_binding(),
+            "special_category_restriction_text_sha256": "0" * 64,
+        },
+    )
+    assert stale_contract.status_code == 422
+    assert api_harness.container.onboarding_repository.snapshot(
+        world.household.id
+    ).version == 1
+
     real_domain = api_harness.client.post(
         "/api/v1/onboarding/steps/email_identity/select",
         headers=_command_headers(api_harness, version=1, key="real-domain-rejected"),
@@ -184,6 +224,7 @@ def test_synthetic_selection_boundaries_fail_closed_at_api(api_harness) -> None:
             "domain": "family.example.com",
             "special_category_restriction_acknowledged": True,
             "special_category_restriction_receipt_id": "real-domain-restriction",
+            **_restriction_binding(),
         },
     )
     assert real_domain.status_code == 422
@@ -204,6 +245,7 @@ def test_synthetic_selection_boundaries_fail_closed_at_api(api_harness) -> None:
             "local_part": "family-agent",
             "special_category_restriction_acknowledged": True,
             "special_category_restriction_receipt_id": "managed-email-restriction",
+            **_restriction_binding(),
         },
     )
     assert managed.status_code == 200
