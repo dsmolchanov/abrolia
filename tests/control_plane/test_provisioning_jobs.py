@@ -738,6 +738,100 @@ def test_issued_runtime_job_rechecks_current_content_restriction_receipt(
     assert blocked is not None and blocked.status == "failed"
     assert blocked.error_code == "content_restriction_receipt_required"
     assert runtime_provider.ensure_calls == 0
+    workflow = cp_stack.onboarding.workflow_for_household(cp_stack.household.id)
+    assert workflow.state == "in_progress"
+    assert workflow.current_step == StepKind.EMAIL.value
+    email_step = next(
+        step
+        for step in cp_stack.onboarding.snapshot(cp_stack.household.id).steps
+        if step.kind is StepKind.EMAIL
+    )
+    assert email_step.status is StepStatus.VERIFIED
+    assert cp_stack.configs.get(cp_stack.household.id, 1).status == "revoked"
+
+    reset = cp_stack.service.reset_from(
+        cp_stack.household.id,
+        StepKind.EMAIL,
+        context=cp_stack.context(),
+        now=BASE_TIME + 101,
+    )
+    assert reset.snapshot.current_step is StepKind.EMAIL
+    reset_email = next(
+        step for step in reset.snapshot.steps if step.kind is StepKind.EMAIL
+    )
+    assert reset_email.status is StepStatus.AVAILABLE
+
+
+def test_email_job_rechecks_current_content_restriction_before_provider(
+    cp_stack,
+) -> None:
+    cp_stack.complete_profile()
+    cp_stack.service.email_provider = "future-real-email"
+    cp_stack.service.select(
+        cp_stack.household.id,
+        StepKind.EMAIL,
+        EMAIL_SELECTION,
+        context=cp_stack.context(),
+        now=BASE_TIME + 2,
+    )
+    with cp_stack.database.write() as connection:
+        connection.execute(
+            "DELETE FROM consent_receipts WHERE household_id = ? AND purpose = ?",
+            (cp_stack.household.id, "special_category_content_restriction"),
+        )
+    email_provider = DeterministicFakeProvisioner("email")
+    providers = ProviderRegistry()
+    providers.register("future-real-email", email_provider)
+
+    blocked = cp_stack.make_worker(
+        providers=providers, now=BASE_TIME + 100
+    ).run_once()
+
+    assert blocked is not None and blocked.status == "failed"
+    assert blocked.error_code == "content_restriction_receipt_required"
+    assert email_provider.ensure_calls == 0
+
+
+def test_email_reconcile_rechecks_current_content_restriction_before_provider(
+    cp_stack,
+) -> None:
+    cp_stack.complete_profile()
+    cp_stack.service.email_provider = "future-real-email"
+    cp_stack.service.select(
+        cp_stack.household.id,
+        StepKind.EMAIL,
+        EMAIL_SELECTION,
+        context=cp_stack.context(),
+        now=BASE_TIME + 2,
+    )
+    job = cp_stack.jobs.lease("worker-before-reconcile", now=BASE_TIME + 3)
+    assert job is not None and job.kind == "email_identity"
+    with cp_stack.database.write() as connection:
+        cp_stack.jobs.settle(
+            connection,
+            job.id,
+            status="outcome_unknown",
+            error_code="email_outcome_unknown",
+            now=BASE_TIME + 4,
+        )
+        connection.execute(
+            "DELETE FROM consent_receipts WHERE household_id = ? AND purpose = ?",
+            (cp_stack.household.id, "special_category_content_restriction"),
+        )
+
+    class ProviderMustNotRun(DeterministicFakeProvisioner):
+        def inspect(self, stable_ref):
+            raise AssertionError(f"provider inspect called for {stable_ref}")
+
+    providers = ProviderRegistry()
+    providers.register("future-real-email", ProviderMustNotRun("email"))
+
+    blocked = cp_stack.make_worker(
+        providers=providers, now=BASE_TIME + 100
+    ).reconcile(job.id)
+
+    assert blocked.status == "failed"
+    assert blocked.error_code == "content_restriction_receipt_required"
 
 
 def test_provider_rejection_after_cancel_cannot_reopen_terminal_projection(cp_stack) -> None:

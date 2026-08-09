@@ -15,6 +15,7 @@ from wsgiref.simple_server import WSGIRequestHandler, make_server
 
 import httpx
 
+from control_plane.privacy.consent import consent_version_and_sha
 from hermes_cloud.core.config import DEFAULT_DB_PATH, ENV_DB
 from hermes_cloud.core.db import open_database
 from hermes_cloud.core.dsar import export_household, is_deleted, wipe_household
@@ -82,6 +83,7 @@ ENV_NERVE_WORKER_SECONDS = "ABROLIA_NERVE_WORKER_SECONDS"
 ENV_GMAIL_WORKER_SECONDS = "ABROLIA_GMAIL_WORKER_SECONDS"
 ENV_WHATSAPP_INSTANCE = "HERMES_WHATSAPP_INSTANCE"
 ENV_WHATSAPP_RELAY_SECRET = "HERMES_WHATSAPP_RELAY_SECRET"
+REQUIRED_CONTENT_RESTRICTION_PURPOSE = "special_category_content_restriction"
 
 
 class RuntimeNotReady(RuntimeError):
@@ -211,6 +213,20 @@ class RuntimeService:
             manifest = load_runtime_manifest(self.manifest_path, env=self.env)
         except ManifestError:
             return None, "manifest_missing_or_invalid"
+        restriction_version, restriction_sha = consent_version_and_sha(
+            REQUIRED_CONTENT_RESTRICTION_PURPOSE
+        )
+        if manifest.consent is None or (
+            REQUIRED_CONTENT_RESTRICTION_PURPOSE
+            not in manifest.consent.required_purposes
+            or not any(
+                receipt.purpose == REQUIRED_CONTENT_RESTRICTION_PURPOSE
+                and receipt.text_version == restriction_version
+                and hmac.compare_digest(receipt.text_sha256, restriction_sha)
+                for receipt in manifest.consent.receipts
+            )
+        ):
+            return None, "content_restriction_not_current"
         try:
             state = load_activation_state(self.activation_path)
         except BootstrapError:

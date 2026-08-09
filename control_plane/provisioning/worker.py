@@ -172,16 +172,10 @@ class ProvisioningWorker:
         if job.kind == "bootstrap_cleanup":
             return self._cleanup_bootstrap(job, request)
         if (
-            job.kind == "runtime"
-            and job.operation != "ensure_secret_namespace"
+            self._requires_current_email_content_restriction(job)
             and not self._has_current_email_content_restriction(job.household_id)
         ):
-            return self._mark_step_problem(
-                job,
-                request,
-                "failed",
-                "content_restriction_receipt_required",
-            )
+            return self._block_for_missing_content_restriction(job, request)
         provider = None
         result = None
         try:
@@ -339,6 +333,105 @@ class ProvisioningWorker:
                 sha256,
             ),
         ) is not None
+
+    @staticmethod
+    def _requires_current_email_content_restriction(job: JobRecord) -> bool:
+        return (
+            job.kind == "email_identity" and job.provider != "fake-email"
+        ) or (
+            job.kind == "runtime" and job.operation != "ensure_secret_namespace"
+        )
+
+    def _block_for_missing_content_restriction(
+        self, job: JobRecord, request: dict[str, Any]
+    ) -> WorkResult:
+        if job.kind != "runtime":
+            return self._mark_step_problem(
+                job,
+                request,
+                "failed",
+                "content_restriction_receipt_required",
+            )
+        now = self.clock()
+        with self.jobs.db.write() as connection:
+            current = connection.execute(
+                "SELECT status FROM provisioning_jobs WHERE id = ?", (job.id,)
+            ).fetchone()
+            if current is None:
+                return WorkResult(job.id, "cancelled", "job_missing")
+            if current["status"] not in {"running", "outcome_unknown"}:
+                return WorkResult(job.id, current["status"], current["status"])
+            self.jobs.settle(
+                connection,
+                job.id,
+                status="failed",
+                error_code="content_restriction_receipt_required",
+                now=now,
+            )
+            workflow_row = connection.execute(
+                "SELECT * FROM onboarding_workflows WHERE id = ? AND household_id = ?",
+                (job.workflow_id, job.household_id),
+            ).fetchone()
+            if workflow_row is None or workflow_row["state"] not in {
+                "runtime_provisioning",
+                "activating",
+            }:
+                return WorkResult(
+                    job.id, "failed", "content_restriction_receipt_required"
+                )
+            owner = connection.execute(
+                "SELECT account_id FROM household_memberships WHERE household_id = ?"
+                " AND role = 'owner' AND status = 'active' LIMIT 1",
+                (job.household_id,),
+            ).fetchone()
+            if owner is None:
+                return WorkResult(
+                    job.id, "failed", "content_restriction_receipt_required"
+                )
+            connection.execute(
+                "UPDATE config_revisions SET status = 'revoked' WHERE household_id = ?"
+                " AND status IN ('planned','issued','claimed')",
+                (job.household_id,),
+            )
+            connection.execute(
+                "UPDATE bootstrap_tokens SET revoked_at = ? WHERE household_id = ?"
+                " AND used_at IS NULL AND revoked_at IS NULL",
+                (now, job.household_id),
+            )
+            connection.execute(
+                "UPDATE households SET status = 'onboarding', updated_at = ? WHERE id = ?"
+                " AND status NOT IN ('deleting','deleted')",
+                (now, job.household_id),
+            )
+            workflow = WorkflowRecord(
+                workflow_row["id"],
+                workflow_row["household_id"],
+                workflow_row["state"],
+                workflow_row["current_step"],
+                workflow_row["version"],
+            )
+            new_version = workflow.version + 1
+            connection.execute(
+                "UPDATE onboarding_workflows SET state = 'in_progress',"
+                " current_step = ?, version = ?, updated_at = ?, completed_at = NULL"
+                " WHERE id = ?",
+                (StepKind.EMAIL.value, new_version, now, workflow.id),
+            )
+            self.onboarding.append_transition(
+                connection,
+                workflow=workflow,
+                new_version=new_version,
+                command="require_content_restriction_acknowledgement",
+                to_state="in_progress",
+                account_id=owner["account_id"],
+                session_id=None,
+                request_id=f"worker:{job.id}:content-restriction",
+                step_kind=StepKind.EMAIL.value,
+                related_job_id=job.id,
+                metadata={"reason": "current_receipt_required"},
+                now=now,
+            )
+        return WorkResult(job.id, "failed", "content_restriction_receipt_required")
 
     def _handle_email_provider_error(
         self,
@@ -1257,6 +1350,11 @@ class ProvisioningWorker:
         request = self.jobs.request(job.id)
         if job.kind == "bootstrap_cleanup":
             return self._cleanup_bootstrap(job, request)
+        if (
+            self._requires_current_email_content_restriction(job)
+            and not self._has_current_email_content_restriction(job.household_id)
+        ):
+            return self._block_for_missing_content_restriction(job, request)
         provider = self.providers.get(job.provider)
         if job.kind == "cleanup":
             deferred = self._defer_runtime_cleanup(job, request)

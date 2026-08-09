@@ -221,7 +221,6 @@ class BootstrapService:
                 config_revision=config_revision,
             )
             self._assert_not_deleted(connection, household_id)
-            self._assert_current_content_restriction(connection, household_id)
             if row["revoked_at"] is not None:
                 raise BootstrapGone("bootstrap credential is no longer available")
             if row["used_at"] is not None:
@@ -289,6 +288,7 @@ class BootstrapService:
                         cleanup_pending=receipt_acknowledged,
                     )
                 raise BootstrapGone("bootstrap credential is no longer available")
+            self._assert_current_content_restriction(connection, household_id)
             if receipt_acknowledged:
                 raise BootstrapConflict("activation receipt cannot be acknowledged before activation")
             if row["expires_at"] <= now:

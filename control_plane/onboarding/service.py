@@ -282,7 +282,6 @@ class OnboardingService:
         parsed: dict[str, Any],
         household_id: str,
         account_id: str,
-        locale: str,
         now: float,
     ) -> None:
         receipt_id = parsed.get("special_category_restriction_receipt_id")
@@ -326,7 +325,7 @@ class OnboardingService:
                 purpose,
                 text_version,
                 text_sha,
-                locale,
+                "en",
                 now,
                 now,
             ),
@@ -414,15 +413,11 @@ class OnboardingService:
                 (row["id"], kind.value),
             ).fetchone()
             if kind is StepKind.EMAIL:
-                household_row = connection.execute(
-                    "SELECT family_language FROM households WHERE id = ?", (household_id,)
-                ).fetchone()
                 self._record_email_content_restriction(
                     connection,
                     parsed=parsed,
                     household_id=household_id,
                     account_id=context.account_id,
-                    locale=household_row["family_language"] or "en",
                     now=now,
                 )
             if kind is StepKind.WHATSAPP:

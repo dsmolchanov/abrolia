@@ -357,7 +357,7 @@ def test_no_js_whatsapp_duplicate_post_replays_same_consent_receipt(api_harness)
     )) == 1
 
 
-def test_no_js_email_requires_and_records_content_restriction(api_harness) -> None:
+def test_no_js_email_requires_and_records_english_content_restriction(api_harness) -> None:
     world = api_harness.create_principal("restriction-owner@family.test")
     api_harness.authenticate(world)
     origin = {"Origin": api_harness.config.public_origin}
@@ -370,7 +370,7 @@ def test_no_js_email_requires_and_records_content_restriction(api_harness) -> No
             "version": "0",
             "first_name": "Restriction",
             "last_name": "Owner",
-            "family_language": "en",
+            "family_language": "ru",
             "timezone": "Europe/Prague",
             "country_code": "CZ",
             "residency_mode": "eu-app",
@@ -408,13 +408,14 @@ def test_no_js_email_requires_and_records_content_restriction(api_harness) -> No
     )
     assert accepted.headers["location"] == "/onboarding"
     receipt = api_harness.container.database.query_one(
-        "SELECT purpose, text_version, revoked_at FROM consent_receipts"
+        "SELECT purpose, text_version, locale, revoked_at FROM consent_receipts"
         " WHERE household_id = ?",
         (world.household.id,),
     )
     assert dict(receipt) == {
         "purpose": "special_category_content_restriction",
         "text_version": "special-category-content-restriction-v1",
+        "locale": "en",
         "revoked_at": None,
     }
 

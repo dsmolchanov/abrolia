@@ -295,6 +295,11 @@ def test_claim_and_activation_are_resumable_and_cleanup_is_durable(
             **binding,
             activated_sha256="0" * 64,
         )
+    with active.database.write() as connection:
+        connection.execute(
+            "DELETE FROM consent_receipts WHERE household_id = ? AND purpose = ?",
+            (runtime.world.household.id, "special_category_content_restriction"),
+        )
     acknowledged = active.bootstrap.activate(
         runtime.raw_token,
         **binding,

@@ -142,9 +142,8 @@ def test_real_email_rollout_does_not_route_gmail_to_nerve(cp_stack) -> None:
                     ),
                     "special_category_restriction_text_version": restriction_version,
                     "special_category_restriction_text_sha256": restriction_sha,
-                },
-                household_id=cp_stack.household.id,
-                account_id=cp_stack.account.id,
-                locale="en",
-                now=10.0,
-            )
+                    },
+                    household_id=cp_stack.household.id,
+                    account_id=cp_stack.account.id,
+                    now=10.0,
+                )

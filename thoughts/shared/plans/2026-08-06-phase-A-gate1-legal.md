@@ -125,7 +125,14 @@ apply to every email selection including synthetic/default API flows, and all
 2, satisfy Art. 9(2), lower DPIA R7, complete any A3 checkbox, or authorize real
 family data. Owner authorization: `/s/ Product owner (CEO), 2026-08-08`.
 
-**Files:** `docs/privacy/lawful-bases.md:92-162` (§3), `docs/privacy/dpia.md:48-57` (R7 row) + `docs/privacy/dpia.md:118-137` (§5 preconditions), `docs/privacy/privacy-notice-{en,ru}.md` (§ Other people's data / Children / legal bases para), onboarding copy `control_plane/onboarding/*` + `control_plane/api/*` if consent copy lives there.
+The same gate is fail-closed across deployment boundaries: queued/retried email
+and runtime jobs recheck the authoritative current receipt before provider work;
+a blocked legacy runtime job returns onboarding to an explicit email reset and
+acknowledgement path; and an already-active runtime refuses readiness when its
+manifest lacks the current version+SHA receipt. Exact activation replays remain
+available only for durable bootstrap-secret cleanup.
+
+**Files:** `docs/privacy/lawful-bases.md:92-162` (§3), `docs/privacy/dpia.md:48-57` (R7 row) + `docs/privacy/dpia.md:118-137` (§5 preconditions), `docs/privacy/privacy-notice-{en,ru}.md` (§ Other people's data / Children / legal bases para), onboarding copy `control_plane/onboarding/*` + `control_plane/api/*`, provisioning/activation enforcement in `control_plane/provisioning/*`, and steady-state readiness in `hermes_cloud/runtime/service.py` if consent copy lives there.
 
 **Edits:**
 
