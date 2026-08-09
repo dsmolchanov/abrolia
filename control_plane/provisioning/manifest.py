@@ -42,7 +42,9 @@ class ConsentReceiptV1(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     receipt_id: str = Field(min_length=1, max_length=128)
     purpose: Literal[
-        "whatsapp_channel_privacy", "whatsapp_linked_device_risk"
+        "special_category_content_restriction",
+        "whatsapp_channel_privacy",
+        "whatsapp_linked_device_risk",
     ]
     text_version: str = Field(min_length=1, max_length=64)
     text_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -53,7 +55,12 @@ class ConsentAuthorityV1(BaseModel):
     authority: Literal["control_plane"] = "control_plane"
     enforcement: Literal["required"] = "required"
     required_purposes: tuple[
-        Literal["whatsapp_channel_privacy", "whatsapp_linked_device_risk"], ...
+        Literal[
+            "special_category_content_restriction",
+            "whatsapp_channel_privacy",
+            "whatsapp_linked_device_risk",
+        ],
+        ...,
     ]
     receipts: tuple[ConsentReceiptV1, ...]
 

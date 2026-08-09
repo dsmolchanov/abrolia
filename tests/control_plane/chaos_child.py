@@ -13,6 +13,7 @@ from control_plane.db import ControlPlaneDatabase, ProcessAlreadyRunning
 from control_plane.email.models import SYNTHETIC_EMAIL_SECRET_BINDING
 from control_plane.models import StepKind
 from control_plane.onboarding.contracts import CommandContext
+from control_plane.privacy.consent import consent_version_and_sha
 from control_plane.provisioning.contracts import ProviderRegistry, ProvisionResult
 from control_plane.provisioning.fakes import DeterministicFakeProvisioner
 from control_plane.provisioning.manifest_toml import manifest_to_toml
@@ -27,7 +28,17 @@ from hermes_cloud.runtime.bootstrap import (
     atomic_write,
 )
 
-EMAIL_SELECTION = {"kind": "abrolia_managed", "local_part": "chaos-agent"}
+_RESTRICTION_VERSION, _RESTRICTION_SHA = consent_version_and_sha(
+    "special_category_content_restriction"
+)
+EMAIL_SELECTION = {
+    "kind": "abrolia_managed",
+    "local_part": "chaos-agent",
+    "special_category_restriction_acknowledged": True,
+    "special_category_restriction_receipt_id": "10000000-0000-4000-8000-000000000012",
+    "special_category_restriction_text_version": _RESTRICTION_VERSION,
+    "special_category_restriction_text_sha256": _RESTRICTION_SHA,
+}
 SECRET_CANARY = "-".join(("phase", "b", "secret", "canary", "value"))
 
 

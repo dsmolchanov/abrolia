@@ -14,6 +14,7 @@ from control_plane.api.internal_bootstrap import _bootstrap_transport_allowed
 from control_plane.db import new_id
 from control_plane.models import ProfileInput, StepKind
 from control_plane.onboarding.contracts import CommandContext
+from control_plane.privacy.consent import consent_version_and_sha
 from control_plane.provisioning.bootstrap import (
     BootstrapConflict,
     BootstrapDenied,
@@ -29,7 +30,17 @@ from hermes_cloud.runtime.bootstrap import (
 )
 from hermes_cloud.runtime.service import RuntimeService
 
-EMAIL_SELECTION = {"kind": "abrolia_managed", "local_part": "bootstrap-agent"}
+_RESTRICTION_VERSION, _RESTRICTION_SHA = consent_version_and_sha(
+    "special_category_content_restriction"
+)
+EMAIL_SELECTION = {
+    "kind": "abrolia_managed",
+    "local_part": "bootstrap-agent",
+    "special_category_restriction_acknowledged": True,
+    "special_category_restriction_receipt_id": "10000000-0000-4000-8000-000000000011",
+    "special_category_restriction_text_version": _RESTRICTION_VERSION,
+    "special_category_restriction_text_sha256": _RESTRICTION_SHA,
+}
 WHATSAPP_SELECTION = {
     "kind": "shared_abrolia",
     "member_phone_test_ref": "synthetic-phone:bootstrap-owner",

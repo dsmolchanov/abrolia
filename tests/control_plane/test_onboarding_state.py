@@ -9,13 +9,24 @@ from control_plane.onboarding.contracts import (
     InvalidTransition,
     WorkflowConflict,
 )
+from control_plane.privacy.consent import consent_version_and_sha
 from control_plane.provisioning.contracts import ProviderRegistry
 from control_plane.provisioning.fakes import DeterministicFakeProvisioner
 
 BASE_TIME = 1_800_000_000.0
 
 
-EMAIL_SELECTION = {"kind": "abrolia_managed", "local_part": "family-agent"}
+_RESTRICTION_VERSION, _RESTRICTION_SHA = consent_version_and_sha(
+    "special_category_content_restriction"
+)
+EMAIL_SELECTION = {
+    "kind": "abrolia_managed",
+    "local_part": "family-agent",
+    "special_category_restriction_acknowledged": True,
+    "special_category_restriction_receipt_id": "10000000-0000-4000-8000-000000000013",
+    "special_category_restriction_text_version": _RESTRICTION_VERSION,
+    "special_category_restriction_text_sha256": _RESTRICTION_SHA,
+}
 WHATSAPP_SELECTION = {
     "kind": "shared_abrolia",
     "member_phone_test_ref": "synthetic-phone:owner-one",
@@ -242,7 +253,10 @@ def test_cancel_only_cancels_intents_that_never_crossed_provider_boundary(
     assert current["status"] == expected_status
     assert current["error_code"] == expected_error
     assert current["leased_by"] is None and current["lease_until"] is None
-    assert cp_stack.jobs.request(job["id"])["selection"] == EMAIL_SELECTION
+    assert cp_stack.jobs.request(job["id"])["selection"] == {
+        "kind": "abrolia_managed",
+        "local_part": "family-agent",
+    }
     stored_identity = cp_stack.email_identities.get(identity.id)
     reservation = cp_stack.database.query_one(
         "SELECT status FROM email_address_reservations WHERE email_identity_id = ?",

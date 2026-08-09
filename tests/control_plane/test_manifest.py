@@ -12,6 +12,7 @@ from control_plane.models import (
     ProviderPublicResult,
     StepKind,
 )
+from control_plane.privacy.consent import consent_version_and_sha
 from control_plane.provisioning.contracts import InspectResult, InspectState, ProvisionResult
 from control_plane.provisioning.manifest import (
     ActorsV1,
@@ -31,7 +32,17 @@ from hermes_cloud.core.runtime_manifest import (
 )
 
 BASE_TIME = 1_800_000_000.0
-EMAIL_SELECTION = {"kind": "abrolia_managed", "local_part": "family-agent"}
+_RESTRICTION_VERSION, _RESTRICTION_SHA = consent_version_and_sha(
+    "special_category_content_restriction"
+)
+EMAIL_SELECTION = {
+    "kind": "abrolia_managed",
+    "local_part": "family-agent",
+    "special_category_restriction_acknowledged": True,
+    "special_category_restriction_receipt_id": "10000000-0000-4000-8000-000000000010",
+    "special_category_restriction_text_version": _RESTRICTION_VERSION,
+    "special_category_restriction_text_sha256": _RESTRICTION_SHA,
+}
 WHATSAPP_SELECTION = {
     "kind": "shared_abrolia",
     "member_phone_test_ref": "synthetic-phone:owner-one",
@@ -239,6 +250,39 @@ def test_planner_requires_all_three_verified_provider_results(cp_stack) -> None:
     assert cp_stack.database.query("SELECT id FROM config_revisions") == []
 
 
+def test_planner_blocks_legacy_verified_email_without_restriction_receipt(
+    cp_stack,
+) -> None:
+    cp_stack.complete_profile()
+    worker = cp_stack.make_worker(now=BASE_TIME + 50)
+    for kind, selection in (
+        (StepKind.EMAIL, EMAIL_SELECTION),
+        (StepKind.WHATSAPP, WHATSAPP_SELECTION),
+    ):
+        cp_stack.service.select(
+            cp_stack.household.id,
+            kind,
+            selection,
+            context=cp_stack.context(),
+        )
+        assert worker.run_once().status == "succeeded"
+    with cp_stack.database.write() as connection:
+        connection.execute(
+            "DELETE FROM consent_receipts WHERE household_id = ? AND purpose = ?",
+            (cp_stack.household.id, "special_category_content_restriction"),
+        )
+    cp_stack.service.select(
+        cp_stack.household.id,
+        StepKind.PRIMARY_CHANNEL,
+        CHANNEL_SELECTION,
+        context=cp_stack.context(),
+    )
+
+    with pytest.raises(ValueError, match="authoritative onboarding consent"):
+        worker.run_once()
+    assert cp_stack.database.query("SELECT id FROM config_revisions") == []
+
+
 def test_verified_inputs_create_encrypted_account_free_manifest(cp_stack) -> None:
     cp_stack.complete_profile()
     worker = cp_stack.make_worker(now=BASE_TIME + 50)
@@ -273,7 +317,10 @@ def test_verified_inputs_create_encrypted_account_free_manifest(cp_stack) -> Non
     assert cp_stack.account.recovery_email.encode() not in bytes(row["manifest_ciphertext"])
     assert spec.actors.owner == CHANNEL_SELECTION["actor_id"]
     assert spec.consent.authority == "control_plane"
-    assert spec.consent.required_purposes == ("whatsapp_channel_privacy",)
+    assert spec.consent.required_purposes == (
+        "special_category_content_restriction",
+        "whatsapp_channel_privacy",
+    )
 
 
 def test_manifest_payload_of_revision_cannot_be_mutated(cp_stack) -> None:

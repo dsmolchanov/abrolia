@@ -19,6 +19,7 @@ from control_plane.email.models import (
 from control_plane.models import StepKind, StepStatus
 from control_plane.observability import StructuredLogger
 from control_plane.onboarding.contracts import CommandResult
+from control_plane.privacy.consent import consent_version_and_sha
 from control_plane.provisioning.contracts import (
     InspectResult,
     InspectState,
@@ -36,7 +37,17 @@ from control_plane.provisioning.manifest_toml import manifest_to_toml
 from control_plane.provisioning.secrets import InMemorySecretSink
 
 BASE_TIME = 1_800_000_000.0
-EMAIL_SELECTION = {"kind": "abrolia_managed", "local_part": "family-agent"}
+_RESTRICTION_VERSION, _RESTRICTION_SHA = consent_version_and_sha(
+    "special_category_content_restriction"
+)
+EMAIL_SELECTION = {
+    "kind": "abrolia_managed",
+    "local_part": "family-agent",
+    "special_category_restriction_acknowledged": True,
+    "special_category_restriction_receipt_id": "10000000-0000-4000-8000-000000000014",
+    "special_category_restriction_text_version": _RESTRICTION_VERSION,
+    "special_category_restriction_text_sha256": _RESTRICTION_SHA,
+}
 WHATSAPP_SELECTION = {
     "kind": "shared_abrolia",
     "member_phone_test_ref": "synthetic-phone:worker-owner",
