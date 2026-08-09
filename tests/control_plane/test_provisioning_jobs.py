@@ -718,6 +718,28 @@ def test_secret_canary_is_confined_to_sink_across_sink_crash_and_public_surfaces
     assert canary not in log_stream.getvalue()
 
 
+def test_issued_runtime_job_rechecks_current_content_restriction_receipt(
+    cp_stack,
+) -> None:
+    _advance_to_runtime(cp_stack)
+    with cp_stack.database.write() as connection:
+        connection.execute(
+            "DELETE FROM consent_receipts WHERE household_id = ? AND purpose = ?",
+            (cp_stack.household.id, "special_category_content_restriction"),
+        )
+    runtime_provider = DryRunRuntimeProvisioner()
+    providers = ProviderRegistry()
+    providers.register("dry-run-runtime", runtime_provider)
+
+    blocked = cp_stack.make_worker(
+        providers=providers, now=BASE_TIME + 100
+    ).run_once()
+
+    assert blocked is not None and blocked.status == "failed"
+    assert blocked.error_code == "content_restriction_receipt_required"
+    assert runtime_provider.ensure_calls == 0
+
+
 def test_provider_rejection_after_cancel_cannot_reopen_terminal_projection(cp_stack) -> None:
     cp_stack.complete_profile()
     cp_stack.service.select(

@@ -121,12 +121,13 @@ fallback.
 2. Завершены runtime trust foundation и control-plane account/session,
    provisioning, retention, export/delete и backup/restore controls — до этого
    не подключается ни один реальный inbox или channel adapter.
-3. Подписаны DPA и оформлены трансферные механизмы с процессорами, которым это
-   применимо: P1, P2, P4, P8, P9. P3 — наша же система (внутренняя запись в
-   ст. 30 и документированная передача в US, отдельный DPA не требуется), P5 —
-   самостоятельный контролёр по своим условиям, доступ выдаёт семья
-   ([`processors.md`](processors.md)). Уведомления описывают фактическое
-   состояние, а не намерение.
+3. Подписаны DPA и оформлены трансферные механизмы с применимыми процессорами
+   P1, P2 и P4; pilot backups/logs используют только P2. Отдельные P8/P9 scoped
+   out и требуют своих DPA/transfer gates только до будущего привлечения. P3 —
+   наша же система (внутренняя запись в ст. 30 и документированная передача в
+   US, отдельный DPA не требуется), P5 — самостоятельный контролёр по своим
+   условиям, доступ выдаёт семья ([`processors.md`](processors.md)).
+   Уведомления описывают фактическое состояние, а не намерение.
 4. Gmail OAuth verification/CASA закрыты до включения dedicated Gmail real path.
 5. Shared WhatsApp получает отдельный channel notice receipt; dedicated QR —
    дополнительный informed-risk receipt. Все исходящие — staged approval.
