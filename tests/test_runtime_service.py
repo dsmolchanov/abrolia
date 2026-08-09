@@ -423,7 +423,7 @@ class FakeRuntimeGmailClient:
     def message(self, message_id):
         return self.messages[message_id]
 
-    def list_inbox(self, page_token=None, *, max_results, query):
+    def list_inbox(self, page_token=None, *, max_results):
         return {"messages": []}
 
     def close(self):

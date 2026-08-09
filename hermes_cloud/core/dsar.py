@@ -71,7 +71,6 @@ EXPORTED: dict[str, tuple[str, ...]] = {
     "email_sync_state": (
         "binding_identity_id", "binding_revision", "cursor", "connected_at",
         "last_success_at", "backoff_until", "health", "updated_at",
-        "cursor_observed_at",
     ),
     "email_sends": (
         "effect_id", "approval_id", "binding_identity_id", "binding_revision",

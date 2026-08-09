@@ -15,15 +15,10 @@ def test_migrations_apply_once_and_are_recorded(tmp_path: Path) -> None:
     applied = database.migrate()
     assert applied == sorted(applied), "миграции применяются по возрастанию имени"
     assert "0001_init.sql" in applied
-    assert "0009_gmail_cursor_overlap.sql" in applied
     assert database.migrate() == [], "повторный запуск не должен ничего применять"
 
     names = {row["name"] for row in database.query("SELECT name FROM schema_migrations")}
     assert names == set(applied)
-    sync_columns = {
-        row["name"] for row in database.query("PRAGMA table_info(email_sync_state)")
-    }
-    assert "cursor_observed_at" in sync_columns
 
 
 def test_durability_pragmas_are_set(tmp_path: Path) -> None:

@@ -25,7 +25,6 @@ class FakeGmail:
         self.history_pages = []
         self.messages = {}
         self.list_page = {"messages": []}
-        self.list_queries = []
         self.error = None
 
     def profile(self):
@@ -40,8 +39,7 @@ class FakeGmail:
     def message(self, message_id):
         return self.messages[message_id]
 
-    def list_inbox(self, page_token=None, *, max_results, query):
-        self.list_queries.append((page_token, max_results, query))
+    def list_inbox(self, page_token=None, *, max_results):
         return self.list_page
 
 
@@ -56,14 +54,7 @@ def encoded(raw=RAW, *, labels=("INBOX",), message_id="m1"):
 def source_world(tmp_path: Path):
     db = open_database(tmp_path / "runtime.db")
     client = FakeGmail()
-    source = GmailHistorySource(
-        db,
-        BINDING,
-        client,
-        clock=lambda: 200.0,
-        resync_limit=2,
-        resync_overlap_seconds=60,
-    )
+    source = GmailHistorySource(db, BINDING, client, clock=lambda: 200.0, resync_limit=2)
     service = EmailRuntimeService(db, [source], clock=lambda: 200.0)
     service.activate(BINDING)
     return db, client, source, service
@@ -111,7 +102,6 @@ def test_expired_history_uses_bounded_resync_and_refuses_unbounded_gap(tmp_path:
     client.messages = {"m1": encoded()}
     assert service.run_once() == 1
     assert db.query_one("SELECT cursor FROM email_sync_state")["cursor"] == "120"
-    assert client.list_queries == [(None, 2, "in:inbox after:140")]
 
     client.list_page = {"messages": [{"id": "m1"}], "nextPageToken": "more"}
     with pytest.raises(GmailHistoryGap):
