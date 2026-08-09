@@ -236,5 +236,68 @@ authenticated Fly deployment or close B-11. Do not deploy this configuration,
 mark Phase B complete, enable real adapters, or run Phase C live batteries until
 authenticated org/app/Machine/volume/image evidence, one synthetic onboarding,
 the live drill matrix, and the isolated restore rehearsal are recorded here.
+
+### Authenticated migration and restore evidence — 2026-08-09
+
+**Operator:** Dmitry Molchanov (`dsmolchanov@gmail.com`), organization admin.
+**Deployed source:** `main@a87d7e9188d32a2fcdfb022769476d5995111de3`.
+
+| Check | Observed evidence | Result |
+|---|---|---|
+| Dedicated organization | `fly orgs show abrolia-synthetic` succeeded; the org has one admin member. | **pass** |
+| Control-plane ownership | `abrolia-control-plane-synthetic` is the only app in `abrolia-synthetic`; no `abrolia-control-plane-synthetic`, `abrolia-hh-*`, or Phase B restore app remains in `personal`. | **pass** |
+| Machine topology | Machine `85e649c449e9e8`, `ams`, `started`, shared CPU 1x, 512 MiB; one passing Fly health check. | **pass** |
+| Volume topology | Volume `vol_r1j6gpg2nq12x0zr`, `control_plane_data`, encrypted, 1 GiB, `ams`, attached to `85e649c449e9e8` at `/data`. | **pass** |
+| Immutable image | `registry.fly.io/abrolia-control-plane-synthetic:deployment-01KZJMAWT0XM42AX09RNDXBM6D@sha256:fabce417012e5de046fa7ba5588e467e2962d144b1a6807c99fddf3c54b05fb2`. | **pass** |
+| Effective gates | `ABROLIA_SYNTHETIC_ONLY=1`; family data, real email, real WhatsApp, real channel and magic-link delivery are all `0`; `ABROLIA_FLY_ORG=abrolia-synthetic`; bare Flycast host retained. The stale `ABROLIA_REAL_EMAIL_ENABLED` secret override was removed. | **pass** |
+| Primary probes | Public `/healthz` and `/readyz` both returned `200`; database/volume/workers were healthy, backup fresh, pending/stale/unknown/expired counters all zero. | **pass** |
+| Exact reconciliation | The one inherited `fly-runtime` cleanup job in `outcome_unknown` was inspected by exact job ID and reconciled to `succeeded`; the now-empty legacy runtime app had zero Machines and zero volumes before exact destruction. | **pass** |
+
+The current image was built and rolled out while the same app temporarily belonged
+to the paid `personal` organization, then the same Machine and volume were moved
+back to `abrolia-synthetic`. This was necessary because Fly rejects both Depot
+builds and existing-Machine updates in the new organization with HTTP 403 until a
+payment method is configured. No control-plane data or resource identity changed
+during either move.
+
+**Backup and isolated restore rehearsal:** the primary produced
+`/data/backups/control-plane-20260809-phase-b-closure.cpb`, 421922 bytes, SHA-256
+`cc956654fd3aeb60134fe3fd711d65174868db9aae0d8d65f3a79cc9f9345ded`.
+An isolated snapshot clone was restored in temporary app
+`abrolia-phase-b-restore-20260809`, Machine `185dd66f943e28`, encrypted 1 GiB
+volume `vol_4m3135olk0xqwxzv`, using pinned image digest
+`sha256:7309762857f0401a3b9713d93b7320070b20e981444f9b245187aa9997c540f3`.
+Only the four application/backup keys were streamed from the source Machine to
+the temporary secret namespace; no value entered output, argv, a local file, or
+this report.
+
+| Restore check | Observed evidence | Result |
+|---|---|---|
+| Authenticated restore | Completed in 4 seconds; `integrity_check=ok`, zero foreign-key violations, WAL, synchronous FULL, migrations `0001` through `0007`. | **pass** |
+| Fail-closed inputs | Existing target, wrong key, and one-byte tamper were rejected; neither negative case left a partial target. | **pass** |
+| Worker pause | Pause marker mode `0600`; paused API returned `/healthz=200`, `/readyz=503` with only `workers_paused`; a deliberately pending job remained pending and no job entered running during the observation window. | **pass** |
+| Authenticated smoke | Masked `/api/v1/me`, onboarding snapshot and export returned `200`; the raw session token was absent from export. | **pass** |
+| Explicit resume | `abrolia-control-plane resume-jobs` returned `resumed`. A new reserved `.test` household then completed email, WhatsApp, channel, runtime and bootstrap-cleanup jobs; workflow `complete`, household `active`, revision `1`, manifest SHA-256 `b49dec33c14a502e84da11fcdf74fedb97b3bc945a07e7405931b72508ab3e56`. | **pass** |
+| Cleanup | Exact temporary app, Machine and volume were destroyed and verified absent. | **pass** |
+
+**Automated gates on the deployed checkout:** full non-live suite **914 tests,
+pass**; `tests/control_plane` **401 tests, pass**; focused Phase B chaos,
+provisioning and backup set **47 tests, pass**; Ruff pass; fixture scan clean
+(private deny patterns were not loaded locally); gitleaks pass across 147 commits.
+
+**Cost tag:** current public Fly list prices put one always-on shared-cpu-1x/512
+MiB Machine plus one 1 GiB volume at approximately **US$3.34–3.47/month**, before
+snapshot storage and network usage. The organization currently has no billable
+plan/payment method, so this is a list-price estimate rather than invoice
+evidence.
+
+**Remaining Phase B gate — do not mark complete:** configure billing for
+`abrolia-synthetic`, then run a new real Fly household onboarding directly in
+that organization, the live eight-window kill matrix, and every remaining B-09
+operator drill (invite replay/re-login, runtime manifest secret check, tamper,
+live cross-household IDOR, export/data-map comparison, delete+tombstone). The
+authenticated topology and isolated restore portions of B-11 are complete; B-09
+and the live runtime portion remain open.
+
 Phase C hermetic work may remain in draft branches; its live execution stays
 blocked on this evidence.
