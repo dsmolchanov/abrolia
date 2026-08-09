@@ -55,3 +55,8 @@ docs/onboarding-runbook.md | email | login@abrolia.com
 docs/SECURITY.md | email | security@abrolia.com
 thoughts/shared/handoffs/general/*.md | email | security@abrolia.com
 .check-fixtures-allow | email | security@abrolia.com
+
+# Privacy and data-subject request contact (operator-owned, not fixture data).
+control_plane/privacy/consent.py | email | help@abrolia.com
+docs/privacy/*.md | email | help@abrolia.com
+.check-fixtures-allow | email | help@abrolia.com

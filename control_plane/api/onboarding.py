@@ -18,8 +18,48 @@ from control_plane.api.dependencies import (
 )
 from control_plane.models import ProfileInput, StepKind
 from control_plane.onboarding.contracts import CommandContext, CommandResult
+from control_plane.privacy.consent import (
+    consent_version_and_sha,
+    consent_version_and_text,
+)
 
 router = APIRouter()
+
+
+def _require_email_content_restriction(
+    kind: StepKind, selection: dict[str, Any]
+) -> None:
+    """Fail closed at the user-facing boundary in every rollout mode."""
+    if kind is not StepKind.EMAIL:
+        return
+    expected_version, expected_sha = consent_version_and_sha(
+        "special_category_content_restriction"
+    )
+    if (
+        selection.get("special_category_restriction_acknowledged") is not True
+        or not selection.get("special_category_restriction_receipt_id")
+        or selection.get("special_category_restriction_text_version")
+        != expected_version
+        or selection.get("special_category_restriction_text_sha256") != expected_sha
+    ):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "special-category content restriction acknowledgement required",
+        )
+
+
+@router.get("/api/v1/onboarding/consent/special-category-content-restriction")
+def email_content_restriction_contract() -> JSONResponse:
+    """Expose the exact copy and digest API clients must acknowledge."""
+    purpose = "special_category_content_restriction"
+    version, copy = consent_version_and_text(purpose)
+    _, sha256 = consent_version_and_sha(purpose)
+    return JSONResponse({
+        "purpose": purpose,
+        "text_version": version,
+        "text": copy,
+        "text_sha256": sha256,
+    })
 
 
 def _response(result: CommandResult) -> JSONResponse:
@@ -72,6 +112,7 @@ def select_step(
     current: Annotated[CurrentHousehold, Depends(current_household_mutation)],
     headers: Annotated[CommandHeaders, Depends(command_headers)],
 ) -> JSONResponse:
+    _require_email_content_restriction(kind, selection)
     try:
         result = container(request).onboarding.select(
             current.household.id,

@@ -6,6 +6,7 @@ import pytest
 
 from control_plane.email.models import EmailOption, EmailProvisionIntent
 from control_plane.models import StepKind
+from control_plane.privacy.consent import consent_version_and_sha
 from control_plane.providers.email.nerve_managed import (
     NERVE_SECRET_BINDING,
     NerveManagedEmailProvisioner,
@@ -26,6 +27,17 @@ INBOX_ID = "00000000-0000-4000-8000-000000000003"
 KEY_ID = "00000000-0000-4000-8000-000000000004"
 OLD_KEY_ID = "00000000-0000-4000-8000-000000000005"
 WEBHOOK_ID = "00000000-0000-4000-8000-000000000006"
+_RESTRICTION_VERSION, _RESTRICTION_SHA = consent_version_and_sha(
+    "special_category_content_restriction"
+)
+MANAGED_SELECTION = {
+    "kind": "abrolia_managed",
+    "local_part": "family-agent",
+    "special_category_restriction_acknowledged": True,
+    "special_category_restriction_receipt_id": "10000000-0000-4000-8000-000000000023",
+    "special_category_restriction_text_version": _RESTRICTION_VERSION,
+    "special_category_restriction_text_sha256": _RESTRICTION_SHA,
+}
 
 
 class FakeNerveAdmin:
@@ -386,7 +398,7 @@ def test_managed_provider_runs_through_durable_worker_and_secret_sink(cp_stack) 
     cp_stack.service.select(
         cp_stack.household.id,
         StepKind.EMAIL,
-        {"kind": "abrolia_managed", "local_part": "family-agent"},
+        MANAGED_SELECTION,
         context=cp_stack.context(),
     )
     registry = ProviderRegistry()
@@ -434,7 +446,7 @@ def test_worker_keeps_onboarding_pending_until_attachment_flag_converges(
     cp_stack.service.select(
         cp_stack.household.id,
         StepKind.EMAIL,
-        {"kind": "abrolia_managed", "local_part": "family-agent"},
+        MANAGED_SELECTION,
         context=cp_stack.context(),
     )
     registry = ProviderRegistry()
@@ -484,7 +496,7 @@ def test_worker_reconciles_lost_create_response_from_durable_intent(cp_stack) ->
     cp_stack.service.select(
         cp_stack.household.id,
         StepKind.EMAIL,
-        {"kind": "abrolia_managed", "local_part": "family-agent"},
+        MANAGED_SELECTION,
         context=cp_stack.context(),
     )
     client = LostInboxResponseNerveAdmin()
@@ -577,7 +589,7 @@ def test_worker_rejects_duplicate_key_noncanonical_nerve_reference(cp_stack) -> 
     cp_stack.service.select(
         cp_stack.household.id,
         StepKind.EMAIL,
-        {"kind": "abrolia_managed", "local_part": "family-agent"},
+        MANAGED_SELECTION,
         context=cp_stack.context(),
     )
 

@@ -7,6 +7,7 @@ import pytest
 
 from control_plane.email.models import EmailIdentityStatus, EmailOption
 from control_plane.models import StepKind
+from control_plane.privacy.consent import consent_version_and_sha
 from control_plane.providers.email.nerve_byo_domain import NerveByoDomainProvisioner
 from control_plane.providers.email.nerve_managed import NERVE_SECRET_BINDING
 from control_plane.provisioning.contracts import (
@@ -23,6 +24,9 @@ INBOX_ID = "10000000-0000-4000-8000-000000000003"
 KEY_ID = "10000000-0000-4000-8000-000000000004"
 WEBHOOK_ID = "10000000-0000-4000-8000-000000000005"
 BASE_TIME = 1_800_000_000.0
+_RESTRICTION_VERSION, _RESTRICTION_SHA = consent_version_and_sha(
+    "special_category_content_restriction"
+)
 
 
 class FakeByoNerveAdmin:
@@ -155,6 +159,10 @@ def _select(cp_stack) -> None:
             "kind": "family_domain",
             "domain": "family.example.test",
             "local_part": "assistant",
+            "special_category_restriction_acknowledged": True,
+            "special_category_restriction_receipt_id": "10000000-0000-4000-8000-000000000022",
+            "special_category_restriction_text_version": _RESTRICTION_VERSION,
+            "special_category_restriction_text_sha256": _RESTRICTION_SHA,
         },
         context=cp_stack.context(),
     )

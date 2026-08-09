@@ -172,10 +172,18 @@ never the agent inbox. A primary change takes effect after a test receipt.
 ## Special categories of data
 
 School emails sometimes contain health information (a sick note, an allergy, an
-exemption) and occasionally religious information. We do not extract it and use
-it in no logic at all. The law requires a specific condition for processing
-such data; that condition is determined before any real family is connected,
-and until then such emails are not processed by the system.
+exemption) and occasionally religious information. We do not extract it or use
+it in any product logic. Do not send this material, or any other special-category
+personal data about any person, to the agent inbox or channel. Before choosing
+an email identity, the household owner separately acknowledges this obligation;
+the accepted text version is stored as an accountability receipt. If material is
+sent by mistake, stop using it and request deletion at `help@abrolia.com`.
+
+This restriction defines the permitted pilot scope, but it does not remove
+Abrolia's data-protection obligations or make accidentally received material
+"unprocessed". The law requires a specific condition for processing such data;
+until that condition is documented, real family inboxes and channels are not
+connected.
 
 ## Is providing data mandatory
 

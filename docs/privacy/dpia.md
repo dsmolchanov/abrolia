@@ -54,7 +54,7 @@ DPIA добровольной — формулировка снята ревиз
 | R4 | Утечка одной семьи в другую через metadata control plane или shared WhatsApp gateway | семьи | высокий | membership-scoped query на каждом API route; caller-supplied household не авторизует; dedicated runtimes/volumes/keys; shared sender exact-mapped к одному household, unknown/ambiguous deny; cross-household tests | низкий |
 | R5 | Данные третьих лиц (учителя, другие родители) обрабатываются без их ведома | третьи лица | средний | LIA, TTL 30 дней на сырьё, отсутствие вторичного использования, публичный notice, право возражения | средний (принят) |
 | R6 | Данные детей в переписке | дети | средний | [`minors.md`](minors.md): минимизация, отсутствие профилей детей, TTL, запрет функций «по ребёнку» | средний → низкий |
-| R7 | Особые категории (здоровье, религия) в письмах | третьи лица, дети | высокий | не извлекаем и не индексируем такие атрибуты; короткий TTL — **но это меры, а не условие ст. 9(2)** | **высокий, блокирующий**: до выбора условия ст. 9(2) юристом реальные данные не подключаются ([`lawful-bases.md`](lawful-bases.md), р. 3) |
+| R7 | Особые категории (здоровье, религия) в письмах | третьи лица, дети | высокий | не извлекаем и не индексируем такие атрибуты; короткий TTL; до выбора email identity семья принимает versioned запрет на отправку таких материалов и при ошибке запрашивает удаление — **но это меры, а не условие ст. 9(2)** | **высокий, блокирующий**: acknowledgement не переносит ответственность и не предотвращает обработку случайно доставленного материала; до выбора условия ст. 9(2) реальные данные не подключаются ([`lawful-bases.md`](lawful-bases.md), р. 3) |
 | R8 | Международные передачи (US) | все | средний | DPA/SCC/TIA в [`processors.md`](processors.md); честная формулировка residency; `eu-strict` как fail-closed upgrade | средний (раскрыт) |
 | R9 | Компрометация runtime/control-plane secrets | семья, все pilot households | высокий | раздельные Fly secret namespaces; field-encryption и lookup-HMAC keys раздельны; browser/job JSON/DB/log никогда не получают Fly/provider/bootstrap plaintext; gitleaks и ротация | низкий → средний для control-plane blast radius |
 | R10 | Потеря данных | семья | средний | SQLite WAL + fsync-before-ACK, бэкапы с тестом восстановления | низкий |
@@ -121,12 +121,13 @@ fallback.
 2. Завершены runtime trust foundation и control-plane account/session,
    provisioning, retention, export/delete и backup/restore controls — до этого
    не подключается ни один реальный inbox или channel adapter.
-3. Подписаны DPA и оформлены трансферные механизмы с процессорами, которым это
-   применимо: P1, P2, P4, P8, P9. P3 — наша же система (внутренняя запись в
-   ст. 30 и документированная передача в US, отдельный DPA не требуется), P5 —
-   самостоятельный контролёр по своим условиям, доступ выдаёт семья
-   ([`processors.md`](processors.md)). Уведомления описывают фактическое
-   состояние, а не намерение.
+3. Подписаны DPA и оформлены трансферные механизмы с применимыми процессорами
+   P1, P2 и P4; pilot backups/logs используют только P2. Отдельные P8/P9 scoped
+   out и требуют своих DPA/transfer gates только до будущего привлечения. P3 —
+   наша же система (внутренняя запись в ст. 30 и документированная передача в
+   US, отдельный DPA не требуется), P5 — самостоятельный контролёр по своим
+   условиям, доступ выдаёт семья ([`processors.md`](processors.md)).
+   Уведомления описывают фактическое состояние, а не намерение.
 4. Gmail OAuth verification/CASA закрыты до включения dedicated Gmail real path.
 5. Shared WhatsApp получает отдельный channel notice receipt; dedicated QR —
    дополнительный informed-risk receipt. Все исходящие — staged approval.

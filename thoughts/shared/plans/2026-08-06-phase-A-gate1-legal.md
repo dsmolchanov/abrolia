@@ -19,7 +19,7 @@ gate: "Gate -1 — no ABROLIA_REAL_* flag enabled until A is merged"
 
 ## Overview
 
-Phase A closes the two legal/residency blockers that gate **every** real-data operation in canon. Until A is merged, the system remains synthetic-only — including owner-mailbox data. This phase produces **no runtime feature code**; it produces signed legal artifacts, corrected privacy disclosures, and a fail-closed config enforcement with tests.
+Phase A closes the two legal/residency blockers that gate **every** real-data operation in canon. Until A is merged, the system remains synthetic-only — including owner-mailbox data. This phase produces no provider execution or content-classification feature code; it produces signed legal artifacts, corrected privacy disclosures, and a fail-closed config enforcement with tests. A narrow, synthetic-only onboarding restriction may land before counsel review under the pre-gate rule below, but it is not Phase A closure.
 
 | Blocker | Severity | Summary |
 |---------|----------|---------|
@@ -116,7 +116,23 @@ After Phase A merges on a short-lived `codex/phase-A-legal` branch:
 
 **Owner:** counsel decides; engineer documents and wires consent receipt.
 
-**Files:** `docs/privacy/lawful-bases.md:92-162` (§3), `docs/privacy/dpia.md:48-57` (R7 row) + `docs/privacy/dpia.md:118-137` (§5 preconditions), `docs/privacy/privacy-notice-{en,ru}.md` (§ Other people's data / Children / legal bases para), onboarding copy `control_plane/onboarding/*` + `control_plane/api/*` if consent copy lives there.
+**Pre-gate operational mitigation (owner-approved 2026-08-08):** before counsel
+selects an Art. 9(2) condition, onboarding may require a versioned acknowledgement
+that the household will not send special-category content. The exact text shown
+to the user must be the text hashed in the durable receipt, the requirement must
+apply to every email selection including synthetic/default API flows, and all
+`ABROLIA_REAL_*` flags remain disabled. This mitigation does not select direction
+2, satisfy Art. 9(2), lower DPIA R7, complete any A3 checkbox, or authorize real
+family data. Owner authorization: `/s/ Product owner (CEO), 2026-08-08`.
+
+The same gate is fail-closed across deployment boundaries: queued/retried email
+and runtime jobs recheck the authoritative current receipt before provider work;
+a blocked legacy runtime job returns onboarding to an explicit email reset and
+acknowledgement path; and an already-active runtime refuses readiness when its
+manifest lacks the current version+SHA receipt. Exact activation replays remain
+available only for durable bootstrap-secret cleanup.
+
+**Files:** `docs/privacy/lawful-bases.md:92-162` (§3), `docs/privacy/dpia.md:48-57` (R7 row) + `docs/privacy/dpia.md:118-137` (§5 preconditions), `docs/privacy/privacy-notice-{en,ru}.md` (§ Other people's data / Children / legal bases para), onboarding copy `control_plane/onboarding/*` + `control_plane/api/*`, provisioning/activation enforcement in `control_plane/provisioning/*`, and steady-state readiness in `hermes_cloud/runtime/service.py` if consent copy lives there.
 
 **Edits:**
 

@@ -76,7 +76,10 @@ class DesiredSpecPlanner:
         email_public = email_result["public_result"]
         channel_public = channel_result["public_result"]
         whatsapp_selection = self.onboarding.selection(workflow.id, "whatsapp_identity")
-        required_purposes = ["whatsapp_channel_privacy"]
+        required_purposes = [
+            "special_category_content_restriction",
+            "whatsapp_channel_privacy",
+        ]
         if whatsapp_selection and whatsapp_selection.get("kind") == "dedicated_number":
             required_purposes.append("whatsapp_linked_device_risk")
         receipt_rows = connection.execute(
@@ -86,7 +89,7 @@ class DesiredSpecPlanner:
         ).fetchall()
         receipts_by_purpose = {row["purpose"]: row for row in receipt_rows}
         if any(purpose not in receipts_by_purpose for purpose in required_purposes):
-            raise ValueError("authoritative WhatsApp consent receipt is missing")
+            raise ValueError("authoritative onboarding consent receipt is missing")
         current = connection.execute(
             "SELECT COALESCE(MAX(revision), 0) AS revision FROM config_revisions"
             " WHERE household_id = ?",
