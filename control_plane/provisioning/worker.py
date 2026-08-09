@@ -54,8 +54,9 @@ class _ProjectionCancelled(RuntimeError):
     pass
 
 
-DNS_POLL_DELAYS_SECONDS = (30.0, 60.0, 120.0, 300.0, 600.0)
-DNS_POLL_MAX_JOB_ATTEMPTS = len(DNS_POLL_DELAYS_SECONDS) + 1
+DNS_POLL_INITIAL_SECONDS = 30.0
+DNS_POLL_MAX_SECONDS = 300.0
+DNS_POLL_MAX_JOB_ATTEMPTS = 5
 
 
 class ProvisioningWorker:
@@ -1525,7 +1526,10 @@ class ProvisioningWorker:
                 }
                 not_before = None
                 if job.attempts < DNS_POLL_MAX_JOB_ATTEMPTS:
-                    delay = DNS_POLL_DELAYS_SECONDS[job.attempts - 1]
+                    delay = min(
+                        DNS_POLL_INITIAL_SECONDS * (2 ** max(0, job.attempts - 1)),
+                        DNS_POLL_MAX_SECONDS,
+                    )
                     not_before = now + delay
                 self.jobs.schedule_waiting_inspect(
                     connection,

@@ -31,42 +31,6 @@ The remaining Phase 2.4 gate passed against production Nerve and Abrolia:
 - Namecheap BasicDNS published the exact six provider records below
   `test.axiomatlas.llc`: inbound MX and SPF, `send` MX and SPF, DKIM, and DMARC.
   Google Public DNS returned all six authoritative values after propagation.
-
-## Phase C2 Addendum — 2026-08-08 (BYO live battery, B-05)
-
-**Branch:** `codex/phase-C2-byo-live` stacked on `codex/phase-B-foundation`.
-Synthetic-only unless the `abrolia-synthetic` live topology is evidenced. Bounded
-backoff `30/60/120/300/600s` + manual `CHECK` is the enforced policy.
-
-**Hermetic coverage (required, no live Nerve):**
-- `pytest tests/control_plane/email -k byo -q` — **26 passed**: fresh-session
-  reload/resume, wrong DNS remains `waiting_user`, verified advance, a real
-  two-client API race returning one `409 domain_already_claimed`, reconnect and
-  provider-unavailable quarantine, lost committed-response cases for
-  org/domain/inbox/key/webhook, and hard-delete/fresh-grant lifecycle.
-- `control_plane/provisioning/worker.py` now uses the explicit bounded sequence
-  `30/60/120/300/600`; the sixth inspection stops automatic polling while manual
-  `CHECK` remains available.
-
-**Live battery on `abrolia-synthetic` (operator, gated by completed Phase B
-topology and operator credentials):**
-Each case to be recorded here with observed `domain_lookup_hmac`, `domain_id`, `org_id`, DNS `TXT`/`MX` values (no secrets). Until live run, status is `pending-operator`:
-
-| # | Case | Expected | Status |
-|---|------|----------|--------|
-| 1 | Reload/login resumes same DNS records/state | Same `domain_lookup_hmac`, same DNS records, `waiting_user`, no duplicate `email_address_reservations` | pending — requires live `abrolia-synthetic` + test domain |
-| 2 | Wrong/partial DNS stays `waiting_user` | `waiting_user` + `needs_attention` missing records | pending |
-| 3 | Verified DNS advances once | `waiting_user → verified` once, second `CHECK` idempotent | pending |
-| 4 | Two-connection race, same canonical domain | One `INSERT` holds HMAC unique, other `409 domain_already_claimed` | pending |
-| 5 | Delete/reconnect — DNS present | New `email_identity_id`/`generation`/`SecretSink` receipt | pending |
-| 6 | Delete/reconnect — provider unavailable | `outcome_unknown` with retry `CHECK` | pending |
-| 7 | Lost-response matrix (webhook/key/inbox/domain/org) | Each `outcome_unknown` explicit, no duplicate on reconcile, backoff observed | pending |
-| 8 | Nerve bootstrap hard-delete (PR #64) | Old `domain-grant` hard-deleted, fresh grant `200` | pending |
-
-Until the authenticated live run records cases 1–8, IDs remain `TBD` and C2 must
-not merge or unblock C3. A synthetic operator-owned test domain does not enable
-real family data; Phase A remains independently required before any real-family
-email flag is enabled.
 - First identity `ca113cc4-538c-42bf-9c3b-8d7b97a25e4a` used durable inspect job
   `c219963d-bc64-4bd6-ab91-b77e886f96d9`. It stayed `waiting_user` through four
   checks, then the same job reached `succeeded` on attempt five at

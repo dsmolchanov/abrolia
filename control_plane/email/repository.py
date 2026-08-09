@@ -14,10 +14,6 @@ from control_plane.repositories.base import Repository
 RESERVATION_TTL_SECONDS = 15 * 60
 
 
-class EmailDomainAlreadyClaimed(ValueError):
-    """A live owned-domain identity already holds the canonical domain."""
-
-
 def _mask_email(address: str) -> str:
     local, domain = normalize_email(address).split("@", 1)
     visible = local[:2]
@@ -121,37 +117,30 @@ class EmailIdentityRepository(Repository):
                     (domain,),
                 ).fetchone()
                 if legacy_claim is not None:
-                    raise EmailDomainAlreadyClaimed("email domain is already claimed")
+                    raise sqlite3.IntegrityError("email domain is already claimed")
         key_version = (
             encrypted_address.key_version
             if encrypted_address is not None
             else self.cipher.active_version
         )
-        try:
-            connection.execute(
-                "INSERT INTO email_identities (id, household_id, option, status,"
-                " address_ciphertext, address_lookup_hmac, address_masked, domain_lookup_hmac,"
-                " encryption_key_version, created_at, updated_at)"
-                " VALUES (?, ?, ?, 'selected', ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    identity_id,
-                    household_id,
-                    option.value,
-                    encrypted_address.ciphertext if encrypted_address else None,
-                    address_hmac,
-                    address_masked,
-                    domain_lookup_hmac,
-                    key_version,
-                    now,
-                    now,
-                ),
-            )
-        except sqlite3.IntegrityError as error:
-            if option is EmailOption.OWN_DOMAIN and domain_lookup_hmac is not None:
-                raise EmailDomainAlreadyClaimed(
-                    "email domain is already claimed"
-                ) from error
-            raise
+        connection.execute(
+            "INSERT INTO email_identities (id, household_id, option, status,"
+            " address_ciphertext, address_lookup_hmac, address_masked, domain_lookup_hmac,"
+            " encryption_key_version, created_at, updated_at)"
+            " VALUES (?, ?, ?, 'selected', ?, ?, ?, ?, ?, ?, ?)",
+            (
+                identity_id,
+                household_id,
+                option.value,
+                encrypted_address.ciphertext if encrypted_address else None,
+                address_hmac,
+                address_masked,
+                domain_lookup_hmac,
+                key_version,
+                now,
+                now,
+            ),
+        )
         if normalized_address is not None:
             local_part, domain = normalized_address.split("@", 1)
             reservation = connection.execute(
