@@ -969,7 +969,9 @@ class FlyRuntimeProvisioner:
                 return InspectResult(InspectState.ABSENT)
 
             self._request(
-                "DELETE", f"/v1/apps/{target.app_ref}", allow_not_found=True
+                "DELETE",
+                f"/v1/apps/{target.app_ref}?force=true",
+                allow_not_found=True,
             )
             if self._get_app(target.app_ref) is None:
                 return InspectResult(InspectState.ABSENT)
