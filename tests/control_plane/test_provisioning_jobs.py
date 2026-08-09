@@ -8,10 +8,12 @@ from pathlib import Path
 
 import pytest
 
+from control_plane.api.onboarding import _response
 from control_plane.crypto import SecretMaterial
 from control_plane.email.contracts import EmailFailureKind, EmailProviderError
 from control_plane.email.models import EmailIdentityStatus
 from control_plane.models import StepKind, StepStatus
+from control_plane.onboarding.contracts import CommandResult
 from control_plane.provisioning.contracts import (
     InspectResult,
     InspectState,
@@ -25,6 +27,7 @@ from control_plane.provisioning.fakes import (
     DeterministicFakeProvisioner,
     DryRunRuntimeProvisioner,
 )
+from control_plane.provisioning.manifest_toml import manifest_to_toml
 from control_plane.provisioning.secrets import InMemorySecretSink
 
 BASE_TIME = 1_800_000_000.0
@@ -556,6 +559,91 @@ def test_sigkill_after_one_time_secret_response_never_falsely_verifies(
     assert recovered.status == "outcome_unknown"
     assert recovered.error_code == "secret_handoff_unknown"
     assert cp_stack.jobs.get(job["id"]).status == "outcome_unknown"
+
+
+def test_secret_canary_is_confined_to_sink_across_sink_crash_and_public_surfaces(
+    cp_stack, caplog
+) -> None:
+    """Exercise the real secret handoff and prove only the sink retains its value."""
+    canary = "phase-b-secret-canary-7f23c0bdb1"
+    binding = "ABROLIA_EMAIL_PROVIDER_KEY"
+
+    class CanaryEmailProvisioner(DeterministicFakeProvisioner):
+        def _result(self, intent, key):
+            result = super()._result(intent, key)
+            return ProvisionResult(
+                external_ref=result.external_ref,
+                public_result={**result.public_result, "secret_binding_ref": binding},
+                secret_material=SecretMaterial.from_mapping({binding: canary}),
+            )
+
+    providers = ProviderRegistry()
+    providers.register("fake-email", CanaryEmailProvisioner("email"))
+    providers.register("fake-whatsapp", DeterministicFakeProvisioner("whatsapp"))
+    providers.register("fake-channel", DeterministicFakeProvisioner("channel"))
+    providers.register("fake-cleanup", DeterministicFakeProvisioner("cleanup"))
+    providers.register("dry-run-runtime", DryRunRuntimeProvisioner())
+    class CrashAfterCanaryInstall(InMemorySecretSink):
+        crashed = False
+
+        def install(self, runtime_ref, material):
+            is_canary_handoff = any(name == binding for name, _value in material.items())
+            super().install(runtime_ref, material)
+            if is_canary_handoff and not self.crashed:
+                self.crashed = True
+                raise RuntimeError("synthetic crash after sink commit")
+
+    sink = CrashAfterCanaryInstall()
+
+    cp_stack.complete_profile()
+    worker = cp_stack.make_worker(
+        providers=providers, secret_sink=sink, now=BASE_TIME + 10
+    )
+    for kind, selection in (
+        (StepKind.EMAIL, EMAIL_SELECTION),
+        (StepKind.WHATSAPP, WHATSAPP_SELECTION),
+        (StepKind.PRIMARY_CHANNEL, CHANNEL_SELECTION),
+    ):
+        cp_stack.service.select(
+            cp_stack.household.id,
+            kind,
+            selection,
+            context=cp_stack.context(),
+            now=BASE_TIME + 3,
+        )
+        result = worker.run_once()
+        if kind is StepKind.EMAIL:
+            assert result.status == "outcome_unknown"
+            assert result.error_code == "secret_handoff_unknown"
+            assert worker.reconcile(result.job_id).status == "succeeded"
+        else:
+            assert result.status == "succeeded"
+
+    runtime = worker.run_once()
+    assert runtime is not None and runtime.status == "succeeded"
+    namespace = worker._secret_namespace_ref(cp_stack.household.id)
+    assert namespace is not None
+    assert sink.get(namespace, binding) == canary.encode()
+
+    snapshot = cp_stack.onboarding.snapshot(cp_stack.household.id)
+    api_body = _response(CommandResult(snapshot)).body
+    manifest = manifest_to_toml(cp_stack.configs.manifest(cp_stack.household.id, 1))
+    job_json = repr([
+        cp_stack.jobs.request(row["id"])
+        for row in cp_stack.database.query("SELECT id FROM provisioning_jobs")
+    ])
+    cp_stack.database.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    database_bytes = cp_stack.database.path.read_bytes()
+    wal_path = cp_stack.database.path.with_name(cp_stack.database.path.name + "-wal")
+    if wal_path.exists():
+        database_bytes += wal_path.read_bytes()
+
+    encoded = canary.encode()
+    assert encoded not in database_bytes
+    assert encoded not in api_body
+    assert canary not in manifest
+    assert canary not in job_json
+    assert canary not in caplog.text
 
 
 def test_provider_rejection_after_cancel_cannot_reopen_terminal_projection(cp_stack) -> None:
