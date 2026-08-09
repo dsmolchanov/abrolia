@@ -301,7 +301,8 @@ class OnboardingService:
                 "special-category content restriction text version does not match"
             )
         existing = connection.execute(
-            "SELECT household_id, account_id, purpose FROM consent_receipts WHERE id = ?",
+            "SELECT household_id, account_id, purpose, text_version, text_sha256"
+            " FROM consent_receipts WHERE id = ?",
             (receipt_id,),
         ).fetchone()
         if existing is not None:
@@ -309,6 +310,8 @@ class OnboardingService:
                 existing["household_id"] != household_id
                 or existing["account_id"] != account_id
                 or existing["purpose"] != purpose
+                or existing["text_version"] != text_version
+                or existing["text_sha256"] != text_sha
             ):
                 raise IdempotencyConflict("consent receipt belongs to another command")
             return

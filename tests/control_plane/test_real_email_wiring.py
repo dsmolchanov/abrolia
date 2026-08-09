@@ -7,7 +7,7 @@ import pytest
 from control_plane.config import ControlPlaneConfig
 from control_plane.container import ControlPlaneContainer
 from control_plane.models import StepKind
-from control_plane.onboarding.contracts import InvalidTransition
+from control_plane.onboarding.contracts import IdempotencyConflict, InvalidTransition
 from control_plane.privacy.consent import consent_version_and_sha
 
 
@@ -77,7 +77,7 @@ def test_real_email_rollout_requires_content_restriction_receipt(cp_stack) -> No
             {
                 "kind": "abrolia_managed",
                 "local_part": "family-agent",
-                "special_category_restriction_receipt_id": "unaccepted-receipt",
+                "special_category_restriction_receipt_id": "10000000-0000-4000-8000-000000000005",
             },
             context=cp_stack.context(),
         )
@@ -101,7 +101,7 @@ def test_real_email_rollout_does_not_route_gmail_to_nerve(cp_stack) -> None:
             "kind": "gmail_agent",
             "separate_agent_account_acknowledged": True,
             "special_category_restriction_acknowledged": True,
-            "special_category_restriction_receipt_id": "synthetic-restriction-receipt",
+            "special_category_restriction_receipt_id": "10000000-0000-4000-8000-000000000006",
             "special_category_restriction_text_version": restriction_version,
             "special_category_restriction_text_sha256": restriction_sha,
         },
@@ -126,3 +126,25 @@ def test_real_email_rollout_does_not_route_gmail_to_nerve(cp_stack) -> None:
         "purpose": "special_category_content_restriction",
         "text_version": "special-category-content-restriction-v1",
     }
+
+    with cp_stack.database.write() as connection:
+        connection.execute(
+            "UPDATE consent_receipts SET text_sha256 = ? WHERE id = ?",
+            ("0" * 64, "10000000-0000-4000-8000-000000000006"),
+        )
+        with pytest.raises(IdempotencyConflict):
+            cp_stack.service._record_email_content_restriction(
+                connection,
+                parsed={
+                    "special_category_restriction_acknowledged": True,
+                    "special_category_restriction_receipt_id": (
+                        "10000000-0000-4000-8000-000000000006"
+                    ),
+                    "special_category_restriction_text_version": restriction_version,
+                    "special_category_restriction_text_sha256": restriction_sha,
+                },
+                household_id=cp_stack.household.id,
+                account_id=cp_stack.account.id,
+                locale="en",
+                now=10.0,
+            )

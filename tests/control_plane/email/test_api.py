@@ -50,7 +50,7 @@ def test_local_part_api_returns_only_suggestion_or_availability(api_harness) -> 
             "kind": "abrolia_managed",
             "local_part": "eva_novak",
             "special_category_restriction_acknowledged": True,
-            "special_category_restriction_receipt_id": "email-policy-restriction",
+            "special_category_restriction_receipt_id": "10000000-0000-4000-8000-000000000001",
             "special_category_restriction_text_version": consent_version_and_sha(
                 "special_category_content_restriction"
             )[0],

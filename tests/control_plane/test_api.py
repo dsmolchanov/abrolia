@@ -206,7 +206,7 @@ def test_synthetic_selection_boundaries_fail_closed_at_api(api_harness) -> None:
             "kind": "abrolia_managed",
             "local_part": "family-agent",
             "special_category_restriction_acknowledged": True,
-            "special_category_restriction_receipt_id": "stale-restriction-receipt",
+            "special_category_restriction_receipt_id": "10000000-0000-4000-8000-000000000002",
             **_restriction_binding(),
             "special_category_restriction_text_sha256": "0" * 64,
         },
@@ -223,7 +223,7 @@ def test_synthetic_selection_boundaries_fail_closed_at_api(api_harness) -> None:
             "kind": "family_domain",
             "domain": "family.example.com",
             "special_category_restriction_acknowledged": True,
-            "special_category_restriction_receipt_id": "real-domain-restriction",
+            "special_category_restriction_receipt_id": "10000000-0000-4000-8000-000000000003",
             **_restriction_binding(),
         },
     )
@@ -244,7 +244,7 @@ def test_synthetic_selection_boundaries_fail_closed_at_api(api_harness) -> None:
             "kind": "abrolia_managed",
             "local_part": "family-agent",
             "special_category_restriction_acknowledged": True,
-            "special_category_restriction_receipt_id": "managed-email-restriction",
+            "special_category_restriction_receipt_id": "10000000-0000-4000-8000-000000000004",
             **_restriction_binding(),
         },
     )
