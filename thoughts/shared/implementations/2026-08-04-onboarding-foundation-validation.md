@@ -239,7 +239,7 @@ the live drill matrix, and the isolated restore rehearsal are recorded here.
 
 ### Authenticated migration and restore evidence — 2026-08-09
 
-**Operator:** Dmitry Molchanov (`dsmolchanov@gmail.com`), organization admin.
+**Operator:** authenticated repository owner and organization admin.
 **Deployed source:** `main@a87d7e9188d32a2fcdfb022769476d5995111de3`.
 
 | Check | Observed evidence | Result |
