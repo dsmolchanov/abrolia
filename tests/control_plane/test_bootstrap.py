@@ -206,6 +206,33 @@ def test_bootstrap_token_is_bound_to_household_runtime_and_revision(api_harness,
     assert row["claimed_at"] is None and row["used_at"] is None
 
 
+def test_activation_rechecks_content_restriction_after_runtime_issue(
+    api_harness,
+) -> None:
+    runtime = _provision_runtime(api_harness)
+    active = api_harness.container
+    binding = _binding(runtime)
+    active.bootstrap.claim(runtime.raw_token, **binding)
+    with active.database.write() as connection:
+        connection.execute(
+            "DELETE FROM consent_receipts WHERE household_id = ? AND purpose = ?",
+            (runtime.world.household.id, "special_category_content_restriction"),
+        )
+
+    with pytest.raises(BootstrapConflict, match="activation consent receipt"):
+        active.bootstrap.activate(
+            runtime.raw_token,
+            **binding,
+            activated_sha256=runtime.manifest_sha256,
+        )
+    assert active.households.get(runtime.world.household.id).status == "provisioning"
+    token = active.database.query_one(
+        "SELECT used_at FROM bootstrap_tokens WHERE household_id = ?",
+        (runtime.world.household.id,),
+    )
+    assert token["used_at"] is None
+
+
 def test_claim_and_activation_are_resumable_and_cleanup_is_durable(
     api_harness,
 ) -> None:

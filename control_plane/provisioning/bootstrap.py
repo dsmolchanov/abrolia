@@ -8,6 +8,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+from control_plane.privacy.consent import consent_version_and_sha
 from control_plane.provisioning.manifest import manifest_sha256
 from control_plane.repositories.configs import ConfigRepository
 from control_plane.repositories.jobs import JobsRepository
@@ -65,6 +66,24 @@ class BootstrapService:
             "SELECT 1 FROM deletion_tombstones WHERE household_id_hmac = ?", (tombstone,)
         ).fetchone():
             raise BootstrapGone("bootstrap target was deleted")
+
+    @staticmethod
+    def _assert_current_content_restriction(connection, household_id: str) -> None:
+        version, sha256 = consent_version_and_sha(
+            "special_category_content_restriction"
+        )
+        receipt = connection.execute(
+            "SELECT 1 FROM consent_receipts WHERE household_id = ? AND purpose = ?"
+            " AND text_version = ? AND text_sha256 = ? AND revoked_at IS NULL LIMIT 1",
+            (
+                household_id,
+                "special_category_content_restriction",
+                version,
+                sha256,
+            ),
+        ).fetchone()
+        if receipt is None:
+            raise BootstrapConflict("activation consent receipt is missing")
 
     @staticmethod
     def _constant_match(actual: str, expected: str) -> bool:
@@ -202,6 +221,7 @@ class BootstrapService:
                 config_revision=config_revision,
             )
             self._assert_not_deleted(connection, household_id)
+            self._assert_current_content_restriction(connection, household_id)
             if row["revoked_at"] is not None:
                 raise BootstrapGone("bootstrap credential is no longer available")
             if row["used_at"] is not None:
