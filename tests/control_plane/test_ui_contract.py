@@ -67,6 +67,14 @@ def test_ui_is_server_state_driven_and_polling_is_read_only(api_harness) -> None
     assert "commandHeaders(state.version)" in script
     assert '"Idempotency-Key": crypto.randomUUID()' in script
     assert '"If-Match": String(version)' in script
+    assert (
+        "selection.special_category_restriction_text_version = "
+        "form.elements.special_category_restriction_text_version.value" in script
+    )
+    assert (
+        "selection.special_category_restriction_text_sha256 = "
+        "form.elements.special_category_restriction_text_sha256.value" in script
+    )
     assert script.index("setInteractive(false);") < script.index("\n  refresh();")
     assert "if (state === null && !(await refresh())) return;" in script
     assert 'state?.state)' in script

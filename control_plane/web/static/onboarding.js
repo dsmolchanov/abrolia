@@ -221,6 +221,8 @@ if (page === "onboarding") {
     if (["abrolia_managed", "gmail_agent", "family_domain"].includes(option)) {
       selection.special_category_restriction_acknowledged = true;
       selection.special_category_restriction_receipt_id = crypto.randomUUID();
+      selection.special_category_restriction_text_version = form.elements.special_category_restriction_text_version.value;
+      selection.special_category_restriction_text_sha256 = form.elements.special_category_restriction_text_sha256.value;
     }
     if (option === "shared_abrolia") selection = {kind: option, member_phone_test_ref: "synthetic-phone:owner", privacy_notice_receipt_id: crypto.randomUUID()};
     if (option === "dedicated_number") selection = {kind: option, phone_test_ref: "synthetic-phone:owner", privacy_notice_receipt_id: crypto.randomUUID(), linked_device_risk_receipt_id: crypto.randomUUID()};
