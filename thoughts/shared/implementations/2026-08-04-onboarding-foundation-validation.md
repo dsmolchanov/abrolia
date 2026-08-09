@@ -220,7 +220,8 @@ Record org slug, app name, Machine ID, volume ID, image digest in this addendum 
 - `pytest tests/test_backup.py -q` — **9 passed** (`integrity_check=ok`, `foreign_key_check=0`, pause marker `0600`, smoke without leasing, resume + new onboarding rev 1).
 
 **Full non-live suite on this branch:**
-- `pytest -p no:cacheprovider -m "not live" -q` — **pass** (same 626+/215+ as Phase 1, plus Phase E/F and C1 remediation)
+- `pytest -p no:cacheprovider -m "not live" -q` — **912 passed, 2 live tests deselected, 1 warning** on the current stacked checkout (2026-08-09)
+- `pytest -p no:cacheprovider tests/control_plane -q` — **401 passed, 1 warning** on the same checkout (2026-08-09)
 - `ruff check .` — pass (Phase A content-restriction #40 is separate branch, not included here)
 - `gitleaks` / `check_fixtures --all` — pass (no secrets, no fixture content leaks)
 
