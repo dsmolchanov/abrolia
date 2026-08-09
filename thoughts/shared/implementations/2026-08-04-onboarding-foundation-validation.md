@@ -215,13 +215,13 @@ Record org slug, app name, Machine ID, volume ID, image digest in this addendum 
 
 **Hermetic 8-window chaos matrix (B-09, dry-run-runtime):**
 - `pytest tests/control_plane/test_phase1_chaos_matrix.py -q` — **3 passed**
-- `pytest tests/control_plane/test_provisioning_jobs.py -q` — **29 passed** with parametrized lease windows
-- Windows: `transition → lease → provider → response → Sink → result → claim → activate → cleanup` — each SIGKILL proves no duplicate household/app/volume/Machine, no duplicate `provisioning_jobs` result, no secret in DB/log/API, `secret_handoff_unknown` stays pending without Sink commit.
+- `pytest tests/control_plane/test_provisioning_jobs.py -q` — **30 passed** with parametrized lease windows and a non-empty canary handoff crash after Sink commit
+- Windows: `transition → lease → provider → response → Sink → result → claim → activate → cleanup` — SIGKILL tests prove idempotent recovery/no duplicate resource or job result. `test_secret_canary_is_confined_to_sink_across_sink_crash_and_public_surfaces` additionally injects a non-empty one-time canary, crashes after Sink commit, reconciles through live Sink proof, and asserts the value is absent from raw DB/WAL, captured logs, exact API response serialization, manifest TOML, and decrypted job request JSON. `secret_handoff_unknown` stays pending when neither receipt nor Sink proof exists.
 - `pytest tests/test_backup.py -q` — **9 passed** (`integrity_check=ok`, `foreign_key_check=0`, pause marker `0600`, smoke without leasing, resume + new onboarding rev 1).
 
 **Full non-live suite on this branch:**
-- `pytest -p no:cacheprovider -m "not live" -q` — **904 passed, 2 live tests deselected, 1 warning** on the Phase B-only checkout (2026-08-09)
-- `pytest -p no:cacheprovider tests/control_plane -q` — **393 passed, 1 warning** on the same checkout (2026-08-09)
+- `pytest -p no:cacheprovider -m "not live" -q` — **905 passed, 2 live tests deselected, 1 warning** on the Phase B-only checkout (2026-08-09)
+- `pytest -p no:cacheprovider tests/control_plane -q` — **394 passed, 1 warning** on the same checkout (2026-08-09)
 - `ruff check .` — pass (Phase A content-restriction #40 is separate branch, not included here)
 - `gitleaks` / `check_fixtures --all` — pass (no secrets, no fixture content leaks)
 
