@@ -215,8 +215,8 @@ Record org slug, app name, Machine ID, volume ID, image digest in this addendum 
 
 **Hermetic 8-window chaos matrix (B-09, dry-run-runtime):**
 - `pytest tests/control_plane/test_phase1_chaos_matrix.py -q` — **3 passed**
-- `pytest tests/control_plane/test_provisioning_jobs.py -q` — **30 passed** with parametrized lease windows and a non-empty canary handoff crash after Sink commit
-- Windows: `transition → lease → provider → response → Sink → result → claim → activate → cleanup` — SIGKILL tests prove idempotent recovery/no duplicate resource or job result. `test_secret_canary_is_confined_to_sink_across_sink_crash_and_public_surfaces` additionally injects a non-empty one-time canary, crashes after Sink commit, reconciles through live Sink proof, and asserts the value is absent from raw DB/WAL, captured logs, exact API response serialization, manifest TOML, and decrypted job request JSON. `secret_handoff_unknown` stays pending when neither receipt nor Sink proof exists.
+- `pytest tests/control_plane/test_provisioning_jobs.py -q` — **30 passed** with parametrized lease windows and a non-empty canary handoff SIGKILL after Sink commit
+- Windows: `transition → lease → provider → response → Sink → result → claim → activate → cleanup` — SIGKILL tests prove idempotent recovery/no duplicate resource or job result. `test_secret_canary_is_confined_to_sink_across_sink_crash_and_public_surfaces` additionally injects a non-empty one-time canary in a child worker, commits it to a durable test Sink, pauses inside `install()`, receives real `SIGKILL`, and is reclaimed from the expired running lease through live Sink proof without a second provider call. It asserts the value is absent from child stderr, raw DB/WAL, production `StructuredLogger` output, exact API response serialization, manifest TOML, and decrypted job request JSON. `secret_handoff_unknown` stays pending when neither receipt nor Sink proof exists.
 - `pytest tests/test_backup.py -q` — **9 passed** (`integrity_check=ok`, `foreign_key_check=0`, pause marker `0600`, smoke without leasing, resume + new onboarding rev 1).
 
 **Full non-live suite on this branch:**
