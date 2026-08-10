@@ -380,6 +380,45 @@ def test_tombstone_and_expiry_block_delayed_bootstrap_callbacks(api_harness) -> 
         active.bootstrap.claim(runtime.raw_token, **_binding(runtime), now=now)
 
 
+def test_delete_retains_tombstone_rejects_old_bootstrap_and_allows_fresh_household(
+    api_harness,
+) -> None:
+    runtime = _provision_runtime(api_harness)
+    active = api_harness.container
+    deleted_household_id = runtime.world.household.id
+
+    result = active.deletion.delete(
+        runtime.world.account.id,
+        deleted_household_id,
+        idempotency_key="delete-before-bootstrap-replay",
+    )
+
+    assert result.completion_status == "complete"
+    # Complete deletion removes the token row, so the old credential is denied
+    # without revealing whether its former household existed. The tombstone is
+    # retained independently to stop delayed callbacks that still carry an ID.
+    with pytest.raises((BootstrapDenied, BootstrapGone)):
+        active.bootstrap.claim(runtime.raw_token, **_binding(runtime))
+    tombstone = active.database.query_one(
+        "SELECT household_id_hmac, completion_status FROM deletion_tombstones"
+    )
+    assert tombstone["household_id_hmac"] == active.lookup.digest(
+        deleted_household_id
+    )
+    assert tombstone["completion_status"] == "complete"
+
+    replacement_account = active.accounts.create_verified(
+        "bootstrap-owner@family.test"
+    )
+    replacement = active.households.create_for_owner(replacement_account.id)
+    assert replacement.id != deleted_household_id
+    assert active.database.query_one(
+        "SELECT household_id_hmac FROM deletion_tombstones"
+        " WHERE household_id_hmac = ?",
+        (active.lookup.digest(deleted_household_id),),
+    ) is not None
+
+
 def test_internal_bootstrap_api_maps_conflicts_replay_and_never_echoes_token(
     api_harness,
 ) -> None:

@@ -34,6 +34,9 @@ def _parser() -> argparse.ArgumentParser:
     dry_run = commands.add_parser("dry-run", help="drain fake providers without Fly writes")
     dry_run.add_argument("--limit", type=int, default=100)
     commands.add_parser("retention", help="run the daily retention sweep")
+    commands.add_parser(
+        "runtime-health", help="reconcile dedicated runtime readiness receipts"
+    )
     resume_deletions = commands.add_parser(
         "resume-deletions", help="resume durable partial deletion requests"
     )
@@ -73,6 +76,7 @@ def _serve(args: argparse.Namespace) -> int:
     def worker_loop() -> None:
         next_retention_at = 0.0
         next_deletion_resume_at = 0.0
+        next_runtime_health_at = 0.0
         while not stop.wait(args.worker_interval):
             try:
                 if active.database.workers_paused:
@@ -85,6 +89,9 @@ def _serve(args: argparse.Namespace) -> int:
                 if now >= next_deletion_resume_at:
                     _resume_deletions_if_running(active, limit=10, now=now)
                     next_deletion_resume_at = now + 30
+                if now >= next_runtime_health_at:
+                    active.runtime_health.reconcile_all(now=now)
+                    next_runtime_health_at = now + 60
             except Exception as error:
                 logger.emit(
                     "worker_loop_failed",
@@ -158,6 +165,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "retention":
             result = active.retention.run()
             print(json.dumps({"deleted": result.deleted, "scrubbed": result.scrubbed}, sort_keys=True))
+            return 0
+        if args.command == "runtime-health":
+            results = active.runtime_health.reconcile_all(now=time.time())
+            print(json.dumps([result.__dict__ for result in results], sort_keys=True))
             return 0
         if args.command == "resume-deletions":
             results = active.deletion.resume_pending(limit=args.limit)

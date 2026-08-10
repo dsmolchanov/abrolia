@@ -395,6 +395,33 @@ def test_current_household_is_derived_from_session_not_request_input(api_harness
     }
     assert not any("{household_id}" in path for path in route_paths if path.startswith("/api/"))
 
+    # The Phase B plan predates the current-household API and names obsolete
+    # ``/api/households/<id>/...`` routes. Inventory every planned suffix and
+    # prove that a foreign UUID is uniformly indistinguishable from a missing
+    # route instead of reintroducing an IDOR-prone public path.
+    foreign_paths = (
+        "onboarding/current",
+        "onboarding/profile",
+        "onboarding/steps/email_identity/select",
+        "onboarding/steps/email_identity/retry",
+        "onboarding/steps/email_identity/check",
+        "onboarding/reset/email_identity",
+        "onboarding/cancel",
+        "onboarding/export",
+        "onboarding/delete",
+        "email/local-part/suggestion",
+        "email/local-part/availability",
+        "email/domain/guidance",
+        "email/google/start",
+        "email/google/confirm",
+    )
+    for suffix in foreign_paths:
+        denied = api_harness.client.get(
+            f"/api/v1/households/{foreign.household.id}/{suffix}"
+        )
+        assert denied.status_code == 404
+        assert foreign.household.id not in denied.text
+
 
 def test_household_create_honors_version_and_hmac_idempotency(api_harness) -> None:
     account = api_harness.container.accounts.create_verified("new-pilot@family.test")
