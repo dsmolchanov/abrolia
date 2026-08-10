@@ -280,7 +280,7 @@ this report.
 | Explicit resume | `abrolia-control-plane resume-jobs` returned `resumed`. A new reserved `.test` household then completed email, WhatsApp, channel, runtime and bootstrap-cleanup jobs; workflow `complete`, household `active`, revision `1`, manifest SHA-256 `b49dec33c14a502e84da11fcdf74fedb97b3bc945a07e7405931b72508ab3e56`. | **pass** |
 | Cleanup | Exact temporary app, Machine and volume were destroyed and verified absent. | **pass** |
 
-#### Paid-org live household and B-09 drills — 2026-08-09
+#### Paid-org live household and partial B-09 drills — 2026-08-09
 
 One new reserved-data household was provisioned directly in
 `abrolia-synthetic` after billing was enabled:
@@ -301,10 +301,10 @@ One new reserved-data household was provisioned directly in
 | Fly cardinality | During activation the household had exactly one app, one Machine and one encrypted volume. Reconcile/restart did not duplicate any of them. | **pass** |
 | Secret absence | The runtime secret namespace exposed only the DSAR secret name after activation; the bootstrap secret was removed. No secret value was written to manifest, API evidence, DB evidence or operator logs. | **pass** |
 | Health and private DSAR | Public control-plane `/healthz` and `/readyz` returned `200`. Runtime `/readyz` returned `200`; authenticated control-plane-to-runtime DSAR over Fly 6PN returned `200` and the combined export became `complete`. | **pass** |
-| Tamper fail-closed | Changing only the runtime manifest hash to zeros and restarting produced `/readyz=503`. Restoring the exact manifest, mode and owner returned `/readyz=200`; no downgrade was accepted. | **pass** |
-| Cross-household isolation | A second owner session could not select household A via a query parameter; its current household remained B and its export contained no A identifier or state. | **pass** |
+| Tamper fail-closed | Changing only the runtime manifest hash to zeros and restarting produced `/readyz=503`. Restoring the exact manifest, mode and owner returned `/readyz=200`; no downgrade was accepted. The planned control-plane `needs_attention` observation was not recorded. | **partial** |
+| Cross-household isolation | A second owner session could not select household A via a query parameter; its current household remained B and its export contained no A identifier or state. This is not the plan's complete route inventory with foreign-owner `404` evidence. | **partial** |
 | Export vs data map | Final export returned `200 complete`; `token_hash`, `lookup_hmac`, `request_ciphertext` and `session_hash` were absent. | **pass** |
-| Delete and tombstone | Fresh re-auth delete returned `202 partial` while Fly converged, then tombstone became `complete`; the household, account, sessions, runtime app, Machine and volume became absent. No unused bootstrap token remained. | **pass** |
+| Delete and tombstone | Fresh re-auth delete returned `202 partial` while Fly converged, then tombstone became `complete`; the household, account, sessions, runtime app, Machine and volume became absent. No unused bootstrap token remained, but the destroyed raw bootstrap credential was not replayed after deletion. | **partial** |
 
 The run exposed four live-only integration defects and closed each one on this
 branch: a terminal secret-namespace failure previously left the email job waiting
@@ -343,12 +343,11 @@ plus one 1 GiB volume at approximately **US$3.34–3.47/month**, before snapshot
 storage and network usage; household runtime resources used for the drill were
 deleted.
 
-**Gate status:** B-11 and the canonical Phase B acceptance items are complete:
-dedicated paid organization, exact topology/image evidence, isolated restore,
-new live household, B-09 operator outcomes, final deletion and cost tag are all
-recorded. The stricter additional Phase B plan wording still lacks eight
-deliberately timed Fly `SIGKILL` runs and a replay of the destroyed raw bootstrap
-credential (the plaintext was intentionally never retained). Those two claims
-must not be inferred from the equivalent live recovery events or the hermetic
-matrix; they remain explicit hardening evidence if literal additional-plan
-closure is required.
+**Gate status:** B-11 is complete, but Phase B remains open. This PR records a
+successful paid-org household lifecycle and lands the correctness fixes exposed
+by it; it does not close B-09. The missing evidence is the eight deliberately
+timed Fly `SIGKILL` runs, a complete foreign-owner route matrix with the planned
+`404` observations, control-plane `needs_attention` after runtime tamper, and
+replay of a retained disposable bootstrap credential after deletion. These
+claims must not be inferred from the equivalent live recovery events, partial
+operator drills or hermetic matrix.
