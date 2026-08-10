@@ -237,13 +237,13 @@ Append to `thoughts/shared/implementations/2026-08-04-onboarding-foundation-vali
 
 ### Org topology
 
-- [ ] `fly orgs show abrolia-synthetic` succeeds; `abrolia-control-plane-synthetic` (or recorded name) is the only control-plane app in that org.
-- [ ] Exactly 1 Machine (`ams`, `started`, `shared-cpu-1x/512mb`), 1 volume (`1GiB`, `encrypted=true`, `ams`), `abrolia-synthetic` — evidenced by `fly` output in PR/addendum.
-- [ ] Image digest pinned `@sha256:` recorded; `ABROLIA_INTERNAL_BOOTSTRAP_HOST` is bare DNS.
+- [x] `fly orgs show abrolia-synthetic` succeeds; `abrolia-control-plane-synthetic` (or recorded name) is the only control-plane app in that org.
+- [x] Exactly 1 Machine (`ams`, `started`, `shared-cpu-1x/512mb`), 1 volume (`1GiB`, `encrypted=true`, `ams`), `abrolia-synthetic` — evidenced by `fly` output in PR/addendum.
+- [x] Image digest pinned `@sha256:` recorded; `ABROLIA_INTERNAL_BOOTSTRAP_HOST` is bare DNS.
 
 ### Chaos + drills
 
-- [ ] Hermetic chaos matrix green:
+- [x] Hermetic chaos matrix green:
 
 ```bash
 pytest tests/control_plane/test_phase1_chaos_matrix.py -q
@@ -255,11 +255,11 @@ pytest tests/control_plane/test_provisioning_jobs.py -q
 
 ### Backup/restore
 
-- [ ] `PRAGMA integrity_check = ok`, `foreign_key_check = 0 rows`, pause-marker `0600`, smoke without leasing succeeded, resume + new onboarding through rev 1 succeeded, temp app destroyed.
+- [x] `PRAGMA integrity_check = ok`, `foreign_key_check = 0 rows`, pause-marker `0600`, smoke without leasing succeeded, resume + new onboarding through rev 1 succeeded, temp app destroyed.
 
 ### Suite
 
-- [ ] Full non-live suite still green on new org's code checkout:
+- [x] Full non-live suite still green on new org's code checkout:
 
 ```bash
 pytest -p no:cacheprovider -m "not live" -q
@@ -269,8 +269,8 @@ ruff check .
 gitleaks detect --no-git --source . 2>&1 | head
 ```
 
-- [ ] Cost tag noted: monthly Fly cost for `abrolia-synthetic` synthetic org (e.g., `$X/mo` from `fly orgs show` / billing).
+- [x] Cost tag noted: monthly Fly cost for `abrolia-synthetic` synthetic org (e.g., `$X/mo` from `fly orgs show` / billing).
 
 ### Gate
 
-- [ ] `personal` org no longer hosts the synthetic control-plane contour (or retention is documented). Phase C work branches from the merged B commit.
+- [x] `personal` org no longer hosts the synthetic control-plane contour (or retention is documented). Phase C work branches from the merged B commit.

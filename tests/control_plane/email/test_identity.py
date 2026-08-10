@@ -1240,7 +1240,9 @@ def test_verified_identity_becomes_active_only_after_both_runtime_checks(cp_stac
     ).status is EmailIdentityStatus.ACTIVE
 
 
-def test_email_provider_waits_for_ready_secret_namespace(cp_stack) -> None:
+def test_email_provider_fails_when_secret_namespace_definitively_failed(
+    cp_stack,
+) -> None:
     cp_stack.complete_profile(provision_namespace=False)
     cp_stack.service.select(
         cp_stack.household.id,
@@ -1259,9 +1261,24 @@ def test_email_provider_waits_for_ready_secret_namespace(cp_stack) -> None:
     email = worker.run_once()
 
     assert namespace is not None and namespace.status == "failed"
-    assert email is not None and email.status == "pending"
-    assert email.error_code == "secret_namespace_not_ready"
+    assert email is not None and email.status == "failed"
+    assert email.error_code == "secret_namespace_failed"
     assert email_provider.ensure_calls == 0
+
+    cp_stack.service.retry(
+        cp_stack.household.id,
+        StepKind.EMAIL,
+        context=cp_stack.context(),
+        now=BASE_TIME + 4,
+    )
+    retry_jobs = cp_stack.database.query(
+        "SELECT kind, operation, status FROM provisioning_jobs"
+        " WHERE status = 'pending' ORDER BY created_at, id"
+    )
+    assert [tuple(row) for row in retry_jobs] == [
+        ("runtime", "ensure_secret_namespace", "pending"),
+        ("email_identity", "ensure", "pending"),
+    ]
 
 
 def test_reset_deprovisions_identity_and_removes_staged_secret(cp_stack) -> None:

@@ -175,6 +175,7 @@ class StatefulFly:
         ignore_volume_update: bool = False,
     ) -> None:
         self.calls: list[tuple[str, str, dict[str, Any] | None]] = []
+        self.query_params: list[dict[str, str]] = []
         self.app: dict[str, Any] | None = None
         self.volume: dict[str, Any] | None = None
         self.machine: dict[str, Any] | None = None
@@ -187,6 +188,7 @@ class StatefulFly:
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
+        self.query_params.append(dict(request.url.params))
         body = json.loads(request.content) if request.content else None
         self.calls.append((request.method, path, body))
         if path == "/v1/apps" and request.method == "POST":
@@ -533,6 +535,7 @@ def test_deprovision_waits_for_post_delete_404_and_uses_exact_ids() -> None:
     assert ("DELETE", f"/v1/apps/{runtime.external_ref}") in [
         (method, path) for method, path, _body in fly.calls
     ]
+    assert {"force": "true"} in fly.query_params
 
     # A 2xx DELETE is only an accepted request. ABSENT is returned only after
     # the following call's GET observes the app's authoritative 404.
