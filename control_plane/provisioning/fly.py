@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import base64
+import os
+import subprocess
+import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -24,10 +27,35 @@ from control_plane.provisioning.manifest import DesiredHouseholdSpecV1, manifest
 
 FLY_API_BASE = "https://api.machines.dev"
 VOLUME_SNAPSHOT_RETENTION_DAYS = 5
+FLY_MACAROON_PREFIXES = frozenset({"fm1r", "fm1a", "fm2"})
+APP_DELETE_RETRY_SECONDS = 30.0
+FLYCTL_APP_DELETE_TIMEOUT_SECONDS = 30.0
 
 
 class _Conflict(RuntimeError):
     pass
+
+
+def _authorization_header(token: str) -> str:
+    """Match fly-go's Flaps header rules without exposing token material."""
+
+    raw = token.strip()
+    if "\r" in raw or "\n" in raw:
+        raise ValueError("Fly token is malformed")
+    while " " in raw:
+        scheme, remainder = raw.split(" ", 1)
+        if scheme.casefold() not in {"bearer", "flyv1"}:
+            break
+        raw = remainder.strip()
+    parts = [part.strip() for part in raw.split(",") if part.strip()]
+    if not parts:
+        raise ValueError("Fly token is required")
+    macaroons = [
+        part for part in parts if part.partition("_")[0] in FLY_MACAROON_PREFIXES
+    ]
+    if macaroons:
+        return "FlyV1 " + ",".join(macaroons)
+    return "Bearer " + ",".join(parts)
 
 
 @dataclass(frozen=True)
@@ -54,6 +82,8 @@ class FlyRuntimeProvisioner:
         mount_path: str = "/data",
         client: httpx.Client | None = None,
         api_base: str = FLY_API_BASE,
+        runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if not api_token or not org_slug:
             raise ValueError("Fly token and organization are required")
@@ -62,6 +92,10 @@ class FlyRuntimeProvisioner:
         if region != "ams" or mount_path != "/data":
             raise ValueError("Phase 1 Fly placement is locked to ams:/data")
         self._token = api_token
+        self._authorization = _authorization_header(api_token)
+        self._runner = runner
+        self._clock = clock
+        self._app_delete_requested_at: dict[str, float] = {}
         self.org_slug = org_slug
         self.image_digest = image_digest
         self.bootstrap_url = bootstrap_url.rstrip("/")
@@ -102,7 +136,7 @@ class FlyRuntimeProvisioner:
                 method,
                 f"{self.api_base}{path}",
                 headers={
-                    "Authorization": f"Bearer {self._token}",
+                    "Authorization": self._authorization,
                     "Content-Type": "application/json",
                 },
                 json=json,
@@ -185,6 +219,26 @@ class FlyRuntimeProvisioner:
 
     def _get_app(self, app: str) -> dict[str, Any] | None:
         return self._request("GET", f"/v1/apps/{app}", allow_not_found=True)
+
+    def _destroy_app_with_flyctl(self, app: str) -> bool:
+        """Use Fly's pinned client when staged secrets stall REST app deletion."""
+
+        environment = os.environ.copy()
+        environment["FLY_ACCESS_TOKEN"] = self._token
+        command = ["fly", "apps", "destroy", app, "--yes"]
+        try:
+            completed = self._runner(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                shell=False,
+                env=environment,
+                timeout=FLYCTL_APP_DELETE_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            return False
+        return completed.returncode == 0
 
     def _ensure_app(self, app: str) -> dict[str, Any]:
         current = self._get_app(app)
@@ -873,6 +927,7 @@ class FlyRuntimeProvisioner:
             return InspectResult(InspectState.FAILED, error_code="fly_reference_rejected")
         try:
             if self._get_app(target.app_ref) is None:
+                self._app_delete_requested_at.pop(target.app_ref, None)
                 return InspectResult(InspectState.ABSENT)
             # Fly retains destroyed Machines in the list API as historical
             # records. They no longer own runtime state and must not block the
@@ -968,13 +1023,35 @@ class FlyRuntimeProvisioner:
             if not delete_app:
                 return InspectResult(InspectState.ABSENT)
 
+            now = self._clock()
+            last_request = self._app_delete_requested_at.get(target.app_ref)
+            if (
+                last_request is not None
+                and now - last_request < APP_DELETE_RETRY_SECONDS
+            ):
+                return InspectResult(
+                    InspectState.PENDING, error_code="fly_delete_pending"
+                )
+            # Machines and volumes are already authoritatively absent. Fly's
+            # own flyctl client therefore uses the unforced app-delete form;
+            # the forced variant can leave an empty app suspended indefinitely.
             self._request(
                 "DELETE",
-                f"/v1/apps/{target.app_ref}?force=true",
+                f"/v1/apps/{target.app_ref}",
                 allow_not_found=True,
             )
+            self._app_delete_requested_at[target.app_ref] = now
             if self._get_app(target.app_ref) is None:
+                self._app_delete_requested_at.pop(target.app_ref, None)
                 return InspectResult(InspectState.ABSENT)
+            cli_accepted = self._destroy_app_with_flyctl(target.app_ref)
+            if self._get_app(target.app_ref) is None:
+                self._app_delete_requested_at.pop(target.app_ref, None)
+                return InspectResult(InspectState.ABSENT)
+            if not cli_accepted:
+                return InspectResult(
+                    InspectState.UNKNOWN, error_code="fly_delete_unknown"
+                )
             return InspectResult(InspectState.PENDING, error_code="fly_delete_pending")
         except (OutcomeUnknown, ProviderRateLimited):
             return InspectResult(InspectState.UNKNOWN, error_code="fly_delete_unknown")

@@ -68,6 +68,13 @@ def _resume_deletions_if_running(
     return active.deletion.resume_pending(limit=limit, now=now)
 
 
+def _reconcile_runtime_health(active: ControlPlaneContainer, *, now: float) -> float:
+    """Run one sweep and schedule the next interval from its completion."""
+
+    active.runtime_health.reconcile_all(now=now)
+    return time.time() + 60
+
+
 def _serve(args: argparse.Namespace) -> int:
     active = _container()
     stop = threading.Event()
@@ -89,9 +96,13 @@ def _serve(args: argparse.Namespace) -> int:
                 if now >= next_deletion_resume_at:
                     _resume_deletions_if_running(active, limit=10, now=now)
                     next_deletion_resume_at = now + 30
-                if now >= next_runtime_health_at:
-                    active.runtime_health.reconcile_all(now=now)
-                    next_runtime_health_at = now + 60
+                if (
+                    active.config.runtime_provider == "fly-runtime"
+                    and now >= next_runtime_health_at
+                ):
+                    next_runtime_health_at = _reconcile_runtime_health(
+                        active, now=now
+                    )
             except Exception as error:
                 logger.emit(
                     "worker_loop_failed",
@@ -137,6 +148,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         restored.close()
         print(json.dumps({"status": "restored", "workers": "paused"}))
         return 0
+    if args.command == "runtime-health":
+        # This read/compare/projection command is safe to run beside the
+        # embedded worker and must remain available while ``serve`` owns the
+        # single-writer process lock.
+        with _container(lock=False) as active:
+            if (
+                active.config.runtime_provider != "fly-runtime"
+                or active.database.workers_paused
+            ):
+                print("[]")
+                return 0
+            results = active.runtime_health.reconcile_all(now=time.time())
+            print(json.dumps([result.__dict__ for result in results], sort_keys=True))
+            return 0
     mailer = ConsoleMailer() if args.command == "invite" else None
     with _container(mailer=mailer) as active:
         if args.command == "migrate":
@@ -165,10 +190,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "retention":
             result = active.retention.run()
             print(json.dumps({"deleted": result.deleted, "scrubbed": result.scrubbed}, sort_keys=True))
-            return 0
-        if args.command == "runtime-health":
-            results = active.runtime_health.reconcile_all(now=time.time())
-            print(json.dumps([result.__dict__ for result in results], sort_keys=True))
             return 0
         if args.command == "resume-deletions":
             results = active.deletion.resume_pending(limit=args.limit)

@@ -87,9 +87,9 @@ Non-blocker debt: codex/phase-4-real-actions dirty file + untracked landing not 
 3. Rehearse isolated backup/restore with workers paused (repeat `docs/control-plane-restore.md`): integrity_check, zero FK violations, mode 0600 pause marker, smoke without leasing, resume-jobs, new onboarding through rev 1, destroy temp app.
 
 **Acceptance:**
-- [ ] Live IDs (new org, Machines, volumes, image digests, household, rev/hash) recorded in `thoughts/shared/implementations/2026-08-04-onboarding-foundation-validation.md` addendum.
-- [ ] `pytest -p no:cacheprovider -m "not live"` 626+ and `tests/control_plane` 215+ remain green on new org.
-- [ ] Cost tag: note monthly Fly cost for synthetic org.
+- [x] Live IDs (new org, Machines, volumes, image digests, household, rev/hash) recorded in `thoughts/shared/implementations/2026-08-04-onboarding-foundation-validation.md` addendum.
+- [x] `pytest -p no:cacheprovider -m "not live"` 626+ and `tests/control_plane` 215+ remain green on new org.
+- [x] Cost tag: note monthly Fly cost for synthetic org.
 
 ### Phase C — Email Identity Closure (B-01, B-02, B-05, B-06)
 

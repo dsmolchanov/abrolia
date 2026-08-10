@@ -367,7 +367,9 @@ class EmailIdentityRepository(Repository):
             " runtime_ref = excluded.runtime_ref, provider = excluded.provider,"
             " inbound_check = excluded.inbound_check, outbound_check = excluded.outbound_check,"
             " checked_at = excluded.checked_at, receipt_digest = excluded.receipt_digest,"
-            " status = excluded.status",
+            " status = excluded.status, runtime_health_status = 'active',"
+            " runtime_health_checked_at = 0, runtime_health_owns_attention = 0,"
+            " runtime_health_identity_version = NULL",
             (
                 identity_id,
                 desired_revision,
