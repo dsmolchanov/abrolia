@@ -37,6 +37,7 @@ from control_plane.providers.email.google_oauth import (
 from control_plane.provisioning.bootstrap import BootstrapService
 from control_plane.provisioning.fakes import synthetic_provider_registry
 from control_plane.provisioning.planner import DesiredSpecPlanner
+from control_plane.provisioning.runtime_health import RuntimeReadinessMonitor
 from control_plane.provisioning.secrets import FlySecretSink, InMemorySecretSink
 from control_plane.provisioning.worker import ProvisioningWorker
 from control_plane.repositories import (
@@ -81,6 +82,7 @@ class ControlPlaneContainer:
     exporter: HouseholdExporter
     deletion: DeletionService
     retention: RetentionService
+    runtime_health: RuntimeReadinessMonitor
 
     @classmethod
     def build(
@@ -244,6 +246,7 @@ class ControlPlaneContainer:
             runtime=runtime_deleter,
         )
         retention = RetentionService(accounts)
+        runtime_health = RuntimeReadinessMonitor(database)
         return cls(
             config,
             database,
@@ -273,6 +276,7 @@ class ControlPlaneContainer:
             exporter,
             deletion,
             retention,
+            runtime_health,
         )
 
     def close(self) -> None:

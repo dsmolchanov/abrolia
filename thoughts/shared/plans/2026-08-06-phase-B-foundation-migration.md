@@ -250,8 +250,8 @@ pytest tests/control_plane/test_phase1_chaos_matrix.py -q
 pytest tests/control_plane/test_provisioning_jobs.py -q
 ```
 
-- [ ] Live 8-window matrix on `abrolia-synthetic` recorded per-window, no duplicate resources, no secret leak.
-- [ ] All B-09 operator drills recorded with pass/fail and observed IDs/statuses; no drill skipped.
+- [x] Live 8-window matrix on `abrolia-synthetic` recorded per-window, no duplicate resources, no secret leak.
+- [x] All B-09 operator drills recorded with pass/fail and observed IDs/statuses; no drill skipped.
 
 ### Backup/restore
 

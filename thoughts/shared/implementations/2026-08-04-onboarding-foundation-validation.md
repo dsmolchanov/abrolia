@@ -351,3 +351,96 @@ timed Fly `SIGKILL` runs, a complete foreign-owner route matrix with the planned
 replay of a retained disposable bootstrap credential after deletion. These
 claims must not be inferred from the equivalent live recovery events, partial
 operator drills or hermetic matrix.
+
+### Final B-09 gate closure — 2026-08-12
+
+This section supersedes only the four incomplete observations in the preceding
+gate-status paragraph. The paid-org migration, household lifecycle, restore,
+cost and other drill evidence above remains unchanged. All commands used
+synthetic reserved data and kept provider credentials out of argv and logs.
+
+#### Live Fly SIGKILL matrix
+
+The matrix ran from an isolated temporary control-plane contour in
+`abrolia-synthetic`: app `abrolia-phase-b-live-matrix-20260812`, Machine
+`d891e969b4d238` (`ams`, shared CPU 1x, 512 MiB), separate rootfs and SQLite
+database, with no production volume mounted. Its scoped Fly credential was
+streamed through `fly secrets import --stage`; its SHA-256 matched the operator
+source, while the value never entered output, argv or this report.
+
+Unlike the earlier Fly-hosted hermetic pytest run, this operator explicitly
+started a new provisioning worker process for each durable boundary, waited for
+the boundary checkpoint, sent that exact process `SIGKILL`, observed
+`returncode=-9`, expired any abandoned lease and resumed the durable job against
+the real Fly adapter. The recovery path created actual household apps, encrypted
+1 GiB volumes and Machines from the pinned runtime image
+`sha256:56f8fd7ce3627eb655292ff2a946599cb462e4f981a739183ddee655c2a1e6ad`.
+
+| Durable boundary | Exercised assertion and observation | Result |
+|---|---|---|
+| transition → lease | Process killed after committing the email transition. Recovery produced one job result; runtime app `abrolia-hh-mk24pwb6t5h4xfilkojekuj5ja` had Machine `e82d1292f09e58` and volume `vol_vp2wo9ln3g097oy4` (counts 1/1). | **pass** |
+| lease → provider | Process killed after leasing, before the provider call. Expired lease was reclaimed on attempt 2; app `abrolia-hh-3uhzi6z26vfcdlewv24hioion4` had Machine `801553b6023968` and volume `vol_42k6n0n3onlx9904` (1/1). | **pass** |
+| provider → response | Process killed after durable provider acceptance but before returning its response. Inspect recovered without a duplicate; app `abrolia-hh-wdbpw3rdqjcpjpfbqfljapjy7i` had Machine `080d439f90e458` and volume `vol_4m319w9wd3lzk16v` (1/1). | **pass** |
+| response → Sink | Process killed after receiving one-time secret material, before the Sink call. Retry settled once; app `abrolia-hh-g7pw46zwd5gmdfwrjlsr5bozjy` had Machine `683d122eb72018` and volume `vol_vgnd1y1ekwdkw214` (1/1). | **pass** |
+| Sink → result | Process killed after `FlySecretSink.install`, before result projection. Live Sink proof recovered attempt 2; app `abrolia-hh-nun7fh4dwrejzk3wbdczi6y2qe` had Machine `8e2440f7de0418` and volume `vol_vxmydndxek201ox4` (1/1); the canary never appeared in output. | **pass** |
+| result → claim | Process killed after the live runtime result committed. App `abrolia-hh-4up5tilwgzdndgaxbsr3eh54pi` retained exactly Machine `683e451b062968` and volume `vol_vp2wo9o3xynkglk4`; the bootstrap credential remained mode `0600` and bound to revision 1. | **pass** |
+| claim → activate | Process killed after the control plane committed the claim. Exact replay returned the same revision and manifest SHA-256; no second app, Machine, volume, job result or config revision appeared. | **pass** |
+| activate → cleanup | Process killed after activation committed but before acknowledgement/cleanup. Exact activation replay succeeded, created one bootstrap-cleanup job, and `FlySecretSink.contains` proved the bootstrap secret absent. | **pass** |
+
+An independent evidence rerun used temporary runner Machine `830152f72923e8`
+and the exact operator command below. The harness command shown in the second
+column was executed once for each boundary after waiting for its durable
+checkpoint; `kill worker` sent `SIGKILL` to that process and every observed
+return code was `-9`.
+
+```bash
+fly ssh console -a abrolia-phase-b-live-matrix-20260812 \
+  --machine 830152f72923e8 \
+  -C 'python /tmp/abrolia-phase-b-live-matrix.py'
+```
+
+Expected for every row: the expired lease resumes to success, job IDs and
+idempotency intents remain unique, the five stable external resources remain
+unique, the secret canary is absent from SQLite, authenticated API output and
+Fly application logs, and public `/healthz` plus `/readyz` both return `200`.
+The DB counts below are scoped to the disposable household created for that
+row; API bodies and logs were scanned before exact cleanup.
+
+| Boundary | Per-window harness command | Jobs / distinct IDs / intents | External rows / distinct stable names | DB / API / Fly-log canary | Probes | Result |
+|---|---|---:|---:|---|---|---|
+| transition → lease | `kill worker; expire lease; resume; inspect Fly/DB/API/log/probes` | 5 / 5 / 5 | 5 / 5 | absent / absent (`200`) / absent | `200` / `200` | **pass** |
+| lease → provider | `kill worker; expire lease; resume; inspect Fly/DB/API/log/probes` | 5 / 5 / 5 | 5 / 5 | absent / absent (`200`) / absent | `200` / `200` | **pass** |
+| provider → response | `kill worker; expire lease; resume; inspect Fly/DB/API/log/probes` | 5 / 5 / 5 | 5 / 5 | absent / absent (`200`) / absent | `200` / `200` | **pass** |
+| response → Sink | `kill worker; expire lease; resume; inspect Fly/DB/API/log/probes` | 5 / 5 / 5 | 5 / 5 | absent / absent (`200`) / absent | `200` / `200` | **pass** |
+| Sink → result | `kill worker; expire lease; resume; inspect Fly/DB/API/log/probes` | 5 / 5 / 5 | 5 / 5 | absent / absent (`200`) / absent | `200` / `200` | **pass** |
+| result → claim | `kill worker; expire lease; resume; inspect Fly/DB/API/log/probes` | 5 / 5 / 5 | 5 / 5 | absent / absent (`200`) / absent | `200` / `200` | **pass** |
+| claim → activate | `kill worker; expire lease; resume; inspect Fly/DB/API/log/probes` | 5 / 5 / 5 | 5 / 5 | absent / absent (`200`) / absent | `200` / `200` | **pass** |
+| activate → cleanup | `kill worker; expire lease; resume; inspect Fly/DB/API/log/probes` | 6 / 6 / 6 | 5 / 5 | absent / absent (`200`) / absent | `200` / `200` | **pass** |
+
+The secret-free JSONL transcript's rolling SHA-256 is
+`75237a2495756031fd063a4303b2af00fb63f08a7a580cb679d9fa41e307e5a9`.
+The operator was the repository owner on 2026-08-12. A fresh authenticated
+backup was created before the rerun so active `/readyz` observed `200` rather
+than the unrelated `backup_stale` readiness condition.
+
+Each of the six real household apps above was destroyed immediately after its
+row passed and verified absent. The temporary matrix app and Machine were then
+destroyed. Final `fly apps list --org abrolia-synthetic --json` showed only
+`abrolia-control-plane-synthetic`; its original topology was unchanged: Machine
+`85e649c449e9e8` started in `ams` at 1 shared CPU / 512 MiB, and encrypted 1 GiB
+volume `vol_r1j6gpg2nq12x0zr` remained attached.
+
+#### Final operator drill observations
+
+| Drill | Command / observation (secret-free) | Result |
+|---|---|---|
+| Runtime tamper projection | A synthetic household `d2fcdf3a-d1be-49a5-8c9a-622c157566d8`, runtime `abrolia-hh-2l6n6owrxze2lde2miwbk5lg3a`, revision `1`, was activated. After replacing only its manifest hash with zeros and restarting, runtime `/readyz` returned `503`; `abrolia-control-plane runtime-health` returned `needs_attention`, and both the identity and receipt rows were observed as `needs_attention`. Restoring the exact manifest and restarting returned `active`. | **pass** |
+| Complete foreign-owner route inventory | On 2026-08-12 the repository owner created two disposable verified accounts, two isolated owner memberships and two live sessions on `app.abrolia.com`. With A's authenticated cookie against B and B's against A, `GET /api/v1/households/<foreign UUID>/<suffix>` covered all 14 planned suffixes in both directions: 28/28 responses were `404`, all bodies had one uniform digest, aggregate digest `5cd5d0af77ef876b4eb640820fc2fb1a22845ac511a15fc1f2fc22beed2ca3d9`, and zero bodies echoed the foreign UUID. Both `/api/v1/onboarding/current?household_id=<foreign>` probes returned `200` without the foreign UUID. Before requests SQLite showed exactly two scoped membership rows and zero cross-memberships; `/healthz` and `/readyz` were `200`. Exact cleanup returned `complete` twice, left zero scoped account/household rows and two complete deletion tombstones. The command was `fly ssh console -a abrolia-control-plane-synthetic --machine 85e649c449e9e8 -C 'python /tmp/phase-b-live-idor.py'`; the temporary script and raw session material were removed immediately. | **pass** |
+| Retained bootstrap replay after deletion | A live disposable household `3d7ebc3a-fd59-416a-b6c3-b9c6467f6a5e`, runtime `abrolia-hh-hv7lyox5lfawvnwdxhdem73kly`, revision `1`, retained its bootstrap credential only in `/data/.phase-b-retained-bootstrap` mode `0600`. After deletion converged, an exact replay returned `BootstrapDenied`; the operator result was `replay_cleanup_pass`, and the credential file was removed. The earlier run also proved a replacement household receives a different UUID while the complete tombstone remains. | **pass** |
+
+The prior table's invite replay/profile, cardinality, secret absence,
+health/private DSAR, export/data-map and paid-org lifecycle rows were already
+passes. With the three rows above and the live Fly per-boundary matrix, no B-09
+drill remains partial or skipped. Phase B (B-09 and B-11) is complete; Phase C
+may branch from the merged Phase B head. Real-family-data and real-provider legal
+gates remain closed and are not changed by this synthetic sign-off.

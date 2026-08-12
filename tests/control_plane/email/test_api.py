@@ -68,6 +68,16 @@ def test_local_part_api_returns_only_suggestion_or_availability(api_harness) -> 
     assert set(reserved.json()) == {"available"}
 
 
+def test_local_part_suggestion_requires_completed_profile(api_harness) -> None:
+    world = api_harness.create_principal("incomplete-profile@family.test")
+    api_harness.authenticate(world)
+
+    response = api_harness.client.get("/api/v1/email/local-part/suggestion")
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "household profile is incomplete"}
+
+
 def test_domain_guidance_is_owner_scoped_and_returns_no_inventory(api_harness) -> None:
     unauthenticated = api_harness.client.get(
         "/api/v1/email/domain/guidance", params={"domain": "example.com"}

@@ -273,6 +273,20 @@ household IDOR matrix, missing/wrong Origin and CSRF matrix, stale version and
 idempotency matrix, secret canaries, export/delete, and the isolated restore
 rehearsal in [`control-plane-restore.md`](control-plane-restore.md).
 
+The public account API is current-household-only: it deliberately has no
+`{household_id}` route parameter. For the IDOR drill, inventory every public
+household-scoped route, verify obsolete/guessed `/api/v1/households/<foreign>/...`
+paths return `404`, verify a foreign query hint cannot change the session-derived
+household, and verify a foreign body field is rejected without echoing the UUID.
+
+The embedded worker polls each active dedicated runtime's private Fly
+`/readyz` once per minute. A definitive `503`, malformed response, or
+household/revision mismatch marks the matching email activation receipt
+`needs_attention`; a matching `200` restores `active`. Network timeout is
+inconclusive and preserves the previous state. Operators can force the same
+bounded reconciliation with `abrolia-control-plane runtime-health`; its output
+contains only runtime refs and status, never response bodies or credentials.
+
 Do not enable real providers or real family data after a successful synthetic
 smoke. Each real integration has its own legal, processor, OAuth/CASA, consent,
 and implementation gate.
