@@ -44,12 +44,17 @@ failure also exits non-zero and prints the archive path to restore from; each
 migration file is applied in its own transaction, so a failed file leaves no
 partial schema. When nothing is pending, no archive is written.
 
-Restore a pre-migrate archive with the normal paused restore:
+Restore a pre-migrate archive with `--no-migrate`. The normal restore applies
+pending migrations, which from the new image would immediately reapply — or fail
+again on — the migration the archive exists to undo:
 
 ```bash
 abrolia-control-plane restore /data/control-plane.db.pre-migrate-0008-1800000000.bak \
-  --target /data/control-plane-rollback.db
+  --target /data/control-plane-rollback.db --no-migrate
 ```
+
+The restored database keeps the archived schema and stays worker-paused; roll the
+image back to the pre-upgrade release before `resume-jobs`.
 
 ## Isolated restore rehearsal
 

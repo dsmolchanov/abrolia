@@ -90,7 +90,14 @@ def restore_backup(
     target: Path | str,
     *,
     backup_key: bytes,
+    apply_migrations: bool = True,
 ) -> ControlPlaneDatabase:
+    """Restore into a new, worker-paused database.
+
+    `apply_migrations=False` is the rollback path: restoring a pre-migrate
+    archive from the new image must not immediately reapply the migration the
+    archive exists to undo.
+    """
     source = Path(archive)
     destination = Path(target)
     if destination.exists():
@@ -130,7 +137,8 @@ def restore_backup(
         os.replace(temporary, destination)
         temporary = None
         restored = ControlPlaneDatabase(destination)
-        restored.migrate()
+        if apply_migrations:
+            restored.migrate()
         restored.pause_workers()
         return restored
     finally:

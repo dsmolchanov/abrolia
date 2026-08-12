@@ -49,6 +49,11 @@ def _parser() -> argparse.ArgumentParser:
     restore = commands.add_parser("restore", help="restore into a new, worker-paused DB")
     restore.add_argument("archive")
     restore.add_argument("--target", required=True)
+    restore.add_argument(
+        "--no-migrate",
+        action="store_true",
+        help="rollback restore: keep the archived schema, apply no migration",
+    )
     commands.add_parser("resume-jobs", help="remove the exact post-restore worker pause")
     return parser
 
@@ -143,10 +148,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "restore":
         config = ControlPlaneConfig.from_env()
         restored = restore_backup(
-            args.archive, args.target, backup_key=config.backup_key
+            args.archive,
+            args.target,
+            backup_key=config.backup_key,
+            apply_migrations=not args.no_migrate,
         )
         restored.close()
-        print(json.dumps({"status": "restored", "workers": "paused"}))
+        print(json.dumps({
+            "status": "restored",
+            "workers": "paused",
+            "migrated": not args.no_migrate,
+        }, sort_keys=True))
         return 0
     if args.command == "runtime-health":
         # This read/compare/projection command is safe to run beside the

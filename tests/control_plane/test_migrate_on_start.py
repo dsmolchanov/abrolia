@@ -104,3 +104,28 @@ def test_migrate_command_refuses_to_migrate_without_a_backup_key(
         " AND name = 'schema_migrations'"
     ) is None
     assert list(tmp_path.glob("*.bak")) == []
+
+
+def test_rollback_restore_keeps_the_archived_schema(tmp_path) -> None:
+    database = _database(tmp_path)
+    database.migrate()
+    directory = _pending_migration_directory(tmp_path)
+    backup = create_pre_migrate_backup(
+        database, backup_key=BACKUP_KEY_BYTES, directory=directory
+    )
+    assert backup is not None
+    assert database.migrate(directory) == ["9999_pilot_probe.sql"]
+    database.close()
+
+    rolled_back = restore_backup(
+        backup,
+        tmp_path / "rollback.db",
+        backup_key=BACKUP_KEY_BYTES,
+        apply_migrations=False,
+    )
+
+    # The rollback keeps the pre-migration schema instead of reapplying it, and
+    # stays paused until an operator resumes it on the pre-upgrade image.
+    assert rolled_back.pending_migrations(directory) == ["9999_pilot_probe.sql"]
+    assert rolled_back.workers_paused
+    rolled_back.close()
