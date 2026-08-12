@@ -1,9 +1,9 @@
 # Privacy Notice
 
-*Version: pilot draft, 2026-08-12. Controller details and the contact address for
-data-subject requests are filled in. The Union representative under Art. 27 GDPR
-and the supervisory authority of that representative's member state remain to be
-recorded before the first real family.*
+*Version: pilot draft, 2026-08-12. Controller details, the contact address for
+data-subject requests, and the legal condition for special-category data are
+filled in. A Union representative under Art. 27 GDPR remains to be designated
+before the first real family.*
 *The Russian version ([`privacy-notice-ru.md`](privacy-notice-ru.md)) is the
 reference text; both are kept in sync.*
 
@@ -43,8 +43,7 @@ Questions, data-subject requests and withdrawal of consent: `help@abrolia.com`.
 controller is established outside the EU and has no establishment in the Union.
 Until a representative is designated in writing, the service runs on synthetic
 data only: no real family data is processed and the real provider adapters are
-disabled and fail closed. The representative's name and address, and the
-supervisory authority of that representative's member state, are recorded in
+disabled and fail closed. The representative's name and address are recorded in
 this notice before the first family is connected.
 
 No Data Protection Officer has been appointed; whether one is required is
@@ -52,8 +51,6 @@ checked before any real family is connected.
 
 You may lodge a complaint with the supervisory authority of your habitual
 residence, place of work, or place of the alleged infringement (Art. 77 GDPR).
-The authority of the representative's establishment will be named here once the
-representative is designated.
 
 ## What we process and why
 
@@ -73,6 +70,27 @@ Legal bases: performance of our contract (account, onboarding, provisioning,
 agent inbox, and channels); separate consent (memory, dedicated-WhatsApp risk,
 and push where required); our legitimate interests (security, replay prevention,
 and processing sender data in content you provide).
+
+## Special-category data (health, religion)
+
+School emails often contain health data (a medical certificate, an allergy, a PE
+exemption) and, indirectly, religion (an exemption for a religious holiday). For
+the content you send to the agent inbox or channel, the legal condition is
+**explicit consent, Art. 9(2)(a) GDPR**: your own, and — for your minor children
+— given by you as a holder of parental responsibility. Consent is collected as a
+separate item, never bundled with the terms, recorded in a versioned receipt, and
+withdrawn in one step.
+
+Special-category data **about other people** — other children, teachers, other
+parents — is **outside the scope of the service**: no Art. 9(2) condition is
+available for it, so such material should not be sent to the assistant. You
+confirm this as a separate item before choosing an email identity. If such
+material reaches us by mistake, stop using it and request deletion at
+`help@abrolia.com`.
+
+We do not extract or index health and religion attributes and build no profiles
+from them. There is no server-side "medical filter" either: telling such an email
+apart would require reading it, which is itself processing.
 
 ## Other people's data
 
