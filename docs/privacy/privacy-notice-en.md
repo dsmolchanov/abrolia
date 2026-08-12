@@ -1,7 +1,9 @@
 # Privacy Notice
 
-*Version: pilot draft, 2026-08-04. Controller details and the contact address for
-data-subject requests are filled in before the first real family (marked TODO).*
+*Version: pilot draft, 2026-08-12. Controller details and the contact address for
+data-subject requests are filled in. The Union representative under Art. 27 GDPR
+and the supervisory authority of that representative's member state remain to be
+recorded before the first real family.*
 *The Russian version ([`privacy-notice-ru.md`](privacy-notice-ru.md)) is the
 reference text; both are kept in sync.*
 
@@ -29,13 +31,29 @@ reference text; both are kept in sync.*
 
 ## Who processes your data
 
-Controller — Abrolia service operator: TODO: legal name, registered
-address, registration details, EU representative (if required under Art. 27).
-Questions, requests and withdrawal of consent: TODO: contact address.
+Controller — **Axiom Atlas, LLC**, a limited liability company formed under the
+laws of the State of Delaware, USA, by Certificate of Formation dated 19 March
+2025. Registered office: 131 Continental Dr, Suite 305, Newark, DE 19713, New
+Castle County, USA. Registered agent: Legalinc Corporate Services Inc. The
+Abrolia service operator is that same legal entity.
+
+Questions, data-subject requests and withdrawal of consent: `support@abrolia.com`.
+
+**No Union representative under Art. 27 GDPR has been designated yet.** The
+controller is established outside the EU and has no establishment in the Union.
+Until a representative is designated in writing, the service runs on synthetic
+data only: no real family data is processed and the real provider adapters are
+disabled and fail closed. The representative's name and address, and the
+supervisory authority of that representative's member state, are recorded in
+this notice before the first family is connected.
+
 No Data Protection Officer has been appointed; whether one is required is
 checked before any real family is connected.
+
 You may lodge a complaint with the supervisory authority of your habitual
-residence or place of work, or of the operator's establishment: TODO: authority.
+residence, place of work, or place of the alleged infringement (Art. 77 GDPR).
+The authority of the representative's establishment will be named here once the
+representative is designated.
 
 ## What we process and why
 
