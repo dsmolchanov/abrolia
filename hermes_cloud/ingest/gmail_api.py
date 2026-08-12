@@ -43,9 +43,7 @@ class GmailApi(Protocol):
     def profile(self) -> dict[str, Any]: ...
     def history(self, start_history_id: str, page_token: str | None = None) -> dict[str, Any]: ...
     def message(self, message_id: str) -> dict[str, Any]: ...
-    def list_inbox(
-        self, page_token: str | None = None, *, max_results: int, query: str
-    ) -> dict[str, Any]: ...
+    def list_inbox(self, page_token: str | None = None, *, max_results: int) -> dict[str, Any]: ...
 
 
 class GmailHistorySource:
@@ -59,7 +57,6 @@ class GmailHistorySource:
         *,
         clock=time.time,
         resync_limit: int = 100,
-        resync_overlap_seconds: float = 5 * 60,
         quota_backoff: float = 60.0,
     ) -> None:
         if binding.provider != "gmail":
@@ -69,9 +66,6 @@ class GmailHistorySource:
         self.client = client
         self.clock = clock
         self.resync_limit = resync_limit
-        if resync_overlap_seconds <= 0:
-            raise ValueError("Gmail resync overlap must be positive")
-        self.resync_overlap_seconds = resync_overlap_seconds
         self.quota_backoff = quota_backoff
         self._pending_cursor: str | None = None
 
@@ -93,15 +87,12 @@ class GmailHistorySource:
         with self.db.write() as connection:
             connection.execute(
                 "INSERT INTO email_sync_state (binding_identity_id, binding_revision, cursor,"
-                " connected_at, last_success_at, backoff_until, health, updated_at,"
-                " cursor_observed_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                " connected_at, last_success_at, backoff_until, health, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
                 " ON CONFLICT (binding_identity_id, binding_revision) DO UPDATE SET"
                 " cursor = excluded.cursor, last_success_at = CASE WHEN ? THEN excluded.last_success_at"
                 " ELSE email_sync_state.last_success_at END, backoff_until = excluded.backoff_until,"
-                " health = excluded.health, updated_at = excluded.updated_at,"
-                " cursor_observed_at = CASE WHEN ? THEN excluded.cursor_observed_at"
-                " ELSE email_sync_state.cursor_observed_at END",
+                " health = excluded.health, updated_at = excluded.updated_at",
                 (
                     self.binding.identity_id,
                     self.binding.revision,
@@ -111,8 +102,6 @@ class GmailHistorySource:
                     backoff_until,
                     health,
                     now,
-                    now if success else None,
-                    int(success),
                     int(success),
                 ),
             )
@@ -137,20 +126,14 @@ class GmailHistorySource:
             raise GmailMalformedMessage("gmail_raw_missing_identity_headers")
         return InboundEmail("gmail", f"gmail:{message_id}", data)
 
-    def _bounded_resync(self, last_cursor_at: float) -> tuple[list[str], str]:
-        if last_cursor_at <= 0:
-            raise GmailHistoryGap("gmail_cursor_time_missing")
-        after = max(0, int(last_cursor_at - self.resync_overlap_seconds))
-        query = f"in:inbox after:{after}"
+    def _bounded_resync(self) -> tuple[list[str], str]:
         ids: list[str] = []
         token: str | None = None
         while True:
             remaining = self.resync_limit - len(ids)
             if remaining <= 0:
                 raise GmailHistoryGap("gmail_history_gap")
-            page = self.client.list_inbox(
-                token, max_results=min(100, remaining), query=query
-            )
+            page = self.client.list_inbox(token, max_results=min(100, remaining))
             ids.extend(str(item["id"]) for item in page.get("messages", []) if item.get("id"))
             token = page.get("nextPageToken")
             if len(ids) > self.resync_limit:
@@ -190,13 +173,7 @@ class GmailHistorySource:
                     break
         except GmailHistoryExpired:
             try:
-                last_cursor_at = float(
-                    state["cursor_observed_at"]
-                    or state["last_success_at"]
-                    or state["connected_at"]
-                    or 0
-                )
-                ids, latest = self._bounded_resync(last_cursor_at)
+                ids, latest = self._bounded_resync()
             except GmailHistoryGap:
                 self._write_state(cursor=cursor, health="needs_attention")
                 raise
