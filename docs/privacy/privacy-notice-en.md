@@ -37,7 +37,7 @@ laws of the State of Delaware, USA, by Certificate of Formation dated 19 March
 Castle County, USA. Registered agent: Legalinc Corporate Services Inc. The
 Abrolia service operator is that same legal entity.
 
-Questions, data-subject requests and withdrawal of consent: `support@abrolia.com`.
+Questions, data-subject requests and withdrawal of consent: `help@abrolia.com`.
 
 **No Union representative under Art. 27 GDPR has been designated yet.** The
 controller is established outside the EU and has no establishment in the Union.

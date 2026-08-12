@@ -57,12 +57,9 @@ thoughts/shared/handoffs/general/*.md | email | security@abrolia.com
 .check-fixtures-allow | email | security@abrolia.com
 
 # Privacy and data-subject request contact (operator-owned, not fixture data).
+# The same address is the controller contact named in the privacy notices and
+# the deletion address inside the hashed special-category consent copy.
 control_plane/privacy/consent.py | email | help@abrolia.com
 docs/privacy/*.md | email | help@abrolia.com
+README.md | email | help@abrolia.com
 .check-fixtures-allow | email | help@abrolia.com
-
-# Controller contact for data-subject requests named in the privacy notices
-# (operator-owned organisation address, not fixture or family data).
-README.md | email | support@abrolia.com
-docs/privacy/*.md | email | support@abrolia.com
-.check-fixtures-allow | email | support@abrolia.com
