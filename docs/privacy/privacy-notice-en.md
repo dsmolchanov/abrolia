@@ -41,13 +41,21 @@ Questions, data-subject requests and withdrawal of consent: `help@abrolia.com`.
 
 **No Union representative under Art. 27 GDPR has been designated yet.** The
 controller is established outside the EU and has no establishment in the Union.
-Until a representative is designated in writing, the service runs on synthetic
-data only: no real family data is processed and the real provider adapters are
-disabled and fail closed. The representative's name and address are recorded in
-this notice before the first family is connected.
+The obligation applies to us: the Art. 27(2)(a) derogation is unavailable
+because the processing is not occasional and involves special categories of
+data, and Art. 27(2)(b) concerns public authorities. Until a representative is
+designated in writing, the service runs on synthetic data only: no real family
+data is processed and the real provider adapters are disabled and fail closed.
+The representative's name and address are recorded in this notice before the
+first family is connected.
 
-No Data Protection Officer has been appointed; whether one is required is
-checked before any real family is connected.
+**No Data Protection Officer is required** — determined on 2026-08-12 under
+Art. 37(1): the controller is not a public authority, and neither regular and
+systematic monitoring of data subjects on a large scale nor large-scale
+processing of special categories is a core activity (the pilot is limited to
+5–20 households, third-party special categories are outside the scope of the
+service, and no profiling of data subjects takes place). The determination is
+revisited when the pilot ends.
 
 You may lodge a complaint with the supervisory authority of your habitual
 residence, place of work, or place of the alleged infringement (Art. 77 GDPR).
