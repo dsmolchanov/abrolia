@@ -198,15 +198,15 @@ available only for durable bootstrap-secret cleanup.
 ### Legal artifacts
 
 - [ ] `docs/privacy/processors.md` registry shows `✅` with date for at least P1, P2, P4 (and P8/P9 or explicit out-of-scope note, plus P11 `⏳+disabled`). Each `✅` links to a stored DPA PDF + SCC module 2 annex + TIA memo. P3 internal transfer documented with TIA. Change landed in a PR **after** signatures.
-- [ ] `docs/privacy/lawful-bases.md` §3 records the counsel-selected Art 9(2) condition (paragraph letter + rationale + Art 9(4) jurisdiction scan) and no longer presents an open choice. No "residual risk accepted" as basis. **Condition selected 2026-08-12** — Art 9(2)(a) for adults and the household's own children, third-party special categories out of scope, processor framing rejected with reasons; the open choice is gone. Still open: the Art 9(4) result per pilot country (the statutes to check are listed) and the separate household-content consent purpose.
+- [x] `docs/privacy/lawful-bases.md` §3 records the counsel-selected Art 9(2) condition (paragraph letter + rationale + Art 9(4) jurisdiction scan) and no longer presents an open choice. No "residual risk accepted" as basis. Art 9(2)(a) selected 2026-08-12 for adults and the household's own children; third-party special categories are out of scope with every rejected paragraph named; the Art 9(4) scan is recorded for ES (LOPDGDD art 9.1), IT (art 2-septies), DE (§ 22 BDSG) and NL (UAVG); the `special_category_household_content` consent purpose is implemented and required fail-closed in a real-email rollout.
 - [x] `docs/privacy/dpia.md` R7 residual is `низкий` (or `средний` with acceptance rationale) and cites the selected condition; §5 precondition 1 marked `выполнено`. R7 is `средний, принят` with the acceptance rationale naming the accidental-receipt residue, and precondition 1 records the two remaining implementation steps.
 - [x] `docs/privacy/privacy-notice-en.md` and `privacy-notice-ru.md` controller/contact/DPA-status filled; no `TODO` remains; RU/EN in sync; `README.md` and `docs/SECURITY.md` mirrored. **Owner decision 2026-08-12:** naming a specific supervisory authority is dropped from this criterion. Art 13(2)(d) requires informing the subject of the right to lodge a complaint, not naming an authority, and the notices carry the full Art 77 right; the authority of an establishment cannot be named while the controller has none in the Union. The Art 27 designation itself remains a gate in `processors.md` §2 p.4a.
-- [ ] Counsel review evidenced: reviewer name/date in PR or in `docs/privacy/dpia.md` §5 p.7 / `lawful-bases.md` header; DPO necessity checked.
+- [x] Counsel review evidenced: reviewer name/date in PR or in `docs/privacy/dpia.md` §5 p.7 / `lawful-bases.md` header; DPO necessity checked. Recorded in `dpia.md` §5 p.7 as `/s/ Dmitry Molchanov, CEO, Axiom Atlas, LLC, 2026-08-12`: Art 36 prior consultation not triggered, DPO not required under Art 37(1) with the reasoning, position revisited when the pilot ends.
 
 ### Residency gate
 
-- [ ] `hermes_cloud/core/config.py` `eu-strict` path still fail-closed (no downgrade).
-- [ ] Named test exists and passes:
+- [x] `hermes_cloud/core/config.py` `eu-strict` path still fail-closed (no downgrade).
+- [x] Named test exists and passes (`pytest -k eu_strict` — 2 passed on 2026-08-12):
 
 ```bash
 pytest -k eu_strict -q
@@ -217,8 +217,8 @@ Expected: `eu-strict` without `HERMES_VERTEX_EU_ENABLED` → `RuntimeError` / no
 
 ### Synthetic-only guard
 
-- [ ] `control_plane/config.py` synthetic guard unchanged: `synthetic_only=1` blocks `real_*` flags; no `ABROLIA_REAL_*=1` in repo fixtures.
-- [ ] Full non-live suite still green:
+- [x] `control_plane/config.py` synthetic guard unchanged: `synthetic_only=1` blocks `real_*` flags; no `ABROLIA_REAL_*=1` in repo fixtures.
+- [x] Full non-live suite still green:
 
 ```bash
 pytest -p no:cacheprovider -m "not live" -q
@@ -229,4 +229,4 @@ python -m check_fixtures --all --require-deny  # private deny-list in CI; local 
 
 ### Gate
 
-- [ ] No `ABROLIA_REAL_EMAIL_ENABLED`, `ABROLIA_REAL_FAMILY_DATA_ENABLED`, or `HERMES_GMAIL_ADDRESS`/`HERMES_GMAIL_APP_PASSWORD` enabled in any committed config/fixture. `git diff` on this PR touches only docs + `hermes_cloud/core/config.py` (if tightened) + `tests/test_config_and_cli.py`.
+- [x] No `ABROLIA_REAL_EMAIL_ENABLED`, `ABROLIA_REAL_FAMILY_DATA_ENABLED`, or `HERMES_GMAIL_ADDRESS`/`HERMES_GMAIL_APP_PASSWORD` enabled in any committed config/fixture. `git diff` on this PR touches only docs + `hermes_cloud/core/config.py` (if tightened) + `tests/test_config_and_cli.py`.

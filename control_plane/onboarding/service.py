@@ -274,31 +274,38 @@ class OnboardingService:
             raise InvalidTransition(
                 "real email requires the special-category content restriction receipt"
             )
+        # The Art 9(2)(a) condition is only reachable where real family content
+        # can actually arrive; synthetic households process no personal data.
+        if (
+            selection.get("special_category_household_consent") is not True
+            or not selection.get("special_category_household_receipt_id")
+        ):
+            raise InvalidTransition(
+                "real email requires the Art 9(2)(a) household content consent"
+            )
 
     @staticmethod
-    def _record_email_content_restriction(
+    def _record_email_consent_receipt(
         connection,
         *,
         parsed: dict[str, Any],
         household_id: str,
         account_id: str,
         now: float,
+        purpose: str,
+        prefix: str,
+        accepted_field: str,
+        mismatch_error: str,
     ) -> None:
-        receipt_id = parsed.get("special_category_restriction_receipt_id")
-        if (
-            parsed.get("special_category_restriction_acknowledged") is not True
-            or not receipt_id
-        ):
+        receipt_id = parsed.get(f"{prefix}_receipt_id")
+        if parsed.get(accepted_field) is not True or not receipt_id:
             return
-        purpose = "special_category_content_restriction"
         text_version, text_sha = consent_version_and_sha(purpose)
         if (
-            parsed.get("special_category_restriction_text_version") != text_version
-            or parsed.get("special_category_restriction_text_sha256") != text_sha
+            parsed.get(f"{prefix}_text_version") != text_version
+            or parsed.get(f"{prefix}_text_sha256") != text_sha
         ):
-            raise InvalidTransition(
-                "special-category content restriction text version does not match"
-            )
+            raise InvalidTransition(mismatch_error)
         existing = connection.execute(
             "SELECT household_id, account_id, purpose, text_version, text_sha256"
             " FROM consent_receipts WHERE id = ?",
@@ -413,12 +420,33 @@ class OnboardingService:
                 (row["id"], kind.value),
             ).fetchone()
             if kind is StepKind.EMAIL:
-                self._record_email_content_restriction(
+                self._record_email_consent_receipt(
                     connection,
                     parsed=parsed,
                     household_id=household_id,
                     account_id=context.account_id,
                     now=now,
+                    purpose="special_category_content_restriction",
+                    prefix="special_category_restriction",
+                    accepted_field="special_category_restriction_acknowledged",
+                    mismatch_error=(
+                        "special-category content restriction text version"
+                        " does not match"
+                    ),
+                )
+                self._record_email_consent_receipt(
+                    connection,
+                    parsed=parsed,
+                    household_id=household_id,
+                    account_id=context.account_id,
+                    now=now,
+                    purpose="special_category_household_content",
+                    prefix="special_category_household",
+                    accepted_field="special_category_household_consent",
+                    mismatch_error=(
+                        "Art 9(2)(a) household content consent text version"
+                        " does not match"
+                    ),
                 )
             if kind is StepKind.WHATSAPP:
                 household_row = connection.execute(
@@ -458,6 +486,10 @@ class OnboardingService:
                         "special_category_restriction_receipt_id",
                         "special_category_restriction_text_version",
                         "special_category_restriction_text_sha256",
+                        "special_category_household_consent",
+                        "special_category_household_receipt_id",
+                        "special_category_household_text_version",
+                        "special_category_household_text_sha256",
                     }
                 }
             job_request = {

@@ -88,6 +88,11 @@ class DesiredSpecPlanner:
             (household_id,),
         ).fetchall()
         receipts_by_purpose = {row["purpose"]: row for row in receipt_rows}
+        # A household that accepted the Art 9(2)(a) condition carries it into the
+        # manifest, so the runtime enforces its exact version like every other
+        # authoritative purpose. Synthetic households never hold that receipt.
+        if "special_category_household_content" in receipts_by_purpose:
+            required_purposes.append("special_category_household_content")
         if any(purpose not in receipts_by_purpose for purpose in required_purposes):
             raise ValueError("authoritative onboarding consent receipt is missing")
         current = connection.execute(

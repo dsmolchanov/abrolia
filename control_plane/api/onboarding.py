@@ -62,6 +62,20 @@ def email_content_restriction_contract() -> JSONResponse:
     })
 
 
+@router.get("/api/v1/onboarding/consent/special-category-household-content")
+def household_content_consent_contract() -> JSONResponse:
+    """Art 9(2)(a) copy and digest; required only in a real-email rollout."""
+    purpose = "special_category_household_content"
+    version, copy = consent_version_and_text(purpose)
+    _, sha256 = consent_version_and_sha(purpose)
+    return JSONResponse({
+        "purpose": purpose,
+        "text_version": version,
+        "text": copy,
+        "text_sha256": sha256,
+    })
+
+
 def _response(result: CommandResult) -> JSONResponse:
     response = JSONResponse(result.snapshot.model_dump(mode="json"))
     response.headers["ETag"] = f'"{result.snapshot.version}"'

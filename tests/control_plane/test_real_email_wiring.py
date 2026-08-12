@@ -94,6 +94,9 @@ def test_real_email_rollout_does_not_route_gmail_to_nerve(cp_stack) -> None:
     restriction_version, restriction_sha = consent_version_and_sha(
         "special_category_content_restriction"
     )
+    consent_version, consent_sha = consent_version_and_sha(
+        "special_category_household_content"
+    )
     cp_stack.service.select(
         cp_stack.household.id,
         StepKind.EMAIL,
@@ -104,6 +107,10 @@ def test_real_email_rollout_does_not_route_gmail_to_nerve(cp_stack) -> None:
             "special_category_restriction_receipt_id": "10000000-0000-4000-8000-000000000006",
             "special_category_restriction_text_version": restriction_version,
             "special_category_restriction_text_sha256": restriction_sha,
+            "special_category_household_consent": True,
+            "special_category_household_receipt_id": "10000000-0000-4000-8000-000000000016",
+            "special_category_household_text_version": consent_version,
+            "special_category_household_text_sha256": consent_sha,
         },
         context=cp_stack.context(),
     )
@@ -117,15 +124,21 @@ def test_real_email_rollout_does_not_route_gmail_to_nerve(cp_stack) -> None:
         "kind": "gmail_agent",
         "separate_agent_account_acknowledged": True,
     }
-    receipt = cp_stack.database.query_one(
+    receipts = cp_stack.database.query(
         "SELECT purpose, text_version FROM consent_receipts"
-        " WHERE household_id = ?",
+        " WHERE household_id = ? ORDER BY purpose",
         (cp_stack.household.id,),
     )
-    assert dict(receipt) == {
-        "purpose": "special_category_content_restriction",
-        "text_version": "special-category-content-restriction-v1",
-    }
+    assert [dict(receipt) for receipt in receipts] == [
+        {
+            "purpose": "special_category_content_restriction",
+            "text_version": "special-category-content-restriction-v1",
+        },
+        {
+            "purpose": "special_category_household_content",
+            "text_version": "special-category-household-content-v1",
+        },
+    ]
 
     with cp_stack.database.write() as connection:
         connection.execute(
@@ -133,7 +146,7 @@ def test_real_email_rollout_does_not_route_gmail_to_nerve(cp_stack) -> None:
             ("0" * 64, "10000000-0000-4000-8000-000000000006"),
         )
         with pytest.raises(IdempotencyConflict):
-            cp_stack.service._record_email_content_restriction(
+            cp_stack.service._record_email_consent_receipt(
                 connection,
                 parsed={
                     "special_category_restriction_acknowledged": True,
@@ -142,8 +155,12 @@ def test_real_email_rollout_does_not_route_gmail_to_nerve(cp_stack) -> None:
                     ),
                     "special_category_restriction_text_version": restriction_version,
                     "special_category_restriction_text_sha256": restriction_sha,
-                    },
-                    household_id=cp_stack.household.id,
-                    account_id=cp_stack.account.id,
-                    now=10.0,
-                )
+                },
+                household_id=cp_stack.household.id,
+                account_id=cp_stack.account.id,
+                now=10.0,
+                purpose="special_category_content_restriction",
+                prefix="special_category_restriction",
+                accepted_field="special_category_restriction_acknowledged",
+                mismatch_error="restriction text version does not match",
+            )
