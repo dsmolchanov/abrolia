@@ -310,7 +310,7 @@ CREATE TABLE channel_bindings (
 
 ### Phase E Acceptance Criteria
 
-- [ ] Durable 3-step machine with `provision.py --dry-run` listing exact writes without mutation; fix-before-effect; idempotency; downstream invalidation.
+- [x] Durable 3-step machine with `provision.py --dry-run` listing exact writes without mutation; fix-before-effect; idempotency; downstream invalidation. The machine, its version checks, idempotent replay and `reset_from` downstream invalidation were already durable in `control_plane/onboarding/{state,service}.py`; `control_plane/onboarding/provision.py` adds the rehearsal and `tests/control_plane/test_provision_dry_run.py` proves it commits nothing (4 tests).
 
 ```bash
 python -m control_plane.onboarding.provision --dry-run --household <test-uuid> 2>&1 | head -n 80

@@ -144,6 +144,26 @@ The link token is displayed once to that operator, stored only as a hash, and
 expires after 15 minutes. Do not paste it into tickets, chat, screenshots, or
 logs. Start the service again, open the link, and verify that a replay fails.
 
+### Pre-onboarding rehearsal (`--dry-run`)
+
+Before every pilot onboarding, rehearse it. The command opens one write
+transaction, replays the desired-spec planner against durable state, records the
+tables that transaction would touch, and rolls back. No provider is called and
+no row is committed; if a commit is ever observed the command exits non-zero
+instead of printing a report.
+
+```bash
+python -m control_plane.onboarding.provision --dry-run --household <household-uuid>
+```
+
+It reports the workflow state and per-step statuses, the `config_revision` the
+next planning pass would issue with its manifest SHA-256, the deterministic Fly
+app/volume/Machine names, and the secret **names** involved (values never leave
+the sink). When a step is not yet verified, `blocked_by` and `unverified_steps`
+say exactly what is missing instead of a plan. The command refuses to run
+without `--dry-run`; it takes no process lock, so it is safe while the API
+serves.
+
 Complete profile preflight with an IANA timezone, then the three choices in
 order. The default synthetic path is managed `@abrolia.com`, shared WhatsApp
 Beta, then Telegram. Reload after each step: the server-side workflow version
