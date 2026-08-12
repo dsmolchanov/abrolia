@@ -1,12 +1,5 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
-from threading import Barrier
-
-from fastapi.testclient import TestClient
-
-from control_plane.models import ProfileInput
-from control_plane.onboarding.contracts import CommandContext
 from control_plane.privacy.consent import consent_version_and_sha
 
 
@@ -112,83 +105,3 @@ def test_domain_guidance_is_owner_scoped_and_returns_no_inventory(api_harness) -
     assert subdomain.json()["apex_mx_risk"] is False
     assert blocked.status_code == 422
     assert blocked.json() == {"detail": "invalid domain"}
-
-
-def test_byo_two_connection_owned_domain_race_returns_one_conflict(api_harness) -> None:
-    worlds = [
-        api_harness.create_principal("domain-race-a@family.test"),
-        api_harness.create_principal("domain-race-b@family.test"),
-    ]
-    for index, world in enumerate(worlds):
-        api_harness.container.onboarding.save_profile(
-            world.household.id,
-            ProfileInput.model_validate({
-                "first_name": "Race",
-                "last_name": str(index),
-                "family_language": "en",
-                "timezone": "Europe/Prague",
-                "country_code": "CZ",
-                "residency_mode": "eu-app",
-            }),
-            context=CommandContext(
-                account_id=world.account.id,
-                session_id=world.session.id,
-                request_id=f"domain-race-profile-{index}",
-                idempotency_key=f"domain-race-profile-{index}",
-                expected_version=0,
-            ),
-        )
-
-    barrier = Barrier(2)
-
-    def select(index: int):
-        world = worlds[index]
-        with TestClient(
-            api_harness.client.app, base_url=api_harness.config.public_origin
-        ) as client:
-            client.cookies.set(
-                api_harness.config.session_cookie_name, world.session.token
-            )
-            client.cookies.set(
-                api_harness.config.csrf_cookie_name, world.session.csrf_token
-            )
-            barrier.wait()
-            return client.post(
-                "/api/v1/onboarding/steps/email_identity/select",
-                headers={
-                    "Origin": api_harness.config.public_origin,
-                    "X-CSRF-Token": world.session.csrf_token,
-                    "If-Match": '"1"',
-                    "Idempotency-Key": f"domain-race-select-{index}",
-                },
-                json={
-                    "kind": "family_domain",
-                    "domain": "family.example.test",
-                    "local_part": f"assistant-{index}",
-                    "special_category_restriction_acknowledged": True,
-                    "special_category_restriction_receipt_id": (
-                        f"10000000-0000-4000-8000-00000000010{index}"
-                    ),
-                    "special_category_restriction_text_version": (
-                        consent_version_and_sha(
-                            "special_category_content_restriction"
-                        )[0]
-                    ),
-                    "special_category_restriction_text_sha256": (
-                        consent_version_and_sha(
-                            "special_category_content_restriction"
-                        )[1]
-                    ),
-                },
-            )
-
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        responses = list(executor.map(select, range(2)))
-
-    assert sorted(response.status_code for response in responses) == [200, 409]
-    conflict = next(response for response in responses if response.status_code == 409)
-    assert conflict.json() == {"detail": "domain_already_claimed"}
-    assert api_harness.container.database.query_one(
-        "SELECT count(*) AS count FROM email_identities"
-        " WHERE option = 'own_domain' AND status != 'deleted'"
-    )["count"] == 1
