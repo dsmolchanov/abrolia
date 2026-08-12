@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import tempfile
+import time
 from pathlib import Path
 
 from cryptography.exceptions import InvalidTag
@@ -24,6 +25,29 @@ def _key(value: bytes) -> bytes:
     if len(value) != 32:
         raise BackupError("a separate 32-byte control-plane backup key is required")
     return value
+
+
+def create_pre_migrate_backup(
+    database: ControlPlaneDatabase,
+    *,
+    backup_key: bytes,
+    now: float | None = None,
+    directory: Path | None = None,
+) -> Path | None:
+    """Snapshot before the first pending migration; None when none are pending.
+
+    The file uses the plan's `<db>.pre-migrate-<rev>-<epoch>.bak` name and the
+    same authenticated archive format as `create_backup`, so it is restored with
+    `abrolia-control-plane restore` and the dedicated backup key.
+    """
+    if not database.pending_migrations(directory):
+        return None
+    revision = database.applied_revision()
+    stamp = int(time.time() if now is None else now)
+    target = database.path.with_name(
+        f"{database.path.name}.pre-migrate-{revision}-{stamp}.bak"
+    )
+    return create_backup(database, target, backup_key=backup_key)
 
 
 def create_backup(

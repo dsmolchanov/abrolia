@@ -5,10 +5,11 @@ from __future__ import annotations
 import fcntl
 import os
 import sqlite3
+import sys
 import threading
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager, suppress
 from pathlib import Path
 
@@ -129,6 +130,34 @@ class ControlPlaneDatabase:
         with self._mutex:
             return self.connection.execute(sql, params).fetchone()
 
+    def pending_migrations(self, directory: Path | None = None) -> list[str]:
+        directory = directory or MIGRATIONS_DIR
+        if not self.path.exists():
+            return [script.name for script in sorted(directory.glob("*.sql"))]
+        applied = {row["name"] for row in self._applied_migrations()}
+        return [
+            script.name
+            for script in sorted(directory.glob("*.sql"))
+            if script.name not in applied
+        ]
+
+    def applied_revision(self) -> str:
+        """Numeric prefix of the last applied migration, `0000` when empty."""
+        applied = sorted(row["name"] for row in self._applied_migrations())
+        if not applied:
+            return "0000"
+        return applied[-1].split("_", 1)[0]
+
+    def _applied_migrations(self) -> list[sqlite3.Row]:
+        with self._mutex:
+            table = self.connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+                " AND name = 'schema_migrations'"
+            ).fetchone()
+            if table is None:
+                return []
+            return list(self.connection.execute("SELECT name FROM schema_migrations"))
+
     def migrate(self, directory: Path | None = None) -> list[str]:
         directory = directory or MIGRATIONS_DIR
         connection = self.connection
@@ -174,3 +203,64 @@ def open_control_plane_database(path: Path | str) -> ControlPlaneDatabase:
     database = ControlPlaneDatabase(path)
     database.migrate()
     return database
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Container entrypoint step: back up before applying any new migration."""
+
+    # Imported here so the module stays importable from control_plane.backup.
+    import argparse
+    import base64
+    import binascii
+    import json
+
+    from control_plane.backup import BackupError, create_pre_migrate_backup
+
+    parser = argparse.ArgumentParser(prog="python -m control_plane.db")
+    commands = parser.add_subparsers(dest="command", required=True)
+    migrate = commands.add_parser("migrate", help="apply pending migrations")
+    migrate.add_argument(
+        "--backup-first",
+        action="store_true",
+        help="take an authenticated snapshot before the first pending migration",
+    )
+    args = parser.parse_args(argv)
+
+    # This step runs before the application config is loaded, so it reads only
+    # the two values it needs: the volume database and the dedicated backup key.
+    database = ControlPlaneDatabase(
+        os.environ.get("ABROLIA_CONTROL_PLANE_DB", "data/control-plane.db")
+    )
+    try:
+        backup_key = base64.urlsafe_b64decode(
+            os.environ.get("ABROLIA_CONTROL_PLANE_BACKUP_KEY", "")
+        )
+    except (binascii.Error, ValueError):
+        backup_key = b""
+    try:
+        backup: Path | None = None
+        if args.backup_first:
+            try:
+                backup = create_pre_migrate_backup(database, backup_key=backup_key)
+            except (BackupError, OSError) as error:
+                # Fail closed: never migrate a database we could not snapshot.
+                print(f"pre-migrate backup failed: {error}", file=sys.stderr)
+                return 1
+        try:
+            applied = database.migrate()
+        except Exception as error:
+            print(f"migration failed: {error}", file=sys.stderr)
+            if backup is not None:
+                print(f"restore from {backup}", file=sys.stderr)
+            return 1
+        print(json.dumps(
+            {"applied": applied, "backup": str(backup) if backup else None},
+            sort_keys=True,
+        ))
+        return 0
+    finally:
+        database.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

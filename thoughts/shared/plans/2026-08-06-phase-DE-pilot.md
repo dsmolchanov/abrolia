@@ -361,7 +361,7 @@ pytest tests/test_onboarding.py tests/test_google_oauth.py -q
 pytest -p no:cacheprovider -m "not live" -q
 ```
 
-- [ ] Release tag + backup-before-migrate + restore drill evidenced.
+- [ ] Release tag + backup-before-migrate + restore drill evidenced. Backup-before-migrate landed: `python -m control_plane.db migrate --backup-first` is the container entrypoint step and fails closed without the dedicated backup key (`tests/control_plane/test_migrate_on_start.py`, 5 tests). The release tag and the Phase E restore drill remain operator actions.
 
 ---
 

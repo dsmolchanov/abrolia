@@ -26,6 +26,31 @@ The archive uses authenticated AES-256-GCM. Secret values are read from the
 environment/Fly secret namespace; they are absent from argv, archive metadata,
 SQLite, and logs.
 
+## Backup before migrate (migrate-on-start)
+
+The container entrypoint runs the migration step before `serve`:
+
+```bash
+python -m control_plane.db migrate --backup-first
+```
+
+When at least one `control_plane/migrations/*.sql` is pending, it first writes
+`/data/control-plane.db.pre-migrate-<last-applied-rev>-<epoch>.bak`, in the same
+authenticated archive format as `abrolia-control-plane backup` and with the same
+dedicated `ABROLIA_CONTROL_PLANE_BACKUP_KEY`, mode `0600`. It fails closed: a
+missing or invalid backup key, or any snapshot error, exits non-zero **before**
+touching the schema, and the container stops instead of serving. A migration
+failure also exits non-zero and prints the archive path to restore from; each
+migration file is applied in its own transaction, so a failed file leaves no
+partial schema. When nothing is pending, no archive is written.
+
+Restore a pre-migrate archive with the normal paused restore:
+
+```bash
+abrolia-control-plane restore /data/control-plane.db.pre-migrate-0008-1800000000.bak \
+  --target /data/control-plane-rollback.db
+```
+
 ## Isolated restore rehearsal
 
 1. Stop the API/embedded worker and snapshot the original volume.
