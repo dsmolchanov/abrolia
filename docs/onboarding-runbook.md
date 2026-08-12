@@ -146,23 +146,27 @@ logs. Start the service again, open the link, and verify that a replay fails.
 
 ### Pre-onboarding rehearsal (`--dry-run`)
 
-Before every pilot onboarding, rehearse it. The command opens one write
-transaction, replays the desired-spec planner against durable state, records the
-tables that transaction would touch, and rolls back. No provider is called and
-no row is committed; if a commit is ever observed the command exits non-zero
-instead of printing a report.
+Before every pilot onboarding, rehearse it. The command reports the config
+revision and runtime job the onboarding will actually provision — both read from
+durable state, because the worker issues them when the primary step verifies —
+then rehearses one planning pass inside a write transaction to enumerate the
+tables such a transaction touches, and rolls that rehearsal back. No provider is
+called and no row is committed; if a commit is ever observed the command exits
+non-zero instead of printing a report.
 
 ```bash
 python -m control_plane.onboarding.provision --dry-run --household <household-uuid>
 ```
 
-It reports the workflow state and per-step statuses, the `config_revision` the
-next planning pass would issue with its manifest SHA-256, the deterministic Fly
-app/volume/Machine names, and the secret **names** involved (values never leave
-the sink). When a step is not yet verified, `blocked_by` and `unverified_steps`
-say exactly what is missing instead of a plan. The command refuses to run
-without `--dry-run`; it takes no process lock, so it is safe while the API
-serves.
+It reports the workflow state and per-step statuses, the issued
+`config_revision` with its status and manifest SHA-256, the pending
+`ensure_runtime` job and its `desired_revision`, the deterministic Fly
+app/volume/Machine names, and the secret **names** involved —
+`HERMES_BOOTSTRAP_TOKEN` and `HERMES_RUNTIME_DSAR_TOKEN` plus any recorded email
+secret installs (values never leave the sink). When a step is not yet verified,
+`blocked_by` and `unverified_steps` say exactly what is missing instead of a
+plan. The command refuses to run without `--dry-run`; it takes no process lock,
+so it is safe while the API serves.
 
 Complete profile preflight with an IANA timezone, then the three choices in
 order. The default synthetic path is managed `@abrolia.com`, shared WhatsApp

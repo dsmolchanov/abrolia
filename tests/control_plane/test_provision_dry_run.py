@@ -10,6 +10,7 @@ from control_plane.models import ProfileInput, StepKind
 from control_plane.onboarding.contracts import CommandContext
 from control_plane.onboarding.provision import (
     RUNTIME_BOOTSTRAP_SECRET,
+    RUNTIME_DSAR_SECRET,
     TableWrite,
     main,
     plan_onboarding,
@@ -131,20 +132,25 @@ def test_dry_run_lists_exact_writes_and_commits_nothing(container) -> None:
     assert plan.blocked_by is None
     assert plan.unverified_steps == []
     durable = container.database.query_one(
-        "SELECT COALESCE(MAX(revision), 0) AS revision FROM config_revisions"
-        " WHERE household_id = ?",
+        "SELECT revision, manifest_sha256 FROM config_revisions"
+        " WHERE household_id = ? ORDER BY revision DESC LIMIT 1",
         (household_id,),
-    )["revision"]
-    assert plan.config_revision["current"] == durable
-    assert plan.config_revision["next"] == durable + 1
-    assert len(plan.config_revision["manifest_sha256"]) == 64
+    )
+    # The reported revision is the one the worker already issued, not a
+    # hypothetical next one the real onboarding would never provision.
+    assert plan.config_revision["revision"] == durable["revision"]
+    assert plan.config_revision["manifest_sha256"] == durable["manifest_sha256"]
+    assert plan.pending_runtime_job["desired_revision"] == durable["revision"]
     assert TableWrite("config_revisions", "insert") in plan.table_writes
     assert {resource["stable_name"] for resource in plan.runtime_resources} >= {
         FlyRuntimeProvisioner.stable_app_name(household_id),
         FlyRuntimeProvisioner.stable_volume_name(),
         FlyRuntimeProvisioner.stable_machine_name(),
     }
-    assert RUNTIME_BOOTSTRAP_SECRET in {secret["name"] for secret in plan.secrets}
+    assert {secret["name"] for secret in plan.secrets} >= {
+        RUNTIME_BOOTSTRAP_SECRET,
+        RUNTIME_DSAR_SECRET,
+    }
     # The rehearsal must leave durable state byte-identical.
     assert container.database.query("SELECT id FROM config_revisions") == revisions_before
 
@@ -157,6 +163,7 @@ def test_dry_run_reports_what_still_blocks_the_pilot(container) -> None:
     assert plan.committed is False
     assert plan.blocked_by is not None
     assert plan.config_revision == {}
+    assert plan.pending_runtime_job == {}
     assert plan.unverified_steps == [
         "email_identity",
         "whatsapp_identity",

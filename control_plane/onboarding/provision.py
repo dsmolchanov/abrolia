@@ -1,9 +1,11 @@
 """Operator rehearsal for a pilot onboarding: list durable writes, mutate nothing.
 
-The operator runs this before every real pilot onboarding. It opens one write
-transaction, replays the desired-spec planner against durable state, records the
-tables that transaction would touch, and then rolls back. No provider is called
-and no row is committed.
+The operator runs this before every real pilot onboarding. It reports the
+config revision and runtime job the onboarding will actually provision — both
+read from durable state, since the worker issues them when the primary step
+verifies — and then rehearses one planning pass to enumerate the tables such a
+transaction touches, rolling that rehearsal back. No provider is called and no
+row is committed.
 """
 
 from __future__ import annotations
@@ -20,9 +22,10 @@ from control_plane.container import ControlPlaneContainer
 from control_plane.models import USER_STEPS
 from control_plane.provisioning.fly import FlyRuntimeProvisioner
 
-# Installed for the activation handshake and deleted by the bootstrap cleanup
-# job; see ProvisioningWorker._finish_runtime_activation.
+# Both are installed into the runtime sink by ProvisioningWorker._finish_runtime;
+# the bootstrap token is then deleted by the bootstrap cleanup job.
 RUNTIME_BOOTSTRAP_SECRET = "HERMES_BOOTSTRAP_TOKEN"
+RUNTIME_DSAR_SECRET = "HERMES_RUNTIME_DSAR_TOKEN"
 
 _WRITE_STATEMENT = re.compile(
     r"^\s*(?P<operation>INSERT(?:\s+OR\s+\w+)?\s+INTO|UPDATE|DELETE\s+FROM)"
@@ -50,6 +53,7 @@ class ProvisionPlan:
     unverified_steps: list[str] = field(default_factory=list)
     table_writes: list[TableWrite] = field(default_factory=list)
     config_revision: dict[str, Any] = field(default_factory=dict)
+    pending_runtime_job: dict[str, Any] = field(default_factory=dict)
     runtime_resources: list[dict[str, str]] = field(default_factory=list)
     secrets: list[dict[str, str]] = field(default_factory=list)
     blocked_by: str | None = None
@@ -117,12 +121,18 @@ def _secret_names(
     container: ControlPlaneContainer, household_id: str
 ) -> list[dict[str, str]]:
     """Secret *names* only. Values never leave the sink, and never appear here."""
+    app = FlyRuntimeProvisioner.stable_app_name(household_id)
     secrets = [
         {
             "name": RUNTIME_BOOTSTRAP_SECRET,
-            "target": FlyRuntimeProvisioner.stable_app_name(household_id),
+            "target": app,
             "lifecycle": "installed for activation, deleted by bootstrap cleanup",
-        }
+        },
+        {
+            "name": RUNTIME_DSAR_SECRET,
+            "target": app,
+            "lifecycle": "installed with the bootstrap token, kept for runtime DSAR",
+        },
     ]
     installed = container.database.query(
         "SELECT secret_name, namespace_ref FROM email_secret_installs"
@@ -165,6 +175,35 @@ def plan_onboarding(
         ],
     )
 
+    # The revision the real onboarding provisions is issued by the worker when
+    # the primary step verifies, so it is read from durable state, never minted
+    # here. The rehearsal below only enumerates the tables a planning pass
+    # touches; it must not present its rolled-back revision as the real one.
+    issued = container.database.query_one(
+        "SELECT revision, status, manifest_sha256 FROM config_revisions"
+        " WHERE household_id = ? ORDER BY revision DESC LIMIT 1",
+        (household_id,),
+    )
+    if issued is not None:
+        plan.config_revision = {
+            "revision": issued["revision"],
+            "status": issued["status"],
+            "manifest_sha256": issued["manifest_sha256"],
+            "source": "issued by the worker when the primary step verified",
+        }
+    runtime_job = container.database.query_one(
+        "SELECT id, status, desired_revision FROM provisioning_jobs"
+        " WHERE household_id = ? AND kind = 'runtime'"
+        " AND operation = 'ensure_runtime' ORDER BY created_at DESC LIMIT 1",
+        (household_id,),
+    )
+    if runtime_job is not None:
+        plan.pending_runtime_job = {
+            "job_id": runtime_job["id"],
+            "status": runtime_job["status"],
+            "desired_revision": runtime_job["desired_revision"],
+        }
+
     revisions_before = container.database.query_one(
         "SELECT COUNT(*) AS count FROM config_revisions WHERE household_id = ?",
         (household_id,),
@@ -176,15 +215,9 @@ def plan_onboarding(
         with container.database.write() as connection:
             connection.set_trace_callback(lambda sql: _record_writes(sql, observed))
             try:
-                planned = container.planner.issue(
+                spec = container.planner.issue(
                     connection, household_id=household_id
-                )
-                spec = planned.spec
-                plan.config_revision = {
-                    "current": planned.revision.revision - 1,
-                    "next": planned.revision.revision,
-                    "manifest_sha256": planned.revision.manifest_sha256,
-                }
+                ).spec
             except ValueError as error:
                 plan.blocked_by = str(error)
             finally:
