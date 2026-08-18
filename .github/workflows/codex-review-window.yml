@@ -57,8 +57,10 @@ on:
 # 08:13:34, and auto-merge squashed it into main at 08:15:23. So: a 15-minute
 # window, a timeout that FAILS, and a late review that re-triggers the gate.
 #
-# Exit-0 audit — exactly TWO paths, each deliberate. Count them by hand when
-# editing this file; exit 0 means "this pull request may merge".
+# Exit-0 audit — exactly TWO paths, each deliberate. `tests/test_gate_workflow.py`
+# asserts the count and the static invariants; `tests/test_gate_behavior.py`
+# EXECUTES this script against a stubbed GitHub API and asserts the exit code on
+# each path, because exit 0 means "this pull request may merge".
 #   1. a head-bound clean signal with no formal review (Codex 👍 on this head's
 #      anchor, or the verbatim "Codex Review: Didn't find any major issues."
 #      summary naming this head and carrying no P0/P1 marker), re-checked for a
@@ -106,6 +108,18 @@ jobs:
       # Empty for fork PRs, where secrets are withheld — the alert is then
       # skipped and the gate still fails.
       SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+      # A PAT for a GitHub account with a connected Codex Cloud subscription.
+      # Codex serves review requests per REQUESTING IDENTITY, and every
+      # GITHUB_TOKEN comment is authored by `github-actions[bot]` — an identity
+      # with no Codex account. It answers those with "To use Codex here, create
+      # a Codex account and connect to github" within seconds and never
+      # reviews. On this repository that silently blocked four PRs for six days
+      # across thirteen requests: the gate posted, Codex refused, the gate
+      # waited out its window and reported "no verdict arrived", which reads as
+      # a flaky timeout rather than a request that was rejected outright.
+      # Optional so a fork PR (secrets withheld) still runs; the gate then
+      # depends on Codex Automatic Reviews, which fire on open/ready only.
+      CODEX_REQUEST_TOKEN: ${{ secrets.CODEX_REQUEST_TOKEN }}
       RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
       # Quiet interval before the verdict lookup, so a burst of checkpoint pushes
       # costs one review generation instead of one each.
@@ -138,7 +152,16 @@ jobs:
               printf '%s\n' "${out}" | tail -5 >&2
               exit 1
             fi
-            printf '%s' "${out}"
+            # Newline-TERMINATED when non-empty, and nothing at all when empty.
+            # `printf '%s'` left the last line unterminated, so a caller piping
+            # into `wc -l` counted one fewer than it matched: with exactly one
+            # clean verdict comment — the ordinary case — the count came back 0
+            # and the clean-verdict path never fired. Command substitution
+            # strips the trailing newline anyway, and `tail`/`grep -c` are
+            # indifferent to it, so every other caller is unaffected.
+            if [ -n "${out}" ]; then
+              printf '%s\n' "${out}"
+            fi
           }
 
           # Count matching lines without letting grep's exit-1 (no match) be
@@ -220,6 +243,26 @@ jobs:
               | tail -1
           }
 
+          # Resolve who will ask Codex for the review. With a request token the
+          # anchor is authored by THAT account, not by `github-actions[bot]`, so
+          # ANCHOR_AUTHOR has to move with it — otherwise anchor_comment_id()
+          # looks for the wrong author, never finds the anchor it just posted,
+          # and requests a fresh review on every run.
+          REQUEST_TOKEN="${CODEX_REQUEST_TOKEN:-}"
+          if [ -n "${REQUEST_TOKEN}" ]; then
+            REQUEST_LOGIN=$(GH_TOKEN="${REQUEST_TOKEN}" gh api user --jq '.login' 2>/dev/null || true)
+            if [ -z "${REQUEST_LOGIN}" ]; then
+              # Fail closed: a rotated or expired PAT would otherwise fall back
+              # to the bot identity and reproduce the six-day silent stall.
+              echo "::error::CODEX_REQUEST_TOKEN is set but does not authenticate — Codex would refuse a request from the fallback bot identity and this gate would time out without a verdict. Rotate the secret, or unset it to depend on Codex Automatic Reviews."
+              exit 1
+            fi
+            ANCHOR_AUTHOR="${REQUEST_LOGIN}"
+            echo "Review requests are posted as ${REQUEST_LOGIN} (a Codex-connected identity)."
+          else
+            echo "::warning::No CODEX_REQUEST_TOKEN is configured, so a review request would be posted as ${ANCHOR_AUTHOR}, which Codex refuses. Only Codex Automatic Reviews (PR opened / marked ready) can produce a verdict here; a verdict for a PUSHED head will never arrive and this gate will time out."
+          fi
+
           # Codex auto-reviews on open/ready but NOT on pushes, so ask for the
           # re-review — and leave the anchor behind either way. The request asks
           # for ONE comprehensive inventory: a bare "@codex review" returns
@@ -227,11 +270,21 @@ jobs:
           # review generation.
           ANCHOR_ID="$(anchor_comment_id)"
           ANCHOR_FAILED=0
+          # `submitted` belongs here. A `pull_request_review` event starts a
+          # replacement run and `cancel-in-progress` kills the synchronize run
+          # that would have asked — so if a human review, or a review of a stale
+          # head, lands during the 90s debounce, excluding `submitted` leaves
+          # NOBODY having requested a verdict for the current head. The run then
+          # waits out its window and fails, and the gate stays red until someone
+          # pushes again or reruns by hand. The guard below already makes the
+          # request idempotent, so including `submitted` costs nothing when the
+          # synchronize run did get there first.
           case "${ACTION}" in
-            synchronize|reopened|ready_for_review)
+            synchronize|reopened|ready_for_review|submitted)
               if [ -z "${ANCHOR_ID}" ] && [ -z "$(review_ids_for_head)" ]; then
                 REQUEST_BODY=$(printf '@codex review\n\nReturn ONE comprehensive inventory of every P0/P1 in this diff, grouped by the root invariant each violates. For each finding give the affected symbol, every sibling consumer with the same defect, the failing input or call path, impact, confidence, a safe remediation path, and the regression test that would represent the class. Completeness on this pass matters more than brevity — a finding held back costs a full review generation. See "Code Review Rules" in AGENTS.md.\n\n<!-- %s -->' "${ANCHOR}")
-                ANCHOR_ID=$(gh api "repos/${REPO}/issues/${PR}/comments" \
+                ANCHOR_ID=$(GH_TOKEN="${REQUEST_TOKEN:-${GH_TOKEN}}" \
+                  gh api "repos/${REPO}/issues/${PR}/comments" \
                   -f body="${REQUEST_BODY}" \
                   --jq '.id' 2>/dev/null || true)
                 if [ -n "${ANCHOR_ID}" ]; then
