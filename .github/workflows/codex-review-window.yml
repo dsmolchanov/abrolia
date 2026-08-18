@@ -1,107 +1,386 @@
 name: codex-review-window
-
 on:
   pull_request:
     types: [opened, reopened, synchronize, ready_for_review]
+  # A review that lands after the wait window expired must re-open the gate;
+  # `pull_request` events alone never fire again for a late review.
+  pull_request_review:
+    types: [submitted]
 
-# This workflow is a required status check. It accepts only a Codex review of
-# the current PR head. A time-bounded operator exception permits unavailable
-# reviews until the subscription resets; P1/[BLOCKER] findings never bypass.
+# `issue_comment` is DELIBERATELY ABSENT. A comment event runs the workflow from
+# the default branch and its check run is bound to the default-branch SHA, so it
+# can never satisfy a PR's required check — and because this job's concurrency
+# group is keyed on the PR number, a comment-triggered run would CANCEL the real
+# PR-associated run. This gate posts its own anchor comment, which made an
+# earlier revision self-cancelling.
+# https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#issue_comment
+#
+# The job key below MUST match the required-status-check name in branch
+# protection. GitHub matches required checks against the job key (or the
+# reported check-run name), NOT a custom display name. Do not add `name:`
+# at the job level unless you also update branch protection.
+#
+# ---------------------------------------------------------------------------
+# WHAT THIS GATE DOES, AND DELIBERATELY DOES NOT DO
+# ---------------------------------------------------------------------------
+# It answers exactly one question: does Codex report a P0/P1/[BLOCKER] on the
+# CURRENT head commit? Verdict states are PASS / BLOCK / UNKNOWN, and only PASS
+# exits 0. That is the whole contract.
+#
+# It does NOT count fix generations, enforce a diff budget, apply labels, or
+# accept a waiver command. An earlier revision of this file did all four; the
+# machinery grew it from 81 to 591 lines and drew five rounds of valid P1
+# findings, three of which were unfixable here at all — a workflow using
+# GITHUB_TOKEN cannot authenticate a marker it reads (every workflow is
+# `github-actions[bot]`), and a stateless run cannot hold a lease. Those
+# features need an authenticated identity and persisted state, so they moved to
+# thoughts/shared/plans/2026-08-17-codex-gate-controller.md.
+#
+# Rounds are reduced instead by the two changes that need no state: AGENTS.md no
+# longer elevates two open-ended predicates to P1, and the review request asks
+# for one comprehensive inventory rather than accepting a trickle. Those shrink
+# the expected round count; they do not hard-cap it. The cap is controller work,
+# and pretending otherwise here is what produced the 591-line version.
+#
+# A human stops automation by applying the `needs-human` label, which server.py
+# treats as terminal. Human-applied, so there is nothing to forge and no lease to
+# hold.
+#
+# History of the two races this file exists to lose no more:
+#
+# 2026-07-02: upgraded from a blind sleep to a real gate. The old soak lost the
+# race — BoardAI#146 merged at 08:43:38 and Codex posted a P1 19s later.
+#
+# 2026-08-13: the gate still lost it. Three PRs merged with open P1s because the
+# wait had an advisory fallback that PASSED on timeout. On NeoMenu#658 the gate
+# gave up on 56a0455 at 08:12:35, Codex posted two P1s on that same commit at
+# 08:13:34, and auto-merge squashed it into main at 08:15:23. So: a 15-minute
+# window, a timeout that FAILS, and a late review that re-triggers the gate.
+#
+# Exit-0 audit — exactly THREE paths, each deliberate. `tests/test_gate_workflow.py`
+# asserts the count, and `tests/test_gate_behavior.py` executes this script to
+# assert the exit code, because exit 0 means "this pull request may merge".
+#   1. the `fast-merge` repo-topic opt-out;
+#   2. a head-bound clean signal with no formal review (Codex 👍 on this head's
+#      anchor, or a "Reviewed commit <sha>" summary comment with no P0/P1 marker);
+#   3. a head-bound review carrying no P0/P1 marker.
+# Everything else — no verdict, quota exhausted, any GitHub API failure, an
+# unresolvable or superseded head, any open blocker — exits 1.
+
+concurrency:
+  # A superseded head's run must not race the current one. Safe to key on the PR
+  # number only because `issue_comment` is not a trigger: a comment-triggered run
+  # would land in this same group and cancel the run that must report.
+  group: codex-review-window-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
   codex-review-window:
+    # Draft PRs cannot merge, so skipping them is safe.
     if: ${{ !github.event.pull_request.draft }}
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     permissions:
+      # A `permissions:` block zeroes every scope it does not list, so each API
+      # call needs its scope spelled out. Reading the head commit's timestamp
+      # needs `contents`; the 👍 verdict lives on the issue-side reactions
+      # endpoint; posting the review-request anchor needs `pull-requests: write`.
+      # No `issues: write` — this gate writes no labels.
+      contents: read
+      issues: read
       pull-requests: write
     env:
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
       PR: ${{ github.event.pull_request.number }}
-      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
       CODEX_BOT: chatgpt-codex-connector[bot]
-      REVIEW_FAIL_OPEN_UNTIL_EPOCH: "1786323600" # 2026-08-10T01:00:00Z
+      ACTION: ${{ github.event.action }}
+      # The gate posts its anchor with GITHUB_TOKEN, so only this identity may
+      # own one. Anything else is someone else's comment wearing the marker.
+      ANCHOR_AUTHOR: github-actions[bot]
+      # Empty for fork PRs, where secrets are withheld — the alert is then
+      # skipped and the gate still fails.
+      SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      # Quiet interval before the verdict lookup, so a burst of checkpoint pushes
+      # costs one review generation instead of one each.
+      DEBOUNCE_SECONDS: "90"
     steps:
+      # One step that always runs and always decides. An `if:` on the gating step
+      # would let the job report `skipped`, which branch protection counts as
+      # SATISFIED — the failure mode this whole file exists to prevent.
       - name: Gate on Codex verdict for this commit
         run: |
           set -euo pipefail
-          echo "Waiting for Codex review of ${HEAD_SHA} on PR #${PR}"
 
-          review_id_for_head() {
-            gh api "repos/${REPO}/pulls/${PR}/reviews" --paginate \
-              --jq "[.[] | select(.user.login == \"${CODEX_BOT}\" and .commit_id == \"${HEAD_SHA}\")] | (last | .id) // empty"
+          # ---------------------------------------------------------------
+          # Fail-hard API wrapper. A `gh api ... || true` that swallows a 403, a
+          # 502, or a jq compile error yields an EMPTY result, and an empty
+          # finding list reads as "clean" — so an outage would open the gate.
+          # Every read that feeds the verdict goes through this, which exits 1
+          # (UNKNOWN) rather than returning nothing.
+          #
+          # `--paginate` runs the jq filter once PER PAGE, so callers must use
+          # filters that emit one line per match and aggregate with wc/tail; a
+          # filter ending in `length` or `last` emits one result per page.
+          # ---------------------------------------------------------------
+          api() {
+            local out rc
+            out=$(gh api --paginate "$@" 2>&1)
+            rc=$?
+            if [ ${rc} -ne 0 ]; then
+              echo "::error::GitHub API call failed (rc=${rc}): gh api $* — the verdict for ${HEAD_SHA:-this head} is UNKNOWN, so the gate holds the merge. Re-run this job. Never treat an API failure as a clean review." >&2
+              printf '%s\n' "${out}" | tail -5 >&2
+              exit 1
+            fi
+            printf '%s' "${out}"
           }
 
-          green_comment_for_head() {
-            local head_short="${HEAD_SHA:0:10}"
-            gh api "repos/${REPO}/issues/${PR}/comments" --paginate \
-              --jq "[.[] | select(.user.login == \"${CODEX_BOT}\" and ((.body | contains(\"Codex Review: Didn't find any major issues.\")) and (.body | contains(\"${head_short}\"))))] | (last | .id) // empty"
+          # Count matching lines without letting grep's exit-1 (no match) be
+          # mistaken for a pipeline failure.
+          count_matches() {
+            local pattern="$1" n
+            n=$(grep -cE "${pattern}" || [ $? -eq 1 ])
+            printf '%s' "${n:-0}"
           }
 
-          fail_open_is_active() {
-            [ "$(date -u +%s)" -lt "${REVIEW_FAIL_OPEN_UNTIL_EPOCH}" ]
-          }
+          # Re-read the head rather than trusting the event payload: this is what
+          # lets the debounce below notice a head that moved mid-run.
+          HEAD_SHA=$(gh api "repos/${REPO}/pulls/${PR}" --jq '.head.sha')
+          if [ -z "${HEAD_SHA}" ]; then
+            echo "::error::Could not resolve the head SHA for PR #${PR}. The verdict is UNKNOWN, so the gate holds the merge."
+            exit 1
+          fi
+          echo "PR #${PR} head is ${HEAD_SHA} (action=${ACTION:-none})"
 
-          codex_limit_reported() {
-            gh api "repos/${REPO}/issues/${PR}/comments" --paginate \
-              --jq "[.[] | select(.user.login == \"${CODEX_BOT}\" and (.body | contains(\"usage limits for code reviews\")))] | length"
-          }
+          HEAD_SHORT="$(printf '%s' "${HEAD_SHA}" | cut -c1-10)"
+          ANCHOR="codex-review-window head ${HEAD_SHA}"
+          # P0 **and** P1. Codex marks severity with its own badge — `P0 Badge`
+          # / `badge/P0` — and does not necessarily add `[BLOCKER]`. A P1-only
+          # pattern therefore read a P0-bearing review as marker-free and exited
+          # 0: the most severe class of finding was the one that could merge.
+          # Keep the two patterns in lockstep; `tests/test_gate_behavior.py`
+          # executes the script against a P0 review.
+          PATTERN='\[BLOCKER\]|badge/P[01]|P[01] Badge'
+          # Same regex for jq's test(), where a string literal needs the
+          # backslashes doubled — `\[` alone is an invalid escape and jq refuses
+          # to compile the program.
+          JQ_PATTERN='\\[BLOCKER\\]|badge/P[01]|P[01] Badge'
 
-          # Opening/readying is covered by Codex Automatic Reviews. A push
-          # changes HEAD, so request a fresh review when none exists yet.
-          if [ "${{ github.event.action }}" = "synchronize" ] && [ -z "$(review_id_for_head)" ]; then
-            gh api "repos/${REPO}/issues/${PR}/comments" -f body="@codex review" >/dev/null
-            echo "Posted '@codex review' for the new head."
+          # ---------------------------------------------------------------
+          # Deliberate bypass 1 of 3: the fast-merge repo topic. A standing,
+          # repo-wide, unattributed opt-out. An attributed per-PR alternative
+          # needs an authenticated identity, so it is controller work.
+          # ---------------------------------------------------------------
+          if gh api "repos/${REPO}/topics" \
+               -H "Accept: application/vnd.github+json" \
+               --jq '.names[]' 2>/dev/null | grep -qx 'fast-merge'; then
+            echo "::warning::Repo carries the 'fast-merge' topic; the Codex gate is bypassed for every PR in this repository."
+            exit 0
           fi
 
-          DEADLINE=$((SECONDS + 480))
-          RID=""
-          GREEN_COMMENT_ID=""
-          while [ ${SECONDS} -lt ${DEADLINE} ]; do
-            RID="$(review_id_for_head)"
-            [ -n "${RID}" ] && break
-            GREEN_COMMENT_ID="$(green_comment_for_head)"
-            [ -n "${GREEN_COMMENT_ID}" ] && break
-            if fail_open_is_active && [ "$(codex_limit_reported)" -gt 0 ]; then
-              echo "::warning::Codex reported exhausted review limits. Review is temporarily advisory until 2026-08-10T01:00:00Z; CI remains required."
-              exit 0
+          # ---------------------------------------------------------------
+          # Debounce. Wait IN-RUN, then re-read the head. If it moved, a newer
+          # run exists and the concurrency group has cancelled or will cancel
+          # this one — exit 1 regardless, because a skipped or neutral required
+          # check SATISFIES branch protection and no later event would wake a
+          # deferred one.
+          # ---------------------------------------------------------------
+          if [ "${ACTION}" = "synchronize" ] && [ "${DEBOUNCE_SECONDS}" -gt 0 ]; then
+            echo "Debouncing ${DEBOUNCE_SECONDS}s so a burst of pushes costs one review generation."
+            sleep "${DEBOUNCE_SECONDS}"
+            HEAD_NOW=$(gh api "repos/${REPO}/pulls/${PR}" --jq '.head.sha')
+            if [ "${HEAD_NOW}" != "${HEAD_SHA}" ]; then
+              echo "::error::Head moved ${HEAD_SHA} -> ${HEAD_NOW} during the debounce window. This run is superseded; the run for the new head decides. Failing rather than skipping, because a skipped required check would satisfy branch protection."
+              exit 1
             fi
+          fi
+
+          HEAD_TIME=$(api "repos/${REPO}/commits/${HEAD_SHA}" --jq '.commit.committer.date')
+
+          # Every Codex review of this exact commit, not just the newest: Codex
+          # can post the auto-review AND a requested re-review against the same
+          # head, and findings in either must hold the merge. This is THE verdict
+          # read, so it fails hard — an API error returning nothing here would
+          # look exactly like "Codex found no findings".
+          review_ids_for_head() {
+            api "repos/${REPO}/pulls/${PR}/reviews" \
+              --jq "[.[] | select(.user.login == \"${CODEX_BOT}\" and .commit_id == \"${HEAD_SHA}\") | .id] | .[]"
+          }
+
+          # The marker is predictable, so ownership is what makes an anchor
+          # usable: it must be authored by the workflow identity and never
+          # edited. Without both checks, someone who can write comments could
+          # collect Codex's 👍 on their own comment for a clean head, push a new
+          # commit, and edit that comment to carry the new marker — the reaction
+          # stays on the comment id and the unreviewed head reads clean.
+          #
+          # Note the limit of this trust model: it establishes "a workflow in
+          # this repo wrote this", NOT "a particular workflow wrote this", since
+          # every GITHUB_TOKEN actor is `github-actions[bot]`. That is sufficient
+          # for an anchor (worst case: a re-review is requested twice) and NOT
+          # sufficient to authorize anything, which is why no authorization
+          # decision is made from a comment here.
+          anchor_comment_id() {
+            api "repos/${REPO}/issues/${PR}/comments" \
+              --jq "[.[] | select(.user.login == \"${ANCHOR_AUTHOR}\") | select(.created_at == .updated_at) | select(.body | contains(\"${ANCHOR}\")) | .id] | .[]" \
+              | tail -1
+          }
+
+          # Codex auto-reviews on open/ready but NOT on pushes, so ask for the
+          # re-review — and leave the anchor behind either way. The request asks
+          # for ONE comprehensive inventory: a bare "@codex review" returns
+          # whatever surfaces on that pass, and each extra pass costs a full
+          # review generation.
+          ANCHOR_ID="$(anchor_comment_id)"
+          ANCHOR_FAILED=0
+          case "${ACTION}" in
+            synchronize|reopened|ready_for_review)
+              if [ -z "${ANCHOR_ID}" ] && [ -z "$(review_ids_for_head)" ]; then
+                REQUEST_BODY=$(printf '@codex review\n\nReturn ONE comprehensive inventory of every P0/P1 in this diff, grouped by the root invariant each violates. For each finding give the affected symbol, every sibling consumer with the same defect, the failing input or call path, impact, confidence, a safe remediation path, and the regression test that would represent the class. Completeness on this pass matters more than brevity — a finding held back costs a full review generation. See "Code Review Rules" in AGENTS.md.\n\n<!-- %s -->' "${ANCHOR}")
+                ANCHOR_ID=$(gh api "repos/${REPO}/issues/${PR}/comments" \
+                  -f body="${REQUEST_BODY}" \
+                  --jq '.id' 2>/dev/null || true)
+                if [ -n "${ANCHOR_ID}" ]; then
+                  echo "Posted an inventory-scoped '@codex review' (comment ${ANCHOR_ID}) anchored to this head."
+                else
+                  # Fork PRs get a read-only GITHUB_TOKEN, so the anchor cannot
+                  # be created. Head-bound signals that need no anchor — a review
+                  # for this commit, or a summary comment naming it — still
+                  # apply; only a bare 👍 becomes unusable.
+                  ANCHOR_FAILED=1
+                  echo "::warning::Could not post the anchor comment (read-only token, likely a fork PR). Falling back to head-bound signals: a Codex review of this commit, or a summary comment naming it."
+                fi
+              fi
+              ;;
+          esac
+
+          # A requested re-review that finds nothing comes back as an issue
+          # comment — "Codex Review: Didn't find any major issues ... Reviewed
+          # commit: <sha>" — not as a review and not as a reaction. That body
+          # names the commit, so it is bound to this head; accept it as green
+          # only when it carries no P1 marker of its own.
+          codex_clean_comment_for_head() {
+            api "repos/${REPO}/issues/${PR}/comments" \
+              --jq "[.[] | select(.user.login == \"${CODEX_BOT}\") | select(.body | contains(\"Reviewed commit\") and contains(\"${HEAD_SHORT}\")) | select(.body | test(\"${JQ_PATTERN}\") | not) | .id] | .[]" \
+              | wc -l | tr -d ' '
+          }
+
+          # The reaction lookups below deliberately keep the raw `gh api ... ||
+          # true` form rather than going through api(). They produce a CLEAN
+          # signal, so a swallowed failure yields 0 — "no verdict" — which falls
+          # through to the fail-closed timeout. Failing toward blocking is the
+          # safe direction here, and a deleted anchor legitimately 404s.
+          codex_clean_for_head() {
+            if [ "$(codex_clean_comment_for_head)" -gt 0 ]; then
+              echo 1
+              return
+            fi
+            if [ -n "${ANCHOR_ID}" ]; then
+              gh api "repos/${REPO}/issues/comments/${ANCHOR_ID}/reactions" --paginate \
+                --jq "[.[] | select(.user.login == \"${CODEX_BOT}\" and .content == \"+1\") | .id] | .[]" \
+                2>/dev/null | wc -l | tr -d ' ' || true
+              return
+            fi
+            if [ "${ACTION}" = "opened" ]; then
+              gh api "repos/${REPO}/issues/${PR}/reactions" --paginate \
+                --jq "[.[] | select(.user.login == \"${CODEX_BOT}\" and .content == \"+1\" and .created_at > \"${HEAD_TIME}\") | .id] | .[]" \
+                2>/dev/null | wc -l | tr -d ' ' || true
+              return
+            fi
+            echo 0
+          }
+
+          WINDOW="${VERDICT_WINDOW_SECONDS:-900}"
+          DEADLINE=$((SECONDS + WINDOW))
+          RIDS=""
+          CLEAN=0
+          # Check-at-least-once, deliberately not `while [ SECONDS -lt DEADLINE ]`.
+          # A pre-test on the deadline means a zero or misconfigured window skips
+          # the verdict lookup ENTIRELY and falls through to the no-verdict path —
+          # the gate would report "Codex never answered" without ever asking.
+          while :; do
+            RIDS="$(review_ids_for_head)"
+            [ -n "${RIDS}" ] && break
+            CLEAN="$(codex_clean_for_head)"
+            CLEAN="${CLEAN:-0}"
+            [ "${CLEAN}" -gt 0 ] && break
+            [ ${SECONDS} -ge ${DEADLINE} ] && break
             sleep 20
           done
 
-          if [ -z "${RID}" ] && [ -n "${GREEN_COMMENT_ID}" ]; then
-            # A formal review can arrive concurrently with the comment. Give
-            # GitHub time to publish it, then make it authoritative if present.
-            sleep 15
-            RID="$(review_id_for_head)"
-            if [ -z "${RID}" ]; then
-              echo "Codex green comment matches current head ${HEAD_SHA}."
-              exit 0
+          # Fail closed. A silent pass on timeout is what let NeoMenu #656, #657
+          # and #658 merge with open P1s: the verdict was still in flight, not
+          # favourable. Absence of a verdict is not approval.
+          if [ -z "${RIDS}" ] && [ "${CLEAN}" -eq 0 ]; then
+            if api "repos/${REPO}/issues/${PR}/comments" \
+                 --jq ".[] | select(.user.login == \"${CODEX_BOT}\") | .body" \
+                 | grep -q "reached your Codex usage limits"; then
+              # A quota outage freezes every merge behind this gate, and the only
+              # visible symptom is a red check on an unrelated PR — so say it out
+              # loud. In NeoMenu that state went unnoticed for three days and
+              # eleven PRs merged unreviewed. Trimming guards against a webhook
+              # stored with a trailing newline, which curl rejects as a malformed
+              # URL; report the real HTTP status rather than claiming delivery.
+              HOOK=$(printf '%s' "${SLACK_WEBHOOK}" | tr -d '[:space:]')
+              if [ -n "${HOOK}" ]; then
+                CODE=$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+                  -H 'Content-type: application/json' \
+                  --data "$(jq -nc --arg text "⚠️ Codex review quota exhausted — merges are blocked. PR #${PR} (${HEAD_SHA}) is unreviewed and codex-review-window fails closed. Restore quota at https://chatgpt.com/codex/cloud/settings/usage, then re-run: ${RUN_URL}" '{text: $text}')" \
+                  "${HOOK}") || CODE="curl-error"
+                echo "Slack responded: ${CODE}"
+              else
+                echo "No SLACK_WEBHOOK available; skipping the alert."
+              fi
+              echo "::error::Codex is out of review quota for this repo, so ${HEAD_SHA} is unreviewed. Restore quota and re-run this job. Do NOT push a commit hoping to shake a verdict loose."
+              exit 1
             fi
-          fi
-
-          if [ -z "${RID}" ]; then
-            if fail_open_is_active; then
-              echo "::warning::No Codex review arrived. Review is temporarily advisory until 2026-08-10T01:00:00Z; CI remains required."
-              exit 0
+            PR_LEVEL=$(gh api "repos/${REPO}/issues/${PR}/reactions" --paginate \
+              --jq "[.[] | select(.user.login == \"${CODEX_BOT}\" and .content == \"+1\") | .id] | .[]" \
+              2>/dev/null | wc -l | tr -d ' ' || true)
+            if [ "${PR_LEVEL}" -gt 0 ]; then
+              echo "::notice::Codex holds a PR-level 👍, but a reaction carries no commit id and cannot be attributed to ${HEAD_SHA}, so it is not accepted as this head's verdict. Re-run this job once Codex answers for this commit."
             fi
-            echo "::error::No Codex review arrived for ${HEAD_SHA}. Verify that Codex Automatic Reviews is enabled; merge remains blocked."
+            if [ "${ANCHOR_FAILED}" -eq 1 ]; then
+              echo "::error::No Codex verdict for ${HEAD_SHA} within ${WINDOW}s, and this run could not request one — the token is read-only, which is normal for a fork PR. The verdict is UNKNOWN, so the gate holds the merge. A maintainer can comment '@codex review' on the PR and re-run this job."
+              exit 1
+            fi
+            echo "::error::No Codex verdict for ${HEAD_SHA} within ${WINDOW}s — neither a review nor a 👍. The verdict is UNKNOWN, so the gate holds the merge. Re-run this job once Codex has answered; if the repo is genuinely not connected to Codex Cloud, add the 'fast-merge' repo topic to opt out deliberately."
             exit 1
           fi
 
-          # Inline comments may land just after the review object.
-          sleep 15
+          # ---------------------------------------------------------------
+          # Deliberate bypass 2 of 3: a clean head-bound signal, no review.
+          # ---------------------------------------------------------------
+          if [ -z "${RIDS}" ]; then
+            echo "Codex reports no findings for ${HEAD_SHA}."
+            exit 0
+          fi
 
-          PATTERN='\[BLOCKER\]|badge/P1|P1 Badge'
-          INLINE=$(gh api "repos/${REPO}/pulls/${PR}/comments" --paginate \
-            --jq ".[] | select(.pull_request_review_id == ${RID}) | .body" \
-            | grep -cE "${PATTERN}" || true)
-          BODY=$(gh api "repos/${REPO}/pulls/${PR}/reviews/${RID}" --jq '.body' \
-            | grep -cE "${PATTERN}" || true)
+          # Give inline finding comments a moment to finish landing.
+          sleep "${SETTLE_SECONDS:-15}"
+
+          INLINE=0
+          BODY=0
+          for RID in ${RIDS}; do
+            HITS=$(api "repos/${REPO}/pulls/${PR}/comments" \
+              --jq ".[] | select(.pull_request_review_id == ${RID}) | .body" \
+              | count_matches "${PATTERN}")
+            INLINE=$((INLINE + HITS))
+            # Through api() as well: a body-only finding is the one form with no
+            # inline comment to fall back on, so dropping it would lose a blocker.
+            HITS=$(api "repos/${REPO}/pulls/${PR}/reviews/${RID}" --jq '.body' \
+              | count_matches "${PATTERN}")
+            BODY=$((BODY + HITS))
+          done
 
           if [ "$((INLINE + BODY))" -gt 0 ]; then
-            echo "::error::Codex reports P1/[BLOCKER] findings on ${HEAD_SHA}. Auto-fix must push a fix; the gate will re-run on the new head."
+            echo "::error::Codex review reports P0/P1/[BLOCKER] finding(s) on ${HEAD_SHA} (inline: ${INLINE}, body: ${BODY}). Fix the invariant rather than the reported instance — audit every sibling consumer of the affected contract in the same batch, because each additional round costs a full review generation. A human can stop automation by applying the 'needs-human' label."
             exit 1
           fi
 
+          # ---------------------------------------------------------------
+          # Deliberate bypass 3 of 3: a head-bound review with no P0/P1 marker.
+          # ---------------------------------------------------------------
           echo "Codex review is green for ${HEAD_SHA}."
+          exit 0
