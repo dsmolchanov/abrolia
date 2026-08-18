@@ -25,7 +25,14 @@ from control_plane.email.repository import EmailIdentityRepository
 from control_plane.models import StepKind, StepStatus
 from control_plane.observability import StructuredLogger
 from control_plane.onboarding.state import VERIFY_RESULT, next_status
-from control_plane.privacy.consent import consent_version_and_sha
+from control_plane.privacy.consent import (
+    CONTENT_RESTRICTION_PURPOSE,
+    CURRENT_RECEIPT_SQL,
+    HOUSEHOLD_CONTENT_PURPOSE,
+    current_receipt_params,
+    manifest_required_purposes,
+    processes_real_household_content,
+)
 from control_plane.providers.email.nerve_client import email_org_external_ref
 from control_plane.provisioning.contracts import (
     InspectState,
@@ -173,7 +180,7 @@ class ProvisioningWorker:
             return self._cleanup_bootstrap(job, request)
         if (
             self._requires_current_email_content_restriction(job)
-            and not self._has_current_email_content_restriction(job.household_id)
+            and self._missing_current_consent_purpose(job) is not None
         ):
             return self._block_for_missing_content_restriction(job, request)
         provider = None
@@ -332,20 +339,40 @@ class ProvisioningWorker:
                 job, request, "outcome_unknown", "outcome_unknown"
             )
 
-    def _has_current_email_content_restriction(self, household_id: str) -> bool:
-        version, sha256 = consent_version_and_sha(
-            "special_category_content_restriction"
-        )
-        return self.jobs.db.query_one(
-            "SELECT 1 FROM consent_receipts WHERE household_id = ? AND purpose = ?"
-            " AND text_version = ? AND text_sha256 = ? AND revoked_at IS NULL LIMIT 1",
-            (
-                household_id,
-                "special_category_content_restriction",
-                version,
-                sha256,
-            ),
-        ) is not None
+    def _required_consent_purposes(self, job: JobRecord) -> list[str]:
+        """Every purpose this job's household must currently hold.
+
+        For a runtime job that is whatever the revision being provisioned
+        declares authoritative, so this worker and the runtime that consumes the
+        same manifest cannot disagree about which consents are in force. For an
+        email identity it is derived from the provider being contacted: a real
+        provider can deliver real family content, which needs the Art. 9(2)(a)
+        consent as well as the S5 restriction.
+        """
+        if job.kind == "runtime" and job.desired_revision is not None:
+            try:
+                manifest = self.configs.manifest(
+                    job.household_id, job.desired_revision
+                )
+            except KeyError:
+                # No revision to read means nothing to relax: fall back to the
+                # floor that every household owes.
+                return [CONTENT_RESTRICTION_PURPOSE]
+            return manifest_required_purposes(manifest)
+        purposes = [CONTENT_RESTRICTION_PURPOSE]
+        if processes_real_household_content(job.provider):
+            purposes.append(HOUSEHOLD_CONTENT_PURPOSE)
+        return purposes
+
+    def _missing_current_consent_purpose(self, job: JobRecord) -> str | None:
+        """The first required purpose the household does not currently hold."""
+        for purpose in self._required_consent_purposes(job):
+            if self.jobs.db.query_one(
+                CURRENT_RECEIPT_SQL,
+                current_receipt_params(job.household_id, purpose),
+            ) is None:
+                return purpose
+        return None
 
     @staticmethod
     def _requires_current_email_content_restriction(job: JobRecord) -> bool:
@@ -1365,7 +1392,7 @@ class ProvisioningWorker:
             return self._cleanup_bootstrap(job, request)
         if (
             self._requires_current_email_content_restriction(job)
-            and not self._has_current_email_content_restriction(job.household_id)
+            and self._missing_current_consent_purpose(job) is not None
         ):
             return self._block_for_missing_content_restriction(job, request)
         provider = self.providers.get(job.provider)

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Mapping
+from typing import Any
 
 CONSENT_TEXTS = {
     "special_category_content_restriction": (
@@ -50,3 +52,74 @@ def consent_version_and_sha(purpose: str) -> tuple[str, str]:
 def consent_version_and_text(purpose: str) -> tuple[str, str]:
     """Return the exact versioned copy presented before a receipt is accepted."""
     return CONSENT_TEXTS[purpose]
+
+
+CONTENT_RESTRICTION_PURPOSE = "special_category_content_restriction"
+HOUSEHOLD_CONTENT_PURPOSE = "special_category_household_content"
+
+# Provider kinds that carry no personal data. The set is an ALLOWLIST so that an
+# unrecognised provider counts as real and therefore requires the Art. 9(2)(a)
+# consent — a new provider must be added here deliberately, and forgetting to
+# blocks provisioning rather than opening it.
+SYNTHETIC_EMAIL_PROVIDER_KINDS = frozenset({"fake-email", "synthetic"})
+
+# One spelling of "the household holds this consent right now". Enforcement runs
+# at four boundaries — planner, provisioning worker, bootstrap, runtime
+# readiness — and three of them had grown their own copy of this predicate.
+# Copies drift: the planner's omitted both `revoked_at IS NULL` and the version
+# columns, so a revoked or superseded receipt still satisfied it.
+CURRENT_RECEIPT_SQL = (
+    "SELECT 1 FROM consent_receipts WHERE household_id = ? AND purpose = ?"
+    " AND text_version = ? AND text_sha256 = ? AND revoked_at IS NULL LIMIT 1"
+)
+
+
+def current_receipt_params(household_id: str, purpose: str) -> tuple[str, str, str, str]:
+    """Bind parameters for `CURRENT_RECEIPT_SQL` at the purpose's current text."""
+    version, sha256 = consent_version_and_sha(purpose)
+    return (household_id, purpose, version, sha256)
+
+
+def processes_real_household_content(provider_kind: str | None) -> bool:
+    """Whether this email provider can deliver real family content.
+
+    `lawful-bases.md` section 3 scopes the Art. 9(2)(a) requirement to exactly
+    this case: in the synthetic circuit there is no personal data and therefore
+    no question of a condition.
+    """
+    if not provider_kind:
+        return True
+    return provider_kind not in SYNTHETIC_EMAIL_PROVIDER_KINDS
+
+
+def required_consent_purposes(
+    *, provider_kind: str | None, whatsapp_dedicated_number: bool
+) -> list[str]:
+    """The authoritative purpose set a household must hold, in manifest order.
+
+    The single place that answers "which consents does this household owe?", so
+    the planner's manifest and the boundaries that re-check it cannot disagree.
+    """
+    purposes = [CONTENT_RESTRICTION_PURPOSE, "whatsapp_channel_privacy"]
+    if whatsapp_dedicated_number:
+        purposes.append("whatsapp_linked_device_risk")
+    if processes_real_household_content(provider_kind):
+        purposes.append(HOUSEHOLD_CONTENT_PURPOSE)
+    return purposes
+
+
+def manifest_required_purposes(manifest: Mapping[str, Any] | None) -> list[str]:
+    """Authoritative purposes declared by a stored manifest document.
+
+    The manifest is what the runtime enforces, so every control-plane boundary
+    that re-checks consent before that runtime can receive content reads the
+    requirement from the same place. Unknown purposes are dropped — they cannot
+    be checked against a text we do not hold — and the S5 restriction is added
+    back if absent, because it is owed by every household and a manifest that
+    omits it is malformed rather than permissive.
+    """
+    declared = ((manifest or {}).get("consent") or {}).get("required_purposes") or ()
+    purposes = [purpose for purpose in declared if purpose in CONSENT_TEXTS]
+    if CONTENT_RESTRICTION_PURPOSE not in purposes:
+        purposes.append(CONTENT_RESTRICTION_PURPOSE)
+    return purposes

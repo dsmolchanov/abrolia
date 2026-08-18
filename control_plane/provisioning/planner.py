@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import hmac
 import sqlite3
 from dataclasses import dataclass
 
+from control_plane.privacy.consent import (
+    consent_version_and_sha,
+    required_consent_purposes,
+)
 from control_plane.provisioning.manifest import (
     ActorsV1,
     ChannelBindingV1,
@@ -76,25 +81,43 @@ class DesiredSpecPlanner:
         email_public = email_result["public_result"]
         channel_public = channel_result["public_result"]
         whatsapp_selection = self.onboarding.selection(workflow.id, "whatsapp_identity")
-        required_purposes = [
-            "special_category_content_restriction",
-            "whatsapp_channel_privacy",
-        ]
-        if whatsapp_selection and whatsapp_selection.get("kind") == "dedicated_number":
-            required_purposes.append("whatsapp_linked_device_risk")
+        # What the household OWES is derived from the provider it is being
+        # provisioned onto, never from what it happens to hold. Keying the
+        # Art 9(2)(a) requirement on "a receipt row exists" made the check
+        # self-satisfying: a real-email household created before that purpose
+        # existed, or one that later revoked it, simply stopped owing it.
+        provider_kind = str(
+            email_public.get("provider", email_public.get("mode", "synthetic"))
+        )
+        required_purposes = required_consent_purposes(
+            provider_kind=provider_kind,
+            whatsapp_dedicated_number=bool(
+                whatsapp_selection
+                and whatsapp_selection.get("kind") == "dedicated_number"
+            ),
+        )
         receipt_rows = connection.execute(
             "SELECT id, purpose, text_version, text_sha256 FROM consent_receipts"
-            " WHERE household_id = ? ORDER BY accepted_at, id",
+            " WHERE household_id = ? AND revoked_at IS NULL"
+            " ORDER BY accepted_at, id",
             (household_id,),
         ).fetchall()
         receipts_by_purpose = {row["purpose"]: row for row in receipt_rows}
-        # A household that accepted the Art 9(2)(a) condition carries it into the
-        # manifest, so the runtime enforces its exact version like every other
-        # authoritative purpose. Synthetic households never hold that receipt.
-        if "special_category_household_content" in receipts_by_purpose:
-            required_purposes.append("special_category_household_content")
-        if any(purpose not in receipts_by_purpose for purpose in required_purposes):
-            raise ValueError("authoritative onboarding consent receipt is missing")
+        # Presence is not currency. The receipt carried into the manifest must be
+        # the one for the copy in force now, or the runtime would enforce a
+        # version the family never saw.
+        for purpose in required_purposes:
+            expected_version, expected_sha = consent_version_and_sha(purpose)
+            row = receipts_by_purpose.get(purpose)
+            if (
+                row is None
+                or row["text_version"] != expected_version
+                or not hmac.compare_digest(str(row["text_sha256"]), expected_sha)
+            ):
+                raise ValueError(
+                    "authoritative onboarding consent receipt is missing,"
+                    f" revoked, or superseded for {purpose}"
+                )
         current = connection.execute(
             "SELECT COALESCE(MAX(revision), 0) AS revision FROM config_revisions"
             " WHERE household_id = ?",

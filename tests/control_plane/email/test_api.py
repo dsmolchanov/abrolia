@@ -22,7 +22,7 @@ def test_local_part_api_returns_only_suggestion_or_availability(api_harness) -> 
             "last_name": "Novák",
             "family_language": "en",
             "timezone": "Europe/Prague",
-            "country_code": "CZ",
+            "country_code": "DE",
             "residency_mode": "eu-app",
         },
     )

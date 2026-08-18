@@ -5,10 +5,15 @@ from __future__ import annotations
 import hashlib
 import hmac
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
-from control_plane.privacy.consent import consent_version_and_sha
+from control_plane.privacy.consent import (
+    CURRENT_RECEIPT_SQL,
+    current_receipt_params,
+    manifest_required_purposes,
+)
 from control_plane.provisioning.manifest import manifest_sha256
 from control_plane.repositories.configs import ConfigRepository
 from control_plane.repositories.jobs import JobsRepository
@@ -67,23 +72,34 @@ class BootstrapService:
         ).fetchone():
             raise BootstrapGone("bootstrap target was deleted")
 
+    def _manifest_or_none(
+        self, household_id: str, config_revision: int
+    ) -> dict[str, Any] | None:
+        try:
+            return self.configs.manifest(household_id, config_revision)
+        except KeyError:
+            return None
+
     @staticmethod
-    def _assert_current_content_restriction(connection, household_id: str) -> None:
-        version, sha256 = consent_version_and_sha(
-            "special_category_content_restriction"
-        )
-        receipt = connection.execute(
-            "SELECT 1 FROM consent_receipts WHERE household_id = ? AND purpose = ?"
-            " AND text_version = ? AND text_sha256 = ? AND revoked_at IS NULL LIMIT 1",
-            (
-                household_id,
-                "special_category_content_restriction",
-                version,
-                sha256,
-            ),
-        ).fetchone()
-        if receipt is None:
-            raise BootstrapConflict("activation consent receipt is missing")
+    def _assert_current_consent(
+        connection, household_id: str, purposes: Iterable[str]
+    ) -> None:
+        """Every purpose named must be held right now, unrevoked and current.
+
+        Activation is the last moment before a runtime can receive real family
+        content, so checking only the S5 restriction here left the Art. 9(2)(a)
+        consent unverified at the boundary that matters most: a household could
+        revoke it and still activate.
+        """
+        for purpose in purposes:
+            receipt = connection.execute(
+                CURRENT_RECEIPT_SQL,
+                current_receipt_params(household_id, purpose),
+            ).fetchone()
+            if receipt is None:
+                raise BootstrapConflict(
+                    f"activation consent receipt is missing for {purpose}"
+                )
 
     @staticmethod
     def _constant_match(actual: str, expected: str) -> bool:
@@ -288,7 +304,13 @@ class BootstrapService:
                         cleanup_pending=receipt_acknowledged,
                     )
                 raise BootstrapGone("bootstrap credential is no longer available")
-            self._assert_current_content_restriction(connection, household_id)
+            self._assert_current_consent(
+                connection,
+                household_id,
+                manifest_required_purposes(
+                    self._manifest_or_none(household_id, config_revision)
+                ),
+            )
             if receipt_acknowledged:
                 raise BootstrapConflict("activation receipt cannot be acknowledged before activation")
             if row["expires_at"] <= now:

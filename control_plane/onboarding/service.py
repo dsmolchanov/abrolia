@@ -27,6 +27,7 @@ from control_plane.onboarding.contracts import (
     WorkflowConflict,
 )
 from control_plane.onboarding.state import CHECK, RETRY, SAVE_PROFILE, SELECT, next_status
+from control_plane.privacy.art9 import real_content_refusal
 from control_plane.privacy.consent import consent_version_and_sha
 from control_plane.repositories.households import HouseholdsRepository
 from control_plane.repositories.jobs import JobsRepository
@@ -283,6 +284,17 @@ class OnboardingService:
             raise InvalidTransition(
                 "real email requires the Art 9(2)(a) household content consent"
             )
+        # Consent is necessary but not sufficient. Art. 9(4) lets a member state
+        # keep further conditions, and lawful-bases.md section 3 refuses real
+        # data outright for any country whose result has not been entered — so
+        # the profile's country is checked here, on the last hop before a real
+        # provider can be selected, and not only in the manifest.
+        profile = self.households.profile(household_id)
+        refusal = real_content_refusal(
+            (profile or {}).get("country_code")
+        )
+        if refusal is not None:
+            raise InvalidTransition(f"real email is not permitted: {refusal}")
 
     @staticmethod
     def _record_email_consent_receipt(

@@ -153,6 +153,12 @@ def create_app(
         _, restriction_sha = consent_version_and_sha(
             "special_category_content_restriction"
         )
+        household_version, household_text = consent_version_and_text(
+            "special_category_household_content"
+        )
+        _, household_sha = consent_version_and_sha(
+            "special_category_household_content"
+        )
         return templates.TemplateResponse(
             request,
             "onboarding.html",
@@ -166,6 +172,12 @@ def create_app(
                 "special_category_restriction_version": restriction_version,
                 "special_category_restriction_text": restriction_text,
                 "special_category_restriction_sha256": restriction_sha,
+                "special_category_household_version": household_version,
+                "special_category_household_text": household_text,
+                "special_category_household_sha256": household_sha,
+                # The consent is asked for only in a real-email rollout; the
+                # server enforces the same condition in _assert_email_rollout.
+                "real_email_enabled": active_container.config.real_email_enabled,
             },
         )
 

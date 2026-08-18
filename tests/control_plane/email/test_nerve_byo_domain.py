@@ -27,6 +27,9 @@ BASE_TIME = 1_800_000_000.0
 _RESTRICTION_VERSION, _RESTRICTION_SHA = consent_version_and_sha(
     "special_category_content_restriction"
 )
+_HOUSEHOLD_VERSION, _HOUSEHOLD_SHA = consent_version_and_sha(
+    "special_category_household_content"
+)
 
 
 class FakeByoNerveAdmin:
@@ -163,6 +166,10 @@ def _select(cp_stack) -> None:
             "special_category_restriction_receipt_id": "10000000-0000-4000-8000-000000000022",
             "special_category_restriction_text_version": _RESTRICTION_VERSION,
             "special_category_restriction_text_sha256": _RESTRICTION_SHA,
+            "special_category_household_consent": True,
+            "special_category_household_receipt_id": "10000000-0000-4000-8000-000000000032",
+            "special_category_household_text_version": _HOUSEHOLD_VERSION,
+            "special_category_household_text_sha256": _HOUSEHOLD_SHA,
         },
         context=cp_stack.context(),
     )

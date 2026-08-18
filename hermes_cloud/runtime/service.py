@@ -214,20 +214,33 @@ class RuntimeService:
             manifest = load_runtime_manifest(self.manifest_path, env=self.env)
         except ManifestError:
             return None, "manifest_missing_or_invalid"
-        restriction_version, restriction_sha = consent_version_and_sha(
-            REQUIRED_CONTENT_RESTRICTION_PURPOSE
-        )
-        if manifest.consent is None or (
-            REQUIRED_CONTENT_RESTRICTION_PURPOSE
-            not in manifest.consent.required_purposes
-            or not any(
-                receipt.purpose == REQUIRED_CONTENT_RESTRICTION_PURPOSE
-                and receipt.text_version == restriction_version
-                and hmac.compare_digest(receipt.text_sha256, restriction_sha)
-                for receipt in manifest.consent.receipts
-            )
-        ):
+        # Enforce EVERY purpose the manifest declares authoritative, not one
+        # hard-coded name. The control plane already decides which consents a
+        # household owes — including the Art. 9(2)(a) household-content consent
+        # for real-email households — and naming a single purpose here meant a
+        # runtime stayed ready while any other required consent was revoked or
+        # superseded.
+        if manifest.consent is None:
+            # A manifest with no consent block is the legacy shape, and it is
+            # the S5 restriction it is missing — keep the established reason.
             return None, "content_restriction_not_current"
+        if REQUIRED_CONTENT_RESTRICTION_PURPOSE not in (
+            manifest.consent.required_purposes
+        ):
+            # The S5 boundary is required of every household, synthetic or not,
+            # so a manifest that omits it is malformed rather than permissive.
+            return None, "content_restriction_not_current"
+        for purpose in manifest.consent.required_purposes:
+            version, sha256 = consent_version_and_sha(purpose)
+            if not any(
+                receipt.purpose == purpose
+                and receipt.text_version == version
+                and hmac.compare_digest(receipt.text_sha256, sha256)
+                for receipt in manifest.consent.receipts
+            ):
+                if purpose == REQUIRED_CONTENT_RESTRICTION_PURPOSE:
+                    return None, "content_restriction_not_current"
+                return None, "consent_not_current"
         try:
             state = load_activation_state(self.activation_path)
         except BootstrapError:
