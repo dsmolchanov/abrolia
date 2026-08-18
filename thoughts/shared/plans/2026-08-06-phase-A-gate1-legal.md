@@ -229,4 +229,26 @@ python -m check_fixtures --all --require-deny  # private deny-list in CI; local 
 
 ### Gate
 
-- [x] No `ABROLIA_REAL_EMAIL_ENABLED`, `ABROLIA_REAL_FAMILY_DATA_ENABLED`, or `HERMES_GMAIL_ADDRESS`/`HERMES_GMAIL_APP_PASSWORD` enabled in any committed config/fixture. `git diff` on this PR touches only docs + `hermes_cloud/core/config.py` (if tightened) + `tests/test_config_and_cli.py`.
+- [x] No `ABROLIA_REAL_EMAIL_ENABLED`, `ABROLIA_REAL_FAMILY_DATA_ENABLED`, or `HERMES_GMAIL_ADDRESS`/`HERMES_GMAIL_APP_PASSWORD` enabled in any committed config/fixture. Verified: the only committed occurrence is `deploy/control-plane/fly.toml:14`, `ABROLIA_REAL_EMAIL_ENABLED = "0"`.
+
+  **Scope revised 2026-08-19.** This item originally also asserted that the diff
+  touches only docs, `hermes_cloud/core/config.py` and
+  `tests/test_config_and_cli.py`. That was the shape of the step as planned on
+  2026-08-06, before A3 selected the Art 9(2)(a) condition on 2026-08-12 and put
+  the consent into the product. The implementation half of A3 necessarily
+  reaches onboarding, provisioning, the consent registry, the runtime readiness
+  path and the web onboarding forms, and the file-scope sentence was left
+  unrevised while the step grew — so the gate contradicted the plan it belongs
+  to rather than constraining it. The assertion that carries the safety
+  property is the first sentence, and it is unchanged and still verified; the
+  file list is replaced by the scope actually approved:
+
+  - `docs/privacy/**` — the determinations and the records of them.
+  - `control_plane/privacy/**`, `control_plane/onboarding/**`,
+    `control_plane/provisioning/**`, `control_plane/api/**`,
+    `control_plane/web/**` — the Art 9(2)(a) consent and its enforcement.
+  - `hermes_cloud/runtime/service.py` — readiness enforcement of the manifest's
+    authoritative purposes.
+  - `tests/**` — the regression suite for each of the above.
+
+  Anything outside this set on this branch remains a deviation and a blocker.
