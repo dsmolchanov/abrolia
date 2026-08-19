@@ -210,11 +210,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     # Imported here so the module stays importable from control_plane.backup.
     import argparse
-    import base64
     import binascii
     import json
 
     from control_plane.backup import BackupError, create_pre_migrate_backup
+    from control_plane.config import decode_key_material
 
     parser = argparse.ArgumentParser(prog="python -m control_plane.db")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -231,11 +231,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     database = ControlPlaneDatabase(
         os.environ.get("ABROLIA_CONTROL_PLANE_DB", "data/control-plane.db")
     )
+    # Same normalisation as ControlPlaneConfig, deliberately shared: this step
+    # reads the key before the application config exists, and decoding it
+    # differently is how a valid unpadded key became `b""` here and stopped the
+    # container from starting at all.
     try:
-        backup_key = base64.urlsafe_b64decode(
+        backup_key = decode_key_material(
             os.environ.get("ABROLIA_CONTROL_PLANE_BACKUP_KEY", "")
         )
-    except (binascii.Error, ValueError):
+    except (binascii.Error, ValueError, TypeError):
         backup_key = b""
     try:
         backup: Path | None = None

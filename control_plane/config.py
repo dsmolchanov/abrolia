@@ -13,9 +13,22 @@ class ConfigurationError(RuntimeError):
     """Configuration would weaken a locked control-plane invariant."""
 
 
+def decode_key_material(value: str) -> bytes:
+    """Decode urlsafe base64 key material, tolerating absent padding.
+
+    One spelling of the padding rule, because there was briefly more than one:
+    the startup migration step decoded the SAME environment variable without
+    restoring padding, so a valid unpadded key that the application accepted
+    turned into `b""` there — the pre-migrate backup then failed closed and the
+    container never reached `serve`. A key is either good for both readers or
+    neither.
+    """
+    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+
+
 def _decode_key(value: str, *, name: str) -> bytes:
     try:
-        decoded = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+        decoded = decode_key_material(value)
     except (ValueError, TypeError) as error:
         raise ConfigurationError(f"{name} must be urlsafe base64") from error
     if len(decoded) != 32:

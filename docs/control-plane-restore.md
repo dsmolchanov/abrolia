@@ -53,8 +53,38 @@ abrolia-control-plane restore /data/control-plane.db.pre-migrate-0008-1800000000
   --target /data/control-plane-rollback.db --no-migrate
 ```
 
-The restored database keeps the archived schema and stays worker-paused; roll the
-image back to the pre-upgrade release before `resume-jobs`.
+The restored database keeps the archived schema and stays worker-paused.
+
+**Then put it where the rolled-back image will look.** `deploy/control-plane/fly.toml`
+pins `ABROLIA_CONTROL_PLANE_DB = "/data/control-plane.db"`, so rolling the image
+back on its own reopens the migrated database this archive exists to undo — the
+restore sits at `/data/control-plane-rollback.db` and is never read. The worker
+pause lives beside the database it belongs to, as
+`<db path>.workers-paused`, so it has to travel with it: moving the database
+alone silently resumes the workers on a database that has not been reconciled.
+
+Move both, with the service stopped and the original kept:
+
+```bash
+mv /data/control-plane.db /data/control-plane.db.superseded-<epoch>
+mv /data/control-plane.db.workers-paused /data/control-plane.db.workers-paused.superseded-<epoch> 2>/dev/null || true
+mv /data/control-plane-rollback.db /data/control-plane.db
+mv /data/control-plane-rollback.db.workers-paused /data/control-plane.db.workers-paused
+```
+
+Confirm the pause survived the move before starting anything:
+
+```bash
+test -f /data/control-plane.db.workers-paused && echo "workers paused"
+```
+
+The alternative is to leave the file where it is and point the rolled-back
+release at it by setting `ABROLIA_CONTROL_PLANE_DB=/data/control-plane-rollback.db`.
+That works and it changes what a later reader of `fly.toml` believes about the
+volume, so prefer the move unless you are keeping both databases deliberately.
+
+Only then roll the image back to the pre-upgrade release, and only after
+verifying the restore run `resume-jobs`.
 
 ## Isolated restore rehearsal
 

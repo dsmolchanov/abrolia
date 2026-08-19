@@ -129,3 +129,70 @@ def test_rollback_restore_keeps_the_archived_schema(tmp_path) -> None:
     assert rolled_back.pending_migrations(directory) == ["9999_pilot_probe.sql"]
     assert rolled_back.workers_paused
     rolled_back.close()
+
+
+def test_an_unpadded_backup_key_still_starts_the_container(
+    tmp_path, capsys, monkeypatch
+) -> None:
+    """The application accepted this key; the startup step must too.
+
+    `ControlPlaneConfig._decode_key` restores absent base64 padding, and this
+    step decoded the SAME environment variable without doing so — an unpadded
+    but perfectly valid key became `b""` here. With a migration pending the
+    pre-migrate backup then failed closed, `serve` never ran, and the only
+    symptom was a container that would not start.
+    """
+    unpadded = BACKUP_KEY.rstrip("=")
+    assert unpadded != BACKUP_KEY, "pick a key whose encoding actually needs padding"
+    monkeypatch.setenv("ABROLIA_CONTROL_PLANE_DB", str(tmp_path / "control-plane.db"))
+    monkeypatch.setenv("ABROLIA_CONTROL_PLANE_BACKUP_KEY", unpadded)
+
+    assert main(["migrate", "--backup-first"]) == 0
+
+    report = json.loads(capsys.readouterr().out)
+    backup = Path(report["backup"])
+    assert backup.exists()
+    # Written under the real key, not a truncated one.
+    restored = tmp_path / "restored.db"
+    restore_backup(backup, restored, backup_key=BACKUP_KEY_BYTES, apply_migrations=False)
+    assert restored.exists()
+
+
+def test_both_key_readers_agree_on_padding() -> None:
+    """One spelling of the rule, so the two readers cannot diverge again."""
+    from control_plane.config import decode_key_material
+
+    padded = base64.urlsafe_b64encode(BACKUP_KEY_BYTES).decode()
+    assert decode_key_material(padded) == BACKUP_KEY_BYTES
+    assert decode_key_material(padded.rstrip("=")) == BACKUP_KEY_BYTES
+
+
+def test_the_rollback_procedure_matches_the_paths_it_depends_on() -> None:
+    """The rollback restored to a path the rolled-back image never opens.
+
+    `fly.toml` pins the database path, and the worker pause is a sibling file
+    named after it. The documented procedure has to name both, or a rollback
+    reopens the migrated database and — if the marker is left behind — resumes
+    workers on a database nobody reconciled. This test fails when either
+    convention moves, which is when the prose goes stale.
+    """
+    root = Path(__file__).resolve().parents[2]
+    fly = (root / "deploy/control-plane/fly.toml").read_text(encoding="utf-8")
+    configured = next(
+        line.split("=", 1)[1].strip().strip('"')
+        for line in fly.splitlines()
+        if line.strip().startswith("ABROLIA_CONTROL_PLANE_DB")
+    )
+    doc = (root / "docs/control-plane-restore.md").read_text(encoding="utf-8")
+
+    assert configured == "/data/control-plane.db"
+    # The move has to put the restore where the image will actually look.
+    assert f"mv /data/control-plane-rollback.db {configured}" in doc
+    # And the pause must be MOVED with it, under the name the code gives it —
+    # merely mentioning the marker elsewhere in the page is not the procedure.
+    suffix = ControlPlaneDatabase(Path(configured)).worker_pause_path.name
+    assert suffix == "control-plane.db.workers-paused"
+    assert (
+        f"mv /data/control-plane-rollback.db.workers-paused {configured}.workers-paused"
+        in doc
+    )
