@@ -538,3 +538,56 @@ def test_the_consent_boundary_holds_on_retry_and_check(cp_stack) -> None:
     # Non-email steps are untouched: they carry no consent evidence.
     whatsapp = {"kind": "shared_abrolia", "privacy_notice_receipt_id": "r"}
     assert service._provider_safe_selection(StepKind.WHATSAPP, whatsapp) == whatsapp
+
+
+def test_withdrawal_disconnects_the_upstream_inbox(cp_stack) -> None:
+    """Stopping our runtime does not stop the processor.
+
+    A provisioned Nerve or Gmail mailbox keeps receiving and storing whatever is
+    forwarded to it. Without a teardown, withdrawal left processing running at
+    the processor boundary — the one the family cannot see and the one the DPA
+    covers.
+    """
+    complete_onboarding(cp_stack)
+    drain(cp_stack)
+    set_runtime_ref(cp_stack)
+    service = ConsentWithdrawalService(
+        cp_stack.database, jobs=cp_stack.jobs, onboarding=cp_stack.service
+    )
+
+    result = service.withdraw(
+        cp_stack.household.id, HOUSEHOLD_CONTENT_PURPOSE, now=BASE_TIME
+    )
+
+    assert result.email_disconnected
+    cleanups = cp_stack.database.query(
+        "SELECT kind, operation, status FROM provisioning_jobs"
+        " WHERE household_id = ? AND kind = 'cleanup'",
+        (cp_stack.household.id,),
+    )
+    assert cleanups, "no upstream teardown was scheduled"
+    assert all(row["operation"] == "deprovision" for row in cleanups)
+
+
+def test_the_teardown_survives_a_later_reset(cp_stack) -> None:
+    """Cleanup jobs are already exempt from supersession; keep it that way."""
+    complete_onboarding(cp_stack)
+    drain(cp_stack)
+    set_runtime_ref(cp_stack)
+    service = ConsentWithdrawalService(
+        cp_stack.database, jobs=cp_stack.jobs, onboarding=cp_stack.service
+    )
+    result = service.withdraw(
+        cp_stack.household.id, HOUSEHOLD_CONTENT_PURPOSE, now=BASE_TIME
+    )
+    assert result.email_cleanup_job_ids
+
+    cp_stack.service.reset_from(
+        cp_stack.household.id, StepKind.EMAIL, context=cp_stack.context()
+    )
+
+    for job_id in result.email_cleanup_job_ids:
+        row = cp_stack.database.query_one(
+            "SELECT status FROM provisioning_jobs WHERE id = ?", (job_id,)
+        )
+        assert row["status"] != "cancelled"

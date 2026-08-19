@@ -282,14 +282,18 @@ you supplied:
 {"purpose": "...", "receipts_revoked": 1, "revisions_revoked": 1, "runtime_notified": true}
 ```
 
-Three things happen, and you should check the third:
+Four things happen, and you should check the last two:
 
 1. The receipt is marked `revoked_at`. Every control-plane boundary — planner,
    provisioning worker, bootstrap activation — reads `revoked_at IS NULL`, so
    nothing further is provisioned or activated from this moment.
 2. Every standing configuration revision moves to `revoked`, so none can be
    activated later.
-3. A runtime job is queued to tell the instance that is ALREADY serving. Until
+3. The upstream inbox is disconnected — the same teardown an onboarding reset
+   schedules. Stopping our runtime does not stop the processor: a provisioned
+   Nerve or Gmail mailbox keeps receiving and storing whatever is forwarded to
+   it, and that is the boundary the DPA covers.
+4. A runtime job is queued to tell the instance that is ALREADY serving. Until
    that job succeeds the household's runtime keeps processing: it re-reads a
    local manifest whose receipt stays valid-looking forever, and the database
    is invisible to it. `runtime_notified: false` means no runtime was

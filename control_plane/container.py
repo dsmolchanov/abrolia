@@ -247,7 +247,9 @@ class ControlPlaneContainer:
             providers,
             runtime=runtime_deleter,
         )
-        withdrawal = ConsentWithdrawalService(database, jobs=jobs)
+        withdrawal = ConsentWithdrawalService(
+            database, jobs=jobs, onboarding=onboarding
+        )
         retention = RetentionService(accounts)
         runtime_health = RuntimeReadinessMonitor(database)
         return cls(

@@ -908,6 +908,43 @@ class OnboardingService:
             )
             return CommandResult(snapshot)
 
+    def disconnect_email_for_withdrawal(
+        self, connection, household_id: str, *, now: float
+    ) -> list[str]:
+        """Tear down the upstream inbox because consent was withdrawn.
+
+        Stopping the runtime stops OUR processing. It does nothing about the
+        mailbox already provisioned at Nerve or Google, which keeps receiving
+        and storing whatever is forwarded to it — so without this, withdrawal
+        left processing running at the processor boundary, which is the boundary
+        the family cannot see and the one the DPA covers.
+
+        Reuses the same cleanup the onboarding reset schedules, rather than a
+        second teardown path: two ways to disconnect an inbox is two ways for
+        one of them to be wrong.
+        """
+        if self.email_identities is None:
+            return []
+        row = connection.execute(
+            "SELECT id, version FROM onboarding_workflows WHERE household_id = ?",
+            (household_id,),
+        ).fetchone()
+        if row is None:
+            return []
+        job_ids = self._schedule_registered_cleanup(
+            connection,
+            household_id=household_id,
+            workflow_id=row["id"],
+            workflow_version=row["version"],
+            now=now,
+            resource_types={"email_identity"},
+        )
+        self.email_identities.repository.begin_disconnect(
+            connection, household_id, now=now
+        )
+        self._finish_safe_email_disconnect(connection, household_id, now=now)
+        return job_ids
+
     def _schedule_registered_cleanup(
         self,
         connection,

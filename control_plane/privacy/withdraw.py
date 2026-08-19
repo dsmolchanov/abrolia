@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
+from typing import Any
 
 from control_plane.db import ControlPlaneDatabase
 from control_plane.privacy.consent import CONSENT_TEXTS
@@ -61,6 +62,12 @@ class WithdrawalResult:
     receipts_revoked: int
     revisions_revoked: int
     runtime_job_id: str | None
+    email_cleanup_job_ids: tuple[str, ...] = ()
+
+    @property
+    def email_disconnected(self) -> bool:
+        """Whether an upstream inbox teardown was scheduled."""
+        return bool(self.email_cleanup_job_ids)
 
     @property
     def runtime_notified(self) -> bool:
@@ -70,10 +77,19 @@ class WithdrawalResult:
 
 class ConsentWithdrawalService:
     def __init__(
-        self, database: ControlPlaneDatabase, *, jobs: JobsRepository
+        self,
+        database: ControlPlaneDatabase,
+        *,
+        jobs: JobsRepository,
+        onboarding: Any | None = None,
     ) -> None:
         self.database = database
         self.jobs = jobs
+        #: The onboarding service owns the email teardown. Optional so the
+        #: control-plane half stays testable on its own, but wired in the
+        #: container — without it, withdrawal stops our runtime and leaves the
+        #: provisioned inbox upstream still receiving.
+        self.onboarding = onboarding
 
     def withdraw(
         self, household_id: str, purpose: str, *, now: float
@@ -135,6 +151,17 @@ class ConsentWithdrawalService:
                 (household_id,),
             ).rowcount
 
+            # Disconnect the inbox BEFORE queuing the runtime stop, so the
+            # ordering in the job table matches the order the effects matter in:
+            # stop accepting new content, then stop processing what arrived.
+            email_cleanup_job_ids: list[str] = []
+            if self.onboarding is not None:
+                email_cleanup_job_ids = (
+                    self.onboarding.disconnect_email_for_withdrawal(
+                        connection, household_id, now=now
+                    )
+                )
+
             runtime_job_id = self._enqueue_runtime_stop(
                 connection,
                 household_id=household_id,
@@ -149,6 +176,7 @@ class ConsentWithdrawalService:
             receipts_revoked=revoked,
             revisions_revoked=revisions,
             runtime_job_id=runtime_job_id,
+            email_cleanup_job_ids=tuple(email_cleanup_job_ids),
         )
 
     def _enqueue_runtime_stop(

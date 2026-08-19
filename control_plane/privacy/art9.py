@@ -56,13 +56,20 @@ DETERMINATIONS: dict[str, Art94Determination] = {
     # that reconciliation to be performed and RECORDED before the first Italian
     # household connects, and no such record exists yet — so Italy is refused,
     # fail-closed, until one is written and this entry is cleared.
+    # SUSPENDED FROM THE PILOT by owner decision, 2026-08-19. Not merely
+    # "awaiting a record": Italy is out of scope until someone chooses to do the
+    # Garante reconciliation, which is a decision with a date rather than a task
+    # sitting in a queue. Recording it as suspended keeps the register honest —
+    # a permanently pending item reads as work in progress, and this is not.
     "IT": Art94Determination(
         "IT",
         "Codice, art. 2-septies",
         outstanding_prerequisite=(
-            "the Garante's misure di garanzia have not been reconciled against "
-            f"our TOMs and recorded; {LAWFUL_BASES_DOC} section 3 requires that "
-            "record before the first Italian household connects"
+            "Italy is suspended from the pilot (owner decision 2026-08-19). "
+            "Art. 2-septies conditions health data on the Garante's misure di "
+            "garanzia in addition to an Art. 9(2) condition, and that "
+            "reconciliation against our TOMs has not been performed or "
+            f"recorded; see {LAWFUL_BASES_DOC} section 3"
         ),
     ),
 }
