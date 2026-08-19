@@ -188,16 +188,35 @@ def test_the_rollback_procedure_matches_the_paths_it_depends_on() -> None:
     doc = (root / "docs/control-plane-restore.md").read_text(encoding="utf-8")
 
     assert configured == "/data/control-plane.db"
-    # The move has to put the restore where the image will actually look.
-    assert f"mv /data/control-plane-rollback.db {configured}" in doc
-    # And the pause must be MOVED with it, under the name the code gives it —
-    # merely mentioning the marker elsewhere in the page is not the procedure.
+    # Whitespace-insensitive: the page aligns these commands in a column, and
+    # the procedure is what matters, not its formatting.
+    moves = {
+        tuple(line.split()[1:3])
+        for line in doc.splitlines()
+        if line.strip().startswith("mv ") and len(line.split()) >= 3
+    }
+
+    # The restore has to land where the rolled-back image will actually look.
+    assert ("/data/control-plane-rollback.db", configured) in moves
+    # The pause must travel with it, under the name the code gives it — merely
+    # mentioning the marker elsewhere on the page is not the procedure.
     suffix = ControlPlaneDatabase(Path(configured)).worker_pause_path.name
     assert suffix == "control-plane.db.workers-paused"
     assert (
-        f"mv /data/control-plane-rollback.db.workers-paused {configured}.workers-paused"
-        in doc
-    )
+        "/data/control-plane-rollback.db.workers-paused",
+        f"{configured}.workers-paused",
+    ) in moves
+    # And so must the WAL sidecars, in BOTH directions: one left behind at the
+    # canonical path is replayed into the restore, and one left behind by the
+    # superseded database separates it from its own committed pages.
+    for sidecar in ("-wal", "-shm"):
+        assert (
+            f"/data/control-plane-rollback.db{sidecar}",
+            f"{configured}{sidecar}",
+        ) in moves, sidecar
+        assert any(
+            source == f"{configured}{sidecar}" for source, _ in moves
+        ), f"superseded {sidecar} is never moved aside"
 
 
 def test_a_failing_script_leaves_no_partially_upgraded_schema(tmp_path) -> None:
@@ -263,27 +282,34 @@ def test_a_healthy_batch_still_applies_every_script(tmp_path) -> None:
 
 
 def test_a_restart_loop_does_not_accumulate_snapshots(tmp_path) -> None:
-    """A failing migration restarts the container; each boot took a full backup.
+    """The real loop: a migration that keeps failing, and a container restart.
 
-    On the configured 1 GB volume that turns a recoverable failed deploy into a
-    full disk — and a full disk costs the ability to take a restore point at
-    all.
+    The previous version of this test repeated only the backup call, so it never
+    opened the failing transaction or closed the connection — and therefore
+    never moved the mtimes that a timestamp-based check was relying on. It
+    passed while the accumulation it was written to prevent still happened.
     """
-    directory = _pending_migration_directory(tmp_path)
-    database = _database(tmp_path)
-    database.migrate()
-
-    first = create_pre_migrate_backup(
-        database, backup_key=BACKUP_KEY_BYTES, directory=directory
+    directory = tmp_path / "migrations"
+    directory.mkdir()
+    (directory / "9999_broken.sql").write_text(
+        "CREATE TABLE half_applied (id TEXT PRIMARY KEY);\nTHIS IS NOT SQL;\n",
+        encoding="utf-8",
     )
-    assert first is not None
-    for _ in range(4):
-        again = create_pre_migrate_backup(
+
+    for boot in range(4):
+        database = _database(tmp_path)
+        database.migrate()  # the real migrations; the broken one is in `directory`
+        archive = create_pre_migrate_backup(
             database, backup_key=BACKUP_KEY_BYTES, directory=directory
         )
-        assert again == first
+        assert archive is not None, f"boot {boot} took no snapshot"
+        with pytest.raises(sqlite3.DatabaseError):
+            database.migrate(directory)
+        # As the entrypoint does: the process exits and the connection closes,
+        # which checkpoints and moves the file timestamps.
+        database.close()
+
     assert len(list(tmp_path.glob("*.bak"))) == 1
-    database.close()
 
 
 def test_a_snapshot_is_not_reused_once_the_database_has_moved_on(tmp_path) -> None:

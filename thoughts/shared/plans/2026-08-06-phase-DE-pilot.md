@@ -294,7 +294,23 @@ CREATE TABLE channel_bindings (
 
 #### Step E9 — Release tag, migrate-on-start, restore drill
 
-**Files:** `deploy/control-plane/Dockerfile`, `control_plane/db.py`, `control_plane/migrations/*`, `docs/control-plane-restore.md`.
+**Files:** `deploy/control-plane/Dockerfile`, `control_plane/db.py`,
+`control_plane/backup.py`, `control_plane/cli.py`, `control_plane/config.py`,
+`control_plane/migrations/*`, `docs/control-plane-restore.md`.
+
+**Scope revised 2026-08-19.** The original list named only the entrypoint, the
+database module, the migrations and the restore documentation. Three more turned
+out to be load-bearing for the step's own guarantees, and the list is corrected
+rather than the changes reverted:
+
+- `control_plane/backup.py` — the pre-migrate snapshot itself lives here, along
+  with the reuse that stops a restart loop filling the volume and the
+  authentication that stops an unopenable archive satisfying the gate.
+- `control_plane/cli.py` — the `restore --no-migrate` rollback path the drill
+  depends on.
+- `control_plane/config.py` — `decode_key_material`, shared so the startup step
+  and the application cannot disagree about whether a backup key is valid. That
+  disagreement stopped the container from booting on a perfectly good key.
 
 **Tag:**
 

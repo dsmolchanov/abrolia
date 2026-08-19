@@ -81,10 +81,27 @@ alone silently resumes the workers on a database that has not been reconciled.
 Move both, with the service stopped and the original kept:
 
 ```bash
-mv /data/control-plane.db /data/control-plane.db.superseded-<epoch>
+# The WAL and shared-memory sidecars belong to the database they sit beside. A
+# service that was killed rather than stopped cleanly leaves a populated
+# control-plane.db-wal; opening the RESTORED file at the same path would replay
+# those migrated pages into it, and the superseded database would be separated
+# from its own latest committed pages. Move all three together, always.
+mv /data/control-plane.db     /data/control-plane.db.superseded-<epoch>
+mv /data/control-plane.db-wal /data/control-plane.db.superseded-<epoch>-wal 2>/dev/null || true
+mv /data/control-plane.db-shm /data/control-plane.db.superseded-<epoch>-shm 2>/dev/null || true
 mv /data/control-plane.db.workers-paused /data/control-plane.db.workers-paused.superseded-<epoch> 2>/dev/null || true
-mv /data/control-plane-rollback.db /data/control-plane.db
+
+mv /data/control-plane-rollback.db     /data/control-plane.db
+mv /data/control-plane-rollback.db-wal /data/control-plane.db-wal 2>/dev/null || true
+mv /data/control-plane-rollback.db-shm /data/control-plane.db-shm 2>/dev/null || true
 mv /data/control-plane-rollback.db.workers-paused /data/control-plane.db.workers-paused
+```
+
+Confirm no sidecar from the superseded database is left at the canonical path
+before starting anything — one that survives will be replayed into the restore:
+
+```bash
+ls /data/control-plane.db-wal /data/control-plane.db-shm 2>/dev/null
 ```
 
 Confirm the pause survived the move before starting anything:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import os
 import sqlite3
 import tempfile
@@ -49,8 +51,8 @@ def create_pre_migrate_backup(
     # each under a fresh epoch, on a 1 GB volume. That turns a recoverable
     # failed deploy into a full disk — losing the ability to take a restore
     # point at all, and eventually the database's own room to write.
-    existing = _reusable_pre_migrate_backup(database, revision)
-    if existing is not None and _archive_opens_with(existing, backup_key):
+    existing = _reusable_pre_migrate_backup(database, revision, backup_key)
+    if existing is not None:
         return existing
 
     stamp = int(time.time() if now is None else now)
@@ -68,49 +70,59 @@ def create_pre_migrate_backup(
     return create_backup(database, target, backup_key=backup_key)
 
 
-def _archive_opens_with(archive: Path, backup_key: bytes) -> bool:
-    """Whether this archive authenticates under the key we hold, right now.
+def _database_image(database: ControlPlaneDatabase) -> bytearray:
+    """The same materialised image `create_backup` would encrypt.
 
-    Reuse skipped `_key()` and every authentication check, so an archive left by
-    an earlier boot satisfied the backup-first gate even when the key had since
-    been rotated, or the file had been truncated by the disk filling up. The
-    migration then proceeded believing it had a restore point that could not be
-    opened — which is the one belief this gate exists to make true.
+    Goes through the backup API rather than reading the file, so WAL content is
+    resolved and the result does not depend on when a checkpoint last ran.
+    """
+    with sqlite3.connect(":memory:") as output:
+        database.connection.backup(output)
+        return bytearray(output.serialize())
 
-    Header and tag only: the payload is decrypted, not written anywhere, and the
-    result is discarded. Cheaper than a restore and sufficient to prove the
-    archive is intact and ours.
+
+def _archive_plaintext(archive: Path, backup_key: bytes) -> bytearray | None:
+    """Decrypt the archive under the key in use, or None if it will not open.
+
+    Reuse used to skip `_key()` and every authentication check, so an archive
+    left by an earlier boot satisfied the backup-first gate even after the key
+    was rotated or the file was truncated by the disk filling up — the migration
+    then proceeded believing in a restore point that could not be opened.
     """
     try:
         payload = archive.read_bytes()
     except OSError:
-        return False
+        return None
     if not payload.startswith(MAGIC) or len(payload) <= len(MAGIC) + NONCE_BYTES + 16:
-        return False
+        return None
     nonce = payload[len(MAGIC) : len(MAGIC) + NONCE_BYTES]
     ciphertext = payload[len(MAGIC) + NONCE_BYTES :]
     try:
-        plaintext = AESGCM(_key(backup_key)).decrypt(nonce, ciphertext, MAGIC)
+        return bytearray(AESGCM(_key(backup_key)).decrypt(nonce, ciphertext, MAGIC))
     except (InvalidTag, BackupError, ValueError):
-        return False
-    finally:
-        del payload
-    return bool(plaintext)
+        return None
 
 
 def _reusable_pre_migrate_backup(
-    database: ControlPlaneDatabase, revision: object
+    database: ControlPlaneDatabase, revision: object, backup_key: bytes
 ) -> Path | None:
-    """An existing snapshot of THIS database at THIS revision, or None.
+    """An existing snapshot that is still an exact image of this database.
 
-    Same revision is not sufficient on its own. A migration can fail, be dropped
-    from the next image so the container serves at the unchanged revision, take
-    writes, and only then meet a new migration — at which point the old archive
-    matches by revision but no longer matches the data. So the archive is reused
-    only when nothing has been written since it was taken, checked against the
-    database file and its WAL sidecar.
+    Compares CONTENT, not timestamps. Timestamps were the obvious choice and the
+    wrong one: a migration that fails still opens a transaction and checkpoints
+    on close, so the database and WAL mtimes advance even though it rolled back
+    and nothing was committed. Every restart therefore looked like a change,
+    rejected the archive and wrote another — leaving in place the accumulation
+    this check exists to prevent.
 
-    Reuse rather than prune: deleting a restore point to save space is the one
+    The digest is of the materialised image, which is stable across a
+    rolled-back transaction and across a close and reopen, and moves as soon as
+    anything is genuinely committed. That last case is the one that matters for
+    safety: a migration can be dropped from the next image, the container can
+    then serve at the unchanged revision and take writes, and an archive
+    matching only by revision would be a restore point that silently loses them.
+
+    Reuse rather than prune. Deleting a restore point to reclaim space is the one
     move that turns a disk problem into a data-loss problem.
     """
     candidates = sorted(
@@ -121,22 +133,18 @@ def _reusable_pre_migrate_backup(
     if not candidates:
         return None
     archive = candidates[-1]
-    try:
-        taken_at = archive.stat().st_mtime
-    except OSError:
+    plaintext = _archive_plaintext(archive, backup_key)
+    if plaintext is None:
         return None
-    for companion in (
-        database.path,
-        database.path.with_name(f"{database.path.name}-wal"),
-    ):
-        try:
-            if companion.stat().st_mtime > taken_at:
-                return None
-        except FileNotFoundError:
-            continue
-        except OSError:
-            return None
-    return archive
+    current = _database_image(database)
+    try:
+        identical = hmac.compare_digest(
+            hashlib.sha256(plaintext).digest(), hashlib.sha256(current).digest()
+        )
+    finally:
+        plaintext[:] = b"\x00" * len(plaintext)
+        current[:] = b"\x00" * len(current)
+    return archive if identical else None
 
 
 def create_backup(
