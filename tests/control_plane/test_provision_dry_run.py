@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import sqlite3
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -712,3 +714,115 @@ def test_a_failed_runtime_job_is_reported_as_a_failure(container) -> None:
     assert "failed" in plan.rehearsal
     assert plan.blocked_by is not None and "failed" in plan.blocked_by
     assert "bootstrap activation" not in plan.rehearsal
+
+
+def test_a_completed_household_is_not_reported_as_awaiting_activation(
+    container,
+) -> None:
+    """`complete` means activation already committed.
+
+    Folding it into the activating case told an operator that every fully
+    onboarded household was still waiting for a step that had finished — a false
+    next action on the state they see most often.
+    """
+    household_id = _household_with_profile(container)
+    _verify_all_steps(container, household_id)
+    while container.worker.run_once() is not None:
+        pass
+    with container.database.write() as connection:
+        connection.execute(
+            "UPDATE onboarding_workflows SET state = 'complete' WHERE household_id = ?",
+            (household_id,),
+        )
+
+    plan = plan_onboarding(container, household_id)
+
+    assert "complete" in plan.rehearsal
+    assert "waiting on bootstrap activation" not in plan.rehearsal
+    assert plan.table_writes == []
+
+
+def test_an_expired_lease_is_reported_as_a_reconciliation(container) -> None:
+    """A reclaimed `running` job is inspected, not retried.
+
+    `_run_once` calls `provider.inspect()` for it — the same provider-dependent
+    branch as `outcome_unknown`, which can deprovision the resource and insert a
+    bootstrap-cleanup job. Those writes fall outside the advertised set
+    entirely, so the guarantee attached to it would have been false.
+    """
+    household_id = _household_with_profile(container)
+    _verify_all_steps(container, household_id)
+    with container.database.write() as connection:
+        connection.execute(
+            "UPDATE provisioning_jobs SET status = 'running', lease_until = 1.0"
+            " WHERE household_id = ? AND kind = 'runtime'"
+            " AND operation = 'ensure_runtime'",
+            (household_id,),
+        )
+
+    plan = plan_onboarding(container, household_id)
+
+    assert "expired lease" in plan.rehearsal
+    assert "reconcile" in plan.rehearsal
+    assert plan.table_writes == []
+    assert plan.blocked_by is not None
+
+
+def test_a_held_lease_is_still_reported_as_the_success_path(container) -> None:
+    """The counterpart: an unexpired running job is an ordinary first attempt."""
+    household_id = _household_with_profile(container)
+    _verify_all_steps(container, household_id)
+    with container.database.write() as connection:
+        connection.execute(
+            "UPDATE provisioning_jobs SET status = 'running',"
+            " lease_until = ? WHERE household_id = ? AND kind = 'runtime'"
+            " AND operation = 'ensure_runtime'",
+            (time.time() + 3600, household_id),
+        )
+
+    plan = plan_onboarding(container, household_id)
+
+    assert "SUCCESS PATH" in plan.rehearsal
+    assert set(plan.table_writes) == set(
+        RUNTIME_WRITES_BY_WORKFLOW_STATE["runtime_provisioning"]
+    )
+
+
+def test_the_cli_leaves_the_live_database_files_byte_identical(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The structural property, tested structurally.
+
+    Every earlier attempt closed one way SQLite writes — migrating on build,
+    creating a missing file, rewriting a persistent journal mode — and another
+    remained: closing the last connection CHECKPOINTS committed WAL frames into
+    the main file and removes the sidecars, which no rollback undoes and no flag
+    prevents. Rehearsing against a copy makes the property structural rather
+    than a list of closed holes, so this asserts the whole directory instead of
+    any single mechanism.
+    """
+    config = ControlPlaneConfig.for_test(tmp_path)
+    seeded = ControlPlaneDatabase(config.database_path)
+    seeded.migrate()
+    with seeded.write() as connection:
+        connection.execute("CREATE TABLE canary (id TEXT PRIMARY KEY)")
+        connection.execute("INSERT INTO canary VALUES ('uncheckpointed')")
+    # Leave committed frames in the WAL, as a stopped or crashed writer does.
+    assert config.database_path.with_name(
+        f"{config.database_path.name}-wal"
+    ).exists()
+
+    def fingerprint() -> dict[str, bytes]:
+        return {
+            path.name: hashlib.sha256(path.read_bytes()).digest()
+            for path in sorted(tmp_path.iterdir())
+            if path.is_file()
+        }
+
+    before = fingerprint()
+    monkeypatch.setattr(ControlPlaneConfig, "from_env", staticmethod(lambda: config))
+
+    with pytest.raises(SystemExit):
+        main(["--dry-run", "--household", "10000000-0000-4000-8000-000000000031"])
+
+    assert fingerprint() == before

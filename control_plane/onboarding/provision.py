@@ -13,9 +13,13 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shutil
 import sqlite3
+import tempfile
+import time
 from collections.abc import Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
+from pathlib import Path
 from typing import Any
 
 from control_plane.config import ControlPlaneConfig
@@ -265,6 +269,11 @@ def _secret_names(
     return secrets
 
 
+def _now_seconds() -> float:
+    """Wall clock, isolated so a test can pin an expired lease."""
+    return time.time()
+
+
 def _flatten(document: Any, prefix: str = "") -> dict[str, Any]:
     """Leaf paths of a manifest, so a diff can name what moved."""
     if isinstance(document, dict):
@@ -401,7 +410,8 @@ def plan_onboarding(
                     ),
                 }
             runtime_job = connection.execute(
-                "SELECT id, status, desired_revision FROM provisioning_jobs"
+                "SELECT id, status, desired_revision, lease_until"
+                " FROM provisioning_jobs"
                 " WHERE household_id = ? AND workflow_id = ? AND kind = 'runtime'"
                 " AND operation = 'ensure_runtime'"
                 " AND status IN ('pending','running','waiting_user','outcome_unknown')"
@@ -469,8 +479,23 @@ def plan_onboarding(
                 issued is not None
                 and runtime_job is None
                 and settled_status == "succeeded"
-                and str(workflow["state"]) in {"activating", "complete"}
+                and str(workflow["state"]) == "activating"
             )
+            # `complete` means bootstrap activation already committed. Folding
+            # it in reported every fully onboarded household as still waiting
+            # for a step that has finished — a false next action on the state an
+            # operator sees most often.
+            already_onboarded = (
+                issued is not None
+                and runtime_job is None
+                and settled_status == "succeeded"
+                and str(workflow["state"]) == "complete"
+            )
+            if already_onboarded:
+                plan.rehearsal = (
+                    f"revision {issued['revision']} is active and onboarding is"
+                    " complete; there is no pending operation to rehearse"
+                )
             failed_runtime = (
                 issued is not None
                 and runtime_job is None
@@ -495,7 +520,7 @@ def plan_onboarding(
                     " bootstrap activation, whose writes this command does not"
                     " model. Nothing is rehearsed and no write set is claimed."
                 )
-            if failed_runtime or awaiting_activation:
+            if failed_runtime or awaiting_activation or already_onboarded:
                 pass
             elif already_planned:
                 state = str(workflow["state"])
@@ -510,7 +535,18 @@ def plan_onboarding(
                 # The set is still worth reporting — it is the upper bound, and
                 # what an operator wants to know is which tables can be touched
                 # — but it is labelled as the success path, not as the answer.
-                if job_status == "outcome_unknown":
+                # A `running` job whose lease has expired is reclaimed, and
+                # `_run_once` then calls `provider.inspect()` — the same
+                # provider-dependent branch as `outcome_unknown`, which can
+                # settle, fail, or run `_cleanup_cancelled_result` and
+                # deprovision the resource plus insert a bootstrap-cleanup job.
+                # Those writes fall outside the advertised set entirely, so the
+                # guarantee attached to it would be false.
+                reclaimed = (
+                    job_status == "running"
+                    and (runtime_job["lease_until"] or 0) <= _now_seconds()
+                )
+                if job_status == "outcome_unknown" or reclaimed:
                     # The next operation is a RECONCILE, and
                     # `ProvisioningWorker._reconcile` branches on
                     # `provider.inspect()` — it may settle, fail, or re-run
@@ -524,7 +560,9 @@ def plan_onboarding(
                     # precision, which is worse than being told to go and look.
                     plan.rehearsal = (
                         f"revision {issued['revision']} is issued and its runtime"
-                        " job is `outcome_unknown`: the next operation is a"
+                        f" job is `{job_status}`"
+                        + (" with an expired lease" if reclaimed else "")
+                        + ": the next operation is a"
                         " reconcile whose write set depends on a provider"
                         " inspection this command does not perform. Inspect with"
                         " `abrolia-control-plane reconcile <job-id>` before"
@@ -640,26 +678,50 @@ def main(argv: Sequence[str] | None = None) -> int:
     # check that reports `committed`. A command whose entire promise is "mutates
     # nothing" was altering the schema of the database it was asked to rehearse
     # against.
-    with ControlPlaneContainer.build(
-        ControlPlaneConfig.from_env(),
-        acquire_process_lock=False,
-        apply_migrations=False,
-        # `PRAGMA journal_mode=WAL` is persistent: on a database in another
-        # mode — an imported or restored file — opening the connection rewrites
-        # the header and creates sidecars before any transaction exists, so the
-        # rollback cannot undo it. The rehearsal works in any journal mode, so
-        # it simply leaves the mode alone.
-        preserve_journal_mode=True,
-    ) as active:
-        if not active.config.database_path.exists():
-            # `sqlite3.connect` CREATES a missing file, and opening the
-            # connection also creates the parent directory — so merely asking
-            # about migrations against a wrong path would leave an empty
-            # database behind, from a command that promises to mutate nothing.
+    # REHEARSE AGAINST A COPY. Every previous attempt at "mutates nothing"
+    # enumerated a way SQLite writes and closed it — migrations on build, a
+    # created file, a persistent `journal_mode` pragma — and each time another
+    # remained. Closing the last connection checkpoints committed WAL frames
+    # into the main file and removes the sidecars, which no rollback undoes and
+    # no flag prevents.
+    #
+    # Copying the database and its sidecars first makes the property structural
+    # rather than a list: the rehearsal cannot touch the live files because it
+    # never opens them. Anything it does is discarded with the copy.
+    #
+    # A plain file copy, not SQLite's backup API, because the backup API would
+    # have to open the live database — the thing being avoided. A writer active
+    # during the copy can leave the pair mid-transaction; SQLite's recovery
+    # handles that on open, and the result describes an instant that genuinely
+    # occurred. The operator runs this before an onboarding, not during one.
+    with tempfile.TemporaryDirectory(prefix="abrolia-dry-run-") as scratch:
+        live = ControlPlaneConfig.from_env()
+        rehearsal_path = Path(scratch) / live.database_path.name
+        if not live.database_path.exists():
             raise SystemExit(
-                f"dry-run found no database at {active.config.database_path};"
+                f"dry-run found no database at {live.database_path};"
                 " refusing rather than creating one"
             )
+        for suffix in ("", "-wal", "-shm"):
+            source = live.database_path.with_name(f"{live.database_path.name}{suffix}")
+            if source.exists():
+                shutil.copy2(source, rehearsal_path.with_name(
+                    f"{rehearsal_path.name}{suffix}"
+                ))
+        config = replace(live, database_path=rehearsal_path)
+        return _rehearse(config, args.household)
+
+
+def _rehearse(config: ControlPlaneConfig, household_id: str) -> int:
+    with ControlPlaneContainer.build(
+        config,
+        acquire_process_lock=False,
+        apply_migrations=False,
+        # Still set, so the copy is not converted either: a report derived from
+        # a database silently rewritten into another journal mode is a report
+        # about something other than what is running.
+        preserve_journal_mode=True,
+    ) as active:
         pending = pending_migrations(active.database)
         if pending:
             # Refuse rather than rehearse: against a stale schema the plan would
@@ -670,7 +732,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 + ", ".join(pending)
             )
         try:
-            plan = plan_onboarding(active, args.household)
+            plan = plan_onboarding(active, household_id)
         except KeyError:
             raise SystemExit("household has no onboarding workflow") from None
         if plan.committed:
