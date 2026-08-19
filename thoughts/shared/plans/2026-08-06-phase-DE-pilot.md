@@ -172,7 +172,16 @@ After `codex/phase-E-pilotization` merges, the system can onboard a pilot househ
 **Durable 3-step machine:** `email → WhatsApp → primary`.
 
 - Each step has `step_id ∈ {email, whatsapp, primary}`, `status ∈ {pending, provisioning, waiting_user, verified, failed, skipped}`, and `version` for idempotency.
-- `provision.py --dry-run` lists the exact writes it would make (tables, household `config_revision` diff, Fly resource names, secret names) without mutating DB or calling providers — used by operator before every real pilot onboarding.
+- `provision.py --dry-run` reports what the next real onboarding will do, mutating nothing and calling no provider — used by the operator before every real pilot onboarding. It reports the household `config_revision` diff (key paths, never values), the Fly resource names, the secret names, and the tables the pending operation writes **where durable state determines them**; where it does not, it says so and points at the command that would settle it.
+
+  **Amended 2026-08-19.** The criterion previously read "lists the exact writes it would make". Six review rounds established that exactness is not achievable for every state without executing the operation, which is the one thing the command must never do:
+
+  - A pending runtime job in `outcome_unknown` is reconciled next, and `ProvisioningWorker._reconcile` branches on `provider.inspect()` — settle, fail, or re-run preparation. The branch depends on an answer only the provider holds.
+  - `_finish_runtime` itself branches on workflow state, and the two branches write very different sets (nine tables from `runtime_provisioning`, two from `activating`), so a single advertised set was wrong for one of them.
+
+  Naming one branch as "exact" is false precision, and an operator acting on it is worse off than one told to go and look. So the promise is now: exact where it is knowable, explicit uncertainty where it is not, and never a guess presented as a fact.
+
+  The no-mutation half is unchanged and was **strengthened** in the same rounds, because it turned out to be doing less than it claimed. The command must not migrate the database (`ControlPlaneContainer.build` did, before its own transaction opened), must not create one that is absent (`sqlite3.connect` did), must not rewrite the journal mode (`PRAGMA journal_mode=WAL` is persistent), must roll its rehearsal back, and must attribute only rows it minted itself — a count taken across the rollback blamed the API worker's concurrent commits on the dry-run.
 - Fix-before-effect: advancing a step is a durable `onboarding_transitions` append before any provider effect; stale `version` → `409 conflict`.
 - Downstream invalidation: if `email` step is reset (delete/reconnect), `whatsapp` and `primary` steps that depended on that `config_revision` are invalidated (`needs_revalidation`) and must be re-confirmed.
 - Idempotency: re-POSTing the same `Idempotency-Key` for the same `step_id+version` returns the same response snapshot without re-calling the provider.
