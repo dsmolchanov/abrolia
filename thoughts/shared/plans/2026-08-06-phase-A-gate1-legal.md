@@ -254,5 +254,8 @@ python -m check_fixtures --all --require-deny  # private deny-list in CI; local 
   - `README.md` and `.check-fixtures-allow` — the operator-facing description of
     the above, and the sanitizer allowance the new fixtures need.
   - `thoughts/**` — this plan and the session handoffs recorded beside it.
+  - `control_plane/cli.py` and `control_plane/container.py` — the operator
+    boundary that makes Art. 7(3) withdrawal invocable outside tests.
+  - `docs/onboarding-runbook.md` — the procedure that boundary is run from.
 
   Anything outside this set on this branch remains a deviation and a blocker.

@@ -245,7 +245,19 @@ class RuntimeService:
             # so a manifest that omits it is malformed rather than permissive.
             return None, "content_restriction_not_current"
         for purpose in manifest.consent.required_purposes:
-            version, sha256 = consent_version_and_sha(purpose)
+            # A manifest may legitimately name a purpose this build does not
+            # know: during a rolling addition the control plane issues the new
+            # purpose before every runtime carries the copy for it. The parser
+            # accepts any non-empty string, so this lookup would raise KeyError
+            # — and readiness is not the only caller. `can_start_workers` reads
+            # it OUTSIDE the worker loops' exception handlers, so the raise
+            # terminated ingress worker threads rather than returning a 503.
+            # An unknown purpose is unverifiable, which is not-current, which is
+            # the fail-closed answer.
+            try:
+                version, sha256 = consent_version_and_sha(purpose)
+            except KeyError:
+                return None, "consent_not_current"
             if not any(
                 receipt.purpose == purpose
                 and receipt.text_version == version

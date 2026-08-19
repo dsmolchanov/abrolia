@@ -13,11 +13,15 @@ unparseable manifest is a withdrawal that did not happen.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
 
-from hermes_cloud.core.runtime_manifest import parse_runtime_manifest
+from hermes_cloud.core.runtime_manifest import (
+    compute_config_sha256,
+    parse_runtime_manifest,
+)
 from hermes_cloud.runtime.bootstrap import (
     ActivationState,
     atomic_write,
@@ -160,3 +164,68 @@ def test_deletion_still_takes_precedence(tmp_path: Path) -> None:
     atomic_write(service.deletion_marker, b'{"status":"deleted"}')
     assert revoke(service).status_code == 200
     assert service.readyz().payload["reason"] == "runtime_deleted"
+
+
+def test_an_unknown_consent_purpose_fails_closed_without_raising(
+    tmp_path: Path,
+) -> None:
+    """A manifest may name a purpose this build does not know.
+
+    During a rolling addition the control plane issues a new purpose before
+    every runtime carries the copy for it, and the manifest parser accepts any
+    non-empty string. Looking the copy up raised `KeyError`, which is worse than
+    it sounds: `can_start_workers` reads readiness OUTSIDE the worker loops'
+    exception handlers, so the raise terminated ingress worker threads instead
+    of producing a fail-closed 503.
+    """
+    # The digest covers the body, so the purpose has to be added BEFORE it is
+    # computed — editing a finished manifest only produces a hash mismatch,
+    # which is a different failure and would not exercise the lookup at all.
+    stripped = re.sub(r'config_sha256 = "[0-9a-f]*"\n', "", manifest_toml())
+    body = stripped.replace(
+        'required_purposes = ["special_category_content_restriction"]',
+        'required_purposes = ["special_category_content_restriction",'
+        ' "a_purpose_added_after_this_build"]',
+    )
+    # The parser requires a receipt for every required purpose, and so does the
+    # real rolling addition: the control plane issues the new purpose WITH its
+    # receipt. What the older runtime lacks is the copy to verify it against.
+    body += """
+[[consent.receipts]]
+receipt_id = "10000000-0000-4000-8000-000000000099"
+purpose = "a_purpose_added_after_this_build"
+text_version = "a-purpose-added-after-this-build-v1"
+text_sha256 = "{}"
+""".format("b" * 64)
+    assert "a_purpose_added_after_this_build" in body
+    digest = compute_config_sha256(body)
+    content = body.replace(
+        "schema_version = 1\n", f'schema_version = 1\nconfig_sha256 = "{digest}"\n'
+    )
+    manifest_path = tmp_path / "household.toml"
+    atomic_write(manifest_path, content.encode())
+    parsed = parse_runtime_manifest(content)
+    activation_path = tmp_path / "activation.json"
+    write_activation_state(
+        activation_path,
+        ActivationState(
+            status="active",
+            runtime_ref=RUNTIME_REF,
+            household_id=parsed.household_id,
+            config_revision=parsed.config_revision,
+            config_sha256=parsed.config_sha256,
+            updated_at=1.0,
+        ),
+    )
+    service = RuntimeService(
+        manifest_path=manifest_path,
+        activation_path=activation_path,
+        runtime_ref=RUNTIME_REF,
+        env={ENV_RUNTIME_DSAR_TOKEN: DSAR_TOKEN},
+    )
+
+    probe = service.readyz()
+    assert probe.status_code == 503
+    assert probe.payload["reason"] == "consent_not_current"
+    # The property that actually kept the workers alive.
+    assert service.can_start_workers is False
