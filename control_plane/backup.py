@@ -11,10 +11,12 @@ import time
 from pathlib import Path
 
 from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from control_plane.db import ControlPlaneDatabase
 
+TAG_BYTES = 16
 MAGIC = b"ABCP1\x00"
 NONCE_BYTES = 12
 
@@ -70,37 +72,76 @@ def create_pre_migrate_backup(
     return create_backup(database, target, backup_key=backup_key)
 
 
-def _database_image(database: ControlPlaneDatabase) -> bytearray:
-    """The same materialised image `create_backup` would encrypt.
+CHUNK_BYTES = 1 << 16
 
-    Goes through the backup API rather than reading the file, so WAL content is
-    resolved and the result does not depend on when a checkpoint last ran.
+
+def _materialise(database: ControlPlaneDatabase, destination: Path) -> None:
+    """Write the database's image to a file on disk, not into memory.
+
+    The Machine has 512 MiB of RAM against a 1 GiB volume, so anything that
+    holds a database-sized buffer — let alone several — can OOM while trying to
+    decide whether a snapshot is still usable, and leave the container unable to
+    migrate or serve at all. Disk is the resource this deployment has.
     """
-    with sqlite3.connect(":memory:") as output:
+    output = sqlite3.connect(destination)
+    try:
         database.connection.backup(output)
-        return bytearray(output.serialize())
+    finally:
+        output.close()
 
 
-def _archive_plaintext(archive: Path, backup_key: bytes) -> bytearray | None:
-    """Decrypt the archive under the key in use, or None if it will not open.
+def _digest_file(path: Path) -> bytes:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(CHUNK_BYTES), b""):
+            digest.update(chunk)
+    return digest.digest()
 
-    Reuse used to skip `_key()` and every authentication check, so an archive
-    left by an earlier boot satisfied the backup-first gate even after the key
-    was rotated or the file was truncated by the disk filling up — the migration
-    then proceeded believing in a restore point that could not be opened.
+
+def _authenticated_digest(archive: Path, backup_key: bytes) -> bytes | None:
+    """Digest of the archive's plaintext, or None if it will not open.
+
+    Decrypts in chunks and keeps none of it: each block is hashed and dropped.
+    The digest is returned only after `finalize_with_tag` succeeds, so an
+    unauthenticated archive can never be mistaken for a matching one — and a
+    rotated key or a truncated file is rejected here rather than satisfying the
+    backup-first gate with a snapshot nobody can open.
     """
+    prologue = len(MAGIC) + NONCE_BYTES
     try:
-        payload = archive.read_bytes()
-    except OSError:
+        size = archive.stat().st_size
+        with open(archive, "rb") as handle:
+            header = handle.read(prologue)
+            if len(header) < prologue or not header.startswith(MAGIC):
+                return None
+            if size < prologue + TAG_BYTES:
+                return None
+            nonce = header[len(MAGIC) :]
+
+            # The tag lives at the end, so read it first and then stream the
+            # ciphertext between. Reading the body whole — even to slice the tag
+            # off it — would put the entire archive in memory and defeat the
+            # point of chunking the decryption.
+            handle.seek(size - TAG_BYTES)
+            tag = handle.read(TAG_BYTES)
+
+            decryptor = Cipher(
+                algorithms.AES(_key(backup_key)), modes.GCM(nonce, tag)
+            ).decryptor()
+            decryptor.authenticate_additional_data(MAGIC)
+            digest = hashlib.sha256()
+            handle.seek(prologue)
+            remaining = size - prologue - TAG_BYTES
+            while remaining > 0:
+                chunk = handle.read(min(CHUNK_BYTES, remaining))
+                if not chunk:
+                    return None
+                remaining -= len(chunk)
+                digest.update(decryptor.update(chunk))
+            digest.update(decryptor.finalize())
+    except (OSError, InvalidTag, BackupError, ValueError):
         return None
-    if not payload.startswith(MAGIC) or len(payload) <= len(MAGIC) + NONCE_BYTES + 16:
-        return None
-    nonce = payload[len(MAGIC) : len(MAGIC) + NONCE_BYTES]
-    ciphertext = payload[len(MAGIC) + NONCE_BYTES :]
-    try:
-        return bytearray(AESGCM(_key(backup_key)).decrypt(nonce, ciphertext, MAGIC))
-    except (InvalidTag, BackupError, ValueError):
-        return None
+    return digest.digest()
 
 
 def _reusable_pre_migrate_backup(
@@ -115,12 +156,11 @@ def _reusable_pre_migrate_backup(
     rejected the archive and wrote another — leaving in place the accumulation
     this check exists to prevent.
 
-    The digest is of the materialised image, which is stable across a
-    rolled-back transaction and across a close and reopen, and moves as soon as
-    anything is genuinely committed. That last case is the one that matters for
-    safety: a migration can be dropped from the next image, the container can
-    then serve at the unchanged revision and take writes, and an archive
-    matching only by revision would be a restore point that silently loses them.
+    The digest moves as soon as anything is genuinely committed, which is the
+    case that matters for safety: a migration can be dropped from the next
+    image, the container can then serve at the unchanged revision and take
+    writes, and an archive matching only by revision would be a restore point
+    that silently loses them.
 
     Reuse rather than prune. Deleting a restore point to reclaim space is the one
     move that turns a disk problem into a data-loss problem.
@@ -133,42 +173,68 @@ def _reusable_pre_migrate_backup(
     if not candidates:
         return None
     archive = candidates[-1]
-    plaintext = _archive_plaintext(archive, backup_key)
-    if plaintext is None:
+    archived = _authenticated_digest(archive, backup_key)
+    if archived is None:
         return None
-    current = _database_image(database)
+    scratch: Path | None = None
     try:
-        identical = hmac.compare_digest(
-            hashlib.sha256(plaintext).digest(), hashlib.sha256(current).digest()
-        )
+        with tempfile.NamedTemporaryFile(
+            prefix=f".{database.path.name}.compare.", dir=database.path.parent,
+            delete=False,
+        ) as handle:
+            scratch = Path(handle.name)
+        _materialise(database, scratch)
+        current = _digest_file(scratch)
+    except (OSError, sqlite3.DatabaseError):
+        return None
     finally:
-        plaintext[:] = b"\x00" * len(plaintext)
-        current[:] = b"\x00" * len(current)
-    return archive if identical else None
+        if scratch is not None:
+            scratch.unlink(missing_ok=True)
+    return archive if hmac.compare_digest(archived, current) else None
 
 
 def create_backup(
     database: ControlPlaneDatabase, target: Path | str, *, backup_key: bytes
 ) -> Path:
+    """Encrypt an image of the database into an authenticated archive.
+
+    Both the image and the encryption go through disk in chunks: the same
+    memory ceiling applies here as to the reuse check, and taking a snapshot is
+    exactly when the volume is most likely to be under pressure.
+
+    The layout is unchanged — MAGIC, nonce, ciphertext, 16-byte tag — so
+    `restore_backup` reads archives written before and after this change
+    identically.
+    """
     destination = Path(target)
     if destination.exists():
         raise FileExistsError(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary_archive: Path | None = None
-    plaintext: bytearray | None = None
+    image: Path | None = None
     try:
-        with sqlite3.connect(":memory:") as output:
-            database.connection.backup(output)
-            plaintext = bytearray(output.serialize())
+        with tempfile.NamedTemporaryFile(
+            prefix=f".{destination.name}.image.", dir=destination.parent, delete=False
+        ) as handle:
+            image = Path(handle.name)
+        _materialise(database, image)
+
         nonce = os.urandom(NONCE_BYTES)
-        ciphertext = AESGCM(_key(backup_key)).encrypt(nonce, bytes(plaintext), MAGIC)
+        encryptor = Cipher(
+            algorithms.AES(_key(backup_key)), modes.GCM(nonce)
+        ).encryptor()
+        encryptor.authenticate_additional_data(MAGIC)
         with tempfile.NamedTemporaryFile(
             prefix=f".{destination.name}.", dir=destination.parent, delete=False
         ) as archive_file:
             temporary_archive = Path(archive_file.name)
             archive_file.write(MAGIC)
             archive_file.write(nonce)
-            archive_file.write(ciphertext)
+            with open(image, "rb") as source:
+                for chunk in iter(lambda: source.read(CHUNK_BYTES), b""):
+                    archive_file.write(encryptor.update(chunk))
+            archive_file.write(encryptor.finalize())
+            archive_file.write(encryptor.tag)
             archive_file.flush()
             os.fsync(archive_file.fileno())
         os.chmod(temporary_archive, 0o600)
@@ -176,8 +242,8 @@ def create_backup(
         temporary_archive = None
         return destination
     finally:
-        if plaintext is not None:
-            plaintext[:] = b"\x00" * len(plaintext)
+        if image is not None:
+            image.unlink(missing_ok=True)
         if temporary_archive is not None:
             temporary_archive.unlink(missing_ok=True)
 

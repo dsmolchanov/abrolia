@@ -4,11 +4,20 @@ import base64
 import json
 import os
 import sqlite3
+import tracemalloc
 from pathlib import Path
 
 import pytest
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from control_plane.backup import BackupError, create_pre_migrate_backup, restore_backup
+from control_plane.backup import (
+    MAGIC,
+    NONCE_BYTES,
+    BackupError,
+    _key,
+    create_pre_migrate_backup,
+    restore_backup,
+)
 from control_plane.db import ControlPlaneDatabase, main
 
 BACKUP_KEY_BYTES = b"pre-migrate-backup-key-32-bytes!"
@@ -399,4 +408,78 @@ def test_a_truncated_archive_is_not_reused(tmp_path) -> None:
         backup_key=BACKUP_KEY_BYTES,
         apply_migrations=False,
     )
+    database.close()
+
+
+def _grow(database, megabytes: int) -> None:
+    with database.write() as connection:
+        connection.execute("CREATE TABLE IF NOT EXISTS bulk (id INTEGER, blob BLOB)")
+        payload = b"x" * 64_000
+        for row in range(megabytes * 16):
+            connection.execute("INSERT INTO bulk VALUES (?, ?)", (row, payload))
+
+
+def test_the_reuse_decision_does_not_hold_the_database_in_memory(tmp_path) -> None:
+    """512 MiB of RAM against a 1 GiB volume.
+
+    Deciding whether a snapshot is reusable used to allocate a decrypted archive
+    AND an in-memory SQLite copy AND a serialised duplicate — several times the
+    database size, on the retry path of a failed migration, which is exactly
+    when a container can least afford to die. A database of a few hundred MiB
+    could leave it permanently unable to migrate or serve.
+
+    `tracemalloc` measures Python-level allocation, which is precisely where
+    those buffers lived.
+    """
+    directory = _pending_migration_directory(tmp_path)
+    database = _database(tmp_path)
+    database.migrate()
+    _grow(database, megabytes=8)
+    first = create_pre_migrate_backup(
+        database, backup_key=BACKUP_KEY_BYTES, directory=directory
+    )
+    assert first is not None
+    assert first.stat().st_size > 4_000_000, "the fixture database is too small to test"
+
+    tracemalloc.start()
+    try:
+        again = create_pre_migrate_backup(
+            database, backup_key=BACKUP_KEY_BYTES, directory=directory
+        )
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert again == first, "the reuse decision itself must still be correct"
+    # Bounded by the chunk size and bookkeeping, not by the database.
+    assert peak < 1_000_000, f"reuse decision peaked at {peak} bytes"
+    database.close()
+
+
+def test_an_archive_written_by_the_one_shot_path_still_restores(tmp_path) -> None:
+    """Streaming changed how archives are written; it must not orphan old ones.
+
+    An operator's existing `.bak` predates this change, and it is the file they
+    reach for on the worst day.
+    """
+    database = _database(tmp_path)
+    database.migrate()
+    legacy = tmp_path / "legacy.bak"
+    with sqlite3.connect(":memory:") as image:
+        database.connection.backup(image)
+        plaintext = image.serialize()
+    nonce = os.urandom(NONCE_BYTES)
+    legacy.write_bytes(
+        MAGIC + nonce + AESGCM(_key(BACKUP_KEY_BYTES)).encrypt(nonce, plaintext, MAGIC)
+    )
+
+    restored = restore_backup(
+        legacy,
+        tmp_path / "from-legacy.db",
+        backup_key=BACKUP_KEY_BYTES,
+        apply_migrations=False,
+    )
+
+    assert restored.query_one("SELECT COUNT(*) AS n FROM schema_migrations")["n"] > 0
+    restored.close()
     database.close()
