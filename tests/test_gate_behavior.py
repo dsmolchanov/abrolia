@@ -150,6 +150,7 @@ def run_gate(tmp_path: Path):
         reactions: list[dict] | None = None,
         pr_reactions: list[dict] | None = None,
         errors: list[str] | None = None,
+        post_response: object | None = None,
         action: str = "opened",
         request_token: str = "",
         user_login: str = "codex-connected-human",
@@ -170,10 +171,10 @@ def run_gate(tmp_path: Path):
         for rid, body in (review_bodies or {}).items():
             responses[f"repos/o/r/pulls/1/reviews/{rid}"] = {"body": body}
 
-        state_path.write_text(
-            json.dumps({"responses": responses, "errors": errors or []}),
-            encoding="utf-8",
-        )
+        state = {"responses": responses, "errors": errors or []}
+        if post_response is not None:
+            state["post_response"] = post_response
+        state_path.write_text(json.dumps(state), encoding="utf-8")
         log_path.write_text("", encoding="utf-8")
         counts_path.write_text("{}", encoding="utf-8")
 
@@ -411,3 +412,44 @@ def test_existing_review_for_this_head_is_not_re_requested(run_gate) -> None:
     )
     assert result.may_merge
     assert result.posted_comments() == []
+
+
+def test_a_rejected_anchor_post_is_not_announced_as_success(run_gate) -> None:
+    """`--jq .id` on an error emits the error body, not nothing.
+
+    Observed in production: a `CODEX_REQUEST_TOKEN` that authenticates but lacks
+    `Issues: write` gets 403 "Resource not accessible by personal access token".
+    The gate captured that JSON as the comment id, logged
+    `Posted ... (comment {"message":"Resource not accessible...})`, and then
+    timed out 900s later with nothing to explain why. A gate whose whole purpose
+    is stopping errors from reading as success was doing it to itself.
+    """
+    result = run_gate(
+        action="synchronize",
+        request_token="pat-without-issues-write",
+        post_response={
+            "message": "Resource not accessible by personal access token",
+            "status": "403",
+        },
+    )
+
+    assert not result.may_merge
+    assert "Could not post the anchor comment" in result.output
+    assert "Resource not accessible" in result.output
+    # And it must say what would fix it.
+    assert "Issues: Read and write" in result.output
+    assert "Posted an inventory-scoped" not in result.output
+
+
+def test_a_successful_anchor_post_is_still_recognised(run_gate) -> None:
+    """The counterpart: a real id must still be accepted."""
+    result = run_gate(
+        action="synchronize",
+        request_token="pat-with-issues-write",
+        post_response={"id": 5334512611},
+    )
+
+    assert "Posted an inventory-scoped '@codex review' (comment 5334512611)" in (
+        result.output
+    )
+    assert "Could not post the anchor comment" not in result.output
