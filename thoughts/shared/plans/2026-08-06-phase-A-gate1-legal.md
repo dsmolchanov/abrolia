@@ -250,5 +250,9 @@ python -m check_fixtures --all --require-deny  # private deny-list in CI; local 
   - `hermes_cloud/runtime/service.py` — readiness enforcement of the manifest's
     authoritative purposes.
   - `tests/**` — the regression suite for each of the above.
+  - `control_plane/models.py` — the selection fields the consent travels in.
+  - `README.md` and `.check-fixtures-allow` — the operator-facing description of
+    the above, and the sanitizer allowance the new fixtures need.
+  - `thoughts/**` — this plan and the session handoffs recorded beside it.
 
   Anything outside this set on this branch remains a deviation and a blocker.

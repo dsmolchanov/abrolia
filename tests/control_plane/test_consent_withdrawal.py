@@ -254,8 +254,18 @@ def test_a_deleted_runtime_satisfies_the_withdrawal(cp_stack) -> None:
 
     worker = cp_stack.make_worker(now=BASE_TIME + 50)
     worker._runtime_client = FakeRuntime(status_code=410)
+    outcome = worker.run_once()
 
-    assert worker.run_once().status == "succeeded"
+    assert outcome.status == "succeeded"
+    # And SETTLED. Returning success without settling leaves the job `running`;
+    # once the lease expires the reclaimer resends an already-satisfied
+    # revocation, forever.
+    job = cp_stack.database.query_one(
+        "SELECT status, settled_at FROM provisioning_jobs WHERE id = ?",
+        (outcome.job_id,),
+    )
+    assert job["status"] == "succeeded"
+    assert job["settled_at"] is not None
 
 
 def test_a_refusing_runtime_stays_retryable(cp_stack) -> None:
@@ -298,3 +308,36 @@ def test_no_new_revision_can_be_issued_after_withdrawal(cp_stack) -> None:
         pytest.raises(ValueError, match="authoritative onboarding consent"),
     ):
         planner.issue(connection, household_id=cp_stack.household.id)
+
+
+# ---------------------------------------------------------------------------
+# The production boundary. A right only tests can exercise is not a right.
+# ---------------------------------------------------------------------------
+
+
+def test_the_container_exposes_the_withdrawal_service(cp_stack) -> None:
+    """Wiring, not just a class.
+
+    The service existed for one review round with no caller outside tests: no
+    container attribute, no command, nothing a support engineer answering
+    the advertised withdrawal address could run.
+    """
+    from control_plane.config import ControlPlaneConfig
+    from control_plane.container import ControlPlaneContainer
+
+    with ControlPlaneContainer.build(
+        ControlPlaneConfig.for_test(cp_stack.config.database_path.parent)
+    ) as container:
+        assert isinstance(container.withdrawal, ConsentWithdrawalService)
+
+
+def test_the_cli_offers_every_consent_purpose() -> None:
+    """A purpose absent from the command cannot be withdrawn at all."""
+    from control_plane.cli import _parser
+    from control_plane.privacy.consent import CONSENT_TEXTS
+
+    action = next(
+        a for a in _parser()._subparsers._group_actions[0].choices["withdraw-consent"]._actions
+        if a.dest == "purpose"
+    )
+    assert set(action.choices) == set(CONSENT_TEXTS)

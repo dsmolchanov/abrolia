@@ -386,11 +386,11 @@ class ProvisioningWorker:
             )
         except Exception:
             return WorkResult(job.id, "outcome_unknown", "runtime_unreachable")
-        if response.status_code == 410:
-            # Already deleted: there is nothing left to stop, and the
-            # withdrawal is satisfied.
-            return WorkResult(job.id, "succeeded")
-        if response.status_code != 200:
+        # 410 is "already deleted": nothing left to stop, so the withdrawal is
+        # satisfied exactly as it is by a 200. Both must SETTLE — an unsettled
+        # job stays `running`, its lease expires, and the reclaimer resends an
+        # already-satisfied revocation forever.
+        if response.status_code not in (200, 410):
             return WorkResult(job.id, "outcome_unknown", "runtime_refused")
         now = self.clock()
         with self.jobs.db.write() as connection:

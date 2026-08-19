@@ -17,6 +17,8 @@ from control_plane.backup import create_backup, restore_backup
 from control_plane.config import ControlPlaneConfig
 from control_plane.container import ControlPlaneContainer
 from control_plane.observability import StructuredLogger
+from control_plane.privacy.consent import CONSENT_TEXTS
+from control_plane.privacy.withdraw import ConsentNotHeld
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -50,6 +52,21 @@ def _parser() -> argparse.ArgumentParser:
     restore.add_argument("archive")
     restore.add_argument("--target", required=True)
     commands.add_parser("resume-jobs", help="remove the exact post-restore worker pause")
+    # The operator boundary for Art. 7(3). The consent copy advertises a
+    # mailbox, not a button, so withdrawal arrives as mail to a human — this
+    # is the command that human runs. A self-service route needs an
+    # authenticated session and belongs with the account UI; until it exists,
+    # a right that only tests can exercise is not a right.
+    withdraw = commands.add_parser(
+        "withdraw-consent",
+        help="withdraw one consent for one household (Art. 7(3))",
+    )
+    withdraw.add_argument("household_id")
+    withdraw.add_argument(
+        "purpose",
+        choices=sorted(CONSENT_TEXTS),
+        help="the consent purpose being withdrawn",
+    )
     return parser
 
 
@@ -186,6 +203,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "reconcile":
             result = active.worker.reconcile(args.job_id)
             print(json.dumps(result.__dict__, sort_keys=True))
+            return 0
+        if args.command == "withdraw-consent":
+            try:
+                result = active.withdrawal.withdraw(
+                    args.household_id, args.purpose, now=time.time()
+                )
+            except ConsentNotHeld as error:
+                raise SystemExit(str(error)) from error
+            # No household or account identifiers beyond the one supplied: the
+            # operator already knows it, and the log must not gain a new copy.
+            print(json.dumps({
+                "purpose": result.purpose,
+                "receipts_revoked": result.receipts_revoked,
+                "revisions_revoked": result.revisions_revoked,
+                "runtime_notified": result.runtime_notified,
+            }, sort_keys=True))
             return 0
         if args.command == "retention":
             result = active.retention.run()
