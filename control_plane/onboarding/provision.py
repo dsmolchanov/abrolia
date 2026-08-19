@@ -13,12 +13,14 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sqlite3
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from control_plane.config import ControlPlaneConfig
 from control_plane.container import ControlPlaneContainer
+from control_plane.db import MIGRATIONS_DIR
 from control_plane.models import USER_STEPS
 from control_plane.provisioning.fly import FlyRuntimeProvisioner
 
@@ -32,6 +34,30 @@ _WRITE_STATEMENT = re.compile(
     r"\s+(?P<table>[a-z_][a-z0-9_]*)",
     re.IGNORECASE,
 )
+
+
+def pending_migrations(database: Any) -> list[str]:
+    """Migration files this database has not applied, without applying any.
+
+    Deliberately local and read-only. `ControlPlaneDatabase.migrate()` is the
+    only other implementation and it WRITES, which is the thing this command
+    must not do. (Phase E9 adds an equivalent method on the database; collapse
+    onto it once that lands — the duplication is here so this branch stays
+    independent of that one.)
+    """
+    try:
+        applied = {
+            row["name"]
+            for row in database.query("SELECT name FROM schema_migrations")
+        }
+    except sqlite3.DatabaseError:
+        # No `schema_migrations` at all: nothing has ever been applied.
+        applied = set()
+    return [
+        script.name
+        for script in sorted(MIGRATIONS_DIR.glob("*.sql"))
+        if script.name not in applied
+    ]
 
 
 class _DryRunRollback(Exception):
@@ -57,6 +83,10 @@ class ProvisionPlan:
     runtime_resources: list[dict[str, str]] = field(default_factory=list)
     secrets: list[dict[str, str]] = field(default_factory=list)
     blocked_by: str | None = None
+    #: What, if anything, this run rehearsed — so `table_writes` is never
+    #: read as the write set of an operation that was not rehearsed.
+    rehearsal: str = ""
+    uncommitted_revision_delta: int = 0
     committed: bool = False
 
     def public_dict(self) -> dict[str, Any]:
@@ -153,88 +183,143 @@ def _secret_names(
 def plan_onboarding(
     container: ControlPlaneContainer, household_id: str
 ) -> ProvisionPlan:
-    workflow = container.onboarding_repository.workflow_for_household(household_id)
-    step_rows = container.database.query(
-        "SELECT kind, status, ordinal FROM onboarding_steps WHERE workflow_id = ?"
-        " ORDER BY ordinal",
-        (workflow.id,),
-    )
-    plan = ProvisionPlan(
-        household_id=household_id,
-        workflow_state=workflow.state,
-        workflow_version=workflow.version,
-        steps=[
-            {"kind": row["kind"], "status": row["status"], "ordinal": row["ordinal"]}
-            for row in step_rows
-        ],
-        unverified_steps=[
-            row["kind"]
-            for row in step_rows
-            if row["kind"] in {step.value for step in USER_STEPS}
-            and row["status"] != "verified"
-        ],
-    )
+    """Report what a real onboarding will do, from ONE consistent snapshot.
 
-    # The revision the real onboarding provisions is issued by the worker when
-    # the primary step verifies, so it is read from durable state, never minted
-    # here. The rehearsal below only enumerates the tables a planning pass
-    # touches; it must not present its rolled-back revision as the real one.
-    issued = container.database.query_one(
-        "SELECT revision, status, manifest_sha256 FROM config_revisions"
-        " WHERE household_id = ? ORDER BY revision DESC LIMIT 1",
-        (household_id,),
-    )
-    if issued is not None:
-        plan.config_revision = {
-            "revision": issued["revision"],
-            "status": issued["status"],
-            "manifest_sha256": issued["manifest_sha256"],
-            "source": "issued by the worker when the primary step verified",
-        }
-    runtime_job = container.database.query_one(
-        "SELECT id, status, desired_revision FROM provisioning_jobs"
-        " WHERE household_id = ? AND kind = 'runtime'"
-        " AND operation = 'ensure_runtime' ORDER BY created_at DESC LIMIT 1",
-        (household_id,),
-    )
-    if runtime_job is not None:
-        plan.pending_runtime_job = {
-            "job_id": runtime_job["id"],
-            "status": runtime_job["status"],
-            "desired_revision": runtime_job["desired_revision"],
-        }
-
-    revisions_before = container.database.query_one(
-        "SELECT COUNT(*) AS count FROM config_revisions WHERE household_id = ?",
-        (household_id,),
-    )["count"]
-
+    Every read below happens inside a single write transaction, and the
+    transaction is always rolled back. Reading piecemeal produced impossible
+    reports: the API worker could commit the revision and the runtime job
+    between two of these queries, so a run could print an empty or stale
+    `config_revision` beside the new job that provisions it — a plan describing
+    a state that never existed.
+    """
     observed: list[TableWrite] = []
     spec = None
+    plan: ProvisionPlan | None = None
+    revisions_before = 0
+
     try:
         with container.database.write() as connection:
-            connection.set_trace_callback(lambda sql: _record_writes(sql, observed))
-            try:
-                spec = container.planner.issue(
-                    connection, household_id=household_id
-                ).spec
-            except ValueError as error:
-                plan.blocked_by = str(error)
-            finally:
-                connection.set_trace_callback(None)
+            workflow = connection.execute(
+                "SELECT id, state, version FROM onboarding_workflows"
+                " WHERE household_id = ?",
+                (household_id,),
+            ).fetchone()
+            if workflow is None:
+                raise KeyError(household_id)
+            step_rows = connection.execute(
+                "SELECT kind, status, ordinal FROM onboarding_steps"
+                " WHERE workflow_id = ? ORDER BY ordinal",
+                (workflow["id"],),
+            ).fetchall()
+            plan = ProvisionPlan(
+                household_id=household_id,
+                workflow_state=workflow["state"],
+                workflow_version=workflow["version"],
+                steps=[
+                    {
+                        "kind": row["kind"],
+                        "status": row["status"],
+                        "ordinal": row["ordinal"],
+                    }
+                    for row in step_rows
+                ],
+                unverified_steps=[
+                    row["kind"]
+                    for row in step_rows
+                    if row["kind"] in {step.value for step in USER_STEPS}
+                    and row["status"] != "verified"
+                ],
+            )
+
+            # The revision the real onboarding provisions is issued by the
+            # worker when the primary step verifies, so it is read from durable
+            # state, never minted here.
+            issued = connection.execute(
+                "SELECT revision, status, manifest_sha256 FROM config_revisions"
+                " WHERE household_id = ? ORDER BY revision DESC LIMIT 1",
+                (household_id,),
+            ).fetchone()
+            if issued is not None:
+                plan.config_revision = {
+                    "revision": issued["revision"],
+                    "status": issued["status"],
+                    "manifest_sha256": issued["manifest_sha256"],
+                    "source": "issued by the worker when the primary step verified",
+                }
+            runtime_job = connection.execute(
+                "SELECT id, status, desired_revision FROM provisioning_jobs"
+                " WHERE household_id = ? AND kind = 'runtime'"
+                " AND operation = 'ensure_runtime' ORDER BY created_at DESC LIMIT 1",
+                (household_id,),
+            ).fetchone()
+            if runtime_job is not None:
+                plan.pending_runtime_job = {
+                    "job_id": runtime_job["id"],
+                    "status": runtime_job["status"],
+                    "desired_revision": runtime_job["desired_revision"],
+                }
+
+            revisions_before = connection.execute(
+                "SELECT COUNT(*) AS count FROM config_revisions WHERE household_id = ?",
+                (household_id,),
+            ).fetchone()["count"]
+
+            # Only rehearse a planning pass that has not already happened.
+            #
+            # Once a revision is issued, the pending runtime job provisions THAT
+            # revision and performs no planning write at all. Calling the planner
+            # anyway mints a hypothetical N+1 and traces its insert into
+            # `config_revisions` — a write the real onboarding will never make.
+            # Reporting that as the "exact writes" described an operation this
+            # run had just discarded.
+            already_planned = issued is not None
+            if already_planned:
+                plan.rehearsal = (
+                    f"skipped: revision {issued['revision']} is already issued, so"
+                    " the planning pass is done and the pending runtime job"
+                    " provisions it. Nothing hypothetical is traced."
+                )
+            else:
+                plan.rehearsal = (
+                    "planning pass for the next revision, rolled back;"
+                    " table_writes is the set of tables it touched"
+                )
+                connection.set_trace_callback(
+                    lambda sql: _record_writes(sql, observed)
+                )
+                try:
+                    spec = container.planner.issue(
+                        connection, household_id=household_id
+                    ).spec
+                except ValueError as error:
+                    plan.blocked_by = str(error)
+                finally:
+                    connection.set_trace_callback(None)
+
+            revisions_after = connection.execute(
+                "SELECT COUNT(*) AS count FROM config_revisions WHERE household_id = ?",
+                (household_id,),
+            ).fetchone()["count"]
+            plan.uncommitted_revision_delta = revisions_after - revisions_before
+
+            plan.table_writes = observed
+            plan.runtime_resources = _runtime_resources(container, household_id, spec)
+            plan.secrets = _secret_names(container, household_id)
             raise _DryRunRollback
     except _DryRunRollback:
         pass
 
-    revisions_after = container.database.query_one(
-        "SELECT COUNT(*) AS count FROM config_revisions WHERE household_id = ?",
-        (household_id,),
-    )["count"]
-    plan.committed = revisions_after != revisions_before
-
-    plan.table_writes = observed
-    plan.runtime_resources = _runtime_resources(container, household_id, spec)
-    plan.secrets = _secret_names(container, household_id)
+    assert plan is not None
+    # After the rollback, not before: the count inside the transaction sees the
+    # rehearsal's own uncommitted insert, which proves nothing about what was
+    # committed. This reads the database as everyone else now sees it.
+    plan.committed = (
+        container.database.query_one(
+            "SELECT COUNT(*) AS count FROM config_revisions WHERE household_id = ?",
+            (household_id,),
+        )["count"]
+        != revisions_before
+    )
     return plan
 
 
@@ -254,9 +339,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise SystemExit("provision refuses to run without --dry-run")
     # No process lock: the rehearsal only ever rolls back, so it must not block
     # the single writer that is serving the pilot.
+    #
+    # And NO MIGRATIONS. `ControlPlaneContainer.build` applies them by default,
+    # committing schema changes and `schema_migrations` rows before this
+    # command's own transaction opens — outside its rollback, and outside the
+    # check that reports `committed`. A command whose entire promise is "mutates
+    # nothing" was altering the schema of the database it was asked to rehearse
+    # against.
     with ControlPlaneContainer.build(
-        ControlPlaneConfig.from_env(), acquire_process_lock=False
+        ControlPlaneConfig.from_env(),
+        acquire_process_lock=False,
+        apply_migrations=False,
     ) as active:
+        pending = pending_migrations(active.database)
+        if pending:
+            # Refuse rather than rehearse: against a stale schema the plan would
+            # describe an onboarding that cannot happen. Migrating is a separate,
+            # deliberate operator action.
+            raise SystemExit(
+                "dry-run refuses a database with pending migrations: "
+                + ", ".join(pending)
+            )
         try:
             plan = plan_onboarding(active, args.household)
         except KeyError:
