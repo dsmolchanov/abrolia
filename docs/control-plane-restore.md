@@ -48,6 +48,14 @@ next boot and recorded as the new pre-migrate archive, silently replacing the
 good restore point with one taken of the broken schema. When nothing is
 pending, no archive is written.
 
+Both the snapshot and the rollback restore stream through disk in bounded
+chunks, so neither is limited by the Machine's 512 MiB of RAM. The intermediate
+image is written to ephemeral storage rather than beside the database — putting
+an image and an archive, each about the size of the database, on the same 1 GiB
+volume would exhaust it while trying to take a backup. Set
+`ABROLIA_BACKUP_SCRATCH_DIR` if the machine's default temporary directory is not
+where you want that image.
+
 A failing migration restarts the container, and each boot reaches this step
 again. It does **not** snapshot again: an existing `pre-migrate-<rev>-*` archive
 for the unchanged revision is reused, so a restart loop cannot fill `/data` and

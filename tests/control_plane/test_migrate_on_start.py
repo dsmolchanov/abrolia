@@ -10,11 +10,14 @@ from pathlib import Path
 import pytest
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+from control_plane import backup as backup_module
 from control_plane.backup import (
     MAGIC,
     NONCE_BYTES,
+    SCRATCH_DIR_ENV,
     BackupError,
     _key,
+    create_backup,
     create_pre_migrate_backup,
     restore_backup,
 )
@@ -482,4 +485,75 @@ def test_an_archive_written_by_the_one_shot_path_still_restores(tmp_path) -> Non
 
     assert restored.query_one("SELECT COUNT(*) AS n FROM schema_migrations")["n"] > 0
     restored.close()
+    database.close()
+
+
+def test_the_snapshot_image_is_not_written_beside_the_database(
+    tmp_path, monkeypatch
+) -> None:
+    """The RAM problem must not simply become a disk problem.
+
+    The image and the encrypted archive are each about the size of the database.
+    Putting both on the 1 GiB data volume beside the live file means a database
+    near a third of the volume exhausts it while taking a backup — and every
+    deployment with a pending migration then fails closed and never serves.
+    """
+    scratch = tmp_path / "ephemeral"
+    scratch.mkdir()
+    monkeypatch.setenv(SCRATCH_DIR_ENV, str(scratch))
+    directory = _pending_migration_directory(tmp_path)
+    database = _database(tmp_path)
+    database.migrate()
+
+    destinations: list[Path] = []
+    original = backup_module._materialise
+
+    def recording(db, target):
+        destinations.append(Path(target))
+        return original(db, target)
+
+    monkeypatch.setattr(backup_module, "_materialise", recording)
+    archive = create_pre_migrate_backup(
+        database, backup_key=BACKUP_KEY_BYTES, directory=directory
+    )
+
+    assert archive is not None
+    assert destinations, "no image was materialised"
+    for target in destinations:
+        assert target.parent == scratch, f"{target} landed on the data volume"
+    # The archive itself must still be installed beside the database.
+    assert archive.parent == database.path.parent
+    database.close()
+
+
+def test_restoring_does_not_buffer_the_whole_archive(tmp_path) -> None:
+    """The rollback path is the one an operator needs on the worst day.
+
+    It held the payload, a ciphertext slice, the decrypted bytes AND a copy of
+    them — so a ~125 MiB archive could OOM the 512 MiB Machine, taking the
+    documented recovery procedure down for exactly the larger databases whose
+    migrations are most likely to need it.
+    """
+    database = _database(tmp_path)
+    database.migrate()
+    _grow(database, megabytes=8)
+    archive = tmp_path / "rollback.bak"
+    create_backup(database, archive, backup_key=BACKUP_KEY_BYTES)
+    assert archive.stat().st_size > 4_000_000, "the fixture archive is too small"
+
+    tracemalloc.start()
+    try:
+        restored = restore_backup(
+            archive,
+            tmp_path / "restored.db",
+            backup_key=BACKUP_KEY_BYTES,
+            apply_migrations=False,
+        )
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert restored.query_one("SELECT COUNT(*) AS n FROM bulk")["n"] > 0
+    restored.close()
+    assert peak < 1_000_000, f"restore peaked at {peak} bytes"
     database.close()

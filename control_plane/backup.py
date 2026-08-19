@@ -12,11 +12,11 @@ from pathlib import Path
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from control_plane.db import ControlPlaneDatabase
 
 TAG_BYTES = 16
+SCRATCH_DIR_ENV = "ABROLIA_BACKUP_SCRATCH_DIR"
 MAGIC = b"ABCP1\x00"
 NONCE_BYTES = 12
 
@@ -178,9 +178,9 @@ def _reusable_pre_migrate_backup(
         return None
     scratch: Path | None = None
     try:
+        scratch_root = os.environ.get(SCRATCH_DIR_ENV) or tempfile.gettempdir()
         with tempfile.NamedTemporaryFile(
-            prefix=f".{database.path.name}.compare.", dir=database.path.parent,
-            delete=False,
+            prefix=f".{database.path.name}.compare.", dir=scratch_root, delete=False
         ) as handle:
             scratch = Path(handle.name)
         _materialise(database, scratch)
@@ -213,8 +213,16 @@ def create_backup(
     temporary_archive: Path | None = None
     image: Path | None = None
     try:
+        # NOT beside the database. The image and the encrypted archive are each
+        # about the size of the database, and putting both on the 1 GiB data
+        # volume alongside the live file means a database near a third of the
+        # volume exhausts it while trying to take a backup — every deployment
+        # with a pending migration would then fail closed and never serve. The
+        # RAM problem this replaced must not simply become a disk problem.
+        # `SCRATCH_DIR` lets an operator point this at whatever the machine has.
+        scratch_root = os.environ.get(SCRATCH_DIR_ENV) or tempfile.gettempdir()
         with tempfile.NamedTemporaryFile(
-            prefix=f".{destination.name}.image.", dir=destination.parent, delete=False
+            prefix=f".{destination.name}.image.", dir=scratch_root, delete=False
         ) as handle:
             image = Path(handle.name)
         _materialise(database, image)
@@ -265,26 +273,49 @@ def restore_backup(
     destination = Path(target)
     if destination.exists():
         raise FileExistsError(destination)
-    payload = source.read_bytes()
-    if not payload.startswith(MAGIC) or len(payload) <= len(MAGIC) + NONCE_BYTES + 16:
+    # Streamed, not buffered. Holding the payload, a ciphertext slice, the
+    # decrypted bytes and a copy of them meant a ~125 MiB archive could OOM the
+    # 512 MiB Machine — taking down the rollback procedure precisely for the
+    # larger databases whose migrations are most likely to need it.
+    prologue = len(MAGIC) + NONCE_BYTES
+    size = source.stat().st_size
+    if size <= prologue + TAG_BYTES:
         raise BackupError("unsupported or truncated control-plane backup")
-    nonce_start = len(MAGIC)
-    nonce = payload[nonce_start : nonce_start + NONCE_BYTES]
-    ciphertext = payload[nonce_start + NONCE_BYTES :]
-    try:
-        plaintext = bytearray(AESGCM(_key(backup_key)).decrypt(nonce, ciphertext, MAGIC))
-    except InvalidTag as error:
-        raise BackupError("backup authentication failed") from error
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary: Path | None = None
     try:
-        with tempfile.NamedTemporaryFile(
-            prefix=f".{destination.name}.", dir=destination.parent, delete=False
-        ) as output:
-            temporary = Path(output.name)
-            output.write(plaintext)
-            output.flush()
-            os.fsync(output.fileno())
+        with open(source, "rb") as archive_file:
+            header = archive_file.read(prologue)
+            if not header.startswith(MAGIC):
+                raise BackupError("unsupported or truncated control-plane backup")
+            nonce = header[len(MAGIC) :]
+            archive_file.seek(size - TAG_BYTES)
+            tag = archive_file.read(TAG_BYTES)
+            decryptor = Cipher(
+                algorithms.AES(_key(backup_key)), modes.GCM(nonce, tag)
+            ).decryptor()
+            decryptor.authenticate_additional_data(MAGIC)
+            archive_file.seek(prologue)
+            remaining = size - prologue - TAG_BYTES
+            with tempfile.NamedTemporaryFile(
+                prefix=f".{destination.name}.", dir=destination.parent, delete=False
+            ) as output:
+                temporary = Path(output.name)
+                while remaining > 0:
+                    chunk = archive_file.read(min(CHUNK_BYTES, remaining))
+                    if not chunk:
+                        raise BackupError("truncated control-plane backup")
+                    remaining -= len(chunk)
+                    output.write(decryptor.update(chunk))
+                # Only now is the plaintext authentic. Nothing has read the file
+                # yet, and a failure here deletes it in the `finally` below, so
+                # unverified bytes never reach the caller.
+                try:
+                    output.write(decryptor.finalize())
+                except InvalidTag as error:
+                    raise BackupError("backup authentication failed") from error
+                output.flush()
+                os.fsync(output.fileno())
         os.chmod(temporary, 0o600)
         try:
             with sqlite3.connect(temporary) as connection:
@@ -305,6 +336,5 @@ def restore_backup(
         restored.pause_workers()
         return restored
     finally:
-        plaintext[:] = b"\x00" * len(plaintext)
         if temporary is not None:
             temporary.unlink(missing_ok=True)

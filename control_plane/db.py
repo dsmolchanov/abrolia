@@ -162,14 +162,22 @@ class ControlPlaneDatabase:
         directory = directory or MIGRATIONS_DIR
         connection = self.connection
         with self._mutex:
-            connection.execute(
-                "CREATE TABLE IF NOT EXISTS schema_migrations ("
-                "name TEXT PRIMARY KEY, applied_at REAL NOT NULL)"
-            )
-            applied = {
-                row["name"]
-                for row in connection.execute("SELECT name FROM schema_migrations")
-            }
+            # Read the ledger WITHOUT creating it. Creating it here autocommits
+            # before the batch transaction opens, so on a fresh or legacy
+            # database a failed migration left the file different from the
+            # snapshot taken moments earlier — the next boot then compared
+            # content, found a difference, rejected the archive and wrote
+            # another. The creation moves into the batch below, where it rolls
+            # back with everything else.
+            try:
+                applied = {
+                    row["name"]
+                    for row in connection.execute(
+                        "SELECT name FROM schema_migrations"
+                    )
+                }
+            except sqlite3.DatabaseError:
+                applied = set()
             pending = [
                 script
                 for script in sorted(directory.glob("*.sql"))
@@ -192,7 +200,11 @@ class ControlPlaneDatabase:
             # no VACUUM. The `BEGIN`s inside the .sql files are trigger bodies,
             # not transaction control. A future migration needing either must
             # not join this batch.
-            statements = ["BEGIN IMMEDIATE;"]
+            statements = [
+                "BEGIN IMMEDIATE;",
+                "CREATE TABLE IF NOT EXISTS schema_migrations ("
+                "name TEXT PRIMARY KEY, applied_at REAL NOT NULL);",
+            ]
             for script in pending:
                 name_literal = script.name.replace("'", "''")
                 statements.append(script.read_text(encoding="utf-8"))
