@@ -33,6 +33,8 @@ from control_plane.privacy.consent import (
     manifest_required_purposes,
     processes_real_household_content,
 )
+from control_plane.privacy.runtime import RUNTIME_REF
+from control_plane.privacy.withdraw import REVOKE_CONSENT_OPERATION
 from control_plane.providers.email.nerve_client import email_org_external_ref
 from control_plane.provisioning.contracts import (
     InspectState,
@@ -84,6 +86,8 @@ class ProvisioningWorker:
         bootstrap_ttl_seconds: int = 3600,
         max_safe_attempts: int = 5,
         logger: StructuredLogger | None = None,
+        # Injected so tests can drive the withdrawal push without a network.
+        runtime_client: Any | None = None,
         clock=time.time,
     ) -> None:
         self.jobs = jobs
@@ -99,6 +103,7 @@ class ProvisioningWorker:
         self.bootstrap_ttl_seconds = bootstrap_ttl_seconds
         self.max_safe_attempts = max_safe_attempts
         self.logger = logger
+        self._runtime_client = runtime_client
         self.clock = clock
 
     def run_once(self) -> WorkResult | None:
@@ -178,6 +183,11 @@ class ProvisioningWorker:
         request = self.jobs.request(job.id)
         if job.kind == "bootstrap_cleanup":
             return self._cleanup_bootstrap(job, request)
+        if job.operation == REVOKE_CONSENT_OPERATION:
+            # Deliberately ahead of the consent precondition below: this job
+            # exists precisely because a consent was withdrawn, so gating it on
+            # holding that consent would make withdrawal unenforceable.
+            return self._revoke_runtime_consent(job, request)
         if (
             self._requires_current_email_content_restriction(job)
             and self._missing_current_consent_purpose(job) is not None
@@ -338,6 +348,54 @@ class ProvisioningWorker:
             return self._mark_step_problem(
                 job, request, "outcome_unknown", "outcome_unknown"
             )
+
+    @property
+    def runtime_client(self) -> Any:
+        if self._runtime_client is None:
+            import httpx
+
+            self._runtime_client = httpx.Client(timeout=10.0, follow_redirects=False)
+        return self._runtime_client
+
+    def _revoke_runtime_consent(
+        self, job: JobRecord, request: dict[str, Any]
+    ) -> WorkResult:
+        """Tell a live runtime to stop, because a consent behind it was withdrawn.
+
+        The receipt is already revoked before this job is created, so every
+        control-plane boundary is closed regardless of what happens here. What
+        is still open is the instance already serving: it re-reads a local
+        manifest whose embedded receipt stays valid-looking forever, so only a
+        signal delivered to that instance stops it.
+
+        Unreachable is `outcome_unknown`, never `failed`: the job must keep
+        retrying until the runtime confirms, because the family has a right to
+        the withdrawal and not merely to an attempt at it.
+        """
+        runtime_ref = str(request.get("runtime_ref") or "")
+        if not RUNTIME_REF.fullmatch(runtime_ref):
+            return self._mark_step_problem(
+                job, request, "failed", "runtime_ref_invalid"
+            )
+        token = self.configs.token_hasher.digest(f"runtime-dsar:{runtime_ref}")
+        try:
+            response = self.runtime_client.post(
+                f"http://{runtime_ref}.internal:8080/internal/v1/consent/revoke",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=10.0,
+            )
+        except Exception:
+            return WorkResult(job.id, "outcome_unknown", "runtime_unreachable")
+        if response.status_code == 410:
+            # Already deleted: there is nothing left to stop, and the
+            # withdrawal is satisfied.
+            return WorkResult(job.id, "succeeded")
+        if response.status_code != 200:
+            return WorkResult(job.id, "outcome_unknown", "runtime_refused")
+        now = self.clock()
+        with self.jobs.db.write() as connection:
+            self.jobs.settle(connection, job.id, status="succeeded", now=now)
+        return WorkResult(job.id, "succeeded")
 
     def _required_consent_purposes(self, job: JobRecord) -> list[str]:
         """Every purpose this job's household must currently hold.
@@ -1390,6 +1448,11 @@ class ProvisioningWorker:
         request = self.jobs.request(job.id)
         if job.kind == "bootstrap_cleanup":
             return self._cleanup_bootstrap(job, request)
+        if job.operation == REVOKE_CONSENT_OPERATION:
+            # Deliberately ahead of the consent precondition below: this job
+            # exists precisely because a consent was withdrawn, so gating it on
+            # holding that consent would make withdrawal unenforceable.
+            return self._revoke_runtime_consent(job, request)
         if (
             self._requires_current_email_content_restriction(job)
             and self._missing_current_consent_purpose(job) is not None

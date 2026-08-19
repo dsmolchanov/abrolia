@@ -78,6 +78,7 @@ ENV_RUNTIME_PORT = "HERMES_RUNTIME_PORT"
 ENV_BOOTSTRAP_RETRY_SECONDS = "HERMES_BOOTSTRAP_RETRY_SECONDS"
 ENV_RUNTIME_DSAR_TOKEN = "HERMES_RUNTIME_DSAR_TOKEN"
 ENV_RUNTIME_DELETION_MARKER = "HERMES_RUNTIME_DELETION_MARKER"
+ENV_RUNTIME_CONSENT_MARKER = "HERMES_RUNTIME_CONSENT_MARKER"
 ENV_NERVE_RUNTIME_URL = "ABROLIA_NERVE_RUNTIME_URL"
 ENV_NERVE_REST_URL = "ABROLIA_NERVE_REST_URL"
 ENV_NERVE_WORKER_SECONDS = "ABROLIA_NERVE_WORKER_SECONDS"
@@ -136,6 +137,14 @@ class RuntimeService:
         self.deletion_marker = Path(
             self.env.get(ENV_RUNTIME_DELETION_MARKER)
             or self.activation_path.with_name("runtime-deleted.json")
+        )
+        # Withdrawal has to stop a runtime that is ALREADY serving, and the
+        # manifest it serves is immutable — the receipt embedded in it stays
+        # valid-looking forever. A local marker is the only signal that reaches
+        # a running instance, which is why deletion already works this way.
+        self.consent_marker = Path(
+            self.env.get(ENV_RUNTIME_CONSENT_MARKER)
+            or self.activation_path.with_name("consent-withdrawn.json")
         )
         self._gmail_runtime: EmailRuntimeService | None = None
         self._gmail_client: Any | None = None
@@ -210,6 +219,11 @@ class RuntimeService:
     def _ready_manifest(self) -> tuple[RuntimeManifest | None, str]:
         if self.deletion_marker.is_file():
             return None, "runtime_deleted"
+        if self.consent_marker.is_file():
+            # Checked before the manifest is even loaded: the manifest cannot
+            # express this state, and the Art 9(2)(a) copy promises withdrawal
+            # "stops further processing", not "stops it at the next delivery".
+            return None, "consent_withdrawn"
         try:
             manifest = load_runtime_manifest(self.manifest_path, env=self.env)
         except ManifestError:
@@ -567,6 +581,8 @@ class RuntimeService:
             probe = self._nerve_webhook(environ)
         elif path in {"/v1/whatsapp/webhook", "/webhooks/whatsapp"} and method == "POST":
             probe = self._whatsapp_webhook(environ)
+        elif path == "/internal/v1/consent/revoke":
+            probe = self._consent_revoke(method, str(environ.get("HTTP_AUTHORIZATION") or ""))
         elif path in {"/internal/v1/dsar/export", "/internal/v1/dsar/delete"}:
             probe = self._dsar(path, method, str(environ.get("HTTP_AUTHORIZATION") or ""))
         elif path == "/internal/v1/email/google/revoke":
@@ -679,6 +695,33 @@ class RuntimeService:
                 "event_id": accepted.event.id,
             },
         )
+
+    def _consent_revoke(self, method: str, authorization: str) -> Probe:
+        """Stop serving because a consent behind this runtime was withdrawn.
+
+        Deliberately unconditional once authenticated: it must succeed on a
+        runtime that is already deleted, not yet active, or serving a manifest
+        that cannot be parsed. Withdrawal that fails because the runtime is in
+        an awkward state is withdrawal that did not happen, and Art. 7(3) gives
+        the family a right to it, not an attempt at it. Idempotent — the marker
+        is the state, and re-posting rewrites the same file.
+        """
+        expected = self.env.get(ENV_RUNTIME_DSAR_TOKEN, "")
+        if method != "POST" or not expected:
+            return Probe(404, {"status": "not_found"})
+        prefix = "Bearer "
+        supplied = (
+            authorization[len(prefix) :] if authorization.startswith(prefix) else ""
+        )
+        if not supplied or not hmac.compare_digest(supplied, expected):
+            return Probe(401, {"status": "unauthorized"})
+        try:
+            atomic_write(self.consent_marker, b'{"status":"consent_withdrawn"}')
+        except OSError:
+            # The control plane retries; reporting success here would record a
+            # withdrawal that never reached disk and would not survive a restart.
+            return Probe(503, {"status": "consent_marker_unavailable"})
+        return Probe(200, {"state": "consent_withdrawn"})
 
     def _dsar(self, path: str, method: str, authorization: str) -> Probe:
         expected = self.env.get(ENV_RUNTIME_DSAR_TOKEN, "")
