@@ -286,6 +286,9 @@ def test_the_cli_never_migrates_the_database_it_rehearses_against(
     place the container is built.
     """
     config = ControlPlaneConfig.for_test(tmp_path)
+    # A real but unmigrated database: the missing-file refusal is a separate
+    # case, tested below.
+    sqlite3.connect(config.database_path).close()
     monkeypatch.setattr(ControlPlaneConfig, "from_env", staticmethod(lambda: config))
 
     with pytest.raises(SystemExit, match="pending migrations"):
@@ -453,15 +456,16 @@ def test_the_two_states_are_genuinely_different(container) -> None:
     assert TableWrite("onboarding_transitions", "insert") in first - reconcile
 
 
-def test_the_rehearsal_reports_the_set_for_the_state_the_workflow_is_in(
-    container,
-) -> None:
-    """Selecting by state is the point; a fixed set would be wrong here.
+def test_an_unknown_runtime_outcome_is_reported_as_uncertain(container) -> None:
+    """Some states have no single answer, and saying so is the honest report.
 
-    With the workflow stalled in `activating`, the pending operation is a
-    reconcile. Reporting the first-attempt set would tell the operator to expect
-    a bootstrap token, a household update and a workflow transition — none of
-    which that operation performs.
+    A job left `outcome_unknown` is reconciled next, and
+    `ProvisioningWorker._reconcile` branches on `provider.inspect()` — settle,
+    fail, or re-run preparation. Which branch is taken depends on an answer only
+    the provider has, and asking is precisely what this command must not do.
+    Reporting the first-attempt set here would promise a bootstrap token, a
+    household update and a workflow transition that may never happen: false
+    precision, which is worse for an operator than being told to go and look.
     """
     household_id = _household_with_profile(container)
     _verify_all_steps(container, household_id)
@@ -472,10 +476,77 @@ def test_the_rehearsal_reports_the_set_for_the_state_the_workflow_is_in(
 
     plan = plan_onboarding(container, household_id)
 
-    assert "`activating`" in plan.rehearsal
-    assert set(plan.table_writes) == set(
-        RUNTIME_WRITES_BY_WORKFLOW_STATE["activating"]
-    )
-    assert TableWrite("bootstrap_tokens", "insert") not in plan.table_writes
-    assert TableWrite("onboarding_transitions", "insert") not in plan.table_writes
+    assert "outcome_unknown" in plan.rehearsal
+    assert "reconcile" in plan.rehearsal
+    assert plan.table_writes == []
+    assert plan.blocked_by is not None
     assert plan.committed is False
+
+
+def test_the_cli_refuses_a_missing_database_without_creating_one(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """`sqlite3.connect` creates a missing file, and opening makes directories.
+
+    So asking about pending migrations against a wrong path left an empty
+    database behind — a mutation, from the one command that promises none, and
+    one an operator could easily cause with a typo.
+    """
+    config = ControlPlaneConfig.for_test(tmp_path / "absent" / "control-plane.db")
+    monkeypatch.setattr(ControlPlaneConfig, "from_env", staticmethod(lambda: config))
+
+    with pytest.raises(SystemExit, match="no database"):
+        main(["--dry-run", "--household", "10000000-0000-4000-8000-000000000031"])
+
+    assert not config.database_path.exists()
+    assert not config.database_path.parent.exists()
+
+
+def test_committed_reports_only_rows_this_rehearsal_minted(container) -> None:
+    """The worker can commit the instant the rehearsal rolls back.
+
+    Comparing COUNTS across the rollback made that legitimate commit look like
+    the dry-run's own write, and the CLI then refused to print a report that was
+    in fact correct. The verdict is now about ids this rehearsal minted, which a
+    concurrent commit cannot forge.
+    """
+    household_id = _household_with_profile(container)
+    _verify_all_steps(container, household_id)
+
+    # A revision the WORKER committed, present before the rehearsal begins.
+    foreign = container.database.query(
+        "SELECT id FROM config_revisions WHERE household_id = ?", (household_id,)
+    )
+    assert foreign
+
+    plan = plan_onboarding(container, household_id)
+
+    # Nothing was rehearsed here (the revision is issued), so nothing is owned.
+    assert plan.uncommitted_revision_delta == 0
+    assert plan.committed is False
+    # The worker's rows are still there and are not the dry-run's business.
+    assert container.database.query(
+        "SELECT id FROM config_revisions WHERE household_id = ?", (household_id,)
+    ) == foreign
+
+
+def test_a_rehearsed_revision_is_owned_and_rolled_back(container) -> None:
+    """The other half: a row the rehearsal DID mint, and did not keep."""
+    household_id = _household_with_profile(container)
+    _verify_all_steps(container, household_id)
+    with container.database.write() as connection:
+        connection.execute(
+            "DELETE FROM provisioning_jobs WHERE household_id = ? AND kind = 'runtime'",
+            (household_id,),
+        )
+        connection.execute(
+            "DELETE FROM config_revisions WHERE household_id = ?", (household_id,)
+        )
+
+    plan = plan_onboarding(container, household_id)
+
+    assert plan.uncommitted_revision_delta == 1
+    assert plan.committed is False
+    assert container.database.query(
+        "SELECT id FROM config_revisions WHERE household_id = ?", (household_id,)
+    ) == []

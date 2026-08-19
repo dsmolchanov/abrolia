@@ -84,6 +84,14 @@ class TableWrite:
 #: operator reading the first set in this state would be told to expect writes
 #: that are not going to happen.
 #:
+#: The `activating` entry is measured and validated but deliberately NOT
+#: reported: reaching it means the job is `outcome_unknown`, and the reconcile
+#: that follows branches on `provider.inspect()` — settle, fail, or re-run
+#: preparation — so this set is only one of the possible outcomes. The rehearsal
+#: reports that uncertainty instead. The entry stays because the validation test
+#: is what proves the two states differ at all, which is the reason the
+#: uncertainty has to be reported rather than guessed away.
+#:
 #: Note `config_revisions` is an UPDATE in the first set and absent from the
 #: second — never an INSERT. That is the difference from the planning pass, and
 #: reporting a planner trace here claimed an insert the real onboarding never
@@ -294,7 +302,7 @@ def plan_onboarding(
     observed: list[TableWrite] = []
     spec = None
     plan: ProvisionPlan | None = None
-    revisions_before = 0
+    rehearsed_revision_ids: set[str] = set()
 
     try:
         with container.database.write() as connection:
@@ -371,10 +379,19 @@ def plan_onboarding(
                     "desired_revision": runtime_job["desired_revision"],
                 }
 
-            revisions_before = connection.execute(
-                "SELECT COUNT(*) AS count FROM config_revisions WHERE household_id = ?",
-                (household_id,),
-            ).fetchone()["count"]
+            # IDs, not a count. The API worker can be waiting on this
+            # `BEGIN IMMEDIATE` and commit a legitimate revision the moment the
+            # rehearsal rolls back — a count taken afterwards would differ and
+            # the command would accuse itself of writing, refusing to print a
+            # report that was in fact correct. An id the rehearsal minted is
+            # unambiguous: a concurrent commit produces a different one.
+            revision_ids_before = {
+                row["id"]
+                for row in connection.execute(
+                    "SELECT id FROM config_revisions WHERE household_id = ?",
+                    (household_id,),
+                ).fetchall()
+            }
 
             # Only rehearse a planning pass that has not already happened.
             #
@@ -395,15 +412,43 @@ def plan_onboarding(
             )
             if already_planned:
                 state = str(workflow["state"])
-                writes = RUNTIME_WRITES_BY_WORKFLOW_STATE.get(state)
-                if writes is None:
-                    # A state the runtime operation does not run from. Say so
-                    # rather than reporting another state's tables.
+                job_status = str((runtime_job or {})["status"])
+                if job_status == "outcome_unknown":
+                    # The next operation is a RECONCILE, and
+                    # `ProvisioningWorker._reconcile` branches on
+                    # `provider.inspect()` — it may settle, fail, or re-run
+                    # preparation. Which branch is taken is not knowable from
+                    # durable state; it depends on an answer only the provider
+                    # has, and asking is exactly what this command must not do.
+                    #
+                    # So it reports the uncertainty instead of picking a branch.
+                    # An operator told "these tables, exactly" when the real
+                    # answer is "one of these, depending" has been given false
+                    # precision, which is worse than being told to go and look.
                     plan.rehearsal = (
-                        f"revision {issued['revision']} is already issued, and the"
-                        f" workflow is `{state}`, which the runtime operation does"
-                        " not run from; no write set applies"
+                        f"revision {issued['revision']} is issued and its runtime"
+                        " job is `outcome_unknown`: the next operation is a"
+                        " reconcile whose write set depends on a provider"
+                        " inspection this command does not perform. Inspect with"
+                        " `abrolia-control-plane reconcile <job-id>` before"
+                        " relying on a write set."
                     )
+                    plan.blocked_by = (
+                        "runtime job outcome is unknown; reconcile it before"
+                        " onboarding"
+                    )
+                    writes = None
+                else:
+                    writes = RUNTIME_WRITES_BY_WORKFLOW_STATE.get(state)
+                if writes is None:
+                    if plan.rehearsal == "":
+                        # A state the runtime operation does not run from. Say
+                        # so rather than reporting another state's tables.
+                        plan.rehearsal = (
+                            f"revision {issued['revision']} is already issued, and"
+                            f" the workflow is `{state}`, which the runtime"
+                            " operation does not run from; no write set applies"
+                        )
                 else:
                     plan.rehearsal = (
                         f"revision {issued['revision']} is already issued, so the"
@@ -429,11 +474,14 @@ def plan_onboarding(
                 finally:
                     connection.set_trace_callback(None)
 
-            revisions_after = connection.execute(
-                "SELECT COUNT(*) AS count FROM config_revisions WHERE household_id = ?",
-                (household_id,),
-            ).fetchone()["count"]
-            plan.uncommitted_revision_delta = revisions_after - revisions_before
+            rehearsed_revision_ids = {
+                row["id"]
+                for row in connection.execute(
+                    "SELECT id FROM config_revisions WHERE household_id = ?",
+                    (household_id,),
+                ).fetchall()
+            } - revision_ids_before
+            plan.uncommitted_revision_delta = len(rehearsed_revision_ids)
 
             plan.table_writes = observed
             plan.runtime_resources = _runtime_resources(container, household_id, spec)
@@ -443,15 +491,15 @@ def plan_onboarding(
         pass
 
     assert plan is not None
-    # After the rollback, not before: the count inside the transaction sees the
-    # rehearsal's own uncommitted insert, which proves nothing about what was
-    # committed. This reads the database as everyone else now sees it.
-    plan.committed = (
+    # After the rollback, and asking only about rows THIS rehearsal minted.
+    # Anything else in the table belongs to the worker and is none of this
+    # command's business to report as its own.
+    plan.committed = any(
         container.database.query_one(
-            "SELECT COUNT(*) AS count FROM config_revisions WHERE household_id = ?",
-            (household_id,),
-        )["count"]
-        != revisions_before
+            "SELECT 1 FROM config_revisions WHERE id = ?", (revision_id,)
+        )
+        is not None
+        for revision_id in rehearsed_revision_ids
     )
     return plan
 
@@ -490,6 +538,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         # it simply leaves the mode alone.
         preserve_journal_mode=True,
     ) as active:
+        if not active.config.database_path.exists():
+            # `sqlite3.connect` CREATES a missing file, and opening the
+            # connection also creates the parent directory — so merely asking
+            # about migrations against a wrong path would leave an empty
+            # database behind, from a command that promises to mutate nothing.
+            raise SystemExit(
+                f"dry-run found no database at {active.config.database_path};"
+                " refusing rather than creating one"
+            )
         pending = pending_migrations(active.database)
         if pending:
             # Refuse rather than rehearse: against a stale schema the plan would
