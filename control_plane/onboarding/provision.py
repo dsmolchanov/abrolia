@@ -70,6 +70,30 @@ class TableWrite:
     operation: str
 
 
+#: Tables the pending runtime operation updates when it runs.
+#:
+#: Declared rather than traced, because tracing it would mean EXECUTING it —
+#: which calls providers, and that is precisely what this command must not do.
+#: Note `config_revisions` is an UPDATE: the operation moves the already-issued
+#: revision's status and never inserts another. That is the whole difference
+#: from the planning pass, and reporting a planner trace here claimed an insert
+#: the real onboarding never performs.
+#:
+#: `test_the_declared_runtime_write_set_matches_a_real_run` traces an actual
+#: worker run and asserts this set is exactly right, so it cannot drift.
+RUNTIME_OPERATION_WRITES: tuple[TableWrite, ...] = (
+    TableWrite("bootstrap_tokens", "insert"),
+    TableWrite("bootstrap_tokens", "update"),
+    TableWrite("config_revisions", "update"),
+    TableWrite("external_resources", "insert"),
+    TableWrite("external_resources", "update"),
+    TableWrite("households", "update"),
+    TableWrite("onboarding_transitions", "insert"),
+    TableWrite("onboarding_workflows", "update"),
+    TableWrite("provisioning_jobs", "update"),
+)
+
+
 @dataclass
 class ProvisionPlan:
     household_id: str
@@ -180,6 +204,64 @@ def _secret_names(
     return secrets
 
 
+def _flatten(document: Any, prefix: str = "") -> dict[str, Any]:
+    """Leaf paths of a manifest, so a diff can name what moved."""
+    if isinstance(document, dict):
+        flat: dict[str, Any] = {}
+        for key, value in document.items():
+            flat.update(_flatten(value, f"{prefix}.{key}" if prefix else str(key)))
+        return flat
+    if isinstance(document, (list, tuple)):
+        flat = {}
+        for index, value in enumerate(document):
+            flat.update(_flatten(value, f"{prefix}[{index}]"))
+        return flat
+    return {prefix: document}
+
+
+def _revision_diff(
+    container: ControlPlaneContainer, household_id: str, revision: int
+) -> dict[str, Any]:
+    """How this household's configuration changes relative to the prior revision.
+
+    KEY PATHS ONLY, never values. The manifest carries provider bindings and
+    inbox addresses, and this command prints to an operator's terminal and
+    scrollback; "what moved" is what the rehearsal is for, and "to what" is
+    available to someone who needs it through the manifest itself.
+
+    A first revision has no predecessor, which is reported as such rather than
+    as a diff against nothing.
+    """
+    try:
+        current = _flatten(container.configs.manifest(household_id, revision))
+    except KeyError:
+        return {"unavailable": "manifest for the issued revision is not readable"}
+    if revision <= 1:
+        return {
+            "previous_revision": None,
+            "added": sorted(current),
+            "removed": [],
+            "changed": [],
+        }
+    try:
+        previous = _flatten(container.configs.manifest(household_id, revision - 1))
+    except KeyError:
+        return {
+            "previous_revision": revision - 1,
+            "unavailable": "prior manifest is no longer readable",
+        }
+    return {
+        "previous_revision": revision - 1,
+        "added": sorted(set(current) - set(previous)),
+        "removed": sorted(set(previous) - set(current)),
+        "changed": sorted(
+            key
+            for key in set(current) & set(previous)
+            if current[key] != previous[key]
+        ),
+    }
+
+
 def plan_onboarding(
     container: ControlPlaneContainer, household_id: str
 ) -> ProvisionPlan:
@@ -245,6 +327,9 @@ def plan_onboarding(
                     "status": issued["status"],
                     "manifest_sha256": issued["manifest_sha256"],
                     "source": "issued by the worker when the primary step verified",
+                    "diff": _revision_diff(
+                        container, household_id, issued["revision"]
+                    ),
                 }
             runtime_job = connection.execute(
                 "SELECT id, status, desired_revision FROM provisioning_jobs"
@@ -275,10 +360,12 @@ def plan_onboarding(
             already_planned = issued is not None
             if already_planned:
                 plan.rehearsal = (
-                    f"skipped: revision {issued['revision']} is already issued, so"
-                    " the planning pass is done and the pending runtime job"
-                    " provisions it. Nothing hypothetical is traced."
+                    f"revision {issued['revision']} is already issued, so the"
+                    " planning pass is done; table_writes is the declared write"
+                    " set of the pending runtime operation, which UPDATES that"
+                    " revision rather than inserting another"
                 )
+                observed.extend(RUNTIME_OPERATION_WRITES)
             else:
                 plan.rehearsal = (
                     "planning pass for the next revision, rolled back;"

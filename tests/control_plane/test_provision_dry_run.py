@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -13,7 +14,9 @@ from control_plane.onboarding.contracts import CommandContext
 from control_plane.onboarding.provision import (
     RUNTIME_BOOTSTRAP_SECRET,
     RUNTIME_DSAR_SECRET,
+    RUNTIME_OPERATION_WRITES,
     TableWrite,
+    _record_writes,
     main,
     plan_onboarding,
 )
@@ -143,15 +146,22 @@ def test_dry_run_lists_exact_writes_and_commits_nothing(container) -> None:
     assert plan.config_revision["revision"] == durable["revision"]
     assert plan.config_revision["manifest_sha256"] == durable["manifest_sha256"]
     assert plan.pending_runtime_job["desired_revision"] == durable["revision"]
-    # And NOTHING hypothetical is traced. Once a revision is issued the pending
-    # runtime job provisions THAT revision and performs no planning write;
-    # calling the planner anyway minted a revision N+1 and reported its insert
+    # The tables reported are the pending RUNTIME operation's, not a planner
+    # trace. Once a revision is issued the runtime job provisions THAT revision:
+    # calling the planner anyway minted a revision N+1 and reported its INSERT
     # into `config_revisions` as the onboarding's "exact writes" — a write the
-    # real onboarding will never make, sourced from an operation this very run
-    # discarded.
-    assert plan.table_writes == []
+    # real onboarding never makes, from an operation this very run discarded.
+    # The real operation UPDATES the issued revision.
+    assert TableWrite("config_revisions", "update") in plan.table_writes
+    assert TableWrite("config_revisions", "insert") not in plan.table_writes
+    assert set(plan.table_writes) == set(RUNTIME_OPERATION_WRITES)
     assert "already issued" in plan.rehearsal
     assert plan.uncommitted_revision_delta == 0
+    # And the config_revision diff the Phase E1 plan requires, key paths only.
+    diff = plan.config_revision["diff"]
+    assert diff["previous_revision"] is None
+    assert "email.agent_inbox" in diff["added"]
+    assert diff["removed"] == [] and diff["changed"] == []
     assert {resource["stable_name"] for resource in plan.runtime_resources} >= {
         FlyRuntimeProvisioner.stable_app_name(household_id),
         FlyRuntimeProvisioner.stable_volume_name(),
@@ -285,3 +295,40 @@ def test_the_cli_never_migrates_the_database_it_rehearses_against(
             database.query("SELECT name FROM schema_migrations")
     finally:
         database.close()
+
+
+def test_the_declared_runtime_write_set_matches_a_real_run(container) -> None:
+    """`RUNTIME_OPERATION_WRITES` is declared, so something must keep it true.
+
+    The dry-run cannot trace the runtime operation — tracing means executing,
+    which calls providers. So the set is written down, and this test traces an
+    actual worker run and requires the declaration to be exactly right. When the
+    worker starts or stops touching a table, this fails and the operator-facing
+    list is corrected with it, rather than drifting into a plausible fiction.
+    """
+    household_id = _household_with_profile(container)
+    _verify_all_steps(container, household_id)
+
+    observed: set[TableWrite] = set()
+    original = ControlPlaneDatabase.write
+
+    @contextmanager
+    def traced(self):
+        with original(self) as connection:
+            recorder: list[TableWrite] = []
+            connection.set_trace_callback(lambda sql: _record_writes(sql, recorder))
+            try:
+                yield connection
+            finally:
+                connection.set_trace_callback(None)
+                observed.update(recorder)
+
+    ControlPlaneDatabase.write = traced
+    try:
+        while container.worker.run_once() is not None:
+            pass
+    finally:
+        ControlPlaneDatabase.write = original
+
+    assert observed, "the runtime phase wrote nothing; the trace is not working"
+    assert observed == set(RUNTIME_OPERATION_WRITES)
