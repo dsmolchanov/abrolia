@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -196,3 +197,65 @@ def test_the_rollback_procedure_matches_the_paths_it_depends_on() -> None:
         f"mv /data/control-plane-rollback.db.workers-paused {configured}.workers-paused"
         in doc
     )
+
+
+def test_a_failing_script_leaves_no_partially_upgraded_schema(tmp_path) -> None:
+    """A batch is all or nothing, across files as well as within one.
+
+    Per-file transactions meant a failure in the third of four scripts left the
+    first two committed — a schema no migration file describes. The pre-migrate
+    backup is still correct, but a RESTART would snapshot the partial state and
+    record that as the new restore point, quietly replacing the good one.
+    """
+    directory = tmp_path / "migrations"
+    directory.mkdir()
+    (directory / "0001_first.sql").write_text(
+        "CREATE TABLE first_table (id TEXT PRIMARY KEY);\n", encoding="utf-8"
+    )
+    (directory / "0002_second.sql").write_text(
+        "CREATE TABLE second_table (id TEXT PRIMARY KEY);\n", encoding="utf-8"
+    )
+    (directory / "0003_broken.sql").write_text(
+        "CREATE TABLE third_table (id TEXT PRIMARY KEY);\n"
+        "THIS IS NOT VALID SQL;\n",
+        encoding="utf-8",
+    )
+    database = _database(tmp_path)
+
+    with pytest.raises(sqlite3.DatabaseError):
+        database.migrate(directory)
+
+    # Neither the earlier scripts' tables nor their bookkeeping rows survive.
+    tables = {
+        row["name"]
+        for row in database.query(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )
+    }
+    assert "first_table" not in tables
+    assert "second_table" not in tables
+    assert "third_table" not in tables
+    assert database.pending_migrations(directory) == [
+        "0001_first.sql",
+        "0002_second.sql",
+        "0003_broken.sql",
+    ]
+    database.close()
+
+
+def test_a_healthy_batch_still_applies_every_script(tmp_path) -> None:
+    """The counterpart: batching must not stop it working."""
+    directory = tmp_path / "migrations"
+    directory.mkdir()
+    for index in (1, 2, 3):
+        (directory / f"000{index}_step.sql").write_text(
+            f"CREATE TABLE step_{index} (id TEXT PRIMARY KEY);\n", encoding="utf-8"
+        )
+    database = _database(tmp_path)
+
+    applied = database.migrate(directory)
+
+    assert applied == ["0001_step.sql", "0002_step.sql", "0003_step.sql"]
+    assert database.pending_migrations(directory) == []
+    assert database.migrate(directory) == []
+    database.close()

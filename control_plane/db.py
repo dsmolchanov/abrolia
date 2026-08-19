@@ -170,26 +170,44 @@ class ControlPlaneDatabase:
                 row["name"]
                 for row in connection.execute("SELECT name FROM schema_migrations")
             }
-            freshly: list[str] = []
-            for script in sorted(directory.glob("*.sql")):
-                if script.name in applied:
-                    continue
+            pending = [
+                script
+                for script in sorted(directory.glob("*.sql"))
+                if script.name not in applied
+            ]
+            if not pending:
+                return []
+            # ONE transaction for the WHOLE pending batch, not one per file.
+            #
+            # Per-file transactions meant a failure in the third of four scripts
+            # left the first two committed: a partially upgraded schema that no
+            # migration file describes. The pre-migrate backup is taken before
+            # the batch, so the operator's restore point is correct — but a
+            # RESTART would snapshot the partial state and record THAT as the
+            # new restore point, quietly replacing the good one. Step E9
+            # promises "a failed file leaves no partial schema"; this is what
+            # makes that true across files as well as within one.
+            #
+            # Safe because every migration here is transactional DDL: no PRAGMA,
+            # no VACUUM. The `BEGIN`s inside the .sql files are trigger bodies,
+            # not transaction control. A future migration needing either must
+            # not join this batch.
+            statements = ["BEGIN IMMEDIATE;"]
+            for script in pending:
                 name_literal = script.name.replace("'", "''")
-                body = "\n".join((
-                    "BEGIN IMMEDIATE;",
-                    script.read_text(encoding="utf-8"),
+                statements.append(script.read_text(encoding="utf-8"))
+                statements.append(
                     "INSERT INTO schema_migrations (name, applied_at)"
-                    f" VALUES ('{name_literal}', {time.time()!r});",
-                    "COMMIT;",
-                ))
-                try:
-                    connection.executescript(body)
-                except BaseException:
-                    if connection.in_transaction:
-                        connection.execute("ROLLBACK")
-                    raise
-                freshly.append(script.name)
-            return freshly
+                    f" VALUES ('{name_literal}', {time.time()!r});"
+                )
+            statements.append("COMMIT;")
+            try:
+                connection.executescript("\n".join(statements))
+            except BaseException:
+                if connection.in_transaction:
+                    connection.execute("ROLLBACK")
+                raise
+            return [script.name for script in pending]
 
     def pragma(self) -> dict[str, object]:
         return {
