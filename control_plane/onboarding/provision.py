@@ -70,28 +70,45 @@ class TableWrite:
     operation: str
 
 
-#: Tables the pending runtime operation updates when it runs.
+#: Tables the pending runtime operation updates, BY THE WORKFLOW STATE it runs
+#: from. One set for the whole operation was wrong: `_finish_runtime` branches
+#: on that state, and the two branches touch very different tables.
 #:
-#: Declared rather than traced, because tracing it would mean EXECUTING it —
-#: which calls providers, and that is precisely what this command must not do.
-#: Note `config_revisions` is an UPDATE: the operation moves the already-issued
-#: revision's status and never inserts another. That is the whole difference
-#: from the planning pass, and reporting a planner trace here claimed an insert
-#: the real onboarding never performs.
+#: From `runtime_provisioning` it is a first attempt — it issues the bootstrap
+#: token, inserts the external resource, stamps the runtime ref on the
+#: household, moves the workflow to `activating` and records the transition.
 #:
-#: `test_the_declared_runtime_write_set_matches_a_real_run` traces an actual
-#: worker run and asserts this set is exactly right, so it cannot drift.
-RUNTIME_OPERATION_WRITES: tuple[TableWrite, ...] = (
-    TableWrite("bootstrap_tokens", "insert"),
-    TableWrite("bootstrap_tokens", "update"),
-    TableWrite("config_revisions", "update"),
-    TableWrite("external_resources", "insert"),
-    TableWrite("external_resources", "update"),
-    TableWrite("households", "update"),
-    TableWrite("onboarding_transitions", "insert"),
-    TableWrite("onboarding_workflows", "update"),
-    TableWrite("provisioning_jobs", "update"),
-)
+#: From `activating` it is a RECONCILE after a partial activation, such as an
+#: `outcome_unknown` on `secret_install_unknown`. The workflow has already
+#: moved, the resource already exists, and the operation only updates them. An
+#: operator reading the first set in this state would be told to expect writes
+#: that are not going to happen.
+#:
+#: Note `config_revisions` is an UPDATE in the first set and absent from the
+#: second — never an INSERT. That is the difference from the planning pass, and
+#: reporting a planner trace here claimed an insert the real onboarding never
+#: performs.
+#:
+#: Both sets are measured, not read off the worker, and
+#: `test_the_declared_runtime_write_set_matches_a_real_run` re-measures each by
+#: tracing an actual run in that state. They cannot drift.
+RUNTIME_WRITES_BY_WORKFLOW_STATE: dict[str, tuple[TableWrite, ...]] = {
+    "runtime_provisioning": (
+        TableWrite("bootstrap_tokens", "insert"),
+        TableWrite("bootstrap_tokens", "update"),
+        TableWrite("config_revisions", "update"),
+        TableWrite("external_resources", "insert"),
+        TableWrite("external_resources", "update"),
+        TableWrite("households", "update"),
+        TableWrite("onboarding_transitions", "insert"),
+        TableWrite("onboarding_workflows", "update"),
+        TableWrite("provisioning_jobs", "update"),
+    ),
+    "activating": (
+        TableWrite("external_resources", "update"),
+        TableWrite("provisioning_jobs", "update"),
+    ),
+}
 
 
 @dataclass
@@ -377,13 +394,24 @@ def plan_onboarding(
                 and runtime_job["desired_revision"] == issued["revision"]
             )
             if already_planned:
-                plan.rehearsal = (
-                    f"revision {issued['revision']} is already issued, so the"
-                    " planning pass is done; table_writes is the declared write"
-                    " set of the pending runtime operation, which UPDATES that"
-                    " revision rather than inserting another"
-                )
-                observed.extend(RUNTIME_OPERATION_WRITES)
+                state = str(workflow["state"])
+                writes = RUNTIME_WRITES_BY_WORKFLOW_STATE.get(state)
+                if writes is None:
+                    # A state the runtime operation does not run from. Say so
+                    # rather than reporting another state's tables.
+                    plan.rehearsal = (
+                        f"revision {issued['revision']} is already issued, and the"
+                        f" workflow is `{state}`, which the runtime operation does"
+                        " not run from; no write set applies"
+                    )
+                else:
+                    plan.rehearsal = (
+                        f"revision {issued['revision']} is already issued, so the"
+                        " planning pass is done; table_writes is the write set of"
+                        f" the pending runtime operation running from `{state}`,"
+                        " which UPDATES that revision rather than inserting another"
+                    )
+                    observed.extend(writes)
             else:
                 plan.rehearsal = (
                     "planning pass for the next revision, rolled back;"

@@ -14,7 +14,7 @@ from control_plane.onboarding.contracts import CommandContext
 from control_plane.onboarding.provision import (
     RUNTIME_BOOTSTRAP_SECRET,
     RUNTIME_DSAR_SECRET,
-    RUNTIME_OPERATION_WRITES,
+    RUNTIME_WRITES_BY_WORKFLOW_STATE,
     TableWrite,
     _record_writes,
     main,
@@ -22,6 +22,7 @@ from control_plane.onboarding.provision import (
 )
 from control_plane.privacy.consent import consent_version_and_sha
 from control_plane.provisioning.fly import FlyRuntimeProvisioner
+from control_plane.provisioning.secrets import InMemorySecretSink
 from tests.control_plane.conftest import BASE_TIME
 
 _RESTRICTION_VERSION, _RESTRICTION_SHA = consent_version_and_sha(
@@ -154,7 +155,9 @@ def test_dry_run_lists_exact_writes_and_commits_nothing(container) -> None:
     # The real operation UPDATES the issued revision.
     assert TableWrite("config_revisions", "update") in plan.table_writes
     assert TableWrite("config_revisions", "insert") not in plan.table_writes
-    assert set(plan.table_writes) == set(RUNTIME_OPERATION_WRITES)
+    assert set(plan.table_writes) == set(
+        RUNTIME_WRITES_BY_WORKFLOW_STATE["runtime_provisioning"]
+    )
     assert "already issued" in plan.rehearsal
     assert plan.uncommitted_revision_delta == 0
     # And the config_revision diff the Phase E1 plan requires, key paths only.
@@ -297,43 +300,6 @@ def test_the_cli_never_migrates_the_database_it_rehearses_against(
         database.close()
 
 
-def test_the_declared_runtime_write_set_matches_a_real_run(container) -> None:
-    """`RUNTIME_OPERATION_WRITES` is declared, so something must keep it true.
-
-    The dry-run cannot trace the runtime operation — tracing means executing,
-    which calls providers. So the set is written down, and this test traces an
-    actual worker run and requires the declaration to be exactly right. When the
-    worker starts or stops touching a table, this fails and the operator-facing
-    list is corrected with it, rather than drifting into a plausible fiction.
-    """
-    household_id = _household_with_profile(container)
-    _verify_all_steps(container, household_id)
-
-    observed: set[TableWrite] = set()
-    original = ControlPlaneDatabase.write
-
-    @contextmanager
-    def traced(self):
-        with original(self) as connection:
-            recorder: list[TableWrite] = []
-            connection.set_trace_callback(lambda sql: _record_writes(sql, recorder))
-            try:
-                yield connection
-            finally:
-                connection.set_trace_callback(None)
-                observed.update(recorder)
-
-    ControlPlaneDatabase.write = traced
-    try:
-        while container.worker.run_once() is not None:
-            pass
-    finally:
-        ControlPlaneDatabase.write = original
-
-    assert observed, "the runtime phase wrote nothing; the trace is not working"
-    assert observed == set(RUNTIME_OPERATION_WRITES)
-
-
 def test_a_reset_workflow_is_not_reported_as_already_planned(container) -> None:
     """`reset_from` retains the rows and marks them revoked/cancelled.
 
@@ -360,7 +326,9 @@ def test_a_reset_workflow_is_not_reported_as_already_planned(container) -> None:
     assert plan.pending_runtime_job == {}
     assert plan.blocked_by is not None
     assert plan.unverified_steps
-    assert set(plan.table_writes) != set(RUNTIME_OPERATION_WRITES)
+    assert set(plan.table_writes) != set(
+        RUNTIME_WRITES_BY_WORKFLOW_STATE["runtime_provisioning"]
+    )
     assert plan.committed is False
 
 
@@ -395,3 +363,119 @@ def test_the_cli_leaves_a_non_wal_database_in_its_own_journal_mode(
     assert not config.database_path.with_name(
         f"{config.database_path.name}-wal"
     ).exists()
+
+
+class _BrokenSecretSink(InMemorySecretSink):
+    """Makes the runtime job stop at `secret_install_unknown`, as in production."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail = True
+
+    def install(self, runtime_ref, material):
+        if self.fail:
+            raise RuntimeError("secret install outcome unknown")
+        return super().install(runtime_ref, material)
+
+
+@contextmanager
+def _tracing_writes(observed: set[TableWrite]):
+    original = ControlPlaneDatabase.write
+
+    @contextmanager
+    def traced(self):
+        with original(self) as connection:
+            recorder: list[TableWrite] = []
+            connection.set_trace_callback(lambda sql: _record_writes(sql, recorder))
+            try:
+                yield connection
+            finally:
+                connection.set_trace_callback(None)
+                observed.update(recorder)
+
+    ControlPlaneDatabase.write = traced
+    try:
+        yield
+    finally:
+        ControlPlaneDatabase.write = original
+
+
+def test_the_declared_write_set_matches_a_real_run_from_runtime_provisioning(
+    container,
+) -> None:
+    """First attempt: the operation does the full insert/transition sequence."""
+    household_id = _household_with_profile(container)
+    _verify_all_steps(container, household_id)
+
+    observed: set[TableWrite] = set()
+    with _tracing_writes(observed):
+        while container.worker.run_once() is not None:
+            pass
+
+    assert observed == set(RUNTIME_WRITES_BY_WORKFLOW_STATE["runtime_provisioning"])
+
+
+def test_the_declared_write_set_matches_a_real_run_from_activating(container) -> None:
+    """Reconcile after a partial activation writes far less.
+
+    The workflow has already moved to `activating` and the external resource
+    already exists, so `_finish_runtime` skips the transition entirely and only
+    updates. Validating the declaration against the first-attempt path alone
+    checked the happy case against itself and would never have caught this.
+    """
+    household_id = _household_with_profile(container)
+    _verify_all_steps(container, household_id)
+    sink = _BrokenSecretSink()
+    container.worker.secret_sink = sink
+
+    stalled = container.worker.run_once()
+    assert stalled.status == "outcome_unknown"
+    assert stalled.error_code == "secret_install_unknown"
+    assert container.database.query_one(
+        "SELECT state FROM onboarding_workflows WHERE household_id = ?",
+        (household_id,),
+    )["state"] == "activating"
+
+    sink.fail = False
+    observed: set[TableWrite] = set()
+    with _tracing_writes(observed):
+        reconciled = container.worker.reconcile(stalled.job_id)
+
+    assert reconciled.status == "succeeded"
+    assert observed == set(RUNTIME_WRITES_BY_WORKFLOW_STATE["activating"])
+
+
+def test_the_two_states_are_genuinely_different(container) -> None:
+    """If they were equal, one set would have done and this design is wrong."""
+    first = set(RUNTIME_WRITES_BY_WORKFLOW_STATE["runtime_provisioning"])
+    reconcile = set(RUNTIME_WRITES_BY_WORKFLOW_STATE["activating"])
+    assert reconcile < first
+    assert TableWrite("onboarding_transitions", "insert") in first - reconcile
+
+
+def test_the_rehearsal_reports_the_set_for_the_state_the_workflow_is_in(
+    container,
+) -> None:
+    """Selecting by state is the point; a fixed set would be wrong here.
+
+    With the workflow stalled in `activating`, the pending operation is a
+    reconcile. Reporting the first-attempt set would tell the operator to expect
+    a bootstrap token, a household update and a workflow transition — none of
+    which that operation performs.
+    """
+    household_id = _household_with_profile(container)
+    _verify_all_steps(container, household_id)
+    sink = _BrokenSecretSink()
+    container.worker.secret_sink = sink
+    stalled = container.worker.run_once()
+    assert stalled.error_code == "secret_install_unknown"
+
+    plan = plan_onboarding(container, household_id)
+
+    assert "`activating`" in plan.rehearsal
+    assert set(plan.table_writes) == set(
+        RUNTIME_WRITES_BY_WORKFLOW_STATE["activating"]
+    )
+    assert TableWrite("bootstrap_tokens", "insert") not in plan.table_writes
+    assert TableWrite("onboarding_transitions", "insert") not in plan.table_writes
+    assert plan.committed is False
