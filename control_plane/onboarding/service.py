@@ -277,6 +277,40 @@ class OnboardingService:
             self._provider_for(StepKind.EMAIL, option)
         )
 
+    #: Consent evidence is control-plane-only. A provider is told which mailbox
+    #: to create, never which conditions the family accepted or what receipt
+    #: records them — that is accountability data with no purpose at the
+    #: provider, and sending it would be a disclosure the notices do not cover.
+    CONSENT_FIELDS = frozenset({
+        "special_category_restriction_acknowledged",
+        "special_category_restriction_receipt_id",
+        "special_category_restriction_text_version",
+        "special_category_restriction_text_sha256",
+        "special_category_household_consent",
+        "special_category_household_receipt_id",
+        "special_category_household_text_version",
+        "special_category_household_text_sha256",
+    })
+
+    def _provider_safe_selection(
+        self, kind: StepKind, selection: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        """Strip consent evidence from anything crossing to a provider.
+
+        One function for every provider-bound path. It was previously inline in
+        `select` alone, so a RETRY of the same step, and the inspect request
+        raised by `check`, both forwarded the full durable selection — the
+        consent flag, receipt id, version and digest — to Nerve or Google. The
+        boundary held on the first attempt and leaked on the second.
+        """
+        if kind is not StepKind.EMAIL or selection is None:
+            return selection
+        return {
+            key: value
+            for key, value in selection.items()
+            if key not in self.CONSENT_FIELDS
+        }
+
     def _assert_email_rollout(self, household_id: str, selection: dict[str, Any]) -> None:
         # Gate on the PROVIDER this selection routes to, not on the managed
         # rollout flag. `gmail_agent` goes to `google-oauth` unconditionally —
@@ -522,23 +556,7 @@ class OnboardingService:
                 "onboarding_steps", f"{row['id']}:{kind.value}", "selection", parsed
             )
             intent_key = f"{household_id}:{kind.value}:{selection_kind}:{attempt}"
-            provider_selection = parsed
-            if kind is StepKind.EMAIL:
-                provider_selection = {
-                    key: value
-                    for key, value in parsed.items()
-                    if key
-                    not in {
-                        "special_category_restriction_acknowledged",
-                        "special_category_restriction_receipt_id",
-                        "special_category_restriction_text_version",
-                        "special_category_restriction_text_sha256",
-                        "special_category_household_consent",
-                        "special_category_household_receipt_id",
-                        "special_category_household_text_version",
-                        "special_category_household_text_sha256",
-                    }
-                }
+            provider_selection = self._provider_safe_selection(kind, parsed)
             job_request = {
                 "step_kind": kind.value,
                 "selection": provider_selection,
@@ -700,7 +718,9 @@ class OnboardingService:
                     "email_identity_id": identity.id,
                     "household_id": household_id,
                     "option": identity.option.value,
-                    "selection": self.onboarding.selection(row["id"], kind),
+                    "selection": self._provider_safe_selection(
+                        kind, self.onboarding.selection(row["id"], kind)
+                    ),
                 })
             inspect_id, _ = self.jobs.create(
                 connection,
@@ -787,7 +807,7 @@ class OnboardingService:
             intent_key = f"{household_id}:{kind.value}:{parsed['kind']}:{attempt}"
             job_request = {
                 "step_kind": kind.value,
-                "selection": parsed,
+                "selection": self._provider_safe_selection(kind, parsed),
                 "attempt": attempt,
             }
             if kind is StepKind.EMAIL and self.email_identities is not None:
@@ -997,11 +1017,19 @@ class OnboardingService:
         # cancel. Running and waiting-user jobs may already have created
         # upstream state, so preserve their durable intent for explicit
         # inspect/reconcile/compensation instead of claiming they are absent.
+        #
+        # A consent revocation is exempt from both, like cleanup. It is not part
+        # of the onboarding attempt being superseded — it carries an Art. 7(3)
+        # withdrawal to a runtime that is still serving. Cancelling it left that
+        # runtime processing indefinitely, since nothing would re-enqueue the
+        # stop; an owner resetting an unrelated step must not silently undo a
+        # withdrawal.
         connection.execute(
             "UPDATE provisioning_jobs SET status = 'cancelled', settled_at = ?,"
             " updated_at = ?, lease_until = NULL, leased_by = NULL,"
             " error_code = ? WHERE household_id = ? AND status = 'pending'"
-            " AND kind NOT IN ('cleanup','bootstrap_cleanup')",
+            " AND kind NOT IN ('cleanup','bootstrap_cleanup')"
+            " AND operation != 'revoke_consent'",
             (now, now, f"{reason}_before_provider_call", household_id),
         )
         connection.execute(
@@ -1009,7 +1037,8 @@ class OnboardingService:
             " updated_at = ?, lease_until = NULL, leased_by = NULL,"
             " error_code = ? WHERE household_id = ?"
             " AND status IN ('running','waiting_user')"
-            " AND kind NOT IN ('cleanup','bootstrap_cleanup')",
+            " AND kind NOT IN ('cleanup','bootstrap_cleanup')"
+            " AND operation != 'revoke_consent'",
             (now, now, f"{reason}_requires_reconciliation", household_id),
         )
 

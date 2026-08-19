@@ -234,7 +234,19 @@ class RuntimeService:
         """
         if self.deletion_marker.is_file():
             return None, "runtime_deleted"
-        if self.consent_marker.is_file() and not for_data_subject_request:
+        if for_data_subject_request:
+            # DSAR loads the manifest and stops. Not the withdrawal marker, and
+            # not the consent-currency checks below either: bumping the
+            # restriction copy to v2 makes every pre-existing runtime's receipt
+            # stale, which would have taken export and deletion down for exactly
+            # the households that had been running longest. Art. 15 and Art. 17
+            # are about data already held; whether the consent covering further
+            # PROCESSING is current has no bearing on them.
+            try:
+                return load_runtime_manifest(self.manifest_path, env=self.env), "dsar"
+            except ManifestError:
+                return None, "manifest_missing_or_invalid"
+        if self.consent_marker.is_file():
             # Checked before the manifest is even loaded: the manifest cannot
             # express this state, and the Art 9(2)(a) copy promises withdrawal
             # "stops further processing", not "stops it at the next delivery".

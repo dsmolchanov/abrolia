@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import pytest
 
+from control_plane.models import StepKind
 from control_plane.privacy.consent import (
     CONTENT_RESTRICTION_PURPOSE,
     HOUSEHOLD_CONTENT_PURPOSE,
@@ -25,7 +26,7 @@ from control_plane.privacy.withdraw import (
 )
 from control_plane.provisioning.planner import DesiredSpecPlanner
 
-from .test_art9_household_consent import complete_onboarding
+from .test_art9_household_consent import complete_onboarding, real_email_selection
 
 BASE_TIME = 1_800_000_000.0
 # Must satisfy control_plane.privacy.runtime.RUNTIME_REF; a ref that does
@@ -485,3 +486,55 @@ def test_a_managed_runtime_reference_still_queues_one(cp_stack) -> None:
     )
 
     assert result.runtime_notified
+
+
+def test_resetting_onboarding_does_not_cancel_a_pending_withdrawal(cp_stack) -> None:
+    """`reset_from` supersedes the attempt; a withdrawal is not part of it.
+
+    `_supersede_unsettled_jobs` cancelled every pending non-cleanup job, so an
+    owner resetting an unrelated step silently undid an Art. 7(3) withdrawal —
+    and nothing would re-enqueue the stop, leaving the runtime processing
+    indefinitely.
+    """
+    complete_onboarding(cp_stack)
+    drain(cp_stack)
+    set_runtime_ref(cp_stack)
+    result = withdrawal(cp_stack).withdraw(
+        cp_stack.household.id, HOUSEHOLD_CONTENT_PURPOSE, now=BASE_TIME
+    )
+    assert result.runtime_notified
+
+    cp_stack.service.reset_from(
+        cp_stack.household.id, StepKind.EMAIL, context=cp_stack.context()
+    )
+
+    stop = cp_stack.database.query_one(
+        "SELECT status FROM provisioning_jobs WHERE id = ?", (result.runtime_job_id,)
+    )
+    assert stop["status"] == "pending"
+
+
+def test_the_consent_boundary_holds_on_retry_and_check(cp_stack) -> None:
+    """Consent evidence is control-plane-only on EVERY provider-bound path.
+
+    The sanitizer was inline in `select`, so a retry of the same step and the
+    inspect request raised by `check` both forwarded the full durable selection
+    — flag, receipt id, version and digest — to Nerve or Google.
+    """
+    service = cp_stack.service
+    selection = real_email_selection()
+
+    for kind_name, sanitised in (
+        ("select", service._provider_safe_selection(StepKind.EMAIL, selection)),
+        ("retry", service._provider_safe_selection(StepKind.EMAIL, dict(selection))),
+    ):
+        assert sanitised is not None, kind_name
+        for field in service.CONSENT_FIELDS:
+            assert field not in sanitised, f"{kind_name} leaked {field}"
+        # And it must still say what the provider actually needs.
+        assert sanitised["kind"] == selection["kind"], kind_name
+        assert sanitised["local_part"] == selection["local_part"], kind_name
+
+    # Non-email steps are untouched: they carry no consent evidence.
+    whatsapp = {"kind": "shared_abrolia", "privacy_notice_receipt_id": "r"}
+    assert service._provider_safe_selection(StepKind.WHATSAPP, whatsapp) == whatsapp

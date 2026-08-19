@@ -313,3 +313,44 @@ def test_dsar_still_requires_its_credential_after_withdrawal(tmp_path: Path) -> 
 
     denied = service._dsar("/internal/v1/dsar/export", "POST", "Bearer wrong")
     assert denied.status_code == 401
+
+
+def test_dsar_survives_a_stale_consent_version(tmp_path: Path) -> None:
+    """Bumping the restriction copy must not disarm export and deletion.
+
+    Every runtime already carrying a v1 receipt became stale the moment v2
+    shipped. Routing DSAR through the ordinary readiness path would have taken
+    export and deletion down for exactly the households that had been running
+    longest — the ones with the most data to exercise those rights over.
+    """
+    content = manifest_toml(content_restriction_sha="0" * 64)
+    manifest_path = tmp_path / "household.toml"
+    atomic_write(manifest_path, content.encode())
+    parsed = parse_runtime_manifest(content)
+    activation_path = tmp_path / "activation.json"
+    write_activation_state(
+        activation_path,
+        ActivationState(
+            status="active",
+            runtime_ref=RUNTIME_REF,
+            household_id=parsed.household_id,
+            config_revision=parsed.config_revision,
+            config_sha256=parsed.config_sha256,
+            updated_at=1.0,
+        ),
+    )
+    service = RuntimeService(
+        manifest_path=manifest_path,
+        activation_path=activation_path,
+        runtime_ref=RUNTIME_REF,
+        env={ENV_RUNTIME_DSAR_TOKEN: DSAR_TOKEN},
+    )
+
+    # Ordinary serving is correctly suspended by the stale receipt.
+    assert service.readyz().payload["reason"] == "content_restriction_not_current"
+
+    # The rights over data already held are not.
+    export = service._dsar(
+        "/internal/v1/dsar/export", "POST", f"Bearer {DSAR_TOKEN}"
+    )
+    assert export.status_code != 503
