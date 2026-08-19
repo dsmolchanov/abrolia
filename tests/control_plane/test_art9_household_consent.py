@@ -378,15 +378,47 @@ def test_the_page_presents_the_consent_on_every_email_option(
     assert "Art. 9(2)(a)" in html_module.unescape(html)
 
 
-def test_the_synthetic_page_does_not_ask_for_a_consent_it_does_not_need(
+def test_the_synthetic_page_asks_only_where_a_real_provider_is_routed_to(
     api_harness,
 ) -> None:
+    """Per option, not per deployment flag.
+
+    With the managed rollout off, `abrolia_managed` and `family_domain` route to
+    `fake-email` and owe nothing. `gmail_agent` routes to `google-oauth`
+    regardless, so its form must carry the consent — otherwise the server gate,
+    which asks the same question, rejects a submission the page could not have
+    made valid.
+    """
     world = api_harness.create_principal("synthetic-owner@family.test")
     api_harness.authenticate(world)
     html = api_harness.client.get("/onboarding").text
 
-    assert 'name="special_category_household_consent"' not in html
+    assert html.count('name="special_category_household_consent"') == 1
     assert html.count('name="special_category_restriction_acknowledged"') == 3
+    # And it is on the Gmail form, not one of the synthetic ones.
+    gmail = html.index('value="gmail_agent"')
+    following = html.index('name="special_category_household_consent"', gmail)
+    assert following < html.index('value="family_domain"', gmail)
+
+
+def test_the_page_and_the_gate_never_disagree(api_harness) -> None:
+    """They are the same predicate, and that is the property worth pinning.
+
+    Keying the page on the rollout flag while the gate keyed on the provider
+    made Gmail-only browser onboarding impossible: no consent rendered, and a
+    server that demanded one.
+    """
+    service = api_harness.container.onboarding
+    world = api_harness.create_principal("agreement-owner@family.test")
+    api_harness.authenticate(world)
+    html = api_harness.client.get("/onboarding").text
+
+    for option in ("abrolia_managed", "gmail_agent", "family_domain"):
+        required = service.email_option_processes_real_content(option)
+        start = html.index(f'value="{option}"')
+        end = html.index("</form>", start)
+        rendered = 'name="special_category_household_consent"' in html[start:end]
+        assert rendered == required, option
 
 
 def test_the_javascript_path_submits_the_consent(api_harness) -> None:

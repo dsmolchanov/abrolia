@@ -179,6 +179,33 @@ def main(argv: Sequence[str] | None = None) -> int:
             results = active.runtime_health.reconcile_all(now=time.time())
             print(json.dumps([result.__dict__ for result in results], sort_keys=True))
             return 0
+    if args.command == "withdraw-consent":
+        # Handled before the locking container below. `serve` holds the
+        # nonblocking writer flock for the life of the process, so a command
+        # that takes it can only run with production stopped — and an Art. 7(3)
+        # withdrawal that requires taking the service down is not the one-step
+        # withdrawal the consent copy promises. The work here is one short
+        # transaction plus a queued job, which SQLite serialises on its own;
+        # the flock guards against a second long-running WORKER, which this is
+        # not. Routing it through the running process instead would need an
+        # authenticated admin surface, and that belongs with the account UI.
+        with _container(lock=False) as active:
+            try:
+                result = active.withdrawal.withdraw(
+                    args.household_id, args.purpose, now=time.time()
+                )
+            except ConsentNotHeld as error:
+                raise SystemExit(str(error)) from error
+            # No identifiers beyond the one supplied: the operator already knows
+            # it, and the log must not gain a new copy.
+            print(json.dumps({
+                "purpose": result.purpose,
+                "receipts_revoked": result.receipts_revoked,
+                "revisions_revoked": result.revisions_revoked,
+                "runtime_notified": result.runtime_notified,
+            }, sort_keys=True))
+            return 0
+
     mailer = ConsoleMailer() if args.command == "invite" else None
     with _container(mailer=mailer) as active:
         if args.command == "migrate":
@@ -203,22 +230,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "reconcile":
             result = active.worker.reconcile(args.job_id)
             print(json.dumps(result.__dict__, sort_keys=True))
-            return 0
-        if args.command == "withdraw-consent":
-            try:
-                result = active.withdrawal.withdraw(
-                    args.household_id, args.purpose, now=time.time()
-                )
-            except ConsentNotHeld as error:
-                raise SystemExit(str(error)) from error
-            # No household or account identifiers beyond the one supplied: the
-            # operator already knows it, and the log must not gain a new copy.
-            print(json.dumps({
-                "purpose": result.purpose,
-                "receipts_revoked": result.receipts_revoked,
-                "revisions_revoked": result.revisions_revoked,
-                "runtime_notified": result.runtime_notified,
-            }, sort_keys=True))
             return 0
         if args.command == "retention":
             result = active.retention.run()

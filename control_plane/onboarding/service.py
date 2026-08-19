@@ -263,6 +263,20 @@ class OnboardingService:
             StepKind.PRIMARY_CHANNEL: "fake-channel",
         }[kind]
 
+    def email_option_processes_real_content(self, option: str) -> bool:
+        """Whether this email option routes to a provider handling real content.
+
+        The gate below and the onboarding page must agree about this, and they
+        did not: the server started keying on the provider while the page still
+        keyed on the managed-rollout flag, so with `ABROLIA_REAL_EMAIL_ENABLED=0`
+        the Gmail form rendered no consent and the server then rejected the
+        submission for lacking it — browser onboarding became impossible. One
+        predicate, asked by both.
+        """
+        return processes_real_household_content(
+            self._provider_for(StepKind.EMAIL, option)
+        )
+
     def _assert_email_rollout(self, household_id: str, selection: dict[str, Any]) -> None:
         # Gate on the PROVIDER this selection routes to, not on the managed
         # rollout flag. `gmail_agent` goes to `google-oauth` unconditionally —

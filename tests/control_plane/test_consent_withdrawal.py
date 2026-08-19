@@ -415,3 +415,33 @@ def test_one_withdrawal_still_queues_exactly_one_stop(cp_stack) -> None:
     )
     assert len(stops) == 1
     assert first.runtime_job_id == stops[0]["id"]
+
+
+def test_withdrawal_runs_while_the_service_holds_the_writer_lock(tmp_path) -> None:
+    """`serve` owns the nonblocking flock for the life of the process.
+
+    A withdrawal command that takes the same lock can only run with production
+    stopped, and an Art. 7(3) withdrawal that requires taking the service down
+    is not the one-step withdrawal the consent copy promises.
+    """
+    from control_plane.cli import main
+    from control_plane.config import ControlPlaneConfig
+    from control_plane.container import ControlPlaneContainer
+
+    config = ControlPlaneConfig.for_test(tmp_path)
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(ControlPlaneConfig, "from_env", staticmethod(lambda: config))
+    try:
+        # Stand in for the running service: hold the writer flock.
+        with ControlPlaneContainer.build(config, acquire_process_lock=True):
+            # No receipt exists, so it exits on that — the point is that it gets
+            # far enough to look, rather than dying on the lock.
+            with pytest.raises(SystemExit) as exit_info:
+                main([
+                    "withdraw-consent",
+                    "10000000-0000-4000-8000-000000000031",
+                    HOUSEHOLD_CONTENT_PURPOSE,
+                ])
+            assert "holds no" in str(exit_info.value)
+    finally:
+        monkey.undo()

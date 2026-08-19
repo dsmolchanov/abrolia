@@ -175,9 +175,13 @@ def create_app(
                 "special_category_household_version": household_version,
                 "special_category_household_text": household_text,
                 "special_category_household_sha256": household_sha,
-                # The consent is asked for only in a real-email rollout; the
-                # server enforces the same condition in _assert_email_rollout.
-                "real_email_enabled": active_container.config.real_email_enabled,
+                # Per OPTION, from the same predicate the gate uses — not from
+                # the managed-rollout flag, which says nothing about Gmail.
+                "household_consent_required": {
+                    option: active_container.onboarding
+                    .email_option_processes_real_content(option)
+                    for option in ("abrolia_managed", "gmail_agent", "family_domain")
+                },
             },
         )
 
