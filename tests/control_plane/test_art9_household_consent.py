@@ -387,3 +387,34 @@ def test_the_javascript_path_submits_the_consent(api_harness) -> None:
     assert "selection.special_category_household_consent = true" in script
     assert "special_category_household_receipt_id = crypto.randomUUID()" in script
     assert "special_category_household_text_sha256" in script
+
+
+# ---------------------------------------------------------------------------
+# The two copies must be mutually satisfiable.
+# ---------------------------------------------------------------------------
+
+
+def test_the_restriction_does_not_forbid_what_the_consent_permits() -> None:
+    """v1 forbade special-category data "about any person".
+
+    That included the owner and their own minor children — exactly the subjects
+    the Art. 9(2)(a) consent authorises — so a family could not obey the
+    restriction and use the consented feature at the same time. It also
+    misstated the S5 boundary, which puts only THIRD-PARTY special categories
+    out of scope.
+    """
+    from control_plane.privacy.consent import consent_version_and_text
+
+    restriction_version, restriction = consent_version_and_text(
+        CONTENT_RESTRICTION_PURPOSE
+    )
+    _, consent = consent_version_and_text(HOUSEHOLD_CONTENT_PURPOSE)
+
+    assert "about any person" not in restriction
+    assert "anyone other than yourself and your own minor children" in restriction
+    # Both texts must agree on who is in scope and who is not.
+    assert "your own minor children" in consent
+    assert "outside the scope" in restriction
+    # A copy change that reintroduces the contradiction must also bump the
+    # version, because every enforcement boundary compares it exactly.
+    assert restriction_version.endswith("-v2")

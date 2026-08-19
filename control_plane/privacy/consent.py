@@ -7,11 +7,23 @@ from collections.abc import Mapping
 from typing import Any
 
 CONSENT_TEXTS = {
+    # v2, 2026-08-19. v1 forbade special-category data "about any person",
+    # which included the owner and their own minor children — precisely the
+    # subjects the Art 9(2)(a) consent below authorises. A family could not obey
+    # the restriction and use the consented feature at the same time, and the
+    # contradiction also misstated the S5 boundary, which puts only THIRD-PARTY
+    # special categories out of scope (docs/privacy/lawful-bases.md section 3).
+    # The version bump invalidates v1 receipts by design: every enforcement
+    # boundary compares the exact version and digest, so a household holding v1
+    # must accept v2 before real content flows again.
     "special_category_content_restriction": (
-        "special-category-content-restriction-v1",
+        "special-category-content-restriction-v2",
         "Do not send or forward medical certificates, health or allergy data, "
-        "religious beliefs, or other special-category personal data about any "
-        "person to the agent inbox or channel. If such content is sent by "
+        "religious beliefs, or other special-category personal data about "
+        "anyone other than yourself and your own minor children, to the agent "
+        "inbox or channel. Data about other people — other children, teachers, "
+        "other parents — is outside the scope of this service and Abrolia has "
+        "no lawful condition to process it. If such content is sent by "
         "mistake, stop using it and request deletion at help@abrolia.com. This "
         "acknowledgement does not transfer Abrolia's legal obligations.",
     ),

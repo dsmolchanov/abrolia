@@ -414,7 +414,9 @@ def test_no_js_email_requires_and_records_english_content_restriction(api_harnes
     )
     assert dict(receipt) == {
         "purpose": "special_category_content_restriction",
-        "text_version": "special-category-content-restriction-v1",
+        "text_version": consent_version_and_sha(
+            "special_category_content_restriction"
+        )[0],
         "locale": "en",
         "revoked_at": None,
     }

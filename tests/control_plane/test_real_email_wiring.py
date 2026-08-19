@@ -132,11 +132,15 @@ def test_real_email_rollout_does_not_route_gmail_to_nerve(cp_stack) -> None:
     assert [dict(receipt) for receipt in receipts] == [
         {
             "purpose": "special_category_content_restriction",
-            "text_version": "special-category-content-restriction-v1",
+            "text_version": consent_version_and_sha(
+            "special_category_content_restriction"
+        )[0],
         },
         {
             "purpose": "special_category_household_content",
-            "text_version": "special-category-household-content-v1",
+            "text_version": consent_version_and_sha(
+            "special_category_household_content"
+        )[0],
         },
     ]
 

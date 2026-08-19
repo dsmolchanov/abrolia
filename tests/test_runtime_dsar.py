@@ -6,6 +6,7 @@ import json
 import stat
 from pathlib import Path
 
+from control_plane.privacy.consent import consent_version_and_sha
 from hermes_cloud.core.db import open_database
 from hermes_cloud.core.dsar import is_deleted
 from hermes_cloud.core.runtime_manifest import compute_config_sha256, parse_runtime_manifest
@@ -19,8 +20,13 @@ RUNTIME_REF = "abrolia-hh-aaaaaaaaaaaaaaaaaaaaaaaaaa"
 DSAR_TOKEN = "synthetic-runtime-dsar-token-canary"
 
 
+_RESTRICTION_VERSION, _RESTRICTION_SHA = consent_version_and_sha(
+    "special_category_content_restriction"
+)
+
+
 def _manifest_toml() -> str:
-    body = '''\
+    body = f'''\
 schema_version = 1
 household_id = "33333333-3333-4333-8333-333333333333"
 config_revision = 4
@@ -55,8 +61,8 @@ required_purposes = ["special_category_content_restriction"]
 [[consent.receipts]]
 receipt_id = "10000000-0000-4000-8000-000000000033"
 purpose = "special_category_content_restriction"
-text_version = "special-category-content-restriction-v1"
-text_sha256 = "64221529a01cff070f1f614451eecaa5c6ed28a2b7c5d6af6f56e5ef5054e509"
+text_version = "{_RESTRICTION_VERSION}"
+text_sha256 = "{_RESTRICTION_SHA}"
 '''
     digest = compute_config_sha256(body)
     return body.replace("schema_version = 1\n", f'schema_version = 1\nconfig_sha256 = "{digest}"\n')

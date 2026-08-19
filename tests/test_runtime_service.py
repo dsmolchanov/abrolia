@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 
+from control_plane.privacy.consent import consent_version_and_sha
 from hermes_cloud.core.db import open_database
 from hermes_cloud.core.runtime_manifest import compute_config_sha256, parse_runtime_manifest
 from hermes_cloud.runtime import service as runtime_service_module
@@ -31,12 +32,17 @@ RUNTIME_REF = "fly:abrolia-hh-test"
 TOKEN = "synthetic-bootstrap-token-canary"
 
 
+_RESTRICTION_VERSION, _RESTRICTION_SHA = consent_version_and_sha(
+    "special_category_content_restriction"
+)
+
+
 def manifest_toml(
     *,
     with_email_binding: bool = False,
     email_provider: str = "nerve-managed",
     with_content_restriction: bool = True,
-    content_restriction_sha: str = "64221529a01cff070f1f614451eecaa5c6ed28a2b7c5d6af6f56e5ef5054e509",
+    content_restriction_sha: str = _RESTRICTION_SHA,
 ) -> str:
     body = '''\
 schema_version = 1
@@ -87,7 +93,7 @@ required_purposes = ["special_category_content_restriction"]
 [[consent.receipts]]
 receipt_id = "10000000-0000-4000-8000-000000000031"
 purpose = "special_category_content_restriction"
-text_version = "special-category-content-restriction-v1"
+text_version = "{_RESTRICTION_VERSION}"
 text_sha256 = "{content_restriction_sha}"
 """
     digest = compute_config_sha256(body)
