@@ -182,10 +182,11 @@ def test_an_unknown_consent_purpose_fails_closed_without_raising(
     # computed — editing a finished manifest only produces a hash mismatch,
     # which is a different failure and would not exercise the lookup at all.
     stripped = re.sub(r'config_sha256 = "[0-9a-f]*"\n', "", manifest_toml())
-    body = stripped.replace(
-        'required_purposes = ["special_category_content_restriction"]',
-        'required_purposes = ["special_category_content_restriction",'
-        ' "a_purpose_added_after_this_build"]',
+    body = re.sub(
+        r"required_purposes = \[(.*?)\]",
+        lambda m: f'required_purposes = [{m.group(1)}, "a_purpose_added_after_this_build"]',
+        stripped,
+        count=1,
     )
     # The parser requires a receipt for every required purpose, and so does the
     # real rolling addition: the control plane issues the new purpose WITH its
@@ -229,3 +230,86 @@ text_sha256 = "{}"
     assert probe.payload["reason"] == "consent_not_current"
     # The property that actually kept the workers alive.
     assert service.can_start_workers is False
+
+
+def test_a_legacy_real_email_manifest_without_the_consent_is_suspended(
+    tmp_path: Path,
+) -> None:
+    """Validating only DECLARED purposes let a legacy manifest keep serving.
+
+    A schema-v1 manifest issued before `special_category_household_content`
+    existed can name `nerve-managed` as its provider and declare only the
+    restriction. Checking "every purpose the manifest declares" found nothing
+    wrong with it, so real family content kept flowing with no Art. 9 condition
+    at all. What is owed comes from the provider, as the control plane derives
+    it — never read back from the document being validated.
+    """
+    content = manifest_toml(
+        with_email_binding=True,
+        email_provider="nerve-managed",
+        with_household_consent=False,
+    )
+    assert 'provider_kind = "nerve-managed"' in content
+    assert "special_category_household_content" not in content
+    manifest_path = tmp_path / "household.toml"
+    atomic_write(manifest_path, content.encode())
+    parsed = parse_runtime_manifest(content)
+    activation_path = tmp_path / "activation.json"
+    write_activation_state(
+        activation_path,
+        ActivationState(
+            status="active",
+            runtime_ref=RUNTIME_REF,
+            household_id=parsed.household_id,
+            config_revision=parsed.config_revision,
+            config_sha256=parsed.config_sha256,
+            updated_at=1.0,
+        ),
+    )
+    service = RuntimeService(
+        manifest_path=manifest_path,
+        activation_path=activation_path,
+        runtime_ref=RUNTIME_REF,
+        env={ENV_RUNTIME_DSAR_TOKEN: DSAR_TOKEN},
+    )
+
+    probe = service.readyz()
+    assert probe.status_code == 503
+    assert probe.payload["reason"] == "consent_not_current"
+
+
+def test_withdrawal_does_not_change_what_dsar_answers(tmp_path: Path) -> None:
+    """Art. 7(3) stops processing; it does not extinguish Art. 15 and Art. 17.
+
+    Withdrawal made `_ready_manifest` return nothing, and both DSAR routes go
+    through it — so exercising one right destroyed the others, and a household
+    that withdrew could no longer get its data out or have it deleted.
+
+    Asserted as an equivalence rather than a fixed status: whatever this runtime
+    answers for export, it must answer the same after withdrawal. That pins the
+    property without depending on how a seeded DSAR database would respond.
+    """
+    before_service = active_service(tmp_path / "before")
+    before = before_service._dsar(
+        "/internal/v1/dsar/export", "POST", f"Bearer {DSAR_TOKEN}"
+    )
+
+    after_service = active_service(tmp_path / "after")
+    assert revoke(after_service).status_code == 200
+    assert after_service.readyz().payload["reason"] == "consent_withdrawn"
+    after = after_service._dsar(
+        "/internal/v1/dsar/export", "POST", f"Bearer {DSAR_TOKEN}"
+    )
+
+    assert after.status_code == before.status_code
+    # And specifically not the readiness refusal withdrawal used to cause.
+    assert after.status_code != 503
+
+
+def test_dsar_still_requires_its_credential_after_withdrawal(tmp_path: Path) -> None:
+    """Relaxing readiness must not relax authentication with it."""
+    service = active_service(tmp_path)
+    assert revoke(service).status_code == 200
+
+    denied = service._dsar("/internal/v1/dsar/export", "POST", "Bearer wrong")
+    assert denied.status_code == 401

@@ -16,7 +16,11 @@ from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
 import httpx
 
-from control_plane.privacy.consent import consent_version_and_sha
+from control_plane.privacy.consent import (
+    HOUSEHOLD_CONTENT_PURPOSE,
+    consent_version_and_sha,
+    processes_real_household_content,
+)
 from hermes_cloud.core.config import DEFAULT_DB_PATH, ENV_DB
 from hermes_cloud.core.db import open_database
 from hermes_cloud.core.dsar import export_household, is_deleted, wipe_household
@@ -216,10 +220,21 @@ class RuntimeService:
         # Liveness deliberately does not depend on bootstrap/control-plane state.
         return Probe(200, {"status": "ok"})
 
-    def _ready_manifest(self) -> tuple[RuntimeManifest | None, str]:
+    def _ready_manifest(
+        self, *, for_data_subject_request: bool = False
+    ) -> tuple[RuntimeManifest | None, str]:
+        """Resolve the manifest, and whether this runtime may serve from it.
+
+        `for_data_subject_request` relaxes exactly one condition: a withdrawn
+        consent. Withdrawal under Art. 7(3) stops PROCESSING; it does not
+        extinguish the Art. 15 and Art. 17 rights over data already held, and an
+        arrangement in which exercising one right destroys the others is not a
+        rights regime. Deletion still takes precedence — there is then nothing
+        left to export, and the caller is told exactly that.
+        """
         if self.deletion_marker.is_file():
             return None, "runtime_deleted"
-        if self.consent_marker.is_file():
+        if self.consent_marker.is_file() and not for_data_subject_request:
             # Checked before the manifest is even loaded: the manifest cannot
             # express this state, and the Art 9(2)(a) copy promises withdrawal
             # "stops further processing", not "stops it at the next delivery".
@@ -244,7 +259,21 @@ class RuntimeService:
             # The S5 boundary is required of every household, synthetic or not,
             # so a manifest that omits it is malformed rather than permissive.
             return None, "content_restriction_not_current"
-        for purpose in manifest.consent.required_purposes:
+        # What the household OWES is derived from the provider, exactly as the
+        # control plane derives it — not read back from what the manifest
+        # happens to declare. A schema-v1 manifest issued before the Art 9(2)(a)
+        # purpose existed can name `nerve-managed` or `gmail` and declare only
+        # the restriction; validating "every declared purpose" then found
+        # nothing wrong with it and kept serving real family content with no
+        # Art. 9 condition at all.
+        owed = set(manifest.consent.required_purposes)
+        if processes_real_household_content(manifest.email.provider_kind):
+            owed.add(HOUSEHOLD_CONTENT_PURPOSE)
+        for purpose in sorted(owed):
+            if purpose not in manifest.consent.required_purposes:
+                # Owed but not declared: the manifest predates the purpose and
+                # carries no receipt for it. Only a new revision can fix that.
+                return None, "consent_not_current"
             # A manifest may legitimately name a purpose this build does not
             # know: during a rolling addition the control plane issues the new
             # purpose before every runtime carries the copy for it. The parser
@@ -748,7 +777,7 @@ class RuntimeService:
                 return Probe(200, {"state": "absent"})
             return Probe(410, {"status": "runtime_deleted"})
         try:
-            manifest, _reason = self._ready_manifest()
+            manifest, _reason = self._ready_manifest(for_data_subject_request=True)
             if manifest is None:
                 raise RuntimeNotReady("runtime is not active")
             with open_database(self.database_path) as database:
@@ -779,7 +808,7 @@ class RuntimeService:
         if not supplied or not hmac.compare_digest(supplied, expected):
             return Probe(401, {"status": "unauthorized"})
         try:
-            manifest, _reason = self._ready_manifest()
+            manifest, _reason = self._ready_manifest(for_data_subject_request=True)
             if manifest is None:
                 raise RuntimeNotReady("runtime is not active")
             if not self._revoke_google_credential(manifest):
