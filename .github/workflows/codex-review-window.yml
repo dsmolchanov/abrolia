@@ -109,6 +109,22 @@ jobs:
       # skipped and the gate still fails.
       SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
       # A PAT for a GitHub account with a connected Codex Cloud subscription.
+      #
+      # SCOPE IT TO NOTHING BUT COMMENTING. This workflow runs from the PULL
+      # REQUEST's copy of itself on a same-repository branch, and same-repo PRs
+      # receive base-repository secrets — so anyone who can push a branch here
+      # can add a step that prints this value. `permissions:` above does not
+      # constrain it; that block governs GITHUB_TOKEN, not a PAT.
+      #
+      # Therefore: a FINE-GRAINED token, limited to these repositories, with
+      # `Pull requests: Read and write` and nothing else. Stealing it then buys
+      # the ability to write PR comments, which is noise. A classic token with
+      # `repo` would hand over read/write on every private repository it covers.
+      #
+      # The right home for this is the App-owned controller, where the credential
+      # never enters a PR-executed workflow at all:
+      # thoughts/shared/plans/2026-08-17-codex-gate-controller.md, Phase 2. Until
+      # that exists, the narrow token is the containment.
       # Codex serves review requests per REQUESTING IDENTITY, and every
       # GITHUB_TOKEN comment is authored by `github-actions[bot]` — an identity
       # with no Codex account. It answers those with "To use Codex here, create
@@ -416,11 +432,29 @@ jobs:
           # decided. Wait, then re-query — a review found now is authoritative
           # and the clean signal does not override it.
           # ---------------------------------------------------------------
+          # POLL across the whole window rather than checking once at the end.
+          # A single `sleep 15` was shorter than the lag recorded two lines above:
+          # on NeoMenu#658 the review landed 59 seconds later, so the one recheck
+          # found nothing, the gate exited 0, and auto-merge consumed the green
+          # check before the P1s were published. A grace shorter than the lag it
+          # cites is not a grace.
+          #
+          # 90s covers the observed 59s with room, and the poll returns the
+          # instant a review appears — so only a genuinely clean head pays the
+          # full window.
           if [ -z "${RIDS}" ]; then
-            sleep "${GRACE_SECONDS:-15}"
-            RIDS="$(review_ids_for_head)"
+            GRACE="${GRACE_SECONDS:-90}"
+            GRACE_DEADLINE=$((SECONDS + GRACE))
+            while :; do
+              RIDS="$(review_ids_for_head)"
+              [ -n "${RIDS}" ] && break
+              [ ${SECONDS} -ge ${GRACE_DEADLINE} ] && break
+              sleep 5
+            done
             if [ -n "${RIDS}" ]; then
-              echo "A formal review for ${HEAD_SHA} arrived during the grace window; it overrides the clean signal."
+              echo "A formal review for ${HEAD_SHA} arrived during the ${GRACE}s grace window; it overrides the clean signal."
+            else
+              echo "No formal review for ${HEAD_SHA} within ${GRACE}s of the clean signal."
             fi
           fi
 
