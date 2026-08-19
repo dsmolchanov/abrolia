@@ -48,6 +48,17 @@ next boot and recorded as the new pre-migrate archive, silently replacing the
 good restore point with one taken of the broken schema. When nothing is
 pending, no archive is written.
 
+A failing migration restarts the container, and each boot reaches this step
+again. It does **not** snapshot again: an existing `pre-migrate-<rev>-*` archive
+for the unchanged revision is reused, so a restart loop cannot fill `/data` and
+cost you the ability to take a restore point at all. Reuse requires that nothing
+has been written since — the database and its WAL are checked against the
+archive's timestamp — because a migration can be dropped from the next image,
+the container can then serve at the same revision and take writes, and an
+archive matching only by revision would be a restore point that silently loses
+them. Nothing is ever deleted to reclaim space; discarding a restore point is
+the one move that turns a disk problem into a data-loss problem.
+
 Restore a pre-migrate archive with `--no-migrate`. The normal restore applies
 pending migrations, which from the new image would immediately reapply — or fail
 again on — the migration the archive exists to undo:

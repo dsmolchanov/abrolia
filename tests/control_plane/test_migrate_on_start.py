@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import sqlite3
 from pathlib import Path
 
@@ -258,4 +259,62 @@ def test_a_healthy_batch_still_applies_every_script(tmp_path) -> None:
     assert applied == ["0001_step.sql", "0002_step.sql", "0003_step.sql"]
     assert database.pending_migrations(directory) == []
     assert database.migrate(directory) == []
+    database.close()
+
+
+def test_a_restart_loop_does_not_accumulate_snapshots(tmp_path) -> None:
+    """A failing migration restarts the container; each boot took a full backup.
+
+    On the configured 1 GB volume that turns a recoverable failed deploy into a
+    full disk — and a full disk costs the ability to take a restore point at
+    all.
+    """
+    directory = _pending_migration_directory(tmp_path)
+    database = _database(tmp_path)
+    database.migrate()
+
+    first = create_pre_migrate_backup(
+        database, backup_key=BACKUP_KEY_BYTES, directory=directory
+    )
+    assert first is not None
+    for _ in range(4):
+        again = create_pre_migrate_backup(
+            database, backup_key=BACKUP_KEY_BYTES, directory=directory
+        )
+        assert again == first
+    assert len(list(tmp_path.glob("*.bak"))) == 1
+    database.close()
+
+
+def test_a_snapshot_is_not_reused_once_the_database_has_moved_on(tmp_path) -> None:
+    """Same revision is not sufficient — the data can still have changed.
+
+    A migration can fail, be dropped from the next image so the container serves
+    at the unchanged revision, take writes, and only then meet a new migration.
+    The old archive matches by revision and no longer matches the data; reusing
+    it would hand the operator a restore point that silently loses those writes.
+    """
+    directory = _pending_migration_directory(tmp_path)
+    database = _database(tmp_path)
+    database.migrate()
+    first = create_pre_migrate_backup(
+        database, backup_key=BACKUP_KEY_BYTES, directory=directory
+    )
+    assert first is not None
+
+    # Serving writes to the database after the archive was taken.
+    with database.write() as connection:
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS post_backup_write (id TEXT PRIMARY KEY)"
+        )
+    for companion in (database.path, database.path.with_name(f"{database.path.name}-wal")):
+        if companion.exists():
+            os.utime(companion, (first.stat().st_mtime + 10,) * 2)
+
+    second = create_pre_migrate_backup(
+        database, backup_key=BACKUP_KEY_BYTES, directory=directory
+    )
+
+    assert second is not None and second != first
+    assert len(list(tmp_path.glob("*.bak"))) == 2
     database.close()

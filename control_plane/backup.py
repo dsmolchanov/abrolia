@@ -43,11 +43,70 @@ def create_pre_migrate_backup(
     if not database.pending_migrations(directory):
         return None
     revision = database.applied_revision()
+
+    # A persistently failing migration restarts the container in a loop, and
+    # every boot reached this line: one full encrypted snapshot per attempt,
+    # each under a fresh epoch, on a 1 GB volume. That turns a recoverable
+    # failed deploy into a full disk — losing the ability to take a restore
+    # point at all, and eventually the database's own room to write.
+    existing = _reusable_pre_migrate_backup(database, revision)
+    if existing is not None:
+        return existing
+
     stamp = int(time.time() if now is None else now)
-    target = database.path.with_name(
-        f"{database.path.name}.pre-migrate-{revision}-{stamp}.bak"
-    )
+    base = f"{database.path.name}.pre-migrate-{revision}-{stamp}"
+    target = database.path.with_name(f"{base}.bak")
+    # Two attempts inside one second is not exotic — a container that fails fast
+    # and restarts does exactly that. `create_backup` refuses to overwrite, so
+    # without a disambiguator the collision raises and the boot fails for a
+    # reason that has nothing to do with the migration. The suffix is bounded;
+    # reuse above already prevents the unbounded case.
+    for suffix in range(1, 10):
+        if not target.exists():
+            break
+        target = database.path.with_name(f"{base}-{suffix}.bak")
     return create_backup(database, target, backup_key=backup_key)
+
+
+def _reusable_pre_migrate_backup(
+    database: ControlPlaneDatabase, revision: object
+) -> Path | None:
+    """An existing snapshot of THIS database at THIS revision, or None.
+
+    Same revision is not sufficient on its own. A migration can fail, be dropped
+    from the next image so the container serves at the unchanged revision, take
+    writes, and only then meet a new migration — at which point the old archive
+    matches by revision but no longer matches the data. So the archive is reused
+    only when nothing has been written since it was taken, checked against the
+    database file and its WAL sidecar.
+
+    Reuse rather than prune: deleting a restore point to save space is the one
+    move that turns a disk problem into a data-loss problem.
+    """
+    candidates = sorted(
+        database.path.parent.glob(
+            f"{database.path.name}.pre-migrate-{revision}-*.bak"
+        )
+    )
+    if not candidates:
+        return None
+    archive = candidates[-1]
+    try:
+        taken_at = archive.stat().st_mtime
+    except OSError:
+        return None
+    for companion in (
+        database.path,
+        database.path.with_name(f"{database.path.name}-wal"),
+    ):
+        try:
+            if companion.stat().st_mtime > taken_at:
+                return None
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return None
+    return archive
 
 
 def create_backup(
