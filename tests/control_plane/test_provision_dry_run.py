@@ -332,3 +332,66 @@ def test_the_declared_runtime_write_set_matches_a_real_run(container) -> None:
 
     assert observed, "the runtime phase wrote nothing; the trace is not working"
     assert observed == set(RUNTIME_OPERATION_WRITES)
+
+
+def test_a_reset_workflow_is_not_reported_as_already_planned(container) -> None:
+    """`reset_from` retains the rows and marks them revoked/cancelled.
+
+    Reading the highest revision regardless of status made a reset workflow look
+    planned: it reported a cancelled job as pending and advertised the runtime
+    write set while the steps that work depends on were unverified — a plan for
+    an onboarding that is not going to happen next.
+    """
+    household_id = _household_with_profile(container)
+    _verify_all_steps(container, household_id)
+    account_id, session_id = _PRINCIPALS[household_id]
+    container.onboarding.reset_from(
+        household_id,
+        StepKind.EMAIL,
+        context=_context(
+            container, household_id, "reset", account_id=account_id,
+            session_id=session_id,
+        ),
+    )
+
+    plan = plan_onboarding(container, household_id)
+
+    assert plan.config_revision == {}
+    assert plan.pending_runtime_job == {}
+    assert plan.blocked_by is not None
+    assert plan.unverified_steps
+    assert set(plan.table_writes) != set(RUNTIME_OPERATION_WRITES)
+    assert plan.committed is False
+
+
+def test_the_cli_leaves_a_non_wal_database_in_its_own_journal_mode(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """`PRAGMA journal_mode=WAL` is persistent, so opening the file is a write.
+
+    On a database in another mode — an imported or restored SQLite file — the
+    connection rewrote the header and created `-wal`/`-shm` sidecars before any
+    transaction existed, so no rollback could undo it. The command promises to
+    mutate nothing; that has to hold for this database state too.
+    """
+    config = ControlPlaneConfig.for_test(tmp_path)
+    seed = ControlPlaneDatabase(config.database_path)
+    seed.migrate()
+    seed.connection.execute("PRAGMA journal_mode=DELETE")
+    assert seed.query_one("PRAGMA journal_mode")[0].lower() == "delete"
+    seed.close()
+    monkeypatch.setattr(ControlPlaneConfig, "from_env", staticmethod(lambda: config))
+
+    # Exits on the missing household — after the container has been built,
+    # which is where the mutation used to happen.
+    with pytest.raises(SystemExit):
+        main(["--dry-run", "--household", "10000000-0000-4000-8000-000000000031"])
+
+    check = ControlPlaneDatabase(config.database_path, preserve_journal_mode=True)
+    try:
+        assert check.query_one("PRAGMA journal_mode")[0].lower() == "delete"
+    finally:
+        check.close()
+    assert not config.database_path.with_name(
+        f"{config.database_path.name}-wal"
+    ).exists()

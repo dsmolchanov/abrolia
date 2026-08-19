@@ -316,9 +316,17 @@ def plan_onboarding(
             # The revision the real onboarding provisions is issued by the
             # worker when the primary step verifies, so it is read from durable
             # state, never minted here.
+            # Status matters, not merely existence. `reset_from` RETAINS the
+            # revision and runtime-job rows and marks them `revoked` and
+            # `cancelled`; reading the highest revision regardless of status
+            # made a reset workflow look already-planned, reported a cancelled
+            # job as pending, and advertised the runtime write set while the
+            # steps it depends on were unverified.
             issued = connection.execute(
                 "SELECT revision, status, manifest_sha256 FROM config_revisions"
-                " WHERE household_id = ? ORDER BY revision DESC LIMIT 1",
+                " WHERE household_id = ?"
+                " AND status IN ('planned','issued','claimed','active')"
+                " ORDER BY revision DESC LIMIT 1",
                 (household_id,),
             ).fetchone()
             if issued is not None:
@@ -333,9 +341,11 @@ def plan_onboarding(
                 }
             runtime_job = connection.execute(
                 "SELECT id, status, desired_revision FROM provisioning_jobs"
-                " WHERE household_id = ? AND kind = 'runtime'"
-                " AND operation = 'ensure_runtime' ORDER BY created_at DESC LIMIT 1",
-                (household_id,),
+                " WHERE household_id = ? AND workflow_id = ? AND kind = 'runtime'"
+                " AND operation = 'ensure_runtime'"
+                " AND status NOT IN ('cancelled','failed')"
+                " ORDER BY created_at DESC LIMIT 1",
+                (household_id, workflow["id"]),
             ).fetchone()
             if runtime_job is not None:
                 plan.pending_runtime_job = {
@@ -357,7 +367,15 @@ def plan_onboarding(
             # `config_revisions` — a write the real onboarding will never make.
             # Reporting that as the "exact writes" described an operation this
             # run had just discarded.
-            already_planned = issued is not None
+            # Both must be current AND agree with each other. A revision with
+            # no live job for this workflow is not a plan the operator can rely
+            # on, so the rehearsal below runs instead and reports whatever still
+            # blocks it.
+            already_planned = (
+                issued is not None
+                and runtime_job is not None
+                and runtime_job["desired_revision"] == issued["revision"]
+            )
             if already_planned:
                 plan.rehearsal = (
                     f"revision {issued['revision']} is already issued, so the"
@@ -437,6 +455,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         ControlPlaneConfig.from_env(),
         acquire_process_lock=False,
         apply_migrations=False,
+        # `PRAGMA journal_mode=WAL` is persistent: on a database in another
+        # mode — an imported or restored file — opening the connection rewrites
+        # the header and creates sidecars before any transaction exists, so the
+        # rollback cannot undo it. The rehearsal works in any journal mode, so
+        # it simply leaves the mode alone.
+        preserve_journal_mode=True,
     ) as active:
         pending = pending_migrations(active.database)
         if pending:

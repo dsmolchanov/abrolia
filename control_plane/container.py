@@ -94,9 +94,12 @@ class ControlPlaneContainer:
         runtime_exporter: RuntimeExporter | None = None,
         runtime_deleter: RuntimeDeleter | None = None,
         apply_migrations: bool = True,
+        preserve_journal_mode: bool = False,
     ) -> ControlPlaneContainer:
         config.validate()
-        database = ControlPlaneDatabase(config.database_path)
+        database = ControlPlaneDatabase(
+            config.database_path, preserve_journal_mode=preserve_journal_mode
+        )
         if acquire_process_lock:
             database.acquire_process_lock()
         if apply_migrations:
