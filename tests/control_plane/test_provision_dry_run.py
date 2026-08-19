@@ -658,3 +658,57 @@ def test_the_write_set_is_labelled_as_the_success_path(container) -> None:
     assert set(plan.table_writes) == set(
         RUNTIME_WRITES_BY_WORKFLOW_STATE["runtime_provisioning"]
     )
+
+
+def test_the_secret_target_is_the_configured_provider_s_reference(container) -> None:
+    """`_finish_runtime` installs against the provider's runtime reference.
+
+    Reporting a Fly app name under `dry-run-runtime` — the allowed default —
+    made the rehearsal contradict its own resource section, which reports the
+    synthetic reference, and misstated where the real operation puts secrets.
+    """
+    household_id = _household_with_profile(container)
+    _verify_all_steps(container, household_id)
+
+    plan = plan_onboarding(container, household_id)
+
+    runtime_secrets = [
+        secret
+        for secret in plan.secrets
+        if secret["name"] in {RUNTIME_BOOTSTRAP_SECRET, RUNTIME_DSAR_SECRET}
+    ]
+    assert len(runtime_secrets) == 2
+    for secret in runtime_secrets:
+        assert secret["target"] == f"synthetic-runtime:{household_id}"
+        assert secret["target"] != FlyRuntimeProvisioner.stable_app_name(household_id)
+    # The rehearsal must not contradict itself.
+    assert {resource["stable_name"] for resource in plan.runtime_resources} == {
+        runtime_secrets[0]["target"]
+    }
+
+
+def test_a_failed_runtime_job_is_reported_as_a_failure(container) -> None:
+    """The absence of a pending job does not mean success.
+
+    `_mark_step_problem` leaves the revision issued and the workflow in
+    `runtime_provisioning`, so inferring "awaiting activation" from a missing
+    pending row reported a failed onboarding as normal progress — hiding the one
+    state that actually needs a human.
+    """
+    household_id = _household_with_profile(container)
+    _verify_all_steps(container, household_id)
+    with container.database.write() as connection:
+        connection.execute(
+            "UPDATE provisioning_jobs SET status = 'failed', settled_at = 1.0,"
+            " error_code = 'provider_rejected' WHERE household_id = ?"
+            " AND kind = 'runtime' AND operation = 'ensure_runtime'",
+            (household_id,),
+        )
+
+    plan = plan_onboarding(container, household_id)
+
+    assert plan.pending_runtime_job == {}
+    assert plan.table_writes == []
+    assert "failed" in plan.rehearsal
+    assert plan.blocked_by is not None and "failed" in plan.blocked_by
+    assert "bootstrap activation" not in plan.rehearsal

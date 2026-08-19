@@ -212,11 +212,31 @@ def _runtime_resources(
     ]
 
 
+def _runtime_secret_target(
+    container: ControlPlaneContainer, household_id: str, resources: list[dict[str, str]]
+) -> str:
+    """Where the configured provider will install the runtime secrets.
+
+    `_finish_runtime` installs both tokens against the runtime reference the
+    provider returns, so the answer belongs to the provider — not to Fly. With
+    `dry-run-runtime`, the allowed default, that reference is
+    `synthetic-runtime:<household-id>` and no Fly app exists at all; naming one
+    made the rehearsal contradict its own resource section, which now reports
+    the synthetic reference correctly.
+    """
+    for resource in resources:
+        if resource["kind"] in {"runtime_reference", "app"} and resource["stable_name"]:
+            return resource["stable_name"]
+    return ""
+
+
 def _secret_names(
-    container: ControlPlaneContainer, household_id: str
+    container: ControlPlaneContainer,
+    household_id: str,
+    resources: list[dict[str, str]],
 ) -> list[dict[str, str]]:
     """Secret *names* only. Values never leave the sink, and never appear here."""
-    app = FlyRuntimeProvisioner.stable_app_name(household_id)
+    app = _runtime_secret_target(container, household_id, resources)
     secrets = [
         {
             "name": RUNTIME_BOOTSTRAP_SECRET,
@@ -432,7 +452,42 @@ def plan_onboarding(
             # real flow never creates, and the reconcile set describes an
             # operation that has already finished. The next writes belong to
             # activation, which this command does not model, so it says that.
-            awaiting_activation = issued is not None and runtime_job is None
+            # A job that FAILED also leaves no pending row, and
+            # `_mark_step_problem` leaves the revision issued with the workflow
+            # still in `runtime_provisioning`. Inferring success from the mere
+            # absence of a pending job therefore reported a failed onboarding as
+            # waiting for activation — hiding the one state that needs a human.
+            settled = connection.execute(
+                "SELECT status FROM provisioning_jobs WHERE household_id = ?"
+                " AND workflow_id = ? AND kind = 'runtime'"
+                " AND operation = 'ensure_runtime'"
+                " ORDER BY created_at DESC LIMIT 1",
+                (household_id, workflow["id"]),
+            ).fetchone()
+            settled_status = str(settled["status"]) if settled else ""
+            awaiting_activation = (
+                issued is not None
+                and runtime_job is None
+                and settled_status == "succeeded"
+                and str(workflow["state"]) in {"activating", "complete"}
+            )
+            failed_runtime = (
+                issued is not None
+                and runtime_job is None
+                and settled_status in {"failed", "cancelled"}
+            )
+            if failed_runtime:
+                plan.blocked_by = (
+                    f"the runtime operation for revision {issued['revision']} is"
+                    f" `{settled_status}`; onboarding cannot proceed until it is"
+                    " retried or reset"
+                )
+                plan.rehearsal = (
+                    f"revision {issued['revision']} is issued but its runtime"
+                    f" operation is `{settled_status}` — a terminal state needing"
+                    " intervention, not a stage this command can rehearse past."
+                    " No write set is claimed."
+                )
             if awaiting_activation:
                 plan.rehearsal = (
                     f"revision {issued['revision']} is issued and its runtime"
@@ -440,7 +495,7 @@ def plan_onboarding(
                     " bootstrap activation, whose writes this command does not"
                     " model. Nothing is rehearsed and no write set is claimed."
                 )
-            if awaiting_activation:
+            if failed_runtime or awaiting_activation:
                 pass
             elif already_planned:
                 state = str(workflow["state"])
@@ -541,7 +596,9 @@ def plan_onboarding(
                 except KeyError:
                     spec = None
             plan.runtime_resources = _runtime_resources(container, household_id, spec)
-            plan.secrets = _secret_names(container, household_id)
+            plan.secrets = _secret_names(
+                container, household_id, plan.runtime_resources
+            )
             raise _DryRunRollback
     except _DryRunRollback:
         pass
