@@ -295,10 +295,18 @@ jobs:
                 # A comment id is a positive integer. Anything else is a
                 # failure, whatever it looks like — this gate exists to stop
                 # errors reading as success, and it was doing it to itself.
+                # `-i` keeps the response headers. On a 403 GitHub returns
+                # `x-accepted-github-permissions`, which names the permissions
+                # that WOULD have been accepted — the authoritative answer,
+                # straight from the API, rather than something inferred.
                 ANCHOR_POST=$(GH_TOKEN="${REQUEST_TOKEN:-${GH_TOKEN}}" \
-                  gh api "repos/${REPO}/issues/${PR}/comments" \
+                  gh api -i "repos/${REPO}/issues/${PR}/comments" \
                   -f body="${REQUEST_BODY}" 2>&1 || true)
-                ANCHOR_ID=$(printf '%s' "${ANCHOR_POST}" \
+                # `-i` prepends headers, so take the JSON body: from the
+                # first line that starts a JSON object to the end. Works with or
+                # without headers, which keeps this honest if `-i` is ever
+                # dropped.
+                ANCHOR_ID=$(printf '%s' "${ANCHOR_POST}" | sed -n '/^{/,$p' \
                   | jq -r 'if type == "object" and (.id | type) == "number"
                            then .id else empty end' 2>/dev/null || true)
                 case "${ANCHOR_ID}" in
@@ -316,28 +324,28 @@ jobs:
                   ANCHOR_FAILED=1
                   echo "::warning::Could not post the anchor comment. GitHub said: $(printf '%s' "${ANCHOR_POST}" | tr -d '\n' | cut -c1-300)"
                   if [ -n "${REQUEST_TOKEN}" ]; then
-                    # Probe what the token CAN do, so the next reader is not left
-                    # deducing it from a bare 403. These distinguish the three
-                    # ways a fine-grained PAT lands here: not scoped to this
-                    # repository at all, scoped but unable to read pull
-                    # requests, or able to read and not to write.
-                    if GH_TOKEN="${REQUEST_TOKEN}" gh api "repos/${REPO}" --jq '.full_name' >/dev/null 2>&1; then
-                      REPO_VISIBLE="yes"
+                    # Read probes are NOT used here, deliberately. This
+                    # repository is public, so "can the token read the repo /
+                    # the pull request" is true for an unauthenticated request
+                    # and proves nothing about the token — an earlier version of
+                    # this probe reported exactly that and led to a wrong
+                    # conclusion about which permission was missing.
+                    #
+                    # GitHub answers the question itself. On a 403 it returns
+                    # `x-accepted-github-permissions` listing what would have
+                    # been accepted; there is nothing to infer.
+                    # `|| true` is load-bearing: `set -o pipefail` is on, and
+                    # grep exits 1 when the header is absent — which is exactly
+                    # the case this branch exists to handle. Without it the job
+                    # aborts here instead of printing the guidance.
+                    ACCEPTED=$(printf '%s' "${ANCHOR_POST}" \
+                      | grep -i '^x-accepted-github-permissions:' \
+                      | head -1 | cut -d: -f2- | tr -d '\r' | sed 's/^ *//' \
+                      || true)
+                    if [ -n "${ACCEPTED}" ]; then
+                      echo "::warning::GitHub says this request would be accepted with: ${ACCEPTED}. Grant one of those to CODEX_REQUEST_TOKEN on ${REPO}, as 'Read and write' — a permission listed at 'Read' is not enough to post."
                     else
-                      REPO_VISIBLE="no"
-                    fi
-                    if GH_TOKEN="${REQUEST_TOKEN}" gh api "repos/${REPO}/pulls/${PR}" --jq '.number' >/dev/null 2>&1; then
-                      PR_READABLE="yes"
-                    else
-                      PR_READABLE="no"
-                    fi
-                    echo "::warning::CODEX_REQUEST_TOKEN diagnostics — identity: ${ANCHOR_AUTHOR}; can read ${REPO}: ${REPO_VISIBLE}; can read pull request #${PR}: ${PR_READABLE}."
-                    if [ "${REPO_VISIBLE}" = "no" ]; then
-                      echo "::warning::The token cannot see ${REPO}. A fine-grained PAT must list this repository under 'Repository access' and have 'Metadata: Read'."
-                    elif [ "${PR_READABLE}" = "no" ]; then
-                      echo "::warning::The token sees ${REPO} but not its pull requests. Grant 'Pull requests: Read and write'."
-                    else
-                      echo "::warning::The token can read pull request #${PR} but not comment on it. This endpoint is shared between issues and pull requests, and the permission checked is the one matching the RESOURCE — so a pull request needs 'Pull requests: Read and write'. 'Issues: Read and write' alone covers issues only."
+                      echo "::warning::CODEX_REQUEST_TOKEN (identity ${ANCHOR_AUTHOR}) could not comment on pull request #${PR} and GitHub returned no x-accepted-github-permissions header. Check that ${REPO} is listed under the token's 'Repository access', and that 'Pull requests' is granted as 'Read and write'."
                     fi
                   else
                     echo "::warning::No CODEX_REQUEST_TOKEN is set, so this used GITHUB_TOKEN. A read-only token is expected on fork PRs."
