@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -17,6 +18,7 @@ from control_plane.onboarding.provision import (
     RUNTIME_WRITES_BY_WORKFLOW_STATE,
     TableWrite,
     _record_writes,
+    _runtime_resources,
     main,
     plan_onboarding,
 )
@@ -165,10 +167,15 @@ def test_dry_run_lists_exact_writes_and_commits_nothing(container) -> None:
     assert diff["previous_revision"] is None
     assert "email.agent_inbox" in diff["added"]
     assert diff["removed"] == [] and diff["changed"] == []
-    assert {resource["stable_name"] for resource in plan.runtime_resources} >= {
-        FlyRuntimeProvisioner.stable_app_name(household_id),
-        FlyRuntimeProvisioner.stable_volume_name(),
-        FlyRuntimeProvisioner.stable_machine_name(),
+    # The resources the CONFIGURED provider creates. `dry-run-runtime` is the
+    # allowed default here and creates one synthetic reference — reporting a Fly
+    # app, volume and Machine under its name described three resources that
+    # would never exist.
+    assert {resource["stable_name"] for resource in plan.runtime_resources} == {
+        f"synthetic-runtime:{household_id}"
+    }
+    assert {resource["provider"] for resource in plan.runtime_resources} == {
+        container.config.runtime_provider
     }
     assert {secret["name"] for secret in plan.secrets} >= {
         RUNTIME_BOOTSTRAP_SECRET,
@@ -550,3 +557,104 @@ def test_a_rehearsed_revision_is_owned_and_rolled_back(container) -> None:
     assert container.database.query(
         "SELECT id FROM config_revisions WHERE household_id = ?", (household_id,)
     ) == []
+
+
+def test_a_fly_configured_deployment_reports_fly_resources(container) -> None:
+    """The counterpart: Fly names must still appear when Fly is configured.
+
+    Otherwise "report the configured provider" would be satisfied by reporting
+    nothing useful at all. Exercised directly against `_runtime_resources`,
+    because driving a full onboarding through the real Fly provisioner would
+    make network calls the rehearsal exists to avoid.
+    """
+    household_id = _household_with_profile(container)
+    _verify_all_steps(container, household_id)
+    revision = container.database.query_one(
+        "SELECT revision FROM config_revisions WHERE household_id = ?"
+        " ORDER BY revision DESC LIMIT 1",
+        (household_id,),
+    )["revision"]
+    spec = container.configs.manifest(household_id, revision)
+
+    fly = FlyRuntimeProvisioner(
+        api_token="fly-api-secret-canary",
+        org_slug="synthetic-org",
+        image_digest="registry.example.test/abrolia@sha256:" + "a" * 64,
+        bootstrap_url="https://app.example.test",
+    )
+
+    class _FlyConfigured:
+        config = SimpleNamespace(runtime_provider="fly-runtime")
+        providers = SimpleNamespace(get=lambda _name: fly)
+        configs = container.configs
+
+    resources = _runtime_resources(_FlyConfigured(), household_id, spec)
+
+    assert {resource["stable_name"] for resource in resources} == {
+        FlyRuntimeProvisioner.stable_app_name(household_id),
+        FlyRuntimeProvisioner.stable_volume_name(),
+        FlyRuntimeProvisioner.stable_machine_name(),
+    }
+    assert {resource["provider"] for resource in resources} == {"fly-runtime"}
+
+
+def test_an_unplannable_provider_asserts_nothing_rather_than_guessing() -> None:
+    """No plan and not Fly: say so, do not borrow Fly's resource list."""
+
+    class _Opaque:
+        config = SimpleNamespace(runtime_provider="some-future-runtime")
+        providers = SimpleNamespace(get=lambda _name: object())
+
+    resources = _runtime_resources(_Opaque(), "household-1", None)
+
+    assert len(resources) == 1
+    assert resources[0]["kind"] == "unknown"
+    assert "some-future-runtime" in resources[0]["summary"]
+    assert FlyRuntimeProvisioner.stable_volume_name() not in str(resources)
+
+
+def test_a_succeeded_runtime_job_is_not_reported_as_pending(container) -> None:
+    """`_settle_runtime_ready` settles the job while the workflow is `activating`.
+
+    A terminal row was still selected, labelled `pending_runtime_job`, and used
+    to advertise a reconcile write set — but no `ensure_runtime` operation
+    remains at that point; the next writes belong to bootstrap activation, which
+    this command says nothing about.
+    """
+    household_id = _household_with_profile(container)
+    _verify_all_steps(container, household_id)
+    while container.worker.run_once() is not None:
+        pass
+    settled = container.database.query_one(
+        "SELECT status FROM provisioning_jobs WHERE household_id = ?"
+        " AND kind = 'runtime' AND operation = 'ensure_runtime'"
+        " ORDER BY created_at DESC LIMIT 1",
+        (household_id,),
+    )
+    assert settled["status"] == "succeeded"
+
+    plan = plan_onboarding(container, household_id)
+
+    assert plan.pending_runtime_job == {}
+    assert plan.table_writes == []
+    assert "bootstrap activation" in plan.rehearsal
+
+
+def test_the_write_set_is_labelled_as_the_success_path(container) -> None:
+    """It is an upper bound on a provider result, not a prediction of one.
+
+    A first attempt can be rate-limited, rejected or time out, and those
+    branches write a subset. Presenting the nine-table mapping as "the exact
+    writes" told an operator one possible future as fact.
+    """
+    household_id = _household_with_profile(container)
+    _verify_all_steps(container, household_id)
+
+    plan = plan_onboarding(container, household_id)
+
+    assert plan.pending_runtime_job
+    assert "SUCCESS PATH" in plan.rehearsal
+    assert "subset" in plan.rehearsal
+    assert set(plan.table_writes) == set(
+        RUNTIME_WRITES_BY_WORKFLOW_STATE["runtime_provisioning"]
+    )

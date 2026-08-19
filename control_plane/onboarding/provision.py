@@ -161,19 +161,35 @@ def _runtime_resources(
     container: ControlPlaneContainer, household_id: str, spec: Any | None
 ) -> list[dict[str, str]]:
     provider_name = container.config.runtime_provider
-    if spec is not None:
-        provider = container.providers.get(provider_name)
-        planner = getattr(provider, "plan", None)
-        if callable(planner):
-            return [
-                {
-                    "provider": provider_name,
-                    "kind": planned.kind,
-                    "stable_name": planned.stable_name,
-                    "summary": planned.summary,
-                }
-                for planned in planner(spec)
-            ]
+    provider = container.providers.get(provider_name)
+    planner = getattr(provider, "plan", None)
+    if spec is not None and callable(planner):
+        return [
+            {
+                "provider": provider_name,
+                "kind": planned.kind,
+                "stable_name": planned.stable_name,
+                "summary": planned.summary,
+            }
+            for planned in planner(spec)
+        ]
+    if not isinstance(provider, FlyRuntimeProvisioner):
+        # The fallback below describes FLY resources. Printing them under
+        # another provider's name invents an app, a volume and a Machine that
+        # will never exist — and `dry-run-runtime`, the allowed default, creates
+        # exactly one synthetic reference and no Fly resources at all. Say what
+        # is not known rather than describe the wrong provider.
+        return [
+            {
+                "provider": provider_name,
+                "kind": "unknown",
+                "stable_name": "",
+                "summary": (
+                    f"{provider_name} does not describe its resources without a"
+                    " planned revision; nothing is asserted about what it creates"
+                ),
+            }
+        ]
     return [
         {
             "provider": provider_name,
@@ -368,7 +384,7 @@ def plan_onboarding(
                 "SELECT id, status, desired_revision FROM provisioning_jobs"
                 " WHERE household_id = ? AND workflow_id = ? AND kind = 'runtime'"
                 " AND operation = 'ensure_runtime'"
-                " AND status NOT IN ('cancelled','failed')"
+                " AND status IN ('pending','running','waiting_user','outcome_unknown')"
                 " ORDER BY created_at DESC LIMIT 1",
                 (household_id, workflow["id"]),
             ).fetchone()
@@ -410,9 +426,35 @@ def plan_onboarding(
                 and runtime_job is not None
                 and runtime_job["desired_revision"] == issued["revision"]
             )
-            if already_planned:
+            # Issued, and no runtime job left to run: provisioning is done and
+            # the household is waiting on bootstrap activation. Neither branch
+            # below fits — rehearsing the planner would mint a revision N+1 the
+            # real flow never creates, and the reconcile set describes an
+            # operation that has already finished. The next writes belong to
+            # activation, which this command does not model, so it says that.
+            awaiting_activation = issued is not None and runtime_job is None
+            if awaiting_activation:
+                plan.rehearsal = (
+                    f"revision {issued['revision']} is issued and its runtime"
+                    " operation has settled; the household is waiting on"
+                    " bootstrap activation, whose writes this command does not"
+                    " model. Nothing is rehearsed and no write set is claimed."
+                )
+            if awaiting_activation:
+                pass
+            elif already_planned:
                 state = str(workflow["state"])
                 job_status = str((runtime_job or {})["status"])
+                # EVERY status here is pending on a provider call whose result
+                # is not in durable state. `_run_once` can be rate-limited,
+                # rejected or time out, taking branches that write a subset of
+                # the success path; `_reconcile` branches on `provider.inspect()`
+                # and may settle, fail, or re-run preparation. Selecting the
+                # success mapping presented one possible future as the fact.
+                #
+                # The set is still worth reporting — it is the upper bound, and
+                # what an operator wants to know is which tables can be touched
+                # — but it is labelled as the success path, not as the answer.
                 if job_status == "outcome_unknown":
                     # The next operation is a RECONCILE, and
                     # `ProvisioningWorker._reconcile` branches on
@@ -452,9 +494,12 @@ def plan_onboarding(
                 else:
                     plan.rehearsal = (
                         f"revision {issued['revision']} is already issued, so the"
-                        " planning pass is done; table_writes is the write set of"
-                        f" the pending runtime operation running from `{state}`,"
-                        " which UPDATES that revision rather than inserting another"
+                        " planning pass is done. table_writes is the SUCCESS PATH"
+                        f" of the pending runtime operation from `{state}`, which"
+                        " UPDATES that revision rather than inserting another. A"
+                        " provider that rate-limits, rejects or times out takes a"
+                        " branch writing a subset of these; none writes outside"
+                        " them."
                     )
                     observed.extend(writes)
             else:
@@ -484,6 +529,17 @@ def plan_onboarding(
             plan.uncommitted_revision_delta = len(rehearsed_revision_ids)
 
             plan.table_writes = observed
+            if spec is None and issued is not None:
+                # The planning pass was skipped because a revision is already
+                # issued — but its manifest describes the same household, so the
+                # provider can still say what it will create. Better than
+                # reporting nothing for the ordinary case.
+                try:
+                    spec = container.configs.manifest(
+                        household_id, issued["revision"]
+                    )
+                except KeyError:
+                    spec = None
             plan.runtime_resources = _runtime_resources(container, household_id, spec)
             plan.secrets = _secret_names(container, household_id)
             raise _DryRunRollback
