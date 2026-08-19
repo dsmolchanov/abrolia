@@ -71,10 +71,37 @@ Restore a pre-migrate archive with `--no-migrate`. The normal restore applies
 pending migrations, which from the new image would immediately reapply — or fail
 again on — the migration the archive exists to undo:
 
+**Check the space first.** At this point `/data` already holds the live
+database and the archive. Restoring beside them puts a third full-size file on
+the same 1 GiB volume, so a database between roughly a third and a half of the
+volume fails with `ENOSPC` — with a perfectly good backup sitting right there.
+The restore is the moment that must not fail for want of room.
+
+```bash
+df -h /data
+ls -l /data/control-plane.db /data/control-plane.db.pre-migrate-*.bak
+```
+
+If the live database, the archive and one more copy do not all fit, stage the
+restore off the volume and move it in afterwards:
+
+```bash
+abrolia-control-plane restore /data/control-plane.db.pre-migrate-0008-1800000000.bak \
+  --target /tmp/control-plane-rollback.db --no-migrate
+```
+
+Otherwise restore beside the database, which keeps everything on the volume that
+survives a Machine replacement:
+
 ```bash
 abrolia-control-plane restore /data/control-plane.db.pre-migrate-0008-1800000000.bak \
   --target /data/control-plane-rollback.db --no-migrate
 ```
+
+Staging on `/tmp` trades durability for room: it does not survive a Machine
+restart, so complete the move below in the same session. Whichever path you
+used, substitute it for `/data/control-plane-rollback.db` in the commands that
+follow.
 
 The restored database keeps the archived schema and stays worker-paused.
 

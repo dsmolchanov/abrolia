@@ -208,6 +208,16 @@ def test_the_rollback_procedure_matches_the_paths_it_depends_on() -> None:
         if line.strip().startswith("mv ") and len(line.split()) >= 3
     }
 
+    # The page must tell the operator to check the space BEFORE restoring: at
+    # that point /data already holds the live database and the archive, and a
+    # third full-size file is what fails with ENOSPC — with a good backup
+    # sitting right there.
+    assert "df -h /data" in doc
+    assert "ENOSPC" in doc
+    assert "--target /tmp/control-plane-rollback.db" in doc, (
+        "no off-volume staging path is documented"
+    )
+
     # The restore has to land where the rolled-back image will actually look.
     assert ("/data/control-plane-rollback.db", configured) in moves
     # The pause must travel with it, under the name the code gives it — merely
