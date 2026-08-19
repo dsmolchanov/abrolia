@@ -41,6 +41,7 @@ from dataclasses import dataclass
 
 from control_plane.db import ControlPlaneDatabase
 from control_plane.privacy.consent import CONSENT_TEXTS
+from control_plane.privacy.runtime import RUNTIME_REF
 from control_plane.repositories.jobs import JobsRepository
 
 #: The runtime job that carries the stop signal. It reuses the `runtime` kind
@@ -163,9 +164,18 @@ class ConsentWithdrawalService:
             "SELECT runtime_ref FROM households WHERE id = ?", (household_id,)
         ).fetchone()
         runtime_ref = str((household or {})["runtime_ref"] or "") if household else ""
-        if not runtime_ref:
-            # Nothing has been provisioned, so there is nothing serving. The
-            # revoked receipt already blocks every future boundary.
+        if not RUNTIME_REF.fullmatch(runtime_ref):
+            # Nothing serving that can be told. Either nothing was provisioned,
+            # or the reference is a synthetic one — `DryRunRuntimeProvisioner`
+            # stores `synthetic-runtime:<household_id>`, which is non-empty and
+            # so passed an emptiness check, producing a stop job the worker was
+            # certain to reject and settle as failed. A withdrawal reported as
+            # `runtime_notified` and then failing is worse than one that says
+            # plainly there was nothing to notify.
+            #
+            # Nothing is lost by skipping: the revoked receipt already closes
+            # every control-plane boundary, and a synthetic runtime holds no
+            # real family content to stop processing.
             return None
         workflow = connection.execute(
             "SELECT id FROM onboarding_workflows WHERE household_id = ?",

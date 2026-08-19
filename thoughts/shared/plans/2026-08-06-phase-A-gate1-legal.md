@@ -206,7 +206,18 @@ available only for durable bootstrap-secret cleanup.
 ### Residency gate
 
 - [x] `hermes_cloud/core/config.py` `eu-strict` path still fail-closed (no downgrade).
-- [x] Named test exists and passes (`pytest -k eu_strict` — 2 passed on 2026-08-12):
+- [x] Named tests exist and pass (`pytest -k "eu_strict or eu_app"` — 5 passed on 2026-08-19):
+  `test_eu_strict_fails_closed_without_vertex`, `test_eu_app_boots_without_vertex`,
+  `test_eu_strict_boots_with_vertex_enabled`, alongside the pre-existing
+  `test_eu_strict_manifest_fails_without_explicit_provider`.
+
+  **Corrected 2026-08-19.** This item was checked on 2026-08-12 naming three
+  tests that did not exist; only the combined
+  `test_eu_strict_manifest_fails_without_explicit_provider` did, and `eu-app`
+  had no coverage at all — so the gate asserted a property nobody had checked.
+  The named tests are now written. `eu-app` matters on its own: if it inherited
+  the strict requirement, the gate would be fail-closed for a reason unrelated
+  to residency and the strict guarantee would be untestable.
 
 ```bash
 pytest -k eu_strict -q

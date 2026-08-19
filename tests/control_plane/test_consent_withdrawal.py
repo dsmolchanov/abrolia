@@ -445,3 +445,43 @@ def test_withdrawal_runs_while_the_service_holds_the_writer_lock(tmp_path) -> No
             assert "holds no" in str(exit_info.value)
     finally:
         monkey.undo()
+
+
+def test_a_synthetic_runtime_reference_queues_no_stop(cp_stack) -> None:
+    """The repository's default household has one, and it is not notifiable.
+
+    `DryRunRuntimeProvisioner` stores `synthetic-runtime:<household_id>` — non
+    empty, so an emptiness check let it through, and the worker then rejected it
+    because `RUNTIME_REF` accepts only managed `abrolia-hh-*` names. The result
+    was a withdrawal that reported `runtime_notified: true` and then settled the
+    job as failed. Nothing is lost by skipping: the revoked receipt already
+    closes every control-plane boundary, and a synthetic runtime holds no real
+    family content.
+    """
+    complete_onboarding(cp_stack)
+    drain(cp_stack)
+    set_runtime_ref(cp_stack, f"synthetic-runtime:{cp_stack.household.id}")
+
+    result = withdrawal(cp_stack).withdraw(
+        cp_stack.household.id, HOUSEHOLD_CONTENT_PURPOSE, now=BASE_TIME
+    )
+
+    assert result.receipts_revoked == 1
+    assert not result.runtime_notified
+    assert cp_stack.database.query(
+        "SELECT id FROM provisioning_jobs WHERE household_id = ? AND operation = ?",
+        (cp_stack.household.id, REVOKE_CONSENT_OPERATION),
+    ) == []
+
+
+def test_a_managed_runtime_reference_still_queues_one(cp_stack) -> None:
+    """The counterpart, so the skip cannot swallow a real runtime."""
+    complete_onboarding(cp_stack)
+    drain(cp_stack)
+    set_runtime_ref(cp_stack)
+
+    result = withdrawal(cp_stack).withdraw(
+        cp_stack.household.id, HOUSEHOLD_CONTENT_PURPOSE, now=BASE_TIME
+    )
+
+    assert result.runtime_notified
