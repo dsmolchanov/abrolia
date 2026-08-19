@@ -40,6 +40,18 @@ BASE_TIME = 1_800_000_000.0
 _RESTRICTION_VERSION, _RESTRICTION_SHA = consent_version_and_sha(
     "special_category_content_restriction"
 )
+_HOUSEHOLD_VERSION, _HOUSEHOLD_SHA = consent_version_and_sha(
+    "special_category_household_content"
+)
+# A real provider owes the Art 9(2)(a) consent as well as the S5 restriction,
+# and an unrecognised provider counts as real by design (fail-closed). The two
+# tests below deliberately wire `future-real-email`, so they carry both.
+REAL_PROVIDER_CONSENT = {
+    "special_category_household_consent": True,
+    "special_category_household_receipt_id": "10000000-0000-4000-8000-000000000024",
+    "special_category_household_text_version": _HOUSEHOLD_VERSION,
+    "special_category_household_text_sha256": _HOUSEHOLD_SHA,
+}
 EMAIL_SELECTION = {
     "kind": "abrolia_managed",
     "local_part": "family-agent",
@@ -770,7 +782,7 @@ def test_email_job_rechecks_current_content_restriction_before_provider(
     cp_stack.service.select(
         cp_stack.household.id,
         StepKind.EMAIL,
-        EMAIL_SELECTION,
+        {**EMAIL_SELECTION, **REAL_PROVIDER_CONSENT},
         context=cp_stack.context(),
         now=BASE_TIME + 2,
     )
@@ -800,7 +812,7 @@ def test_email_reconcile_rechecks_current_content_restriction_before_provider(
     cp_stack.service.select(
         cp_stack.household.id,
         StepKind.EMAIL,
-        EMAIL_SELECTION,
+        {**EMAIL_SELECTION, **REAL_PROVIDER_CONSENT},
         context=cp_stack.context(),
         now=BASE_TIME + 2,
     )

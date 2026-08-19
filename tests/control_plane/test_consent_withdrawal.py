@@ -341,3 +341,77 @@ def test_the_cli_offers_every_consent_purpose() -> None:
         if a.dest == "purpose"
     )
     assert set(action.choices) == set(CONSENT_TEXTS)
+
+
+def test_a_second_withdrawal_after_re_consent_queues_its_own_stop(cp_stack) -> None:
+    """The scenario a household+purpose key silently swallowed.
+
+    Withdraw, re-consent, provision again, withdraw again. With the old key the
+    second withdrawal matched the FIRST withdrawal's job, `JobsRepository.create`
+    returned that already-succeeded job, and no stop was queued — so the runtime
+    then serving carried on processing after a valid Art. 7(3) request.
+    """
+    complete_onboarding(cp_stack)
+    drain(cp_stack)
+    set_runtime_ref(cp_stack)
+    service = withdrawal(cp_stack)
+
+    first = service.withdraw(
+        cp_stack.household.id, HOUSEHOLD_CONTENT_PURPOSE, now=BASE_TIME
+    )
+    assert first.runtime_notified
+    worker = cp_stack.make_worker(now=BASE_TIME + 50)
+    worker._runtime_client = FakeRuntime()
+    assert worker.run_once().status == "succeeded"
+
+    # A new consent cycle: a fresh receipt, and a re-provisioned runtime.
+    with cp_stack.database.write() as connection:
+        connection.execute(
+            "INSERT INTO consent_receipts (id, household_id, account_id, purpose,"
+            " text_version, text_sha256, locale, accepted_at, created_at)"
+            " SELECT ?, household_id, account_id, purpose, text_version,"
+            " text_sha256, locale, ?, ? FROM consent_receipts"
+            " WHERE household_id = ? AND purpose = ? LIMIT 1",
+            (
+                "20000000-0000-4000-8000-000000000077",
+                BASE_TIME + 100,
+                BASE_TIME + 100,
+                cp_stack.household.id,
+                HOUSEHOLD_CONTENT_PURPOSE,
+            ),
+        )
+
+    second = service.withdraw(
+        cp_stack.household.id, HOUSEHOLD_CONTENT_PURPOSE, now=BASE_TIME + 200
+    )
+
+    assert second.receipts_revoked == 1
+    assert second.runtime_notified
+    assert second.runtime_job_id != first.runtime_job_id
+    job = cp_stack.database.query_one(
+        "SELECT status FROM provisioning_jobs WHERE id = ?", (second.runtime_job_id,)
+    )
+    assert job["status"] == "pending"
+
+
+def test_one_withdrawal_still_queues_exactly_one_stop(cp_stack) -> None:
+    """The idempotency the old key was reaching for must survive."""
+    complete_onboarding(cp_stack)
+    drain(cp_stack)
+    set_runtime_ref(cp_stack)
+    service = withdrawal(cp_stack)
+
+    first = service.withdraw(
+        cp_stack.household.id, HOUSEHOLD_CONTENT_PURPOSE, now=BASE_TIME
+    )
+    second = service.withdraw(
+        cp_stack.household.id, HOUSEHOLD_CONTENT_PURPOSE, now=BASE_TIME + 1
+    )
+
+    assert second.receipts_revoked == 0
+    stops = cp_stack.database.query(
+        "SELECT id FROM provisioning_jobs WHERE household_id = ? AND operation = ?",
+        (cp_stack.household.id, REVOKE_CONSENT_OPERATION),
+    )
+    assert len(stops) == 1
+    assert first.runtime_job_id == stops[0]["id"]

@@ -44,6 +44,9 @@ def test_production_container_registers_real_nerve_providers_fail_closed(
 def test_real_email_rollout_rejects_non_allowlisted_household(cp_stack) -> None:
     cp_stack.complete_profile()
     cp_stack.service.real_email_enabled = True
+    # The container derives the providers from this flag; a test that moves
+    # only the flag builds a configuration production cannot have.
+    cp_stack.service.email_provider = "nerve-managed"
     cp_stack.service.real_email_household_allowlist = frozenset()
 
     with pytest.raises(InvalidTransition, match="not enabled for this household"):
@@ -58,6 +61,7 @@ def test_real_email_rollout_rejects_non_allowlisted_household(cp_stack) -> None:
 def test_real_email_rollout_requires_content_restriction_receipt(cp_stack) -> None:
     cp_stack.complete_profile()
     cp_stack.service.real_email_enabled = True
+    cp_stack.service.email_provider = "nerve-managed"
     cp_stack.service.real_email_household_allowlist = frozenset({
         cp_stack.household.id
     })

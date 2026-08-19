@@ -38,6 +38,10 @@ def _selection(**changes: object) -> dict[str, object]:
 def _real_email(cp_stack) -> None:
     cp_stack.complete_profile()
     cp_stack.service.real_email_enabled = True
+    # The container derives the providers from this flag, and the content gate
+    # follows the provider — moving only the flag builds a configuration
+    # production cannot have.
+    cp_stack.service.email_provider = "nerve-managed"
     cp_stack.service.real_email_household_allowlist = frozenset({
         cp_stack.household.id
     })

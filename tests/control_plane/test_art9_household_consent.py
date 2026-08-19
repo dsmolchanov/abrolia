@@ -76,8 +76,16 @@ def set_country(cp_stack, country_code: str) -> None:
 
 
 def enable_real_email(cp_stack) -> None:
+    """Mirror what the container does, flag AND providers together.
+
+    `ControlPlaneContainer.build` derives the email providers from
+    `real_email_enabled`; flipping only the flag produces a configuration that
+    cannot exist in production, and the content gate follows the provider.
+    """
     cp_stack.service.real_email_enabled = True
     cp_stack.service.real_email_household_allowlist = frozenset({cp_stack.household.id})
+    cp_stack.service.email_provider = "nerve-managed"
+    cp_stack.service.byo_domain_provider = "nerve-byo-domain"
 
 
 # ---------------------------------------------------------------------------
@@ -418,3 +426,111 @@ def test_the_restriction_does_not_forbid_what_the_consent_permits() -> None:
     # A copy change that reintroduces the contradiction must also bump the
     # version, because every enforcement boundary compares it exactly.
     assert restriction_version.endswith("-v2")
+
+
+# ---------------------------------------------------------------------------
+# Gmail is a real provider whatever the managed-rollout flag says.
+# ---------------------------------------------------------------------------
+
+
+def gmail_selection(**overrides: object) -> dict[str, object]:
+    selection: dict[str, object] = {
+        "kind": "gmail_agent",
+        "separate_agent_account_acknowledged": True,
+        "special_category_restriction_acknowledged": True,
+        "special_category_restriction_receipt_id": "10000000-0000-4000-8000-000000000051",
+        "special_category_restriction_text_version": RESTRICTION_VERSION,
+        "special_category_restriction_text_sha256": RESTRICTION_SHA,
+        "special_category_household_consent": True,
+        "special_category_household_receipt_id": "10000000-0000-4000-8000-000000000052",
+        "special_category_household_text_version": HOUSEHOLD_VERSION,
+        "special_category_household_text_sha256": HOUSEHOLD_SHA,
+    }
+    selection.update(overrides)
+    return selection
+
+
+def enable_gmail_only(cp_stack) -> None:
+    """What the container actually does: Gmail routes to a real provider always.
+
+    `ControlPlaneContainer.build` passes `gmail_provider="google-oauth"`
+    unconditionally — it is not derived from `ABROLIA_REAL_EMAIL_ENABLED` the
+    way the managed and domain providers are.
+    """
+    cp_stack.service.gmail_provider = "google-oauth"
+    assert cp_stack.service.real_email_enabled is False
+
+
+def test_gmail_requires_the_article_9_consent_with_the_rollout_flag_off(
+    cp_stack,
+) -> None:
+    """The hole: the gate returned early on the flag, before reaching Gmail.
+
+    The web form hides the consent in this configuration and the worker rejects
+    the job for a missing receipt, so it looked contained — but an API client
+    that supplies the receipts reached a real provider with no Art. 9(4)
+    country validation at all.
+    """
+    cp_stack.complete_profile()
+    enable_gmail_only(cp_stack)
+    without_consent = gmail_selection()
+    for field in (
+        "special_category_household_consent",
+        "special_category_household_receipt_id",
+        "special_category_household_text_version",
+        "special_category_household_text_sha256",
+    ):
+        without_consent.pop(field)
+
+    with pytest.raises(InvalidTransition, match="Art 9\\(2\\)\\(a\\)"):
+        cp_stack.service.select(
+            cp_stack.household.id,
+            StepKind.EMAIL,
+            without_consent,
+            context=cp_stack.context(),
+        )
+
+
+def test_gmail_is_country_gated_with_the_rollout_flag_off(cp_stack) -> None:
+    cp_stack.complete_profile()
+    enable_gmail_only(cp_stack)
+    set_country(cp_stack, "CZ")
+
+    with pytest.raises(InvalidTransition, match="no Art. 9\\(4\\) determination"):
+        cp_stack.service.select(
+            cp_stack.household.id,
+            StepKind.EMAIL,
+            gmail_selection(),
+            context=cp_stack.context(),
+        )
+
+
+def test_gmail_is_allowed_in_a_determined_country_with_full_consent(cp_stack) -> None:
+    """The counterpart, so the gate is not merely refusing everything."""
+    cp_stack.complete_profile()
+    enable_gmail_only(cp_stack)
+
+    cp_stack.service.select(
+        cp_stack.household.id,
+        StepKind.EMAIL,
+        gmail_selection(),
+        context=cp_stack.context(),
+    )
+
+    job = cp_stack.database.query_one(
+        "SELECT provider FROM provisioning_jobs WHERE kind = 'email_identity'"
+    )
+    assert job["provider"] == "google-oauth"
+
+
+def test_the_synthetic_managed_path_is_still_ungated(cp_stack) -> None:
+    """Only the provider decides. `fake-email` owes nothing."""
+    cp_stack.complete_profile()
+    set_country(cp_stack, "CZ")
+
+    cp_stack.service.select(
+        cp_stack.household.id,
+        StepKind.EMAIL,
+        {"kind": "abrolia_managed", "local_part": "family-agent"},
+        context=cp_stack.context(),
+    )

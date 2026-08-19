@@ -36,6 +36,7 @@ retries until the runtime confirms.
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 
 from control_plane.db import ControlPlaneDatabase
@@ -80,6 +81,34 @@ class ConsentWithdrawalService:
             raise KeyError(purpose)
 
         with self.database.write() as connection:
+            # Capture WHICH receipts are being withdrawn before revoking them:
+            # the intent key below is keyed to this consent cycle, and after the
+            # UPDATE they are indistinguishable from any earlier withdrawal.
+            cycle = [
+                str(row["id"])
+                for row in connection.execute(
+                    "SELECT id FROM consent_receipts WHERE household_id = ?"
+                    " AND purpose = ? AND revoked_at IS NULL ORDER BY id",
+                    (household_id, purpose),
+                ).fetchall()
+            ]
+            if not cycle:
+                # Nothing left to revoke: this is a repeat of a withdrawal
+                # already performed. Identify that same cycle by the receipts it
+                # revoked, so the key stays stable and the stop stays a single
+                # job — an empty cycle would hash differently every time and
+                # enqueue a fresh stop on every retry.
+                cycle = [
+                    str(row["id"])
+                    for row in connection.execute(
+                        "SELECT id FROM consent_receipts WHERE household_id = ?"
+                        " AND purpose = ? AND revoked_at = ("
+                        "  SELECT MAX(revoked_at) FROM consent_receipts"
+                        "  WHERE household_id = ? AND purpose = ?"
+                        ") ORDER BY id",
+                        (household_id, purpose, household_id, purpose),
+                    ).fetchall()
+                ]
             revoked = connection.execute(
                 "UPDATE consent_receipts SET revoked_at = ?"
                 " WHERE household_id = ? AND purpose = ? AND revoked_at IS NULL",
@@ -106,7 +135,11 @@ class ConsentWithdrawalService:
             ).rowcount
 
             runtime_job_id = self._enqueue_runtime_stop(
-                connection, household_id=household_id, purpose=purpose, now=now
+                connection,
+                household_id=household_id,
+                purpose=purpose,
+                cycle=cycle,
+                now=now,
             )
 
         return WithdrawalResult(
@@ -118,7 +151,13 @@ class ConsentWithdrawalService:
         )
 
     def _enqueue_runtime_stop(
-        self, connection, *, household_id: str, purpose: str, now: float
+        self,
+        connection,
+        *,
+        household_id: str,
+        purpose: str,
+        cycle: list[str],
+        now: float,
     ) -> str | None:
         household = connection.execute(
             "SELECT runtime_ref FROM households WHERE id = ?", (household_id,)
@@ -134,15 +173,28 @@ class ConsentWithdrawalService:
         ).fetchone()
         if workflow is None:
             return None
+        # Keyed to THIS consent cycle, not just the purpose. A household can
+        # withdraw, reset onboarding, accept a new receipt, provision a fresh
+        # runtime, and withdraw again. A key of household+purpose matched the
+        # first withdrawal's job, `JobsRepository.create` returned that already
+        # succeeded job, and no stop was queued for the new runtime — so the
+        # second withdrawal silently did nothing to the instance then serving.
+        #
+        # The receipt ids being revoked identify the cycle: they are new after
+        # re-consent, and identical within one withdrawal, which is exactly the
+        # idempotency the previous key was reaching for. The runtime ref is in
+        # the key too, so a re-provisioned runtime gets its own stop even if the
+        # same receipts somehow persist.
+        fingerprint = hashlib.sha256(
+            "|".join([runtime_ref, purpose, *cycle]).encode("utf-8")
+        ).hexdigest()[:32]
         job_id, _created = self.jobs.create(
             connection,
             household_id=household_id,
             workflow_id=workflow["id"],
             kind="runtime",
             operation=REVOKE_CONSENT_OPERATION,
-            # Keyed on the purpose, so withdrawing two consents enqueues two
-            # stops and withdrawing the same one twice enqueues one.
-            intent_key=f"{household_id}:consent-revoke:{purpose}",
+            intent_key=f"{household_id}:consent-revoke:{fingerprint}",
             request={"runtime_ref": runtime_ref, "purpose": purpose},
             provider="dry-run-runtime",
             now=now,

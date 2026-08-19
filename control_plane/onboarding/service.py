@@ -28,7 +28,10 @@ from control_plane.onboarding.contracts import (
 )
 from control_plane.onboarding.state import CHECK, RETRY, SAVE_PROFILE, SELECT, next_status
 from control_plane.privacy.art9 import real_content_refusal
-from control_plane.privacy.consent import consent_version_and_sha
+from control_plane.privacy.consent import (
+    consent_version_and_sha,
+    processes_real_household_content,
+)
 from control_plane.repositories.households import HouseholdsRepository
 from control_plane.repositories.jobs import JobsRepository
 from control_plane.repositories.onboarding import OnboardingRepository, WorkflowRecord
@@ -261,10 +264,28 @@ class OnboardingService:
         }[kind]
 
     def _assert_email_rollout(self, household_id: str, selection: dict[str, Any]) -> None:
-        if not self.real_email_enabled:
+        # Gate on the PROVIDER this selection routes to, not on the managed
+        # rollout flag. `gmail_agent` goes to `google-oauth` unconditionally —
+        # it is a real provider even when `ABROLIA_REAL_EMAIL_ENABLED=0` — so
+        # keying on the flag let Gmail past the consent and Art. 9(4) checks
+        # entirely. The web form hides the consent in that configuration and the
+        # worker rejects the job for a missing receipt, but an API client that
+        # supplies the receipts reached a real provider with no country
+        # validation at all. Real content is the condition; the flag only ever
+        # described the managed and domain paths.
+        provider = self._provider_for(
+            StepKind.EMAIL, str(selection.get("kind") or "")
+        )
+        if not processes_real_household_content(provider):
             return
+        # The allowlist is a ROLLOUT control and stays tied to its flag: it
+        # limits which households the managed and domain paths are switched on
+        # for. The consent and country checks below are CONTENT controls and
+        # follow the provider, because that is what determines whether real
+        # family data can arrive.
         if (
-            selection.get("kind") != "gmail_agent"
+            self.real_email_enabled
+            and selection.get("kind") != "gmail_agent"
             and household_id not in self.real_email_household_allowlist
         ):
             raise InvalidTransition("real email is not enabled for this household")
