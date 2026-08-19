@@ -40,9 +40,13 @@ authenticated archive format as `abrolia-control-plane backup` and with the same
 dedicated `ABROLIA_CONTROL_PLANE_BACKUP_KEY`, mode `0600`. It fails closed: a
 missing or invalid backup key, or any snapshot error, exits non-zero **before**
 touching the schema, and the container stops instead of serving. A migration
-failure also exits non-zero and prints the archive path to restore from; each
-migration file is applied in its own transaction, so a failed file leaves no
-partial schema. When nothing is pending, no archive is written.
+failure also exits non-zero and prints the archive path to restore from; the
+whole pending batch is applied in ONE transaction, so a failure leaves no
+partial schema — not within a file and not across files. That second half
+matters on restart: a partially upgraded database would be snapshotted by the
+next boot and recorded as the new pre-migrate archive, silently replacing the
+good restore point with one taken of the broken schema. When nothing is
+pending, no archive is written.
 
 Restore a pre-migrate archive with `--no-migrate`. The normal restore applies
 pending migrations, which from the new image would immediately reapply — or fail
