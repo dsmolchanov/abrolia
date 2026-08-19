@@ -50,7 +50,7 @@ def create_pre_migrate_backup(
     # failed deploy into a full disk — losing the ability to take a restore
     # point at all, and eventually the database's own room to write.
     existing = _reusable_pre_migrate_backup(database, revision)
-    if existing is not None:
+    if existing is not None and _archive_opens_with(existing, backup_key):
         return existing
 
     stamp = int(time.time() if now is None else now)
@@ -66,6 +66,36 @@ def create_pre_migrate_backup(
             break
         target = database.path.with_name(f"{base}-{suffix}.bak")
     return create_backup(database, target, backup_key=backup_key)
+
+
+def _archive_opens_with(archive: Path, backup_key: bytes) -> bool:
+    """Whether this archive authenticates under the key we hold, right now.
+
+    Reuse skipped `_key()` and every authentication check, so an archive left by
+    an earlier boot satisfied the backup-first gate even when the key had since
+    been rotated, or the file had been truncated by the disk filling up. The
+    migration then proceeded believing it had a restore point that could not be
+    opened — which is the one belief this gate exists to make true.
+
+    Header and tag only: the payload is decrypted, not written anywhere, and the
+    result is discarded. Cheaper than a restore and sufficient to prove the
+    archive is intact and ours.
+    """
+    try:
+        payload = archive.read_bytes()
+    except OSError:
+        return False
+    if not payload.startswith(MAGIC) or len(payload) <= len(MAGIC) + NONCE_BYTES + 16:
+        return False
+    nonce = payload[len(MAGIC) : len(MAGIC) + NONCE_BYTES]
+    ciphertext = payload[len(MAGIC) + NONCE_BYTES :]
+    try:
+        plaintext = AESGCM(_key(backup_key)).decrypt(nonce, ciphertext, MAGIC)
+    except (InvalidTag, BackupError, ValueError):
+        return False
+    finally:
+        del payload
+    return bool(plaintext)
 
 
 def _reusable_pre_migrate_backup(

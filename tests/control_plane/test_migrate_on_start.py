@@ -318,3 +318,59 @@ def test_a_snapshot_is_not_reused_once_the_database_has_moved_on(tmp_path) -> No
     assert second is not None and second != first
     assert len(list(tmp_path.glob("*.bak"))) == 2
     database.close()
+
+
+def test_a_rotated_key_does_not_reuse_the_old_archive(tmp_path) -> None:
+    """Reuse skipped authentication entirely.
+
+    An archive left by an earlier boot satisfied the backup-first gate even when
+    the key had since been rotated — so the migration proceeded believing it had
+    a restore point that could not be opened. That belief is the only thing this
+    gate exists to establish.
+    """
+    directory = _pending_migration_directory(tmp_path)
+    database = _database(tmp_path)
+    database.migrate()
+    first = create_pre_migrate_backup(
+        database, backup_key=BACKUP_KEY_BYTES, directory=directory
+    )
+    assert first is not None
+
+    # Derived so the length is right by construction, not by counting.
+    rotated = b"rotated!" + BACKUP_KEY_BYTES[8:]
+    assert len(rotated) == len(BACKUP_KEY_BYTES) and rotated != BACKUP_KEY_BYTES
+    second = create_pre_migrate_backup(
+        database, backup_key=rotated, directory=directory
+    )
+
+    assert second is not None and second != first
+    # And the new one opens with the key actually in use.
+    restore_backup(
+        second, tmp_path / "restored.db", backup_key=rotated, apply_migrations=False
+    )
+    database.close()
+
+
+def test_a_truncated_archive_is_not_reused(tmp_path) -> None:
+    """A disk that filled mid-write leaves exactly this."""
+    directory = _pending_migration_directory(tmp_path)
+    database = _database(tmp_path)
+    database.migrate()
+    first = create_pre_migrate_backup(
+        database, backup_key=BACKUP_KEY_BYTES, directory=directory
+    )
+    assert first is not None
+    first.write_bytes(first.read_bytes()[: len(first.read_bytes()) // 2])
+
+    second = create_pre_migrate_backup(
+        database, backup_key=BACKUP_KEY_BYTES, directory=directory
+    )
+
+    assert second is not None and second != first
+    restore_backup(
+        second,
+        tmp_path / "restored.db",
+        backup_key=BACKUP_KEY_BYTES,
+        apply_migrations=False,
+    )
+    database.close()
