@@ -315,7 +315,34 @@ jobs:
                   # still apply; only a bare 👍 becomes unusable.
                   ANCHOR_FAILED=1
                   echo "::warning::Could not post the anchor comment. GitHub said: $(printf '%s' "${ANCHOR_POST}" | tr -d '\n' | cut -c1-300)"
-                  echo "::warning::If CODEX_REQUEST_TOKEN is set, it needs 'Issues: Read and write' on ${REPO} (pull-request comments are issue comments). A read-only token is expected on fork PRs. Falling back to head-bound signals: a Codex review of this commit, or a summary comment naming it."
+                  if [ -n "${REQUEST_TOKEN}" ]; then
+                    # Probe what the token CAN do, so the next reader is not left
+                    # deducing it from a bare 403. These distinguish the three
+                    # ways a fine-grained PAT lands here: not scoped to this
+                    # repository at all, scoped but unable to read pull
+                    # requests, or able to read and not to write.
+                    if GH_TOKEN="${REQUEST_TOKEN}" gh api "repos/${REPO}" --jq '.full_name' >/dev/null 2>&1; then
+                      REPO_VISIBLE="yes"
+                    else
+                      REPO_VISIBLE="no"
+                    fi
+                    if GH_TOKEN="${REQUEST_TOKEN}" gh api "repos/${REPO}/pulls/${PR}" --jq '.number' >/dev/null 2>&1; then
+                      PR_READABLE="yes"
+                    else
+                      PR_READABLE="no"
+                    fi
+                    echo "::warning::CODEX_REQUEST_TOKEN diagnostics — identity: ${ANCHOR_AUTHOR}; can read ${REPO}: ${REPO_VISIBLE}; can read pull request #${PR}: ${PR_READABLE}."
+                    if [ "${REPO_VISIBLE}" = "no" ]; then
+                      echo "::warning::The token cannot see ${REPO}. A fine-grained PAT must list this repository under 'Repository access' and have 'Metadata: Read'."
+                    elif [ "${PR_READABLE}" = "no" ]; then
+                      echo "::warning::The token sees ${REPO} but not its pull requests. Grant 'Pull requests: Read and write'."
+                    else
+                      echo "::warning::The token can read pull request #${PR} but not comment on it. This endpoint is shared between issues and pull requests, and the permission checked is the one matching the RESOURCE — so a pull request needs 'Pull requests: Read and write'. 'Issues: Read and write' alone covers issues only."
+                    fi
+                  else
+                    echo "::warning::No CODEX_REQUEST_TOKEN is set, so this used GITHUB_TOKEN. A read-only token is expected on fork PRs."
+                  fi
+                  echo "::warning::Falling back to head-bound signals: a Codex review of this commit, or a summary comment naming it."
                 fi
               fi
               ;;

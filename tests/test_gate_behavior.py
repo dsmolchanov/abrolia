@@ -157,7 +157,7 @@ def run_gate(tmp_path: Path):
         env: dict[str, str] | None = None,
     ) -> GateResult:
         responses: dict[str, object] = {
-            "repos/o/r/pulls/1": {"head": {"sha": HEAD}},
+            "repos/o/r/pulls/1": {"head": {"sha": HEAD}, "number": 1},
             f"repos/o/r/commits/{HEAD}": {
                 "commit": {"committer": {"date": "2026-01-01T00:00:00Z"}}
             },
@@ -167,6 +167,7 @@ def run_gate(tmp_path: Path):
             "repos/o/r/issues/1/reactions": pr_reactions or [],
             "repos/o/r/issues/comments/4242/reactions": reactions or [],
             "user": {"login": user_login},
+            "repos/o/r": {"full_name": "o/r"},
         }
         for rid, body in (review_bodies or {}).items():
             responses[f"repos/o/r/pulls/1/reviews/{rid}"] = {"body": body}
@@ -453,3 +454,40 @@ def test_a_successful_anchor_post_is_still_recognised(run_gate) -> None:
         result.output
     )
     assert "Could not post the anchor comment" not in result.output
+
+
+def test_a_rejected_post_reports_what_the_token_can_do(run_gate) -> None:
+    """A bare 403 cost a full investigation cycle; the next one should not.
+
+    The three ways a fine-grained PAT lands here are indistinguishable from the
+    error alone: not scoped to the repository, scoped but unable to read pull
+    requests, or able to read and not to write. The gate probes and says which.
+    """
+    result = run_gate(
+        action="synchronize",
+        request_token="pat-that-can-read-but-not-comment",
+        post_response={
+            "message": "Resource not accessible by personal access token",
+            "status": "403",
+        },
+    )
+
+    assert "can read o/r: yes" in result.output
+    assert "can read pull request #1: yes" in result.output
+    assert "Pull requests: Read and write" in result.output
+
+
+def test_a_token_that_cannot_see_the_repository_is_named_as_such(run_gate) -> None:
+    result = run_gate(
+        action="synchronize",
+        request_token="pat-scoped-to-another-repository",
+        post_response={"message": "Not Found", "status": "404"},
+        # Only the repository probe: `repos/o/r/pulls/1` is also how the gate
+        # resolves the head under the WORKFLOW token, and failing that would
+        # end the run before the probe ever ran.
+        errors=["repos/o/r"],
+    )
+
+    assert "can read o/r: no" in result.output
+    assert "Repository access" in result.output
+    assert "Metadata: Read" in result.output
