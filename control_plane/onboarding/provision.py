@@ -29,7 +29,6 @@ from control_plane.db import MIGRATIONS_DIR, ControlPlaneDatabase
 from control_plane.models import USER_STEPS, WorkflowState
 from control_plane.provisioning.contracts import ProviderRejected
 from control_plane.provisioning.fly import FlyRuntimeProvisioner
-from control_plane.repositories.jobs import LEASABLE_SQL
 
 # Both are installed into the runtime sink by ProvisioningWorker._finish_runtime;
 # the bootstrap token is then deleted by the bootstrap cleanup job.
@@ -125,18 +124,6 @@ RUNTIME_WRITES_BY_WORKFLOW_STATE: dict[str, tuple[TableWrite, ...]] = {
     ),
 }
 
-#: What a job of this kind writes, where durable state determines it.
-#:
-#: Only the INTERNAL ones are here. A provider-backed job's write set depends on
-#: an answer the provider has not given yet, and the rule this report follows is
-#: that uncertainty is stated rather than guessed — so those report no set and
-#: say why, exactly as the reconcile path does.
-STEP_WRITES_BY_KIND: dict[str, tuple[TableWrite, ...]] = {
-    "bootstrap_cleanup": (
-        TableWrite("provisioning_jobs", "update"),
-    ),
-}
-
 #: Tables the COMPENSATION path writes, which any in-flight call can reach.
 #:
 #: If the API cancels or resets while the worker is inside `provider.prepare`,
@@ -171,22 +158,25 @@ class ProvisionPlan:
     #: What, if anything, this run rehearsed — so `table_writes` is never
     #: read as the write set of an operation that was not rehearsed.
     rehearsal: str = ""
-    #: True while some operation is actually pending — meaning durable state
-    #: holds work the worker can still pick up. Reported so a consumer can tell
-    #: that from a terminal or complete household without parsing prose.
-    operation_pending: bool = True
-    #: True when that pending operation cannot execute as recorded. The two are
-    #: separate because they answer different questions and were briefly
-    #: conflated: a runtime job queued under one provider and left behind by a
-    #: configuration change is still `pending`, the worker can still lease it,
-    #: and reporting "nothing is pending" told an operator there was no live
-    #: work while the worker was about to stall on it. Future-tense fields are
-    #: suppressed for either, because neither describes work that will happen
-    #: as written.
-    operation_blocked: bool = False
+    #: Whether the deployment's workers are paused. `lease` returns nothing
+    #: at all while this is set, which an operator reading a queue of
+    #: pending jobs needs to know.
+    workers_paused: bool = False
     #: Unsettled jobs that run BEFORE `ensure_runtime` — the namespace job, and
-    #: each step's own provider job. They are work the worker can lease right
-    #: now, so "nothing is pending" cannot be said while one exists.
+    #: each step's own provider job — reported as the durable FACTS they are:
+    #: status, error code, `not_before`, `lease_until`, provider.
+    #:
+    #: This used to carry an `executable` verdict per job, and a pair of derived
+    #: booleans summarised the household's state above. Every one of them was a
+    #: claim about what the worker would do next, and each had to agree with
+    #: `JobsRepository.lease` in every edge case — future `not_before`, held
+    #: lease, paused workers, a provider the deployment no longer registers, a
+    #: kind dispatched without one. Eleven review rounds went into reconciling
+    #: those claims, and the count rose rather than fell.
+    #:
+    #: So the command reports what is durably true and stops predicting. An
+    #: operator reading `status`, `not_before` and `lease_until` can see what
+    #: the worker will take; a field asserting it can be wrong, and was.
     pending_step_jobs: list[dict[str, Any]] = field(default_factory=list)
     #: Every unsettled runtime intent, not only the newest. A reset preserves a
     #: running job as `outcome_unknown` needing reconciliation, and the owner
@@ -410,129 +400,6 @@ def _secret_names(
     return secrets
 
 
-def _describe_next(plan: ProvisionPlan, planner_error: str | None) -> None:
-    """Say what happens next, once, from the inventory every branch shares.
-
-    Each classifier used to write its own version of this and they disagreed:
-    the planner's generic "steps are unverified" overwrote a quarantined
-    intent's reconciliation instruction, and the late `operation_pending`
-    override left `rehearsal` insisting nothing was pending while a cleanup job
-    sat ready to lease. Every field describing the next operation is set here,
-    together, or none is.
-    """
-    runnable = _next_executable(plan.pending_step_jobs)
-    quarantined = [
-        job
-        for job in plan.unresolved_runtime_jobs
-        if job.get("error_code") and "requires_reconciliation" in job["error_code"]
-    ]
-    if quarantined:
-        # An unresolved provider effect outranks a future prerequisite: it is
-        # what an operator must act on, and it names the command that settles
-        # it. Overwriting it with the planner's message sent them to the wrong
-        # place entirely.
-        job = quarantined[0]
-        plan.operation_pending = True
-        plan.operation_blocked = True
-        plan.blocked_by = (
-            f"runtime job {job['job_id']} is {job['status']}"
-            f" ({job['error_code']}); reconcile it with"
-            " `abrolia-control-plane reconcile <job-id>` before anything else"
-        )
-        plan.rehearsal = (
-            "an earlier runtime intent is unresolved, so nothing is rehearsed."
-            " Its provider may already have created state, and settling that is"
-            " the next action."
-        )
-        return
-    if runnable is not None:
-        plan.operation_pending = True
-        plan.operation_blocked = False
-        if plan.blocked_by == planner_error:
-            # ONLY the planner's message. It is a prerequisite that the queued
-            # job may itself be on the way to satisfying, so leaving it over the
-            # description of that job misdirects. A terminal classifier's
-            # explanation — "the workflow is cancelled", "the household is
-            # deleting" — is a STATE no job resolves, and it stays: the
-            # onboarding really is over, and the cleanup below really is what
-            # runs next. Both are true and the report says both.
-            plan.blocked_by = None
-        writes = STEP_WRITES_BY_KIND.get(str(runnable["kind"]))
-        plan.table_writes = list(writes) if writes else []
-        certainty = (
-            "Its write set is deterministic and listed above."
-            if writes
-            else "Its write set depends on a provider result this command does"
-            " not obtain, so none is claimed."
-        )
-        remaining = (
-            f" The onboarding itself is settled — {plan.blocked_by} — so this"
-            " is cleanup, not progress."
-            if plan.blocked_by
-            else ""
-        )
-        plan.rehearsal = (
-            f"the next operation is the queued `{runnable['kind']}` job"
-            f" {runnable['job_id']} ({runnable['operation']}), which the worker"
-            f" can lease now. {certainty}{remaining}"
-        )
-        return
-    plan.operation_pending = bool(
-        plan.pending_step_jobs or plan.unresolved_runtime_jobs
-    )
-    plan.operation_blocked = True
-    if planner_error is not None:
-        plan.blocked_by = planner_error
-
-
-def _worker_can_run(row: Any, container: ControlPlaneContainer, paused: bool) -> bool:
-    """Can this job actually be executed by THIS deployment, right now.
-
-    Three things have to hold, and each was learned the hard way. The SQL
-    predicate is `JobsRepository.lease`'s own, so the report cannot disagree
-    with the worker about which rows are selectable. The pause is separate
-    because `lease` returns nothing at all while it is set. And the provider has
-    to be one this deployment registers: queue a `nerve-managed` email job with
-    real email enabled and restart with it disabled, or queue a Fly namespace
-    job and restart under `dry-run-runtime`, and the row stays perfectly
-    leasable while the dispatch that follows cannot happen. A leasable row is
-    not an executable operation.
-    """
-    if paused or not bool(row["executable"]):
-        return False
-    # Only for work the worker dispatches THROUGH a provider. `_run_once`
-    # handles `bootstrap_cleanup` and the consent revocation before it ever
-    # calls `providers.get`, so those run whatever the registry holds — and
-    # requiring a registered provider for them would report real, runnable
-    # cleanup as unexecutable, which is the mirror of the bug this check
-    # exists to fix.
-    if _dispatched_without_a_provider(row):
-        return True
-    provider = row["provider"]
-    if not provider:
-        return True
-    try:
-        container.providers.get(str(provider))
-    except ProviderRejected:
-        return False
-    return True
-
-
-def _dispatched_without_a_provider(row: Any) -> bool:
-    keys = row.keys() if hasattr(row, "keys") else ()
-    kind = str(row["kind"]) if "kind" in keys else "runtime"
-    operation = str(row["operation"]) if "operation" in keys else ""
-    return kind == "bootstrap_cleanup" or operation == "revoke_consent"
-
-
-def _next_executable(jobs: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """The first job the worker could lease, in the order `lease` would take."""
-    for job in jobs:
-        if job["executable"]:
-            return job
-    return None
-
-
 def _now_seconds() -> float:
     """Wall clock, isolated so a test can pin an expired lease."""
     return time.time()
@@ -610,7 +477,11 @@ def plan_onboarding(
     """
     observed: list[TableWrite] = []
     spec = None
-    planner_error: str | None = None
+    # Whether this run modelled a real operation. Internal: it decides whether
+    # the future-tense fields are emitted, and is not itself reported — a
+    # derived claim about the household's state is what the report stopped
+    # making.
+    models_an_operation = True
     plan: ProvisionPlan | None = None
     rehearsed_revision_ids: set[str] = set()
 
@@ -680,26 +551,20 @@ def plan_onboarding(
             # can complete the steps again and mint a newer job, and the older
             # one still represents provider state nobody has reconciled. An
             # operator shown only the new job proceeds past it.
-            now = _now_seconds()
-            # `lease` returns nothing at all while the workers are paused, so
-            # neither can anything here be executable.
-            paused = container.database.workers_paused
-            # The same `executable` question the step jobs answer, asked with
-            # the same predicate. This query used to select neither `operation`
-            # nor `not_before` and the classifier never consulted the pause — so
-            # a Fly attempt rate-limited back to `pending` with a future
-            # `not_before`, or a queued job under a paused worker, was presented
-            # as the ordinary executable success path while `lease` returns
-            # nothing.
+            # Whether the WORKERS are paused is a fact about the deployment and
+            # is reported as one. `lease` returns nothing at all while it is
+            # set, so an operator reading a queue of pending jobs needs to know
+            # — but the report says "the workers are paused", not "this job will
+            # not run", which is a prediction it kept getting wrong.
+            plan.workers_paused = container.database.workers_paused
             unresolved = connection.execute(
-                "SELECT id, status, desired_revision, lease_until, provider,"
-                f" error_code, CASE WHEN ({LEASABLE_SQL}) THEN 1 ELSE 0 END"
-                " AS executable FROM provisioning_jobs"
+                "SELECT id, status, desired_revision, lease_until, not_before,"
+                " provider, error_code FROM provisioning_jobs"
                 " WHERE household_id = ? AND workflow_id = ? AND kind = 'runtime'"
                 " AND operation = 'ensure_runtime'"
                 " AND status IN ('pending','running','waiting_user','outcome_unknown')"
                 " ORDER BY created_at DESC, id DESC",
-                (now, now, now, household_id, workflow["id"]),
+                (household_id, workflow["id"]),
             ).fetchall()
             plan.unresolved_runtime_jobs = [
                 {
@@ -707,7 +572,8 @@ def plan_onboarding(
                     "status": row["status"],
                     "desired_revision": row["desired_revision"],
                     "provider": row["provider"],
-                    "executable": _worker_can_run(row, container, paused),
+                    "not_before": row["not_before"],
+                    "lease_until": row["lease_until"],
                     "error_code": row["error_code"],
                 }
                 for row in unresolved
@@ -739,17 +605,17 @@ def plan_onboarding(
                     # blocked, and `outcome_unknown` is never selected at all.
                     # A report about what the worker will do has to ask the
                     # worker's question.
-                    "executable": _worker_can_run(row, container, paused),
+                    "not_before": row["not_before"],
+                    "lease_until": row["lease_until"],
                 }
                 for row in connection.execute(
                     "SELECT id, kind, operation, status, provider, error_code,"
-                    f" CASE WHEN ({LEASABLE_SQL}) THEN 1 ELSE 0 END AS executable"
-                    " FROM provisioning_jobs"
+                    " not_before, lease_until FROM provisioning_jobs"
                     " WHERE household_id = ? AND workflow_id = ?"
                     " AND NOT (kind = 'runtime' AND operation = 'ensure_runtime')"
                     " AND status IN ('pending','running','waiting_user','outcome_unknown')"
                     " ORDER BY created_at, id",
-                    (now, now, now, household_id, workflow["id"]),
+                    (household_id, workflow["id"]),
                 ).fetchall()
             ]
             # More than one unresolved intent means an EARLIER provider effect
@@ -765,7 +631,7 @@ def plan_onboarding(
                     + ")"
                     for job in plan.unresolved_runtime_jobs[1:]
                 )
-                plan.operation_blocked = True
+                models_an_operation = False
                 plan.blocked_by = (
                     f"an earlier runtime intent is still unresolved: {older}."
                     " Reconcile it with `abrolia-control-plane reconcile"
@@ -868,7 +734,7 @@ def plan_onboarding(
             household_status = str((household or {})["status"] or "") if household else ""
             being_deleted = household_status in {"deleting", "deleted"}
             if being_deleted:
-                plan.operation_pending = False
+                models_an_operation = False
                 plan.rehearsal = (
                     f"the household is `{household_status}`; there is no"
                     " onboarding operation to rehearse. Any runtime job still"
@@ -906,7 +772,7 @@ def plan_onboarding(
                 # worker can still lease it, and saying "nothing is pending"
                 # told an operator there was no live work while the worker was
                 # about to stall on it. The two facts are reported separately.
-                plan.operation_blocked = True
+                models_an_operation = False
                 plan.rehearsal = (
                     f"the pending runtime job is recorded against"
                     f" `{job_provider}` and this deployment is configured for"
@@ -925,7 +791,7 @@ def plan_onboarding(
 
             cancelled_workflow = str(workflow["state"]) == WorkflowState.CANCELLED.value
             if cancelled_workflow:
-                plan.operation_pending = False
+                models_an_operation = False
                 plan.rehearsal = (
                     "the onboarding workflow is `cancelled`; there is no pending"
                     " operation to rehearse. Verified step results survive a"
@@ -937,7 +803,7 @@ def plan_onboarding(
                     " rather than provisioning from this"
                 )
             if already_onboarded:
-                plan.operation_pending = False
+                models_an_operation = False
                 plan.rehearsal = (
                     f"revision {issued['revision']} is active and onboarding is"
                     " complete; there is no pending operation to rehearse"
@@ -948,7 +814,7 @@ def plan_onboarding(
                 and settled_status in {"failed", "cancelled"}
             )
             if failed_runtime:
-                plan.operation_pending = False
+                models_an_operation = False
                 plan.blocked_by = (
                     f"the runtime operation for revision {issued['revision']} is"
                     f" `{settled_status}`; onboarding cannot proceed until it is"
@@ -961,7 +827,7 @@ def plan_onboarding(
                     " No write set is claimed."
                 )
             if awaiting_activation:
-                plan.operation_pending = False
+                models_an_operation = False
                 plan.rehearsal = (
                     f"revision {issued['revision']} is issued and its runtime"
                     " operation has settled; the household is waiting on"
@@ -1037,7 +903,7 @@ def plan_onboarding(
                     # as though they will be installed — when an inspection may
                     # find the resource already exists, failed, or needs
                     # cleanup. The same uncertainty governs all three.
-                    plan.operation_blocked = True
+                    models_an_operation = False
                     writes = None
                 else:
                     writes = RUNTIME_WRITES_BY_WORKFLOW_STATE.get(state)
@@ -1107,12 +973,11 @@ def plan_onboarding(
                         ),
                     }
                 except ValueError as error:
-                    # Recorded, not narrated. `_describe_next` decides the whole
-                    # top-level story once, from the inventory every branch
-                    # shares — this branch writing its own version is how the
-                    # planner's generic prerequisite came to overwrite a
-                    # quarantined intent's reconciliation instruction.
-                    planner_error = str(error)
+                    # A prerequisite, reported as one. No claim about what runs
+                    # next follows from it — the inventory above says what is
+                    # queued and an operator reads it.
+                    plan.blocked_by = str(error)
+                    models_an_operation = False
                 finally:
                     connection.set_trace_callback(None)
 
@@ -1143,7 +1008,7 @@ def plan_onboarding(
             # says "nothing is asserted about what it creates" is noise dressed
             # as a plan, and the rule everywhere else in this report is that a
             # field describes the pending operation or is empty.
-            if spec is not None and plan.operation_pending and not plan.operation_blocked:
+            if spec is not None and models_an_operation:
                 plan.runtime_resources = _runtime_resources(
                     container,
                     household_id,
@@ -1176,26 +1041,6 @@ def plan_onboarding(
         pass
 
     assert plan is not None
-    # Terminal states set `operation_pending = False` from the WORKFLOW's point
-    # of view, and the workflow is not the only thing that queues work: after
-    # activation completes, `BootstrapService._enqueue_cleanup` leaves a pending
-    # `bootstrap_cleanup` job while the workflow is already `complete`, and a
-    # reset, cancellation or deletion can leave executable cleanup too.
-    #
-    # Narrated once, here, over the inventory every branch shares — and only
-    # when there is something to say. A terminal classifier that already
-    # explained itself keeps its explanation; what it cannot do is claim nothing
-    # is pending over a job the worker leases immediately.
-    if (
-        _next_executable(plan.pending_step_jobs) is not None
-        or planner_error is not None
-        or any(
-            job.get("error_code") and "requires_reconciliation" in job["error_code"]
-            for job in plan.unresolved_runtime_jobs
-        )
-    ):
-        _describe_next(plan, planner_error)
-
     # After the rollback, and asking only about rows THIS rehearsal minted.
     # Anything else in the table belongs to the worker and is none of this
     # command's business to report as its own.

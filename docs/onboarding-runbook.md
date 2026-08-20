@@ -174,66 +174,33 @@ Always reported: the workflow state and per-step statuses, and — when a step i
 not yet verified — `blocked_by` and `unverified_steps` naming exactly what is
 missing.
 
-Two flags, answering two questions. `operation_pending` says whether durable
-state holds work the worker can still pick up. `operation_blocked` says whether
-that work can execute as recorded — a runtime job left behind by a configuration
-change is pending *and* blocked, because the worker will lease it and stall.
-**When either is unfavourable, `table_writes`, `runtime_resources` and `secrets`
-are empty**, since neither case describes work that will happen as written.
+The report states **facts and one label**, and stops there.
 
-`pending_step_jobs` lists unsettled jobs that run BEFORE `ensure_runtime` — the
-secret-namespace job the profile step queues, and each user step's own provider
-job — each with an `executable` flag answering whether the worker can lease it
-right now. That answer comes from `JobsRepository.lease`'s own SQL rather than a
-restatement of its rules, so the report and the worker cannot disagree: a
-`pending` job whose `not_before` is in the future is not executable, a due
-`waiting_user`/`inspect` DNS recheck is, an `outcome_unknown` job never is, and
-nothing is while the workers are paused.
+`rehearsal` says what THIS RUN rehearsed — a planning pass, a pending runtime
+operation's success path, or nothing — so `table_writes` is never read as the
+write set of something that was not rehearsed. `blocked_by` names what prevents
+the next onboarding operation, where durable state determines it.
 
-`executable` means the worker can run it **in this deployment**, which is three
-things: the row is selectable by `lease`, the workers are not paused, and the
-job's durable provider is one this deployment still registers. A `nerve-managed`
-job queued with real email on and reached after a restart with it off is a
-perfectly leasable row that cannot be dispatched. The same three questions are
-asked of the runtime job.
+Everything else is durable state, reported as it is:
 
-A report is never "nothing is pending" while any unsettled intent exists — step
-job or runtime — even when the planner refuses because those very steps have not
-verified yet. That refusal is **not** a blockage: it is the normal state while
-the steps' own jobs are still queued, so `operation_blocked` stays false as long
-as something is leasable.
+- `steps` / `unverified_steps` — where the household is.
+- `pending_step_jobs` — every unsettled job that runs before `ensure_runtime`,
+  with its `status`, `error_code`, `not_before`, `lease_until` and `provider`.
+- `unresolved_runtime_jobs` — every unsettled `ensure_runtime` intent, likewise.
+  An `error_code` ending `_requires_reconciliation` means a provider effect
+  nobody has settled; `abrolia-control-plane reconcile <job-id>` settles it, and
+  it should be settled before provisioning on top of it.
+- `workers_paused` — `JobsRepository.lease` returns nothing at all while this is
+  set, so a queue of pending jobs is not a queue that is moving.
+- `committed` / `uncommitted_revision_delta` — the no-mutation proof.
 
-The top-level story — `operation_pending`, `operation_blocked`, `blocked_by`,
-`rehearsal`, `table_writes` — is decided **together**, in one place, so those
-fields cannot describe different operations. In order of precedence: an
-unresolved runtime intent needing reconciliation outranks everything, because
-its provider may already have created state and settling that is the next
-action; otherwise the next leasable job is named, with its write set where the
-work is internal and deterministic, and an explicit statement of uncertainty
-where it depends on a provider result this command does not obtain. A terminal
-classifier's explanation survives all of this: a cancelled onboarding with a
-queued teardown reports both — the onboarding is over, *and* this cleanup is
-what runs next.
-
-`unresolved_runtime_jobs` lists **every** unsettled `ensure_runtime` intent, not
-just the next one. A reset preserves a started job as `outcome_unknown` with
-`reset_requires_reconciliation`, and the owner can complete the steps again and
-mint a newer job on top of it. **More than one entry blocks the plan**: the older
-job may already have created a runtime, and provisioning on top of it makes the
-conflict the quarantine exists to prevent. `error_code` says which command
-settles it.
-
-Read `rehearsal` for which case you are in:
-
-| State | What is reported |
-|---|---|
-| Before a revision is issued | A planning pass is rehearsed inside a write transaction and rolled back; `table_writes` is the set of tables it touched. |
-| A revision is issued with a pending runtime job | No planning pass happens — it already did. `table_writes` is the **success path** of the pending runtime operation: an upper bound, not a prediction. A provider that rate-limits, rejects or times out writes a subset. |
-| The runtime job is `outcome_unknown`, or `running` with an expired lease | The next operation is a reconcile whose write set depends on a provider inspection this command does not perform. No write set is claimed. Use `abrolia-control-plane reconcile <job-id>`. |
-| The runtime job settled and the household is `activating` | Nothing is pending here; the next writes belong to bootstrap activation, which this command does not model. |
-| The runtime job `failed` or was `cancelled` | A terminal state needing intervention. `blocked_by` says so; no write set is claimed. |
-| The workflow is `complete` | Onboarding is done. There is no pending operation. |
-| The workflow is `cancelled` | Verified step results survive a cancellation, so the steps describe what *was* done. Nothing will resume; start a new workflow. |
+**It does not tell you which job the worker will take next.** It used to, and
+that claim had to agree with `lease` in every edge case — a future `not_before`,
+a held lease, a paused deployment, a provider the configuration no longer
+registers, a kind dispatched without one. Eleven review rounds went into
+reconciling it and the disagreements kept coming. The fields above are what
+`lease` reads; an operator can see the answer, and a report that asserts it can
+be wrong.
 
 `runtime_resources` comes from the provider of the **pending job**, which is not
 always the configured one. A job carries its provider durably and the worker

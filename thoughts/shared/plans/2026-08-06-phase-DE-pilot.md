@@ -169,6 +169,21 @@ After `codex/phase-E-pilotization` merges, the system can onboard a pilot househ
 
 **Files:** `control_plane/onboarding/state.py`, `control_plane/onboarding/provision.py`, `control_plane/onboarding/transitions.py`, `control_plane/migrations/0001_control_plane.sql` (if new columns needed), `docs/onboarding-runbook.md`, `control_plane/container.py`, `control_plane/db.py`, `control_plane/provisioning/fakes.py`, `tests/control_plane/test_provision_dry_run.py`.
 
+**Report narrowed 2026-08-20.** The rehearsal grew a second job beyond the
+no-mutation guarantee: predicting which job the worker would take next, and
+summarising the household's state in derived booleans. That prediction had to
+agree with `JobsRepository.lease` in every edge case — a future `not_before`, a
+held lease, paused workers, a provider the configuration no longer registers, a
+kind dispatched without one — and eleven review rounds went into reconciling it
+while the finding count rose rather than fell.
+
+The command now reports durable FACTS and one label for what it rehearsed. The
+fields `lease` reads are all present, so an operator can see the answer; the
+report no longer asserts it. `−207` lines of implementation and `−379` of tests
+went with the claims. The no-mutation half — the read-only snapshot, the
+refusals, the `committed` proof — is untouched, and it is what Step E1 asked
+for.
+
 **Scope corrected 2026-08-20**, on the same reading that corrected Step E9: an
 inventory listing only the modules a step was expected to touch cannot detect
 the ones it turned out to need, and a changed file outside the plan is a

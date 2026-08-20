@@ -26,9 +26,7 @@ from control_plane.onboarding.provision import (
     RUNTIME_BOOTSTRAP_SECRET,
     RUNTIME_DSAR_SECRET,
     RUNTIME_WRITES_BY_WORKFLOW_STATE,
-    STEP_WRITES_BY_KIND,
     TableWrite,
-    _now_seconds,
     _parser,
     _record_writes,
     _runtime_resources,
@@ -1096,13 +1094,10 @@ def test_a_cancelled_workflow_advertises_no_future_work(container) -> None:
 
     plan = plan_onboarding(container, household_id)
 
-    # `operation_pending` follows what the WORKER can lease, and cancelling
-    # schedules teardown jobs — so it is true here, and it should be: that work
-    # is real and about to run. What the cancellation ends is the ONBOARDING,
-    # which is why nothing future-tense is claimed.
-    assert plan.operation_pending is bool(
-        [job for job in plan.pending_step_jobs if job["executable"]]
-    )
+    # The cancellation ends the ONBOARDING, which is why nothing
+    # future-tense is claimed. Whatever teardown it queued is listed as
+    # fact in `pending_step_jobs`; the report does not predict what the
+    # worker does with it.
     assert plan.blocked_by is not None and "cancelled" in plan.blocked_by
     assert plan.table_writes == []
     assert plan.runtime_resources == []
@@ -1233,7 +1228,6 @@ def test_a_household_under_deletion_advertises_no_onboarding(container) -> None:
 
     plan = plan_onboarding(container, household_id)
 
-    assert plan.operation_pending is False
     assert plan.blocked_by is not None and "deleting" in plan.blocked_by
     assert plan.table_writes == []
     assert plan.runtime_resources == []
@@ -1278,8 +1272,6 @@ def test_a_provider_configuration_mismatch_is_reported_as_blocked(container) -> 
     # still lease it, so reporting "nothing is pending" told an operator there
     # was no live work while the worker was about to stall on it. Two facts,
     # two flags.
-    assert plan.operation_pending is True
-    assert plan.operation_blocked is True
     assert plan.blocked_by is not None
     # Both sides named: which is queued, and which the deployment is set to.
     assert other in plan.blocked_by and configured in plan.blocked_by
@@ -1312,8 +1304,6 @@ def test_a_job_naming_an_unregistered_provider_is_blocked_too(container) -> None
 
     plan = plan_onboarding(container, household_id)
 
-    assert plan.operation_pending is True
-    assert plan.operation_blocked is True
     assert plan.runtime_resources == []
     assert plan.secrets == []
     assert "a-provider-nobody-registers" in (plan.blocked_by or "")
@@ -1415,7 +1405,6 @@ def test_a_blocked_planning_pass_advertises_no_future_work(container) -> None:
 
     assert plan.blocked_by is not None
     assert plan.unverified_steps
-    assert plan.operation_pending is False
     assert plan.runtime_resources == []
     assert plan.secrets == []
     assert plan.table_writes == []
@@ -1558,7 +1547,6 @@ def test_an_older_unresolved_intent_blocks_the_newer_plan(container) -> None:
     plan = plan_onboarding(container, household_id)
 
     assert len(plan.unresolved_runtime_jobs) > 1, "the fixture left only one intent"
-    assert plan.operation_blocked is True
     assert quarantined in (plan.blocked_by or "")
     # Nothing future-tense while an earlier effect is outstanding.
     assert plan.runtime_resources == []
@@ -1588,7 +1576,6 @@ def test_a_reconciliation_asserts_no_resource_or_secret_lifecycle(container) -> 
 
     plan = plan_onboarding(container, household_id)
 
-    assert plan.operation_blocked is True
     assert "reconcile" in plan.rehearsal
     assert plan.table_writes == []
     assert plan.runtime_resources == [], plan.rehearsal
@@ -1640,13 +1627,11 @@ def test_a_pending_step_job_is_not_reported_as_no_work(container) -> None:
     assert {job["job_id"] for job in plan.pending_step_jobs} == {
         row["id"] for row in queued
     }
-    assert plan.operation_pending is True
     # NOT blocked. The planner refusing for unverified steps is the normal state
     # while those steps' own jobs are still queued — that is work in progress.
     # Marking it blocked made the report contradict itself: a job listed with
     # `executable: true` in the same document the flag declared unable to
     # proceed.
-    assert plan.operation_blocked is False
     # Still nothing future-tense: no revision is planned yet, so there is no
     # runtime operation to describe resources or secrets for.
     assert plan.runtime_resources == []
@@ -1690,148 +1675,6 @@ def test_an_unusable_database_path_fails_with_the_commands_own_diagnostic(
         main(["--dry-run", "--household", "10000000-0000-4000-8000-000000000031"])
 
 
-def test_a_leasable_step_job_is_reported_as_executable(container) -> None:
-    """Pending, held, waiting and quarantined are not one state.
-
-    The first inventory collapsed them, and the planner's expected
-    unverified-step error then marked every one blocked — so a leasable
-    `ensure_secret_namespace` right after `save_profile` was reported as unable
-    to execute while `JobsRepository.lease` would take it immediately.
-    """
-    household_id = _household_with_profile(container)
-    # `_household_with_profile` drains the namespace job, so queue a fresh one
-    # by selecting a step and leaving it alone.
-    account_id, session_id = _PRINCIPALS[household_id]
-    container.onboarding.select(
-        household_id,
-        StepKind.EMAIL,
-        EMAIL_SELECTION,
-        context=_context(
-            container, household_id, "select-0",
-            account_id=account_id, session_id=session_id,
-        ),
-    )
-
-    plan = plan_onboarding(container, household_id)
-
-    assert plan.pending_step_jobs, "the queued step job was not inventoried"
-    assert all(job["executable"] for job in plan.pending_step_jobs), (
-        "a pending job the worker can lease right now is reported as unable to run"
-    )
-    assert plan.operation_pending is True
-
-    # And the other direction, through the same inventory: quarantine that job
-    # and it must be reported as NOT executable. Asserting only that something
-    # is executable passes just as well when everything is hard-coded true,
-    # which is how the first version of this test proved nothing.
-    with container.database.write() as connection:
-        connection.execute(
-            "UPDATE provisioning_jobs SET status = 'outcome_unknown',"
-            " error_code = 'reset_requires_reconciliation'"
-            " WHERE household_id = ? AND kind = 'email_identity'",
-            (household_id,),
-        )
-
-    quarantined = plan_onboarding(container, household_id)
-
-    email_jobs = [
-        job for job in quarantined.pending_step_jobs if job["kind"] == "email_identity"
-    ]
-    assert email_jobs, "the quarantined job left the inventory"
-    assert not any(job["executable"] for job in email_jobs), (
-        "a quarantined intent is reported as leasable"
-    )
-
-
-@pytest.mark.parametrize(
-    ("status", "operation", "not_before", "lease_until", "executable"),
-    [
-        pytest.param("pending", "ensure", None, None, True, id="pending-now"),
-        pytest.param("pending", "ensure", 1e12, None, False, id="pending-not-yet"),
-        pytest.param("running", "ensure", None, 1e12, False, id="lease-held"),
-        pytest.param("running", "ensure", None, 1.0, True, id="lease-expired"),
-        pytest.param(
-            "waiting_user", "inspect", 1.0, None, True, id="dns-recheck-due"
-        ),
-        pytest.param(
-            "waiting_user", "inspect", 1e12, None, False, id="dns-recheck-not-due"
-        ),
-        pytest.param("waiting_user", "ensure", 1.0, None, False, id="waits-on-owner"),
-        pytest.param(
-            "outcome_unknown", "ensure", None, None, False, id="never-selected"
-        ),
-    ],
-)
-def test_executability_matches_what_the_worker_would_lease(
-    container, status, operation, not_before, lease_until, executable
-) -> None:
-    """The report's answer and `JobsRepository.lease` must be the same answer.
-
-    Restating the rules in Python is what produced three disagreements: a
-    `pending` job with a future `not_before` called executable when it is not, a
-    due `waiting_user/inspect` DNS recheck called blocked when the worker takes
-    it, and `outcome_unknown` called leasable when nothing selects it at all.
-    Each case here is checked BOTH ways — what the report says, and whether
-    `lease` actually returns that job — so the two cannot drift again.
-    """
-    household_id = _household_with_profile(container)
-    with container.database.write() as connection:
-        connection.execute(
-            "UPDATE provisioning_jobs SET status = ?, operation = ?,"
-            " not_before = ?, lease_until = ? WHERE household_id = ?",
-            (status, operation, not_before, lease_until, household_id),
-        )
-        connection.execute(
-            "DELETE FROM provisioning_jobs WHERE household_id != ?", (household_id,)
-        )
-
-    plan = plan_onboarding(container, household_id)
-    reported = [job["executable"] for job in plan.pending_step_jobs]
-    assert reported == [executable], reported
-
-    leased = container.jobs.lease("probe", now=_now_seconds())
-    assert (leased is not None) is executable, (
-        "the report and the worker disagree about the same job"
-    )
-
-
-def test_paused_workers_make_nothing_executable(container) -> None:
-    """`lease` returns nothing at all while the workers are paused.
-
-    A restored database stays paused until `resume-jobs`, and a report telling
-    an operator that work is about to run — while the pause they deliberately
-    left in place guarantees it will not — is the same class of false statement
-    as any other disagreement with the worker.
-    """
-    household_id = _household_with_profile(container)
-    account_id, session_id = _PRINCIPALS[household_id]
-    container.onboarding.select(
-        household_id,
-        StepKind.EMAIL,
-        EMAIL_SELECTION,
-        context=_context(
-            container, household_id, "select-0",
-            account_id=account_id, session_id=session_id,
-        ),
-    )
-    running = plan_onboarding(container, household_id)
-    assert any(job["executable"] for job in running.pending_step_jobs), (
-        "the fixture queued nothing leasable, so pausing proves nothing"
-    )
-
-    container.database.pause_workers()
-    try:
-        paused = plan_onboarding(container, household_id)
-        assert container.jobs.lease("probe", now=_now_seconds()) is None
-    finally:
-        container.database.resume_workers()
-
-    assert paused.pending_step_jobs, "the pause emptied the inventory"
-    assert not any(job["executable"] for job in paused.pending_step_jobs), (
-        "work was reported as about to run while the workers are paused"
-    )
-
-
 def test_a_quarantined_runtime_intent_keeps_the_operation_pending(container) -> None:
     """Reset a leased runtime job, drain, and rehearse before re-verifying.
 
@@ -1865,10 +1708,6 @@ def test_a_quarantined_runtime_intent_keeps_the_operation_pending(container) -> 
     plan = plan_onboarding(container, household_id)
 
     assert plan.unresolved_runtime_jobs, "the fixture settled the quarantined intent"
-    assert plan.operation_pending is True, (
-        "an unresolved provider intent was reported as no pending work"
-    )
-    assert plan.operation_blocked is True
     assert plan.runtime_resources == []
     assert plan.secrets == []
 
@@ -1910,157 +1749,18 @@ def test_the_snapshot_carries_the_live_worker_pause(tmp_path, monkeypatch) -> No
     )
 
 
-def test_a_queued_cleanup_after_completion_is_still_pending(container) -> None:
-    """The workflow is not the only thing that queues work.
+def test_an_unresolved_intent_is_reported_with_its_reason(container) -> None:
+    """The fact, not a ranking.
 
-    After activation completes, `BootstrapService._enqueue_cleanup` leaves a
-    pending `bootstrap_cleanup` job while the workflow is already `complete`.
-    The terminal branches set `operation_pending = False` from the workflow's
-    point of view and reported "no pending operation" over a job the worker
-    leases immediately.
-    """
-    household_id = _household_with_profile(container)
-    _verify_all_steps(container, household_id)
-    while container.worker.run_once() is not None:
-        pass
-    workflow = container.database.query_one(
-        "SELECT id, state FROM onboarding_workflows WHERE household_id = ?",
-        (household_id,),
-    )
-    with container.database.write() as connection:
-        connection.execute(
-            "UPDATE onboarding_workflows SET state = 'complete' WHERE id = ?",
-            (workflow["id"],),
-        )
-        # Through the repository, so the row is shaped exactly as
-        # `BootstrapService._enqueue_cleanup` shapes it.
-        cleanup_id, _created = container.jobs.create(
-            connection,
-            household_id=household_id,
-            workflow_id=workflow["id"],
-            kind="bootstrap_cleanup",
-            operation="delete_bootstrap_secret",
-            intent_key=f"{household_id}:late-bootstrap-cleanup:probe",
-            request={"name": "HERMES_BOOTSTRAP_TOKEN"},
-            provider="internal-secret-sink",
-            now=BASE_TIME,
-        )
+    An earlier version asserted that the quarantined intent OUTRANKED the
+    planner's prerequisite in `blocked_by` — a precedence claim, and one of
+    several the report used to make about which action mattered most. Those
+    claims are what needed relitigating every review round.
 
-    plan = plan_onboarding(container, household_id)
-
-    assert any(
-        job["job_id"] == cleanup_id for job in plan.pending_step_jobs
-    ), "the queued cleanup was not inventoried"
-    assert plan.operation_pending is True, (
-        "a job the worker leases immediately was reported as no pending work"
-    )
-    # And still nothing future-tense: the onboarding really is over.
-    assert plan.runtime_resources == []
-    assert plan.secrets == []
-
-
-def test_the_report_names_the_job_the_worker_will_actually_lease(container) -> None:
-    """Describing a future planning pass while a job is queued now.
-
-    With `operation_blocked` correctly false, `rehearsal` still claimed a
-    planning pass and `blocked_by` still held the planner's prerequisite error —
-    so the report described an operation that comes later while the actual next
-    one, the job about to be leased, went unnamed.
-    """
-    household_id = _household_with_profile(container)
-    account_id, session_id = _PRINCIPALS[household_id]
-    container.onboarding.select(
-        household_id,
-        StepKind.EMAIL,
-        EMAIL_SELECTION,
-        context=_context(
-            container, household_id, "select-0",
-            account_id=account_id, session_id=session_id,
-        ),
-    )
-
-    plan = plan_onboarding(container, household_id)
-
-    runnable = next(job for job in plan.pending_step_jobs if job["executable"])
-    assert plan.operation_blocked is False
-    assert plan.blocked_by is None, plan.blocked_by
-    assert runnable["job_id"] in plan.rehearsal, plan.rehearsal
-    assert "planning pass" not in plan.rehearsal.split("The planning pass")[0]
-
-
-def test_a_rate_limited_runtime_job_is_not_reported_as_executable(container) -> None:
-    """The runtime query never asked `lease`'s question.
-
-    It selected neither `operation` nor `not_before` and the classifier never
-    consulted the pause, so a Fly attempt rate-limited back to `pending` with a
-    future `not_before` was presented as the ordinary executable success path
-    while `lease` returns nothing at all.
-    """
-    household_id = _household_with_profile(container)
-    _verify_all_steps(container, household_id)
-    with container.database.write() as connection:
-        connection.execute(
-            "UPDATE provisioning_jobs SET status = 'pending', not_before = ?"
-            " WHERE household_id = ? AND kind = 'runtime'"
-            " AND operation = 'ensure_runtime'",
-            (_now_seconds() + 3600, household_id),
-        )
-
-    plan = plan_onboarding(container, household_id)
-
-    assert plan.unresolved_runtime_jobs, "the fixture settled the runtime job"
-    assert not any(job["executable"] for job in plan.unresolved_runtime_jobs), (
-        "a job the worker cannot lease for another hour was reported executable"
-    )
-    assert container.jobs.lease("probe", now=_now_seconds()) is None
-
-
-def test_a_job_whose_provider_is_gone_is_not_executable(container) -> None:
-    """A leasable row is not an executable operation.
-
-    Queue a `nerve-managed` email job with real email enabled and restart with
-    it disabled, or a Fly namespace job under `dry-run-runtime`: the row stays
-    perfectly selectable while the dispatch that follows cannot happen.
-    """
-    household_id = _household_with_profile(container)
-    account_id, session_id = _PRINCIPALS[household_id]
-    container.onboarding.select(
-        household_id,
-        StepKind.EMAIL,
-        EMAIL_SELECTION,
-        context=_context(
-            container, household_id, "select-0",
-            account_id=account_id, session_id=session_id,
-        ),
-    )
-    runnable_before = plan_onboarding(container, household_id)
-    assert any(job["executable"] for job in runnable_before.pending_step_jobs)
-
-    with container.database.write() as connection:
-        connection.execute(
-            "UPDATE provisioning_jobs SET provider = 'a-provider-nobody-registers'"
-            " WHERE household_id = ? AND kind = 'email_identity'",
-            (household_id,),
-        )
-
-    plan = plan_onboarding(container, household_id)
-
-    email = [job for job in plan.pending_step_jobs if job["kind"] == "email_identity"]
-    assert email, "the job left the inventory"
-    assert not any(job["executable"] for job in email), (
-        "a job whose provider this deployment cannot dispatch was called executable"
-    )
-
-
-def test_a_quarantined_intent_outranks_the_planner_prerequisite(container) -> None:
-    """An unresolved provider effect is what an operator must act on.
-
-    Reset a leased `ensure_runtime` so it stays
-    `outcome_unknown/reset_requires_reconciliation`, drain the cleanup, and
-    rehearse before re-verifying: the revoked revision sends execution through
-    `planner.issue`, which raises for the unverified steps, and that generic
-    message overwrote the reconciliation instruction — sending the operator to
-    the wrong place entirely.
+    What an operator needs is durable and unambiguous: the intent is listed with
+    the status and error code that name the command settling it. The report says
+    what is true and leaves the ordering to the person who can see the whole
+    deployment.
     """
     household_id = _household_with_profile(container)
     _verify_all_steps(container, household_id)
@@ -2091,68 +1791,10 @@ def test_a_quarantined_intent_outranks_the_planner_prerequisite(container) -> No
 
     plan = plan_onboarding(container, household_id)
 
-    assert plan.blocked_by is not None
-    assert quarantined in plan.blocked_by, plan.blocked_by
-    assert "reconcile" in plan.blocked_by
-    assert "verified results" not in plan.blocked_by, (
-        "the planner's prerequisite overwrote the reconciliation instruction"
-    )
-
-
-def test_a_terminal_workflow_still_names_its_cleanup_job(container) -> None:
-    """`operation_pending` alone was not enough.
-
-    The late override flipped the flag to true and left `rehearsal` insisting
-    there was no pending operation, naming neither the cleanup job nor what it
-    writes. Every top-level field has to describe the same next operation.
-    """
-    household_id = _household_with_profile(container)
-    _verify_all_steps(container, household_id)
-    while container.worker.run_once() is not None:
-        pass
-    workflow = container.database.query_one(
-        "SELECT id FROM onboarding_workflows WHERE household_id = ?", (household_id,)
-    )
-    with container.database.write() as connection:
-        connection.execute(
-            "UPDATE onboarding_workflows SET state = 'complete' WHERE id = ?",
-            (workflow["id"],),
-        )
-        cleanup_id, _created = container.jobs.create(
-            connection,
-            household_id=household_id,
-            workflow_id=workflow["id"],
-            kind="bootstrap_cleanup",
-            operation="delete_bootstrap_secret",
-            intent_key=f"{household_id}:late-bootstrap-cleanup:probe",
-            request={"name": "HERMES_BOOTSTRAP_TOKEN"},
-            provider="internal-secret-sink",
-            now=BASE_TIME,
-        )
-
-    plan = plan_onboarding(container, household_id)
-
-    assert plan.operation_pending is True
-    assert cleanup_id in plan.rehearsal, plan.rehearsal
-    # Deterministic internal work, so its write set IS knowable and is reported.
-    assert plan.table_writes == list(STEP_WRITES_BY_KIND["bootstrap_cleanup"])
-
-
-def test_a_provider_backed_step_job_states_its_uncertainty(container) -> None:
-    """Knowable where durable state determines it; said so where it does not."""
-    household_id = _household_with_profile(container)
-    account_id, session_id = _PRINCIPALS[household_id]
-    container.onboarding.select(
-        household_id,
-        StepKind.EMAIL,
-        EMAIL_SELECTION,
-        context=_context(
-            container, household_id, "select-0",
-            account_id=account_id, session_id=session_id,
-        ),
-    )
-
-    plan = plan_onboarding(container, household_id)
-
-    assert "depends on a provider result" in plan.rehearsal, plan.rehearsal
-    assert plan.table_writes == []
+    reported = {job["job_id"]: job for job in plan.unresolved_runtime_jobs}
+    assert quarantined in reported, "the unresolved intent was not reported"
+    assert reported[quarantined]["error_code"] == "reset_requires_reconciliation"
+    assert reported[quarantined]["status"] == "outcome_unknown"
+    # And nothing future-tense is advertised over it.
+    assert plan.runtime_resources == []
+    assert plan.secrets == []
