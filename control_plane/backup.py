@@ -169,20 +169,29 @@ def _digest_of(handle) -> bytes:
 
 
 def _content_identity(path: Path) -> tuple[tuple[int, int] | None, bytes | None]:
-    """What this entry IS: which inode, and which bytes.
+    """What this entry IS: which inode, and which bytes — from ONE descriptor.
 
     The inode alone is not identity. A process holding an open descriptor can
     truncate or rewrite a file in place without changing it, so a check that
     compared only `(st_dev, st_ino)` passed and the modified member was
     installed as though it were the validated one.
+
+    Both halves come from `fstat` on the descriptor the digest was read
+    through. Taking the inode by pathname AFTER the open was the same
+    ask-twice mistake one level down: a swap in between pairs one file's digest
+    with another file's inode, and the pair is then trusted as an identity.
+
+    ABSENT is `(None, None)`, and that is the only identity this returns for a
+    file it could not read. An unreadable present member raises: the earlier
+    version answered `(inode, None)`, so two transiently failing states
+    compared EQUAL with no byte proof behind either — an install or a reversal
+    licensed by a pair of failures.
     """
     if not _present(path):
         return (None, None)
-    try:
-        with _open_pinned(path) as handle:
-            return (_inode(path), _digest_of(handle))
-    except OSError:
-        return (_inode(path), None)
+    with _open_pinned(path) as handle:
+        info = os.fstat(handle.fileno())
+        return ((info.st_dev, info.st_ino), _digest_of(handle))
 
 
 def _digest_file(path: Path) -> bytes:
@@ -342,6 +351,10 @@ class _Move:
     #: canonical namespace, reported nothing outstanding, and released the
     #: locks with no fail-safe pause.
     published_digest: bytes | None = None
+    #: False when the identity could not be READ after publication. Such a move
+    #: is never reversed: an unprovable identity must not compare equal to
+    #: another unprovable one, which is what recording `None` for both would do.
+    identity_proven: bool = True
     #: False while the destination is published and the source still stands.
     source_removed: bool = False
 
@@ -350,7 +363,7 @@ def _claim(
     source: Path,
     destination: Path,
     journal: list[_Move] | None = None,
-) -> None:
+) -> tuple[int, int] | None:
     """Move `source` onto `destination`, refusing to replace anything.
 
     `os.replace` is atomic and CLOBBERS, so guarding it with a check leaves a
@@ -369,9 +382,13 @@ def _claim(
     # know the destination now existed, so `_undo` would not reverse it and the
     # bundle stayed half-apart. The link is the move; the unlink is tidying
     # after it, and `source_removed` is set only once that tidying succeeded.
-    published, digest = _content_identity(destination)
+    published, digest, proven = _identity_after_publication(destination)
     record = _Move(
-        source, destination, published_inode=published, published_digest=digest
+        source,
+        destination,
+        published_inode=published,
+        published_digest=digest,
+        identity_proven=proven,
     )
     if journal is not None:
         journal.append(record)
@@ -397,6 +414,7 @@ def _claim(
         _withdraw(destination, published)
         raise
     record.source_removed = True
+    return published
 
 
 class RaceLostSource(BackupError, OSError):
@@ -432,7 +450,24 @@ class AmbiguousPublication(BackupError):
         self.destination = destination
 
 
-def _withdraw(destination: Path, published: tuple[int, int] | None = None) -> None:
+def _identity_after_publication(
+    destination: Path,
+) -> tuple[tuple[int, int] | None, bytes | None, bool]:
+    """Read what was just published, and say whether it could be read at all.
+
+    The publication has already happened, so failing here cannot un-happen it.
+    What it can do is refuse to pretend: an unread identity is recorded as
+    UNPROVEN, and `_undo` never moves an unproven member into an authoritative
+    namespace.
+    """
+    try:
+        inode, digest = _content_identity(destination)
+    except OSError:
+        return (_inode(destination), None, False)
+    return (inode, digest, True)
+
+
+def _withdraw(destination: Path, published: tuple[int, int] | None) -> None:
     """Take a published name away, and make the ABSENCE durable too.
 
     Only while the name still holds what was published. A cleanup that unlinks
@@ -444,7 +479,14 @@ def _withdraw(destination: Path, published: tuple[int, int] | None = None) -> No
     so a caller that then removes a pause marker can leave a database present
     and unpaused. Sync, and say the state is ambiguous if even that fails.
     """
-    if published is not None and _inode(destination) != published:
+    if published is None:
+        # Published, and not identifiable. Removing by name is exactly what
+        # this function exists to stop, so the entry stays and the caller is
+        # told the state is ambiguous — which for a restore means the worker
+        # pause stays too.
+        raise AmbiguousPublication(destination)
+    if _inode(destination) != published:
+        # Somebody else's now. Their file is not this failure's to clean up.
         return
     destination.unlink(missing_ok=True)
     try:
@@ -480,7 +522,7 @@ def _publish(temporary: Path, destination: Path) -> None:
     # narrow one, between the check and the rename. `_claim` has no window:
     # `os.link` fails with `EEXIST` rather than replacing, so this either takes
     # a name nobody held or takes nothing.
-    _claim(temporary, destination)
+    published = _claim(temporary, destination)
     try:
         _fsync_directory(destination.parent)
     except OSError:
@@ -493,7 +535,11 @@ def _publish(temporary: Path, destination: Path) -> None:
         # fail-open one, which is the exact shape of bug this module keeps
         # finding in itself. The caller's `finally` cannot do it: the temporary
         # path no longer exists, so its `unlink(missing_ok=True)` is a no-op.
-        _withdraw(destination)
+        # WITH the token `_claim` returned. Withdrawing by name meant that an
+        # entry another operation had put at that path in the meantime was
+        # deleted by this one's cleanup, while the error reported was the
+        # directory sync that failed.
+        _withdraw(destination, published)
         raise
 
 
@@ -1046,12 +1092,15 @@ def _copy_install(
     # source is gone — a copy whose source removal fails leaves both names
     # holding the generation, which `_undo` has to be able to tell from a move
     # that never started. See `_Move`.
-    landed_inode, landed_digest = _content_identity(destination)
+    landed_inode, landed_digest, landed_proven = _identity_after_publication(
+        destination
+    )
     record = _Move(
         source,
         destination,
         published_inode=landed_inode,
         published_digest=landed_digest,
+        identity_proven=landed_proven,
     )
     if journal is not None:
         journal.append(record)
@@ -1070,7 +1119,7 @@ def _copy_install(
         # it just published has to go away here or stand forever.
         if journal is not None:
             raise
-        _withdraw(destination)
+        _withdraw(destination, landed_inode)
         raise
     record.source_removed = True
 
@@ -1325,7 +1374,13 @@ def _preflight(
     # truncate or rewrite a member in place without the inode changing, so an
     # inode-only comparison passed and the modified file was installed as
     # though it were the validated one.
-    candidate = {member: _content_identity(member) for member in _bundle(restored)}
+    try:
+        candidate = {member: _content_identity(member) for member in _bundle(restored)}
+    except OSError as error:
+        raise RollbackError(
+            f"a member of {restored} is present and could not be read, so the"
+            f" candidate cannot be validated: {error}"
+        ) from error
 
     aside = _reserve_aside(target, stamp)
     required = _occupied_bytes(restored, block_size=_block_size(target.parent))
@@ -1911,7 +1966,7 @@ def _undo(moved: list[_Move]) -> list[_Move]:
                     # bundle missing a file.
                     unreversed.append(move)
                 continue
-            if _content_identity(destination) != (
+            if not move.identity_proven or _content_identity(destination) != (
                 move.published_inode,
                 move.published_digest,
             ):
@@ -1959,6 +2014,19 @@ def _undo(moved: list[_Move]) -> list[_Move]:
     return unreversed
 
 
+#: An identity no real member can have. A present member that will not open
+#: must never compare equal to anything — including another unreadable member —
+#: so the failure gets a value of its own rather than a plausible-looking one.
+_UNREADABLE: tuple[None, str] = (None, "unreadable")
+
+
+def _identity_or_unreadable(path: Path):
+    try:
+        return _content_identity(path)
+    except OSError:
+        return _UNREADABLE
+
+
 def _install_rollback_locked(
     restored_path: Path,
     target_path: Path,
@@ -1994,7 +2062,19 @@ def _install_rollback_locked(
     # What the superseded bundle IS before anything moves, so the final check
     # can say whether the recovery copy this command promises to keep is
     # actually there and unmodified.
-    superseded_before = {member: _content_identity(member) for member in superseded}
+    # Hard refusal, not `_identity_or_unreadable`: an unreadable member
+    # recorded as UNREADABLE would compare equal to itself at the end, so two
+    # failures would agree that the recovery copy is intact. The live bundle is
+    # readable or this command does not touch it.
+    try:
+        superseded_before = {
+            member: _content_identity(member) for member in superseded
+        }
+    except OSError as error:
+        raise RollbackError(
+            f"a member of {target_path} is present and could not be read, so"
+            f" the superseded bundle cannot be accounted for: {error}"
+        ) from error
     aside_names = tuple(
         member.with_name(member.name.replace(target_path.name, aside, 1))
         for member in superseded
@@ -2054,7 +2134,7 @@ def _install_rollback_locked(
             # success — or replace it, in which case an unvalidated file went to
             # the canonical path beside the validated generation's sidecars.
             validated = candidate.get(source, (None, None))
-            if _content_identity(source) != validated:
+            if _identity_or_unreadable(source) != validated:
                 raise RollbackError(
                     f"{source} is not what passed validation; the rollback"
                     " candidate changed under this command and nothing"
@@ -2075,7 +2155,7 @@ def _install_rollback_locked(
             expected = candidate.get(source, (None, None))
             if expected[0] is None:
                 continue
-            if _content_identity(destination)[1] != expected[1]:
+            if _identity_or_unreadable(destination)[1] != expected[1]:
                 raise RollbackError(
                     f"the rollback install is incomplete: {destination} is not"
                     " the validated content. Nothing at that path may be"
@@ -2084,7 +2164,7 @@ def _install_rollback_locked(
         for member, landed in zip(superseded, aside_names, strict=True):
             if superseded_before[member][0] is None:
                 continue
-            if _content_identity(landed)[1] != superseded_before[member][1]:
+            if _identity_or_unreadable(landed)[1] != superseded_before[member][1]:
                 raise RollbackError(
                     "the rollback install is incomplete: the superseded"
                     f" {landed} is not what was moved aside. Nothing at"

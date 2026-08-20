@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import contextlib
 import errno
+import hashlib
 import json
 import os
 import sqlite3
@@ -4050,3 +4051,89 @@ def test_a_reversal_refuses_to_carry_back_modified_bytes(
     ), f"the altered member was not identified: {raised.value.unreversed}"
     assert raised.value.paused, "no fail-safe pause was written"
     assert backup_module._pause_marker(target).exists()
+
+
+def test_content_identity_comes_from_the_descriptor(tmp_path, monkeypatch) -> None:
+    """One open, one `fstat`, one digest — all of the same file.
+
+    Reading the inode by PATHNAME after opening the descriptor is the same
+    ask-twice mistake one level down: a swap in between pairs one file's digest
+    with another file's inode, and the pair is then trusted as an identity.
+    """
+    subject = tmp_path / "member.db"
+    subject.write_bytes(b"the validated bytes")
+    real = subject.stat()
+
+    # If the inode came from `_inode(path)`, this sentinel would be returned.
+    monkeypatch.setattr(backup_module, "_inode", lambda _path: (-1, -1))
+
+    inode, digest = backup_module._content_identity(subject)
+
+    assert inode == (real.st_dev, real.st_ino), inode
+    assert digest == hashlib.sha256(b"the validated bytes").digest()
+
+
+def test_an_unreadable_member_has_no_identity(tmp_path) -> None:
+    """Two failures must not agree with each other.
+
+    The earlier version answered `(inode, None)` for anything it could not
+    read, so two transiently failing states compared EQUAL with no byte proof
+    behind either — an install or a reversal licensed by a pair of failures.
+    Absent is an identity; unreadable is not.
+    """
+    absent = tmp_path / "not-here.db"
+    assert backup_module._content_identity(absent) == (None, None)
+
+    unreadable = tmp_path / "a-directory-where-a-file-should-be"
+    unreadable.mkdir()
+
+    with pytest.raises(OSError):
+        backup_module._content_identity(unreadable)
+
+    readable = tmp_path / "member.db"
+    readable.write_bytes(b"real bytes")
+    assert backup_module._identity_or_unreadable(
+        unreadable
+    ) != backup_module._content_identity(readable)
+
+
+@pytest.mark.parametrize("sentinel", ["regular", "hard-link", "symlink"])
+def test_a_failed_publication_withdraws_only_what_it_published(
+    tmp_path, monkeypatch, sentinel
+) -> None:
+    """`_publish` withdrew by NAME when its directory sync failed.
+
+    Between the rename and that cleanup another operation can take the path —
+    and this one then deleted their archive, restored database or rollback
+    member while reporting its own I/O error.
+    """
+    source = tmp_path / "temporary"
+    source.write_bytes(b"the generation being published")
+    destination = tmp_path / "canonical.db"
+    bystander = tmp_path / "not-yours.txt"
+    bystander.write_bytes(b"not yours to delete")
+
+    def usurp_then_fail(directory):
+        destination.unlink(missing_ok=True)
+        if sentinel == "regular":
+            destination.write_bytes(b"somebody else's file")
+        elif sentinel == "hard-link":
+            os.link(bystander, destination)
+        else:
+            destination.symlink_to(bystander)
+        raise OSError(errno.EIO, "the directory will not sync")
+
+    monkeypatch.setattr(backup_module, "_fsync_directory", usurp_then_fail)
+
+    with pytest.raises(OSError):
+        backup_module._publish(source, destination)
+
+    monkeypatch.undo()
+    assert bystander.read_bytes() == b"not yours to delete", (
+        "the cleanup deleted a file it did not publish"
+    )
+    assert os.path.lexists(destination), (
+        "the cleanup removed an entry another operation had put there"
+    )
+    if sentinel == "regular":
+        assert destination.read_bytes() == b"somebody else's file"

@@ -102,6 +102,14 @@ makes a review loop unable to terminate.
   A move records what it published, and anything else at that name — a
   different entry or the same entry with different bytes — is not this
   operation's to move.
+
+  Two corollaries, each of which was a finding before it was a rule. An
+  identity is read from ONE descriptor: taking the digest through the open file
+  and the inode by pathname afterwards pairs one file's bytes with another
+  file's inode. And a failure is not an identity: answering `(inode, None)` for
+  a member that would not open made two transiently failing states compare
+  EQUAL, so an install or a reversal could be licensed by a pair of failures.
+  Absent is an identity; unreadable is not.
 ### A report describes the branch the worker will actually take
 
 - **Any job the dry-run report annotates with `blocked_by` and `table_writes`
