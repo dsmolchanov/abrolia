@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import hmac
 import os
@@ -193,6 +194,43 @@ def _reusable_pre_migrate_backup(
     return archive if hmac.compare_digest(archived, current) else None
 
 
+def _publish(temporary: Path, destination: Path) -> None:
+    """Rename into place, then make the DIRECTORY ENTRY itself durable.
+
+    `fsync` on the file persists its CONTENTS; it says nothing about the name
+    that finds them. After `os.replace` returns, the new entry lives only in the
+    parent directory's own unsynced metadata — so a power loss between this
+    function returning and the migration committing can leave the archive's
+    bytes on disk with nothing linking to them, while the upgraded database
+    survives. The rollback would be gone at exactly the moment it is needed,
+    which is the single guarantee this module exists to provide.
+
+    Both publication sites go through here rather than each remembering to sync:
+    `create_backup` writes the restore point, and `restore_backup` publishes the
+    database an operator is mid-rollback with. The second had the same gap and
+    is the more dangerous of the two, because a lost restore is discovered with
+    the service already stopped.
+
+    Raising is correct and load-bearing. `db.main` treats an `OSError` from the
+    snapshot as fail-closed and returns before `migrate()`, so a directory that
+    will not sync stops the migration instead of silently proceeding without a
+    durable restore point.
+    """
+    os.replace(temporary, destination)
+    try:
+        _fsync_directory(destination.parent)
+    except OSError:
+        # Undo the rename. Leaving the file behind is worse than not writing it:
+        # `_reusable_pre_migrate_backup` would find this archive on the next
+        # boot, skip the snapshot, and migrate against a restore point whose
+        # name was never made durable — turning a fail-closed boot into a
+        # fail-open one, which is the exact shape of bug this module keeps
+        # finding in itself. The caller's `finally` cannot do it: the temporary
+        # path no longer exists, so its `unlink(missing_ok=True)` is a no-op.
+        destination.unlink(missing_ok=True)
+        raise
+
+
 def create_backup(
     database: ControlPlaneDatabase, target: Path | str, *, backup_key: bytes
 ) -> Path:
@@ -246,7 +284,7 @@ def create_backup(
             archive_file.flush()
             os.fsync(archive_file.fileno())
         os.chmod(temporary_archive, 0o600)
-        os.replace(temporary_archive, destination)
+        _publish(temporary_archive, destination)
         temporary_archive = None
         return destination
     finally:
@@ -328,7 +366,7 @@ def restore_backup(
                     raise BackupError("restored SQLite foreign-key check failed")
         except sqlite3.DatabaseError as error:
             raise BackupError("restored payload is not a valid SQLite database") from error
-        os.replace(temporary, destination)
+        _publish(temporary, destination)
         temporary = None
         restored = ControlPlaneDatabase(destination)
         if apply_migrations:
@@ -338,3 +376,243 @@ def restore_backup(
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
+
+
+SIDECAR_SUFFIXES = ("-wal", "-shm")
+
+
+def _sidecars(database: Path) -> tuple[Path, ...]:
+    """The files SQLite keeps beside a database and treats as part of it.
+
+    A `-wal` left at the canonical path is replayed into whatever database is
+    sitting there — so a superseded WAL abandoned next to an installed rollback
+    silently reapplies migrated pages to it. They move together or not at all.
+    """
+    return tuple(database.with_name(database.name + suffix) for suffix in SIDECAR_SUFFIXES)
+
+
+def _pause_marker(database: Path) -> Path:
+    """Kept in step with `ControlPlaneDatabase.worker_pause_path` by test."""
+    return database.with_name(f"{database.name}.workers-paused")
+
+
+def _free_bytes(directory: Path) -> int:
+    stats = os.statvfs(directory)
+    return int(stats.f_bavail * stats.f_frsize)
+
+
+def _occupied_bytes(database: Path) -> int:
+    total = 0
+    for path in (database, *_sidecars(database)):
+        if path.exists():
+            total += path.stat().st_size
+    return total
+
+
+class RollbackError(RuntimeError):
+    pass
+
+
+def _fsync_directory(directory: Path) -> None:
+    handle = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(handle)
+    finally:
+        os.close(handle)
+
+
+def _rename_or_exdev(source: Path, destination: Path) -> bool:
+    """Rename if the filesystems allow it; report rather than raise if not.
+
+    `EXDEV` is the kernel's answer to "is this a free rename or a full copy?",
+    and asking it is more reliable than predicting it from `st_dev`: bind
+    mounts, overlays and symlinked volumes all make the prediction wrong in one
+    direction or the other. Nothing has happened when this returns False, which
+    is what makes it safe to ask first and decide afterwards.
+    """
+    try:
+        os.replace(source, destination)
+    except OSError as error:
+        if error.errno == errno.EXDEV:
+            return False
+        raise
+    _fsync_directory(destination.parent)
+    return True
+
+
+def _copy_install(source: Path, destination: Path) -> None:
+    """Chunked, because the Machine has 512 MiB against a 1 GiB volume."""
+    temporary = destination.with_name(f".{destination.name}.installing")
+    try:
+        with open(source, "rb") as reader, open(temporary, "wb") as writer:
+            for chunk in iter(lambda: reader.read(CHUNK_BYTES), b""):
+                writer.write(chunk)
+            writer.flush()
+            os.fsync(writer.fileno())
+        _publish(temporary, destination)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+    source.unlink(missing_ok=True)
+
+
+def _is_off_volume(staging: Path, volume: Path) -> bool:
+    """Ask the filesystem the same question the install asks, the same way.
+
+    `st_dev` is the obvious comparison and it disagrees with `rename(2)` often
+    enough to matter: bind mounts and overlays can share a device number across
+    what are, for renaming purposes, different filesystems, and container
+    runtimes produce both mistakes. What matters here is precisely what matters
+    for the install — whether moving a file between these two directories costs
+    blocks on the volume — so move one and see.
+    """
+    probe = staging / f".volume-probe-{os.getpid()}"
+    landed = volume / probe.name
+    probe.write_bytes(b"")
+    try:
+        return not _rename_or_exdev(probe, landed)
+    finally:
+        probe.unlink(missing_ok=True)
+        landed.unlink(missing_ok=True)
+
+
+def install_rollback(
+    restored: Path | str,
+    target: Path | str,
+    *,
+    backup_key: bytes,
+    superseded_to: Path | str | None = None,
+    now: float | None = None,
+) -> dict[str, object]:
+    """Put a restored database where the rolled-back image will open it.
+
+    This was eight `mv` lines in the runbook, and prose cannot be executed —
+    neither by an operator under pressure nor by a test. The sequence has three
+    ways to go wrong that all end with a running service on the wrong data, so
+    it belongs in code with its checks attached:
+
+    1. **The install can run out of room.** When the restore was staged off the
+       volume, moving it in is a COPY, and `/data` at that moment still holds
+       the superseded database and the pre-migrate archive. Renaming the
+       superseded database aside frees nothing — same filesystem, same blocks —
+       so a database between roughly a third and half of the volume fails with
+       `ENOSPC` with a good backup sitting right there. When the copy will not
+       fit, this archives the superseded database off-volume, reads that archive
+       back, and only then releases the blocks.
+    2. **A sidecar can be separated from its database.** Both directions are
+       damaging and one is silent: a superseded `-wal` left at the canonical
+       path is replayed into the restore, reapplying the very pages the rollback
+       exists to undo.
+    3. **The pause marker can fail to travel**, resuming workers against a
+       database nobody has reconciled.
+
+    Whether the install is a free rename or a full copy is DISCOVERED, not
+    predicted: the rename is attempted and `EXDEV` answers the question. The
+    expensive, destructive path is therefore reached only when the filesystem
+    itself says it must be.
+
+    Nothing is deleted before its replacement has been read back, and the
+    superseded database is never discarded — only converted into an archive in
+    the same authenticated format that `restore_backup` opens. Freeing space by
+    dropping a restore point is the one move that turns a disk problem into a
+    data-loss problem.
+    """
+    restored_path, target_path = Path(restored), Path(target)
+    if not restored_path.is_file():
+        raise RollbackError(f"no restored database at {restored_path}")
+    if not target_path.exists():
+        raise RollbackError(f"nothing to supersede at {target_path}")
+
+    stamp = int(time.time() if now is None else now)
+    volume = target_path.parent
+    aside = f"{target_path.name}.superseded-{stamp}"
+    superseded = (target_path, *_sidecars(target_path), _pause_marker(target_path))
+    report: dict[str, object] = {"target": str(target_path)}
+
+    # Step one costs no blocks: these renames stay on the volume. The pause
+    # marker travels with them so that a restore whose own marker fails to
+    # arrive cannot look paused because of a marker belonging to a database that
+    # is no longer there.
+    for path in superseded:
+        if path.exists():
+            path.rename(path.with_name(path.name.replace(target_path.name, aside, 1)))
+    remaining = [str(path) for path in superseded if path.exists()]
+    if remaining:
+        raise RollbackError(
+            f"superseded files remain at the canonical path: {', '.join(remaining)}"
+        )
+    aside_database = volume / aside
+    report["superseded_kept_as"] = str(aside_database)
+
+    if not _rename_or_exdev(restored_path, target_path):
+        required = _occupied_bytes(restored_path)
+        available = _free_bytes(volume)
+        if available < required:
+            report["superseded_kept_as"] = str(
+                _release_superseded(
+                    aside_database,
+                    backup_key=backup_key,
+                    staging=Path(superseded_to) if superseded_to else restored_path.parent,
+                    volume=volume,
+                )
+            )
+            freed = _free_bytes(volume)
+            report["freed_bytes"] = freed - available
+            if freed < required:
+                raise RollbackError(
+                    f"{freed} bytes free after releasing the superseded database"
+                    f" and {required} needed; nothing was installed, and"
+                    f" {report['superseded_kept_as']} holds what was there"
+                )
+        _copy_install(restored_path, target_path)
+
+    for source, destination in (
+        *zip(_sidecars(restored_path), _sidecars(target_path), strict=True),
+        (_pause_marker(restored_path), _pause_marker(target_path)),
+    ):
+        if source.exists() and not _rename_or_exdev(source, destination):
+            _copy_install(source, destination)
+
+    if not _pause_marker(target_path).exists():
+        raise RollbackError(
+            "the restore is installed but its worker pause did not travel;"
+            f" write {_pause_marker(target_path)} before starting anything"
+        )
+    report["workers"] = "paused"
+    report["sidecars"] = sorted(
+        path.name for path in _sidecars(target_path) if path.exists()
+    )
+    return report
+
+
+def _release_superseded(
+    database_path: Path, *, backup_key: bytes, staging: Path, volume: Path
+) -> Path:
+    """Convert the superseded database into an off-volume archive, then free it.
+
+    The order is the whole point. The archive is written and READ BACK while the
+    original still exists, so a failure at any step leaves the operator exactly
+    where they started rather than with neither copy.
+    """
+    if not staging.is_dir():
+        raise RollbackError(f"{staging} is not a directory")
+    if not _is_off_volume(staging, volume):
+        raise RollbackError(
+            f"{staging} is on the volume being freed, so archiving there releases"
+            " nothing; name a location off it"
+        )
+    archive = staging / f"{database_path.name}.cpb"
+    database = ControlPlaneDatabase(database_path)
+    try:
+        create_backup(database, archive, backup_key=backup_key)
+    finally:
+        database.close()
+    if _authenticated_digest(archive, backup_key) is None:
+        archive.unlink(missing_ok=True)
+        raise RollbackError(
+            "the superseded database's archive does not authenticate;"
+            " nothing was deleted"
+        )
+    for path in (database_path, *_sidecars(database_path)):
+        path.unlink(missing_ok=True)
+    return archive

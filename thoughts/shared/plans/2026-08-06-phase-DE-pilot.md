@@ -296,7 +296,9 @@ CREATE TABLE channel_bindings (
 
 **Files:** `deploy/control-plane/Dockerfile`, `control_plane/db.py`,
 `control_plane/backup.py`, `control_plane/cli.py`, `control_plane/config.py`,
-`control_plane/migrations/*`, `docs/control-plane-restore.md`.
+`control_plane/migrations/*`, `docs/control-plane-restore.md`,
+`tests/control_plane/test_migrate_on_start.py`,
+`tests/control_plane/test_db.py`.
 
 **Scope revised 2026-08-19.** The original list named only the entrypoint, the
 database module, the migrations and the restore documentation. Three more turned
@@ -312,6 +314,26 @@ rather than the changes reverted:
   and the application cannot disagree about whether a backup key is valid. That
   disagreement stopped the container from booting on a perfectly good key.
 
+**Scope revised again 2026-08-20.** The list named implementation modules only,
+and named no test module at all, while the step's acceptance depends on two:
+
+- `tests/control_plane/test_migrate_on_start.py` — the step's own suite,
+  referenced further down this plan but never inventoried here.
+- `tests/control_plane/test_db.py` — one assertion, tightened from "the ledger
+  is empty" to "the ledger is ABSENT". It belongs with the database module
+  rather than with the migrate-on-start suite because it is a property of
+  `migrate()` itself: creating `schema_migrations` outside the batch
+  transaction autocommitted, which made the file differ from a snapshot taken
+  moments earlier and caused the next boot to reject that snapshot and write
+  another. The migrate-on-start suite consumes that property; `test_db.py` is
+  where it is established.
+
+An inventory that lists only implementation files cannot detect a changed test,
+which is how this one went unlisted through several revisions. The general
+remedy — a check comparing a branch's changed paths against its plan's
+inventory — is a repository mechanism rather than a Step E9 change, and belongs
+with `AGENTS.repo-invariants.md`.
+
 **Tag:**
 
 - `git tag pilot-YYYY-MM-DD` on the Phase E merge commit; tag message lists included phases and base `b9d3614`.
@@ -319,6 +341,20 @@ rather than the changes reverted:
 **Migrate-on-start with backup-before-migrate:**
 
 - Container entrypoint runs `python -m control_plane.db migrate --backup-first` — creates a timestamped `/data/control-plane.db.pre-migrate-<rev>.bak` before applying any new `control_plane/migrations/*.sql`; migration failure → container exits non-zero, no partial schema.
+
+**Rollback install.** Added 2026-08-20. The drill's rollback was a column of
+`mv` commands in `docs/control-plane-restore.md`, and three of its steps have a
+failure that does not announce itself: the install is a cross-filesystem COPY
+when the restore was staged off the volume (and renaming the superseded database
+aside frees no blocks, so it still ends in `ENOSPC`); a superseded `-wal` left at
+the canonical path is replayed into the restore; and the worker pause is a
+sibling file that does not travel with the database. `abrolia-control-plane
+install-rollback` performs the sequence with those checks attached — archiving
+the superseded database off-volume and reading that archive back before
+releasing its blocks, never deleting a copy that has not been shown to open.
+Prose cannot be executed by a test, which is why the previous check could only
+assert that `/tmp` appeared on the page while the documented procedure still
+failed.
 
 **Restore drill (reuse Phase B procedure):**
 

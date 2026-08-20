@@ -60,11 +60,15 @@ A failing migration restarts the container, and each boot reaches this step
 again. It does **not** snapshot again: an existing `pre-migrate-<rev>-*` archive
 for the unchanged revision is reused, so a restart loop cannot fill `/data` and
 cost you the ability to take a restore point at all. Reuse requires that nothing
-has been written since — the database and its WAL are checked against the
-archive's timestamp — because a migration can be dropped from the next image,
-the container can then serve at the same revision and take writes, and an
-archive matching only by revision would be a restore point that silently loses
-them. Nothing is ever deleted to reclaim space; discarding a restore point is
+has been written since, and that is decided by CONTENT: the archive is decrypted
+and hashed against a fresh image of the database. Timestamps were the obvious
+signal and the wrong one — a migration that fails still opens a transaction and
+checkpoints on close, so the mtimes advance even though nothing was committed,
+every restart looked like a change, and each one wrote another archive. The
+comparison has to be by content anyway, because a migration can be dropped from
+the next image, the container can then serve at the same revision and take
+writes, and an archive matching only by revision would be a restore point that
+silently loses them. Nothing is ever deleted to reclaim space; discarding a restore point is
 the one move that turns a disk problem into a data-loss problem.
 
 Restore a pre-migrate archive with `--no-migrate`. The normal restore applies
@@ -73,7 +77,7 @@ again on — the migration the archive exists to undo:
 
 **Check the space first.** At this point `/data` already holds the live
 database and the archive. Restoring beside them puts a third full-size file on
-the same 1 GiB volume, so a database between roughly a third and a half of the
+the same 1 GiB volume, so a database between roughly a third and half of the
 volume fails with `ENOSPC` — with a perfectly good backup sitting right there.
 The restore is the moment that must not fail for want of room.
 
@@ -82,73 +86,84 @@ df -h /data
 ls -l /data/control-plane.db /data/control-plane.db.pre-migrate-*.bak
 ```
 
-If the live database, the archive and one more copy do not all fit, stage the
-restore off the volume and move it in afterwards:
-
-```bash
-abrolia-control-plane restore /data/control-plane.db.pre-migrate-0008-1800000000.bak \
-  --target /tmp/control-plane-rollback.db --no-migrate
-```
-
-Otherwise restore beside the database, which keeps everything on the volume that
-survives a Machine replacement:
+If the live database, the archive and one more copy all fit, restore beside the
+database, which keeps everything on the volume that survives a Machine
+replacement:
 
 ```bash
 abrolia-control-plane restore /data/control-plane.db.pre-migrate-0008-1800000000.bak \
   --target /data/control-plane-rollback.db --no-migrate
 ```
 
-Staging on `/tmp` trades durability for room: it does not survive a Machine
-restart, so complete the move below in the same session. Whichever path you
-used, substitute it for `/data/control-plane-rollback.db` in the commands that
-follow.
+If they do not, stage the restore off the volume. `/tmp` trades durability for
+room — it does not survive a Machine restart — so complete the install below in
+the same session:
+
+```bash
+abrolia-control-plane restore /data/control-plane.db.pre-migrate-0008-1800000000.bak \
+  --target /tmp/control-plane-rollback.db --no-migrate
+```
 
 The restored database keeps the archived schema and stays worker-paused.
 
-**Then put it where the rolled-back image will look.** `deploy/control-plane/fly.toml`
-pins `ABROLIA_CONTROL_PLANE_DB = "/data/control-plane.db"`, so rolling the image
-back on its own reopens the migrated database this archive exists to undo — the
-restore sits at `/data/control-plane-rollback.db` and is never read. The worker
-pause lives beside the database it belongs to, as
-`<db path>.workers-paused`, so it has to travel with it: moving the database
-alone silently resumes the workers on a database that has not been reconciled.
-
-Move both, with the service stopped and the original kept:
+**Then install it where the rolled-back image will look.**
+`deploy/control-plane/fly.toml` pins `ABROLIA_CONTROL_PLANE_DB = "/data/control-plane.db"`,
+so rolling the image back on its own reopens the migrated database this archive
+exists to undo — a restore left at `/tmp/control-plane-rollback.db` is never
+read.
 
 ```bash
-# The WAL and shared-memory sidecars belong to the database they sit beside. A
-# service that was killed rather than stopped cleanly leaves a populated
-# control-plane.db-wal; opening the RESTORED file at the same path would replay
-# those migrated pages into it, and the superseded database would be separated
-# from its own latest committed pages. Move all three together, always.
-mv /data/control-plane.db     /data/control-plane.db.superseded-<epoch>
-mv /data/control-plane.db-wal /data/control-plane.db.superseded-<epoch>-wal 2>/dev/null || true
-mv /data/control-plane.db-shm /data/control-plane.db.superseded-<epoch>-shm 2>/dev/null || true
-mv /data/control-plane.db.workers-paused /data/control-plane.db.workers-paused.superseded-<epoch> 2>/dev/null || true
-
-mv /data/control-plane-rollback.db     /data/control-plane.db
-mv /data/control-plane-rollback.db-wal /data/control-plane.db-wal 2>/dev/null || true
-mv /data/control-plane-rollback.db-shm /data/control-plane.db-shm 2>/dev/null || true
-mv /data/control-plane-rollback.db.workers-paused /data/control-plane.db.workers-paused
+abrolia-control-plane install-rollback \
+  --restored /tmp/control-plane-rollback.db \
+  --target /data/control-plane.db \
+  --superseded-to /tmp
 ```
 
-Confirm no sidecar from the superseded database is left at the canonical path
-before starting anything — one that survives will be replayed into the restore:
+This was a column of `mv` commands, and it is a command now because three of the
+steps have a failure that does not announce itself:
+
+- **The install itself can run out of room.** Staging off the volume only moved
+  where the restore was written; moving it in is a *copy*, and renaming the
+  superseded database aside frees nothing, because it is the same filesystem and
+  the same blocks. So when the copy will not fit, `install-rollback` writes the
+  superseded database to `--superseded-to` as an authenticated archive in the
+  same format as every other backup, **reads that archive back**, and only then
+  releases the blocks. Nothing is deleted before its replacement has been shown
+  to open; freeing space by dropping a restore point is the one move that turns
+  a disk problem into a data-loss problem. If `--superseded-to` is on the volume
+  being freed, or the restore still does not fit afterwards, the command stops
+  and tells you where everything is.
+- **A `-wal` left behind is replayed into the restore.** A service that was
+  killed rather than stopped leaves committed frames in `control-plane.db-wal`;
+  beside the installed rollback, SQLite replays them and quietly reapplies the
+  migrated pages you are rolling back. The sidecars move with the database they
+  belong to, in both directions, and the command refuses to finish if one is
+  still at the canonical path.
+- **The worker pause is a sibling file**, `<db path>.workers-paused`, so it does
+  not follow the database unless something moves it. Moving the database alone
+  resumes the workers against data nobody has reconciled. The command installs
+  the marker and fails if it did not arrive.
+
+It prints what it did, including where the superseded database ended up:
+
+```json
+{"superseded_kept_as": "/tmp/control-plane.db.superseded-1800000042.cpb",
+ "sidecars": [], "target": "/data/control-plane.db", "workers": "paused"}
+```
+
+Recover from that archive with the ordinary restore command and the same backup
+key, should you need anything written after the migration:
 
 ```bash
-ls /data/control-plane.db-wal /data/control-plane.db-shm 2>/dev/null
+abrolia-control-plane restore /tmp/control-plane.db.superseded-1800000042.cpb \
+  --target /data/control-plane-superseded.db --no-migrate
 ```
 
-Confirm the pause survived the move before starting anything:
-
-```bash
-test -f /data/control-plane.db.workers-paused && echo "workers paused"
-```
-
-The alternative is to leave the file where it is and point the rolled-back
-release at it by setting `ABROLIA_CONTROL_PLANE_DB=/data/control-plane-rollback.db`.
-That works and it changes what a later reader of `fly.toml` believes about the
-volume, so prefer the move unless you are keeping both databases deliberately.
+The alternative to installing at all is to leave the restore where it is and
+point the rolled-back release at it by setting
+`ABROLIA_CONTROL_PLANE_DB=/data/control-plane-rollback.db`. That works, and it
+changes what a later reader of `fly.toml` believes about the volume, so prefer
+the install unless you are keeping both databases deliberately.
 
 Only then roll the image back to the pre-upgrade release, and only after
 verifying the restore run `resume-jobs`.

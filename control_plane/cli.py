@@ -13,7 +13,7 @@ import uvicorn
 
 from control_plane.api.app import create_app
 from control_plane.auth.mailer import ConsoleMailer, Mailer
-from control_plane.backup import create_backup, restore_backup
+from control_plane.backup import create_backup, install_rollback, restore_backup
 from control_plane.config import ControlPlaneConfig
 from control_plane.container import ControlPlaneContainer
 from control_plane.observability import StructuredLogger
@@ -53,6 +53,28 @@ def _parser() -> argparse.ArgumentParser:
         "--no-migrate",
         action="store_true",
         help="rollback restore: keep the archived schema, apply no migration",
+    )
+    install = commands.add_parser(
+        "install-rollback",
+        help="move a restored database to the path the rolled-back image opens",
+    )
+    install.add_argument(
+        "--restored",
+        required=True,
+        help="the database written by `restore --no-migrate`",
+    )
+    install.add_argument(
+        "--target",
+        required=True,
+        help="the canonical path from fly.toml, currently holding the superseded database",
+    )
+    install.add_argument(
+        "--superseded-to",
+        help=(
+            "directory OFF the target volume for the superseded database's archive,"
+            " used only when the install would not otherwise fit;"
+            " defaults to the directory holding --restored"
+        ),
     )
     commands.add_parser("resume-jobs", help="remove the exact post-restore worker pause")
     return parser
@@ -159,6 +181,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             "workers": "paused",
             "migrated": not args.no_migrate,
         }, sort_keys=True))
+        return 0
+    if args.command == "install-rollback":
+        config = ControlPlaneConfig.from_env()
+        # No container and no database handle: this command runs with the
+        # service stopped, and opening the target would create WAL sidecars on
+        # the very volume it is trying to free.
+        print(json.dumps(
+            install_rollback(
+                args.restored,
+                args.target,
+                backup_key=config.backup_key,
+                superseded_to=args.superseded_to,
+            ),
+            sort_keys=True,
+        ))
         return 0
     if args.command == "runtime-health":
         # This read/compare/projection command is safe to run beside the

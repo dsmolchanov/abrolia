@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import base64
+import errno
 import json
 import os
 import sqlite3
+import stat
 import tracemalloc
 from pathlib import Path
 
@@ -16,9 +18,11 @@ from control_plane.backup import (
     NONCE_BYTES,
     SCRATCH_DIR_ENV,
     BackupError,
+    RollbackError,
     _key,
     create_backup,
     create_pre_migrate_backup,
+    install_rollback,
     restore_backup,
 )
 from control_plane.db import ControlPlaneDatabase, main
@@ -182,13 +186,15 @@ def test_both_key_readers_agree_on_padding() -> None:
 
 
 def test_the_rollback_procedure_matches_the_paths_it_depends_on() -> None:
-    """The rollback restored to a path the rolled-back image never opens.
+    """The page must name the path and the command the rollback actually uses.
 
-    `fly.toml` pins the database path, and the worker pause is a sibling file
-    named after it. The documented procedure has to name both, or a rollback
-    reopens the migrated database and — if the marker is left behind — resumes
-    workers on a database nobody reconciled. This test fails when either
-    convention moves, which is when the prose goes stale.
+    This used to parse the page's column of `mv` commands and assert each pair
+    was present. That was the best available check while the procedure WAS the
+    prose — and it was still only a check that the right strings appeared, which
+    is why it passed for a procedure that ended in `ENOSPC`. The moves are now
+    `install_rollback`, exercised end to end against a constrained volume by the
+    tests below; what is left for the page is that it points operators at that
+    command, for the path the deployment actually pins.
     """
     root = Path(__file__).resolve().parents[2]
     fly = (root / "deploy/control-plane/fly.toml").read_text(encoding="utf-8")
@@ -200,45 +206,27 @@ def test_the_rollback_procedure_matches_the_paths_it_depends_on() -> None:
     doc = (root / "docs/control-plane-restore.md").read_text(encoding="utf-8")
 
     assert configured == "/data/control-plane.db"
-    # Whitespace-insensitive: the page aligns these commands in a column, and
-    # the procedure is what matters, not its formatting.
-    moves = {
-        tuple(line.split()[1:3])
-        for line in doc.splitlines()
-        if line.strip().startswith("mv ") and len(line.split()) >= 3
-    }
+    # The restore has to land where the rolled-back image will actually look,
+    # and the page has to say so with the path `fly.toml` pins.
+    assert f"--target {configured}" in doc
 
-    # The page must tell the operator to check the space BEFORE restoring: at
-    # that point /data already holds the live database and the archive, and a
-    # third full-size file is what fails with ENOSPC — with a good backup
-    # sitting right there.
+    # Off-volume staging, and the command that installs from it. A restore left
+    # in the staging directory is never read.
+    assert "--target /tmp/control-plane-rollback.db" in doc
+    for flag in ("install-rollback", "--restored", "--superseded-to"):
+        assert flag in doc, flag
+
+    # Check the space BEFORE restoring: at that point /data holds the live
+    # database and the archive, and a third full-size file is what fails.
     assert "df -h /data" in doc
     assert "ENOSPC" in doc
-    assert "--target /tmp/control-plane-rollback.db" in doc, (
-        "no off-volume staging path is documented"
-    )
 
-    # The restore has to land where the rolled-back image will actually look.
-    assert ("/data/control-plane-rollback.db", configured) in moves
-    # The pause must travel with it, under the name the code gives it — merely
-    # mentioning the marker elsewhere on the page is not the procedure.
-    suffix = ControlPlaneDatabase(Path(configured)).worker_pause_path.name
-    assert suffix == "control-plane.db.workers-paused"
-    assert (
-        "/data/control-plane-rollback.db.workers-paused",
-        f"{configured}.workers-paused",
-    ) in moves
-    # And so must the WAL sidecars, in BOTH directions: one left behind at the
-    # canonical path is replayed into the restore, and one left behind by the
-    # superseded database separates it from its own committed pages.
-    for sidecar in ("-wal", "-shm"):
-        assert (
-            f"/data/control-plane-rollback.db{sidecar}",
-            f"{configured}{sidecar}",
-        ) in moves, sidecar
-        assert any(
-            source == f"{configured}{sidecar}" for source, _ in moves
-        ), f"superseded {sidecar} is never moved aside"
+    # The pause marker's name is a convention shared between the code and the
+    # page. This fails when it moves, which is when the prose goes stale.
+    assert ControlPlaneDatabase(Path(configured)).worker_pause_path.name == (
+        "control-plane.db.workers-paused"
+    )
+    assert "<db path>.workers-paused" in doc
 
 
 def test_a_failing_script_leaves_no_partially_upgraded_schema(tmp_path) -> None:
@@ -567,3 +555,388 @@ def test_restoring_does_not_buffer_the_whole_archive(tmp_path) -> None:
     restored.close()
     assert peak < 1_000_000, f"restore peaked at {peak} bytes"
     database.close()
+
+
+def _durability_trace(monkeypatch, published) -> list[str]:
+    """Record fsync/rename/migrate in order, distinguishing dir from file.
+
+    An fd is not self-describing, so `fstat` is what separates a directory sync
+    from a file sync. Asserting on call counts alone would pass with two file
+    syncs and no directory sync at all — which is precisely the defect.
+
+    `published` decides which rename is the publication, so the scratch image's
+    own temporary churn cannot be mistaken for it.
+    """
+    trace: list[str] = []
+    real_fsync, real_replace = os.fsync, os.replace
+    real_migrate = ControlPlaneDatabase.migrate
+
+    def fsync(fd):
+        trace.append("fsync:dir" if stat.S_ISDIR(os.fstat(fd).st_mode) else "fsync:file")
+        return real_fsync(fd)
+
+    def replace(source, target, **kwargs):
+        if published(Path(target)):
+            trace.append("rename")
+        return real_replace(source, target, **kwargs)
+
+    def migrate(self, directory=None):
+        trace.append("migrate")
+        return real_migrate(self, directory)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    monkeypatch.setattr(os, "replace", replace)
+    monkeypatch.setattr(ControlPlaneDatabase, "migrate", migrate)
+    return trace
+
+
+def test_the_archive_is_linked_durably_before_the_migration_runs(
+    tmp_path, capsys, monkeypatch
+) -> None:
+    """file fsync → rename → DIRECTORY fsync, all of it before `migrate`.
+
+    Syncing the archive's contents and then renaming leaves the new name in the
+    parent directory's unsynced metadata. Lose power between the snapshot
+    returning and the migration committing and that entry can be gone while the
+    upgraded database survives: the archive's blocks are still on the disk with
+    nothing pointing at them, so the one rollback path is unreachable at the one
+    moment it is needed. The directory sync has to be inside the gate, not
+    merely somewhere in the function.
+
+    What this does NOT prove: that the filesystem honours any of it, or that the
+    ordering survives a real power cut. It asserts the order of the syscalls we
+    issue, which is the part we control.
+    """
+    monkeypatch.setenv("ABROLIA_CONTROL_PLANE_DB", str(tmp_path / "control-plane.db"))
+    monkeypatch.setenv("ABROLIA_CONTROL_PLANE_BACKUP_KEY", BACKUP_KEY)
+
+    trace = _durability_trace(monkeypatch, lambda target: target.suffix == ".bak")
+    assert main(["migrate", "--backup-first"]) == 0
+
+    report = json.loads(capsys.readouterr().out)
+    archive = Path(report["backup"])
+    assert archive.exists() and archive.parent == tmp_path
+    assert report["applied"], "nothing was pending, so nothing was proved"
+
+    assert "migrate" in trace, trace
+    published = trace[: trace.index("migrate") + 1]
+    assert published[-4:] == ["fsync:file", "rename", "fsync:dir", "migrate"], trace
+
+
+def test_a_directory_that_will_not_sync_stops_the_migration(
+    tmp_path, capsys, monkeypatch
+) -> None:
+    """Fail closed on the durability step, exactly as on the snapshot itself.
+
+    A directory sync that raises means the archive's name is not durable, which
+    for rollback purposes is the same as having no archive. `db.main` already
+    treats an `OSError` from the snapshot as fatal, so the requirement is that
+    `_publish` raise rather than swallow — this fails if anyone wraps it in a
+    `try`.
+
+    It also pins the cleanup. Leaving the renamed file behind would be worse
+    than never writing it: the next boot's reuse check finds that archive, skips
+    the snapshot and migrates, so a fail-closed boot becomes a fail-open one.
+    """
+    monkeypatch.setenv("ABROLIA_CONTROL_PLANE_DB", str(tmp_path / "control-plane.db"))
+    monkeypatch.setenv("ABROLIA_CONTROL_PLANE_BACKUP_KEY", BACKUP_KEY)
+
+    real_fsync = os.fsync
+
+    def refuse_directories(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(errno.EIO, "directory sync failed")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", refuse_directories)
+    monkeypatch.setattr(
+        ControlPlaneDatabase,
+        "migrate",
+        lambda *a, **k: pytest.fail("migrated without a durably linked archive"),
+    )
+
+    assert main(["migrate", "--backup-first"]) == 1
+    assert "pre-migrate backup failed" in capsys.readouterr().err
+    assert list(tmp_path.glob("*.bak")) == [], "a half-published archive was left behind"
+
+
+def test_the_rollback_restore_is_published_durably_too(tmp_path, monkeypatch) -> None:
+    """The sibling publication site, which the review did not name.
+
+    `restore_backup` renames the operator's rollback into place with the same
+    gap, and it is the worse of the two: a restore lost to an unsynced directory
+    entry is discovered with the service already stopped and the superseded
+    database already moved aside.
+    """
+    database = _database(tmp_path)
+    database.migrate()
+    archive = tmp_path / "control-plane.cpb"
+    create_backup(database, archive, backup_key=BACKUP_KEY_BYTES)
+    database.close()
+
+    target = tmp_path / "restored" / "control-plane.db"
+    trace = _durability_trace(monkeypatch, lambda published: published == target)
+    restored = restore_backup(
+        archive, target, backup_key=BACKUP_KEY_BYTES, apply_migrations=False
+    )
+    restored.close()
+
+    assert "rename" in trace, trace
+    landed = trace[: trace.index("rename") + 2]
+    assert landed[-3:] == ["fsync:file", "rename", "fsync:dir"], trace
+
+
+def _constrain(monkeypatch, volume: Path, capacity: int) -> None:
+    """Give `volume` a real capacity, and make renames onto it cross-device.
+
+    Free space is DERIVED from the files actually on the volume, not returned as
+    a fixed number, so releasing blocks genuinely changes the reading and a test
+    cannot pass by freeing nothing. The files, their sizes and every operation
+    on them are real.
+
+    Two things are simulated, and both are simulated as the kernel produces
+    them: `EXDEV` is literally what `rename(2)` returns across filesystems, and
+    the capacity is applied at the one `statvfs` seam. Everything downstream is
+    real — a real encrypted archive of the real superseded database, a real
+    authenticated read-back, real deletions, a real chunked copy, real sidecars
+    and a real pause marker.
+
+    We cannot do better without privileges: a genuinely small filesystem needs a
+    loopback mount or a tmpfs, so such a test would skip on macOS and on any
+    runner without them, which is a guard that is not one.
+    """
+    real_replace = os.replace
+
+    def replace(source, target, **kwargs):
+        if Path(target).parent == volume and Path(source).parent != volume:
+            raise OSError(errno.EXDEV, "Cross-device link")
+        return real_replace(source, target, **kwargs)
+
+    real_free = backup_module._free_bytes
+
+    def free(directory) -> int:
+        if Path(directory) != volume:
+            return real_free(directory)
+        used = sum(path.stat().st_size for path in volume.iterdir() if path.is_file())
+        return max(0, capacity - used)
+
+    monkeypatch.setattr(os, "replace", replace)
+    monkeypatch.setattr(backup_module, "_free_bytes", free)
+
+
+def _rollback_fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """A migrated volume database, and a staged rollback restored beside it.
+
+    The volume database is the SUPERSEDED one: it carries a table the archive
+    does not, which is what lets a test tell the two apart after the install
+    rather than trusting a report field.
+    """
+    volume = tmp_path / "data"
+    staging = tmp_path / "staging"
+    volume.mkdir()
+    staging.mkdir()
+
+    target = volume / "control-plane.db"
+    database = ControlPlaneDatabase(target)
+    database.migrate()
+    archive = staging / "control-plane.db.pre-migrate-0008-1800000000.bak"
+    create_backup(database, archive, backup_key=BACKUP_KEY_BYTES)
+    # Only the superseded database has this, so it must not survive the install.
+    with database.write() as connection:
+        connection.execute("CREATE TABLE migrated_only (id TEXT PRIMARY KEY)")
+    database.close()
+
+    restored = restore_backup(
+        archive,
+        staging / "control-plane-rollback.db",
+        backup_key=BACKUP_KEY_BYTES,
+        apply_migrations=False,
+    )
+    restored.close()
+    return volume, target, staging / "control-plane-rollback.db"
+
+
+def _tables(path: Path) -> set[str]:
+    connection = sqlite3.connect(path)
+    try:
+        return {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+    finally:
+        connection.close()
+
+
+def test_the_install_frees_the_volume_before_copying_onto_it(
+    tmp_path, monkeypatch
+) -> None:
+    """The low-space branch, executed rather than asserted about.
+
+    The documented `/tmp` staging only moved WHERE the restore was written. The
+    install still copied a third database-sized file onto a volume already
+    holding the superseded database and the archive, so the recovery ended in
+    `ENOSPC` exactly as before, with a good backup sitting right there. Renaming
+    the superseded file aside frees nothing: same filesystem, same blocks.
+
+    So: the superseded database becomes an off-volume archive, that archive is
+    read back, and only then are its blocks released.
+    """
+    volume, target, restored = _rollback_fixture(tmp_path)
+    staging = restored.parent
+    # Room for exactly one database, which is not enough while the superseded
+    # one is still on the volume — the situation the runbook could not survive.
+    _constrain(monkeypatch, volume, capacity=target.stat().st_size * 3 // 2)
+
+    report = install_rollback(
+        restored, target, backup_key=BACKUP_KEY_BYTES, superseded_to=staging, now=1800000042
+    )
+
+    assert target.exists()
+    # The restore is what is installed, not the database it supersedes.
+    assert "migrated_only" not in _tables(target)
+    assert not list(volume.glob("*.superseded-*")), "blocks were never released"
+
+    superseded = Path(str(report["superseded_kept_as"]))
+    assert superseded.parent == staging, "the archive stayed on the volume it must free"
+    assert superseded.exists()
+    assert report["freed_bytes"] > 0
+
+    # Not merely a file with the right name: it has to be the superseded
+    # database, openable with the same key and the same restore command.
+    recovered = restore_backup(
+        superseded,
+        tmp_path / "recovered.db",
+        backup_key=BACKUP_KEY_BYTES,
+        apply_migrations=False,
+    )
+    recovered.close()
+    assert "migrated_only" in _tables(tmp_path / "recovered.db")
+
+
+def test_the_install_keeps_the_superseded_database_when_there_is_room(
+    tmp_path, monkeypatch
+) -> None:
+    """Room means no archiving: the superseded database is set aside intact.
+
+    Converting it to an archive costs a full-size write and makes recovery a
+    restore rather than a rename. That price is worth paying only when the
+    volume leaves no choice, so the cheap path has to stay cheap.
+    """
+    volume, target, restored = _rollback_fixture(tmp_path)
+    _constrain(monkeypatch, volume, capacity=target.stat().st_size * 10)
+
+    report = install_rollback(restored, target, backup_key=BACKUP_KEY_BYTES, now=1800000042)
+
+    assert "freed_bytes" not in report
+    kept = Path(str(report["superseded_kept_as"]))
+    assert kept.parent == volume and kept.suffix != ".cpb"
+    assert "migrated_only" in _tables(kept), "the superseded database was not preserved"
+    assert "migrated_only" not in _tables(target)
+
+
+def test_no_superseded_sidecar_is_left_at_the_canonical_path(
+    tmp_path, monkeypatch
+) -> None:
+    """The silent failure: a stale `-wal` is REPLAYED into the restore.
+
+    A service that was killed rather than stopped leaves committed frames in
+    `control-plane.db-wal`. Left beside the installed rollback, SQLite replays
+    them on the next open and reapplies the migrated pages the rollback exists
+    to undo — with no error, and nothing in the report to suggest it happened.
+    """
+    volume, target, restored = _rollback_fixture(tmp_path)
+    stale = volume / "control-plane.db-wal"
+    stale.write_bytes(b"\x00" * 4096)
+    (volume / "control-plane.db-shm").write_bytes(b"\x00" * 4096)
+    _constrain(monkeypatch, volume, capacity=target.stat().st_size * 3 // 2)
+
+    install_rollback(
+        restored,
+        target,
+        backup_key=BACKUP_KEY_BYTES,
+        superseded_to=restored.parent,
+        now=1800000042,
+    )
+
+    assert not stale.exists(), "a superseded WAL survived at the canonical path"
+    assert not (volume / "control-plane.db-shm").exists()
+
+
+def test_the_worker_pause_travels_with_the_restore(tmp_path, monkeypatch) -> None:
+    """Moving the database alone resumes workers on unreconciled data.
+
+    `restore_backup` pauses the database it writes, and the marker is a sibling
+    file named after it — so it does not follow the database unless something
+    moves it. The install must refuse to finish without it rather than leave a
+    running service to discover the difference.
+    """
+    volume, target, restored = _rollback_fixture(tmp_path)
+    marker = restored.with_name(f"{restored.name}.workers-paused")
+    assert marker.exists(), "the fixture is wrong: the restore was never paused"
+    _constrain(monkeypatch, volume, capacity=target.stat().st_size * 10)
+
+    report = install_rollback(restored, target, backup_key=BACKUP_KEY_BYTES, now=1800000042)
+
+    assert report["workers"] == "paused"
+    installed = ControlPlaneDatabase(target)
+    try:
+        assert installed.workers_paused
+    finally:
+        installed.close()
+
+
+def test_a_restore_with_no_pause_marker_is_reported_not_silently_installed(
+    tmp_path, monkeypatch
+) -> None:
+    volume, target, restored = _rollback_fixture(tmp_path)
+    restored.with_name(f"{restored.name}.workers-paused").unlink()
+    _constrain(monkeypatch, volume, capacity=target.stat().st_size * 10)
+
+    with pytest.raises(RollbackError, match="worker pause did not travel"):
+        install_rollback(restored, target, backup_key=BACKUP_KEY_BYTES, now=1800000042)
+
+
+def test_nothing_is_deleted_when_the_superseded_archive_will_not_open(
+    tmp_path, monkeypatch
+) -> None:
+    """The read-back is the gate, and it must gate a real deletion.
+
+    Writing the archive and deleting the original on the strength of `create_backup`
+    returning would destroy the only copy of every write taken after the
+    migration if that archive were unopenable. The original still exists at this
+    point, so failing here costs nothing.
+    """
+    volume, target, restored = _rollback_fixture(tmp_path)
+    monkeypatch.setattr(backup_module, "_authenticated_digest", lambda *a, **k: None)
+    _constrain(monkeypatch, volume, capacity=target.stat().st_size * 3 // 2)
+
+    with pytest.raises(RollbackError, match="does not authenticate"):
+        install_rollback(
+            restored,
+            target,
+            backup_key=BACKUP_KEY_BYTES,
+            superseded_to=restored.parent,
+            now=1800000042,
+        )
+
+    aside = volume / "control-plane.db.superseded-1800000042"
+    assert "migrated_only" in _tables(aside), "the superseded database was destroyed"
+    assert not list(restored.parent.glob("*.superseded-*.cpb")), "a bad archive was kept"
+    assert restored.exists(), "the restore was consumed by a failed install"
+
+
+def test_archiving_onto_the_volume_being_freed_is_refused(tmp_path, monkeypatch) -> None:
+    """Staging on the same volume releases nothing and fills it further."""
+    volume, target, restored = _rollback_fixture(tmp_path)
+    _constrain(monkeypatch, volume, capacity=target.stat().st_size * 3 // 2)
+
+    with pytest.raises(RollbackError, match="on the volume being freed"):
+        install_rollback(
+            restored,
+            target,
+            backup_key=BACKUP_KEY_BYTES,
+            superseded_to=volume,
+            now=1800000042,
+        )
