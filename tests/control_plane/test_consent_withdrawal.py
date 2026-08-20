@@ -804,6 +804,45 @@ def test_a_channel_withdrawal_leaves_the_inbox_alone(cp_stack) -> None:
     )
 
 
+def test_withdrawing_content_tears_down_every_channel_that_receives_it(
+    cp_stack,
+) -> None:
+    """Content does not only arrive by email.
+
+    The Art 9(2)(a) scope said "everything goes" in a comment and
+    `{"email_identity"}` in the set. A WhatsApp identity or channel binding left
+    `ready` keeps accepting and storing household content at the processor
+    boundary the moment a real adapter is enabled — the boundary the family
+    cannot see and the one the DPA covers.
+    """
+    complete_onboarding(cp_stack)
+    drain(cp_stack)
+    set_runtime_ref(cp_stack)
+    before = {
+        kind: _resources(cp_stack, kind)
+        for kind in ("email_identity", "whatsapp_identity", "channel_binding")
+    }
+    assert all(before.values()), f"the fixture provisioned nothing to tear down: {before}"
+
+    ConsentWithdrawalService(
+        cp_stack.database, jobs=cp_stack.jobs, onboarding=cp_stack.service
+    ).withdraw(cp_stack.household.id, HOUSEHOLD_CONTENT_PURPOSE, now=BASE_TIME)
+
+    for kind in before:
+        assert all(
+            status in {"deleting", "deleted"}
+            for status in _resources(cp_stack, kind)
+        ), f"{kind} still accepts content after withdrawal"
+
+
+def test_the_two_content_purposes_cover_the_same_channels() -> None:
+    """They drifted apart once; naming the set once is what stops it again."""
+    assert (
+        WITHDRAWAL_SCOPES["special_category_household_content"]["resource_types"]
+        == WITHDRAWAL_SCOPES["special_category_content_restriction"]["resource_types"]
+    )
+
+
 def test_the_content_consent_still_terminates_everything(cp_stack) -> None:
     """Scoping must not weaken the withdrawal that matters.
 

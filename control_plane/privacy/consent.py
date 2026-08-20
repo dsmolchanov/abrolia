@@ -66,6 +66,13 @@ def consent_version_and_text(purpose: str) -> tuple[str, str]:
     return CONSENT_TEXTS[purpose]
 
 
+#: Every `external_resources` type that can receive household content. Named
+#: once so the two content purposes cannot drift apart from each other, which is
+#: how one of them came to claim more than it did.
+CONTENT_RESOURCE_TYPES = frozenset(
+    {"email_identity", "whatsapp_identity", "channel_binding"}
+)
+
 #: What withdrawing each consent must actually terminate.
 #:
 #: `withdraw()` ran ONE teardown for every purpose: disconnect the email inbox,
@@ -85,16 +92,22 @@ def consent_version_and_text(purpose: str) -> tuple[str, str]:
 #: what this terminates" is to do nothing and say so.
 WITHDRAWAL_SCOPES: dict[str, dict[str, object]] = {
     # The Art 9(2)(a) condition is the lawful basis for processing household
-    # content at all. Withdrawing it ends the processing, so everything goes.
+    # content at all. Withdrawing it ends the processing, so everything that can
+    # RECEIVE content goes — the comment said "everything goes" while the set
+    # said `email_identity`, and content does not only arrive by email. A
+    # WhatsApp identity or a channel binding left ready keeps accepting and
+    # storing it at the processor boundary the moment a real adapter is enabled,
+    # which is the boundary the family cannot see and the one the DPA covers.
     "special_category_household_content": {
-        "resource_types": frozenset({"email_identity"}),
+        "resource_types": CONTENT_RESOURCE_TYPES,
         "stops_runtime": True,
     },
     # The restriction acknowledgement is a condition ON content processing, and
     # the planner refuses to issue a revision without a current one. Withdrawing
-    # it therefore stops content processing by the same route.
+    # it therefore stops content processing by the same route, and across the
+    # same channels.
     "special_category_content_restriction": {
-        "resource_types": frozenset({"email_identity"}),
+        "resource_types": CONTENT_RESOURCE_TYPES,
         "stops_runtime": True,
     },
     # Channel-scoped. These consent to WhatsApp's metadata exposure and its
