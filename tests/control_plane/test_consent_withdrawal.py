@@ -817,3 +817,65 @@ def test_the_content_consent_still_terminates_everything(cp_stack) -> None:
     assert result.revisions_revoked > 0
     assert result.runtime_job_id is not None
     assert any(status == "deleting" for status in _resources(cp_stack, "email_identity"))
+
+
+def test_a_withdrawal_landing_after_the_barrier_still_compensates(cp_stack) -> None:
+    """The narrower race: withdrawal commits AFTER `_superseded` has read.
+
+    The barrier before the provider call is not enough on its own. It reads the
+    job, work continues, and a withdrawal committing in that window leaves the
+    job `outcome_unknown` with `withdrawal_requires_reconciliation` — which
+    `_finish_step` accepted, because it tested only the status. `mark_verified`
+    then failed against the disconnecting identity and the provider's newly
+    created inbox was discarded with no `external_resources` row and no cleanup
+    job: an untracked mailbox still receiving after withdrawal.
+
+    The barrier is placed inside `_stage_email_secret`, which is the code that
+    runs BETWEEN the `_superseded` read and `_finish_step`'s transaction — the
+    window itself. Doing it from the provider instead, as the sibling test does,
+    commits the withdrawal before the barrier reads and therefore exercises the
+    other race; that version of this test passed with the fix reverted, which is
+    how the placement was found to be wrong.
+    """
+    cp_stack.complete_profile()
+    cp_stack.service.select(
+        cp_stack.household.id,
+        StepKind.EMAIL,
+        real_email_selection(),
+        context=cp_stack.context(),
+        now=BASE_TIME + 2,
+    )
+
+    provider = DeterministicFakeProvisioner("email")
+    registry = ProviderRegistry()
+    registry.register("fake-email", provider)
+    worker = cp_stack.make_worker(providers=registry, now=BASE_TIME + 3)
+
+    staged = worker._stage_email_secret
+
+    def withdraw_then_stage(*args, **kwargs):
+        outcome = staged(*args, **kwargs)
+        withdraw_now(cp_stack, now=BASE_TIME + 3)
+        return outcome
+
+    worker._stage_email_secret = withdraw_then_stage
+
+    worker.run_once()
+    drain(cp_stack, now=BASE_TIME + 60)
+
+    # The PROVIDER's state, not ours. This is the assertion the defect defeats:
+    # it discards the result without writing an `external_resources` row at all,
+    # so "no live rows in our database" is true both when the inbox was torn
+    # down and when it was silently abandoned. The mailbox that keeps receiving
+    # is at the provider, and that is where it has to be gone from.
+    assert provider.resources == {}, (
+        "an inbox created before the withdrawal committed is still at the"
+        " provider, with nothing in our database that would ever delete it"
+    )
+    assert live_email_resources(cp_stack) == []
+    identity = cp_stack.database.query_one(
+        "SELECT status FROM email_identities WHERE household_id = ?"
+        " ORDER BY created_at DESC LIMIT 1",
+        (cp_stack.household.id,),
+    )
+    assert identity is None or identity["status"] == "deleted"

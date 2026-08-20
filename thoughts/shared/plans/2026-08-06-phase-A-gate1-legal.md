@@ -268,5 +268,15 @@ python -m check_fixtures --all --require-deny  # private deny-list in CI; local 
   - `control_plane/cli.py` and `control_plane/container.py` — the operator
     boundary that makes Art. 7(3) withdrawal invocable outside tests.
   - `docs/onboarding-runbook.md` — the procedure that boundary is run from.
+  - `control_plane/repositories/jobs.py` — **added 2026-08-20.** Art. 7(3)
+    withdrawal supersedes a household's in-flight email jobs so the worker's
+    existing compensation fires, and `requires_reconciliation` is the predicate
+    that decides whether an intent is quarantined. It lives here because this is
+    where the durable job state lives, and because `retry_later`'s SQL guard has
+    to enforce it: without that, a withdrawal-quarantined job could simply be
+    revived and re-run the provider call the withdrawal exists to stop. The
+    alternative — defining the predicate in `provisioning/` and leaving the SQL
+    enumerating two of the three reasons — is the enumeration bug that caused
+    this finding in the first place.
 
   Anything outside this set on this branch remains a deviation and a blocker.

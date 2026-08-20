@@ -2053,12 +2053,30 @@ class ProvisioningWorker:
         }
         with self.jobs.db.write() as connection:
             current_job = connection.execute(
-                "SELECT status FROM provisioning_jobs WHERE id = ?", (job.id,)
+                "SELECT status, error_code FROM provisioning_jobs WHERE id = ?",
+                (job.id,),
             ).fetchone()
             if current_job is None or current_job["status"] not in {
                 "running",
                 "outcome_unknown",
             }:
+                raise _ProjectionCancelled
+            if requires_reconciliation(current_job["error_code"]):
+                # The barrier before the provider call is not enough on its own.
+                # `_superseded` reads the job, the provider call takes as long as
+                # it takes, and a cancel, reset or withdrawal committing in that
+                # window leaves the job `outcome_unknown` with a
+                # `_requires_reconciliation` code — which this transaction used
+                # to accept, because it tested only the status. The disconnecting
+                # identity then failed `mark_verified` and the provider's newly
+                # created inbox was discarded with no `external_resources` row
+                # and no cleanup job: an untracked mailbox still receiving after
+                # withdrawal, which is the exact outcome the quarantine exists
+                # to prevent.
+                #
+                # Re-read INSIDE the write transaction, which is the only place
+                # the answer cannot go stale, and raise into the same
+                # compensation the cancelled path uses.
                 raise _ProjectionCancelled
             step = connection.execute(
                 "SELECT * FROM onboarding_steps WHERE workflow_id = ? AND kind = ?",
