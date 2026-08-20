@@ -167,7 +167,7 @@ After `codex/phase-E-pilotization` merges, the system can onboard a pilot househ
 
 #### Step E1 — Durable 3-step onboarding machine
 
-**Files:** `control_plane/onboarding/state.py`, `control_plane/onboarding/provision.py`, `control_plane/onboarding/transitions.py`, `control_plane/migrations/0001_control_plane.sql` (if new columns needed), `docs/onboarding-runbook.md`, `control_plane/container.py`, `control_plane/db.py`, `control_plane/provisioning/fakes.py`, `tests/control_plane/test_provision_dry_run.py`.
+**Files:** `control_plane/onboarding/state.py`, `control_plane/onboarding/provision.py`, `control_plane/onboarding/transitions.py`, `control_plane/migrations/0001_control_plane.sql` (if new columns needed), `docs/onboarding-runbook.md`, `control_plane/container.py`, `control_plane/db.py`, `control_plane/provisioning/fakes.py`, `control_plane/repositories/jobs.py`, `control_plane/privacy/consent.py`, `control_plane/provisioning/worker.py`, `tests/control_plane/test_provision_dry_run.py`, `tests/control_plane/test_plan_inventory.py`.
 
 **Report narrowed 2026-08-20.** The rehearsal grew a second job beyond the
 no-mutation guarantee: predicting which job the worker would take next, and
@@ -203,6 +203,21 @@ blocker under the repository rules. Four were missing rather than unnecessary:
   Python — where they disagreed three ways. A report about what the worker will
   do has to ask the worker's own question, so the predicate is shared from where
   the worker asks it.
+- `control_plane/privacy/consent.py` and `control_plane/provisioning/worker.py`
+  — **added 2026-08-20**, for the same reason and by the same remedy.
+  `_run_once` checks the special-category content restriction BEFORE dispatching
+  any provider: stale or revoked, it fails the queued runtime job, revokes the
+  revision and the bootstrap tokens, and returns the workflow to email.
+  Reporting the ordinary success path over that describes an operation whose
+  first act is to undo itself, so the rehearsal asks the worker's question —
+  `CURRENT_RESTRICTION_RECEIPT_SQL`, which now lives beside the consent rules it
+  is about and is read by `_holds_current_restriction` in `provision.py` and by
+  `ProvisioningWorker._has_current_email_content_restriction` alike.
+
+Three corrections in three rounds is a mechanism failing, not three oversights.
+`tests/control_plane/test_plan_inventory.py` now compares this branch's changed
+implementation paths against the inventories above and fails on an undeclared
+one, so the next omission is caught before a review generation is spent on it.
 
 **Durable 3-step machine:** `email → WhatsApp → primary`.
 
