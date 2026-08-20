@@ -7,9 +7,9 @@ import hashlib
 import hmac
 import os
 import sqlite3
+import stat
 import tempfile
 import time
-from dataclasses import dataclass
 from pathlib import Path
 
 from cryptography.exceptions import InvalidTag
@@ -550,26 +550,6 @@ def _copy_install(source: Path, destination: Path) -> None:
     source.unlink(missing_ok=True)
 
 
-def _is_off_volume(staging: Path, volume: Path) -> bool:
-    """Ask the filesystem the same question the install asks, the same way.
-
-    `st_dev` is the obvious comparison and it disagrees with `rename(2)` often
-    enough to matter: bind mounts and overlays can share a device number across
-    what are, for renaming purposes, different filesystems, and container
-    runtimes produce both mistakes. What matters here is precisely what matters
-    for the install — whether moving a file between these two directories costs
-    blocks on the volume — so move one and see.
-    """
-    probe = staging / f".volume-probe-{os.getpid()}"
-    landed = volume / probe.name
-    probe.write_bytes(b"")
-    try:
-        return not _rename_or_exdev(probe, landed)
-    finally:
-        probe.unlink(missing_ok=True)
-        landed.unlink(missing_ok=True)
-
-
 def _readable_sqlite(path: Path) -> None:
     """Refuse a candidate that is not a database, and leave it exactly as found.
 
@@ -607,25 +587,56 @@ def _readable_sqlite(path: Path) -> None:
                 sidecar.unlink(missing_ok=True)
 
 
+def _regular_file(path: Path) -> bool:
+    """A real file, not a symlink to one, not a directory, not a FIFO.
+
+    `is_file()` follows symlinks and says nothing about the other shapes, so a
+    bundle member could be a directory (the rename fails only after the database
+    has moved), a FIFO (the copy blocks indefinitely with the target already
+    gone), or a symlink pointing off the persistent volume (the canonical path
+    ends up somewhere a Machine replacement will not preserve). `lstat` asks
+    about the entry itself, which is what the installer is going to move.
+    """
+    try:
+        return stat.S_ISREG(path.lstat().st_mode)
+    except OSError:
+        return False
+
+
 def _reserve_aside(target: Path, stamp: int) -> str:
-    """A superseded-bundle name that no existing file answers to.
+    """A superseded-bundle name whose every member is free AND usable.
 
     `Path.rename` REPLACES an existing regular file on POSIX, silently. The name
     is second-resolution, so a retried install within the same second — or a
     caller passing a fixed `now`, or a clock that steps back — would rename the
     live database over the previous attempt's superseded copy and destroy the
-    recovery point it was keeping. The whole bundle has to move as one
-    generation, so the name is reserved only when EVERY member of it is free.
+    recovery point it was keeping.
+
+    Length is checked with it, because `exists()` answers False for a name the
+    filesystem cannot hold rather than rejecting it. On an ext4-like
+    `NAME_MAX=255`, a 242-character basename yields a 255-character aside
+    database name and a 259-character aside WAL name: the database rename
+    succeeded and the WAL rename raised `ENAMETOOLONG`, leaving no canonical
+    database and a retry that refuses because the target is missing. The whole
+    bundle has to move as one generation, so a name is taken only when EVERY
+    member of it is both free and expressible.
     """
+    limit = _name_max(target.parent)
     base = f"{target.name}.superseded-{stamp}"
     for suffix in ("", *(f"-{index}" for index in range(1, 100))):
         candidate = f"{base}{suffix}"
-        bundle = (
-            target.with_name(candidate),
-            *(target.with_name(f"{candidate}{s}") for s in SIDECAR_SUFFIXES),
-            target.with_name(f"{candidate}.workers-paused"),
+        members = (
+            candidate,
+            *(f"{candidate}{sidecar}" for sidecar in SIDECAR_SUFFIXES),
+            f"{candidate}.workers-paused",
         )
-        if not any(path.exists() for path in bundle):
+        if any(len(name) > limit for name in members):
+            raise RollbackError(
+                f"the superseded names for {target.name} would exceed the"
+                f" filesystem's {limit}-character limit; rename the database to"
+                " something shorter before rolling back"
+            )
+        if not any(target.with_name(name).exists() for name in members):
             return candidate
     raise RollbackError(
         f"every superseded name for {target.name} at {stamp} is taken;"
@@ -633,53 +644,39 @@ def _reserve_aside(target: Path, stamp: int) -> str:
     )
 
 
-@dataclass(frozen=True)
-class _InstallPlan:
-    """Every decision the install makes, taken before anything moves.
-
-    They used to be taken as they were needed, which put the staging checks
-    inside the low-space branch — reached only AFTER the live bundle had been
-    renamed aside and the canonical target removed. An absent `--superseded-to`,
-    one on the volume being freed, or a colliding archive name therefore left
-    the operator with no `/data/control-plane.db` at all, and the obvious retry
-    refused too, because its own preflight could not find a target to supersede.
-
-    Deciding once also means the branch cannot be predicted one way here and
-    another way there.
-    """
-
-    required: int
-    copy_needed: bool
-    must_free: bool
-    aside: str
-    archive: Path | None
+def _name_max(directory: Path) -> int:
+    try:
+        return int(os.pathconf(directory, "PC_NAME_MAX"))
+    except (OSError, ValueError, AttributeError):
+        return 255
 
 
-def _preflight(
-    restored: Path, target: Path, staging: Path, stamp: int
-) -> _InstallPlan:
+def _preflight(restored: Path, target: Path, stamp: int) -> str:
     """Everything that can be known before the live database is touched.
 
     The first version checked `restored.is_file()` and `target.exists()` and
     then started renaming, so a bundle that could never be installed — a
     truncated file, a directory, a restore with no worker pause — was discovered
     only after the live database had been moved aside and, in the pause-marker
-    case, after the invalid candidate was already at the canonical path. The
-    checks that remain after the install stay as defence in depth.
+    case, after the invalid candidate was already at the canonical path. An
+    operator mid-rollback then had neither a working database nor an obvious way
+    back. The checks that remain after the install stay as defence in depth.
+
+    Returns the reserved superseded-bundle name, because reserving it is part of
+    deciding whether the install can proceed at all.
     """
-    if not restored.is_file():
-        raise RollbackError(f"no restored database at {restored}")
+    if not _regular_file(restored):
+        raise RollbackError(f"{restored} is not a regular file")
     if not target.exists():
         raise RollbackError(f"nothing to supersede at {target}")
-    if not target.is_file():
+    if not _regular_file(target):
         raise RollbackError(f"{target} is not a regular file")
     if os.path.samefile(restored, target):
         # `resolve()` catches a lexical alias and a symlink, and misses two hard
         # links to one inode — under which the install would leave the
         # superseded path and the canonical target pointing at the same migrated
         # database while reporting a successful rollback. `samefile` compares
-        # (st_dev, st_ino), which is the question actually being asked. Safe
-        # here because both are already confirmed to exist as regular files.
+        # (st_dev, st_ino), which is the question actually being asked.
         raise RollbackError(
             f"{restored} and {target} are the same file; there is nothing to install"
         )
@@ -693,86 +690,96 @@ def _preflight(
             f"{restored} has no worker pause at {marker};"
             " restore it with `abrolia-control-plane restore` rather than by hand"
         )
+    # Every member that is present, on both sides, has to be the shape the
+    # installer will move. A directory or FIFO in a sidecar position fails only
+    # once the database has already gone.
+    for bundle in (_bundle(restored), _bundle(target)):
+        for member in bundle[1:]:
+            if member.exists() and not _regular_file(member):
+                raise RollbackError(f"{member} is not a regular file")
     _readable_sqlite(restored)
 
-    volume = target.parent
-    required = _occupied_bytes(restored, block_size=_block_size(volume))
-    # Non-destructive probe: `EXDEV` from a rename that is undone either way.
-    # Asking the filesystem beats predicting from `st_dev`, and asking now means
-    # the staging prerequisites are checked only when they will actually matter
-    # — an install that is a plain rename has no use for a staging directory,
-    # and demanding one would refuse the ordinary same-volume rollback.
-    copy_needed = _is_off_volume(restored.parent, volume)
-    must_free = copy_needed and _free_bytes(volume) < required
-    archive: Path | None = None
-    if must_free:
-        if not staging.is_dir():
-            raise RollbackError(f"{staging} is not a directory")
-        if not os.access(staging, os.W_OK):
-            raise RollbackError(f"{staging} is not writable")
-        if not _is_off_volume(staging, volume):
-            raise RollbackError(
-                f"{staging} is on the volume being freed, so archiving there"
-                " releases nothing; name a location off it"
-            )
-        archive = staging / f"{target.name}.superseded-{stamp}.cpb"
-        if archive.exists():
-            raise RollbackError(
-                f"{archive} already holds a superseded database; move it aside"
-                " before retrying"
-            )
-    return _InstallPlan(
-        required=required,
-        copy_needed=copy_needed,
-        must_free=must_free,
-        aside=_reserve_aside(target, stamp),
-        archive=archive,
-    )
+    aside = _reserve_aside(target, stamp)
+    required = _occupied_bytes(restored, block_size=_block_size(target.parent))
+    available = _free_bytes(target.parent)
+    # Discovered, not predicted: a rename costs no blocks, and `EXDEV` is the
+    # kernel's own answer to which one this is. Nothing has happened when the
+    # probe returns.
+    if _is_a_copy(restored.parent, target.parent) and available < required:
+        # REFUSED, not resolved. An earlier version archived the superseded
+        # database off-volume and deleted it to make room, which meant this
+        # command could destroy the only copy of post-migration writes as a side
+        # effect of an operator asking it to move a file. Freeing space is a
+        # decision with data-loss consequences and it belongs to the operator,
+        # who knows what else is on the machine; this says exactly what is
+        # needed and stops with `/data` untouched.
+        raise RollbackError(
+            f"installing {restored.name} onto {target.parent} needs {required}"
+            f" bytes and {available} are free. It is a copy, not a rename,"
+            " because the restore is on another filesystem — so nothing is"
+            " freed by moving the superseded database aside. Free space on"
+            f" {target.parent} first: archive the superseded database"
+            " off-volume with `abrolia-control-plane backup`, verify that"
+            " archive restores, and only then delete it. Nothing has been"
+            " changed."
+        )
+    return aside
+
+
+def _is_a_copy(source: Path, destination: Path) -> bool:
+    """Whether moving a file between these directories costs blocks.
+
+    Asked by moving one, because `st_dev` and `rename(2)` disagree often enough
+    to matter: bind mounts and overlays can share a device number across what
+    are, for renaming purposes, different filesystems.
+    """
+    probe = source / f".volume-probe-{os.getpid()}"
+    landed = destination / probe.name
+    try:
+        probe.write_bytes(b"")
+    except OSError:
+        return True
+    try:
+        return not _rename_or_exdev(probe, landed)
+    finally:
+        probe.unlink(missing_ok=True)
+        landed.unlink(missing_ok=True)
 
 
 def install_rollback(
     restored: Path | str,
     target: Path | str,
     *,
-    backup_key: bytes,
-    superseded_to: Path | str | None = None,
     now: float | None = None,
 ) -> dict[str, object]:
     """Put a restored database where the rolled-back image will open it.
 
     This was eight `mv` lines in the runbook, and prose cannot be executed —
-    neither by an operator under pressure nor by a test. The sequence has three
-    ways to go wrong that all end with a running service on the wrong data, so
-    it belongs in code with its checks attached:
+    neither by an operator under pressure nor by a test. Three of those steps
+    have a failure that does not announce itself:
 
-    1. **The install can run out of room.** When the restore was staged off the
-       volume, moving it in is a COPY, and `/data` at that moment still holds
-       the superseded database and the pre-migrate archive. Renaming the
-       superseded database aside frees nothing — same filesystem, same blocks —
-       so a database between roughly a third and half of the volume fails with
-       `ENOSPC` with a good backup sitting right there. When the copy will not
-       fit, this archives the superseded database off-volume, reads that archive
-       back, and only then releases the blocks.
-    2. **A sidecar can be separated from its database.** Both directions are
+    1. **A sidecar can be separated from its database.** Both directions are
        damaging and one is silent: a superseded `-wal` left at the canonical
        path is replayed into the restore, reapplying the very pages the rollback
        exists to undo.
-    3. **The pause marker can fail to travel**, resuming workers against a
+    2. **The pause marker can fail to travel**, resuming workers against a
        database nobody has reconciled.
+    3. **The install can run out of room.** When the restore was staged off the
+       volume, moving it in is a COPY, and renaming the superseded database
+       aside frees nothing — same filesystem, same blocks. This is checked
+       before anything moves and REFUSED with what is needed.
 
-    Whether the install is a free rename or a full copy is DISCOVERED, not
-    predicted, and discovered ONCE: `_preflight` probes it and every later step
-    reads its answer.
+    It does not free space itself. An earlier version archived the superseded
+    database off-volume and deleted it to make room, which meant a command an
+    operator ran to move a file could destroy the only copy of every write taken
+    after the migration. Freeing space is a decision with data-loss consequences
+    and it belongs to whoever knows what else is on the machine.
 
-    Nothing is deleted before its replacement has been read back, and the
-    superseded database is never discarded — only converted into an archive in
-    the same authenticated format that `restore_backup` opens. Freeing space by
-    dropping a restore point is the one move that turns a disk problem into a
-    data-loss problem.
+    Nothing is deleted here at all: the superseded bundle is renamed aside,
+    intact, and its name is in the report.
     """
     restored_path, target_path = Path(restored), Path(target)
     stamp = int(time.time() if now is None else now)
-    staging = Path(superseded_to) if superseded_to else restored_path.parent
 
     # Take the writer lock for the whole install, and take it the same way
     # `serve` does so the two cannot disagree about which file is the lock.
@@ -786,8 +793,7 @@ def install_rollback(
     #
     # `ControlPlaneDatabase` opens no connection until one is asked for, so this
     # takes the lock without touching SQLite. The preflight runs inside it,
-    # because a check made before the lock is a check another writer can
-    # invalidate.
+    # because a check made before the lock is one another writer can invalidate.
     guard = ControlPlaneDatabase(target_path)
     try:
         guard.acquire_process_lock()
@@ -797,57 +803,33 @@ def install_rollback(
             " stop the service before installing a rollback"
         ) from error
     try:
-        plan = _preflight(restored_path, target_path, staging, stamp)
-        return _install_rollback_locked(
-            restored_path, target_path, plan=plan, backup_key=backup_key
-        )
+        aside = _preflight(restored_path, target_path, stamp)
+        return _install_rollback_locked(restored_path, target_path, aside=aside)
     finally:
         guard.release_process_lock()
         guard.close()
 
 
 def _install_rollback_locked(
-    restored_path: Path,
-    target_path: Path,
-    *,
-    plan: _InstallPlan,
-    backup_key: bytes,
+    restored_path: Path, target_path: Path, *, aside: str
 ) -> dict[str, object]:
     volume = target_path.parent
     superseded = _bundle(target_path)
     report: dict[str, object] = {"target": str(target_path)}
 
-    # Step one costs no blocks: these renames stay on the volume. The pause
-    # marker travels with them so that a restore whose own marker fails to
-    # arrive cannot look paused because of a marker belonging to a database that
-    # is no longer there.
+    # These renames stay on the volume and cost no blocks. The pause marker
+    # travels with them so that a restore whose own marker fails to arrive
+    # cannot look paused because of a marker belonging to a database that is no
+    # longer there.
     for path in superseded:
         if path.exists():
-            path.rename(
-                path.with_name(path.name.replace(target_path.name, plan.aside, 1))
-            )
+            path.rename(path.with_name(path.name.replace(target_path.name, aside, 1)))
     remaining = [str(path) for path in superseded if path.exists()]
     if remaining:
         raise RollbackError(
             f"superseded files remain at the canonical path: {', '.join(remaining)}"
         )
-    aside_database = volume / plan.aside
-    report["superseded_kept_as"] = str(aside_database)
-
-    if plan.must_free:
-        assert plan.archive is not None
-        available = _free_bytes(volume)
-        report["superseded_kept_as"] = str(
-            _release_superseded(aside_database, plan.archive, backup_key=backup_key)
-        )
-        freed = _free_bytes(volume)
-        report["freed_bytes"] = freed - available
-        if freed < plan.required:
-            raise RollbackError(
-                f"{freed} bytes free after releasing the superseded database"
-                f" and {plan.required} needed; nothing was installed, and"
-                f" {report['superseded_kept_as']} holds what was there"
-            )
+    report["superseded_kept_as"] = str(volume / aside)
 
     for source, destination in zip(
         _bundle(restored_path), _bundle(target_path), strict=True
@@ -865,33 +847,3 @@ def _install_rollback_locked(
         path.name for path in _sidecars(target_path) if path.exists()
     )
     return report
-
-
-def _release_superseded(
-    database_path: Path, archive: Path, *, backup_key: bytes
-) -> Path:
-    """Convert the superseded database into an off-volume archive, then free it.
-
-    The order is the whole point. The archive is written and READ BACK while the
-    original still exists, so a failure at any step leaves the operator exactly
-    where they started rather than with neither copy.
-
-    Where the archive goes, and whether that location can hold it, was decided
-    in `_preflight` — before the live bundle moved. Deciding it here meant
-    rejecting an unusable `--superseded-to` at the one moment when refusing
-    already cost the operator their database.
-    """
-    database = ControlPlaneDatabase(database_path)
-    try:
-        create_backup(database, archive, backup_key=backup_key)
-    finally:
-        database.close()
-    if _authenticated_digest(archive, backup_key) is None:
-        archive.unlink(missing_ok=True)
-        raise RollbackError(
-            "the superseded database's archive does not authenticate;"
-            " nothing was deleted"
-        )
-    for path in (database_path, *_sidecars(database_path)):
-        path.unlink(missing_ok=True)
-    return archive

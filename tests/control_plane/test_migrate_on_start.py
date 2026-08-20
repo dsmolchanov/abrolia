@@ -215,8 +215,17 @@ def test_the_rollback_procedure_matches_the_paths_it_depends_on() -> None:
     # Off-volume staging, and the command that installs from it. A restore left
     # in the staging directory is never read.
     assert "--target /tmp/control-plane-rollback.db" in doc
-    for flag in ("install-rollback", "--restored", "--superseded-to"):
+    for flag in ("install-rollback", "--restored"):
         assert flag in doc, flag
+    # The command refuses rather than freeing space, so the page has to carry
+    # the manual procedure — and carry it in the safe order, archive verified
+    # before anything is deleted.
+    archive_at = doc.index("abrolia-control-plane backup /tmp/control-plane-superseded.cpb")
+    verify_at = doc.index("--target /tmp/verify.db --no-migrate")
+    delete_at = doc.index("rm -f /data/control-plane.db /data/control-plane.db-wal")
+    assert archive_at < verify_at < delete_at, (
+        "the documented order lets an operator delete before verifying"
+    )
 
     # Check the space BEFORE restoring: at that point /data holds the live
     # database and the archive, and a third full-size file is what fails.
@@ -850,7 +859,7 @@ def _tables(path: Path) -> set[str]:
         connection.close()
 
 
-def test_the_install_frees_the_volume_before_copying_onto_it(
+def test_a_low_space_install_is_refused_with_the_volume_untouched(
     tmp_path, monkeypatch
 ) -> None:
     """The low-space branch, executed rather than asserted about.
@@ -861,39 +870,33 @@ def test_the_install_frees_the_volume_before_copying_onto_it(
     `ENOSPC` exactly as before, with a good backup sitting right there. Renaming
     the superseded file aside frees nothing: same filesystem, same blocks.
 
-    So: the superseded database becomes an off-volume archive, that archive is
-    read back, and only then are its blocks released.
+    An earlier version of this command resolved that itself — archiving the
+    superseded database off-volume and deleting it to make room. That made a
+    command an operator runs to MOVE A FILE capable of destroying the only copy
+    of every write taken after the migration, and it needed a backup key, a
+    staging directory, capacity proofs and collision-free archive naming to do
+    it. Freeing space is a decision with data-loss consequences and it belongs
+    to whoever knows what else is on the machine.
+
+    So it refuses, says what is needed and what is free, and leaves `/data`
+    exactly as it found it — which is also what makes the retry work.
     """
     volume, target, restored = _rollback_fixture(tmp_path)
-    staging = restored.parent
-    # Room for exactly one database, which is not enough while the superseded
-    # one is still on the volume — the situation the runbook could not survive.
+    # Room for one database, which is not enough while the superseded one is
+    # still on the volume — the situation the runbook could not survive.
     _constrain(monkeypatch, volume, capacity=target.stat().st_size * 3 // 2)
+    before = _fingerprint(volume)
 
-    report = install_rollback(
-        restored, target, backup_key=BACKUP_KEY_BYTES, superseded_to=staging, now=1800000042
-    )
+    with pytest.raises(RollbackError, match="bytes and .* are free") as refusal:
+        install_rollback(restored, target, now=1800000042)
 
-    assert target.exists()
-    # The restore is what is installed, not the database it supersedes.
-    assert "migrated_only" not in _tables(target)
-    assert not list(volume.glob("*.superseded-*")), "blocks were never released"
-
-    superseded = Path(str(report["superseded_kept_as"]))
-    assert superseded.parent == staging, "the archive stayed on the volume it must free"
-    assert superseded.exists()
-    assert report["freed_bytes"] > 0
-
-    # Not merely a file with the right name: it has to be the superseded
-    # database, openable with the same key and the same restore command.
-    recovered = restore_backup(
-        superseded,
-        tmp_path / "recovered.db",
-        backup_key=BACKUP_KEY_BYTES,
-        apply_migrations=False,
-    )
-    recovered.close()
-    assert "migrated_only" in _tables(tmp_path / "recovered.db")
+    # The operator is told the two numbers, why it is a copy, and what to do.
+    message = str(refusal.value)
+    assert "copy, not a rename" in message
+    assert "Nothing has been changed" in message
+    assert _fingerprint(volume) == before, "the refusal moved something anyway"
+    assert "migrated_only" in _tables(target), "the live database was disturbed"
+    assert restored.exists(), "the candidate was consumed by a refusal"
 
 
 def test_the_install_keeps_the_superseded_database_when_there_is_room(
@@ -908,7 +911,7 @@ def test_the_install_keeps_the_superseded_database_when_there_is_room(
     volume, target, restored = _rollback_fixture(tmp_path)
     _constrain(monkeypatch, volume, capacity=target.stat().st_size * 10)
 
-    report = install_rollback(restored, target, backup_key=BACKUP_KEY_BYTES, now=1800000042)
+    report = install_rollback(restored, target, now=1800000042)
 
     assert "freed_bytes" not in report
     kept = Path(str(report["superseded_kept_as"]))
@@ -931,13 +934,11 @@ def test_no_superseded_sidecar_is_left_at_the_canonical_path(
     stale = volume / "control-plane.db-wal"
     stale.write_bytes(b"\x00" * 4096)
     (volume / "control-plane.db-shm").write_bytes(b"\x00" * 4096)
-    _constrain(monkeypatch, volume, capacity=target.stat().st_size * 3 // 2)
+    _constrain(monkeypatch, volume, capacity=target.stat().st_size * 10)
 
     install_rollback(
         restored,
         target,
-        backup_key=BACKUP_KEY_BYTES,
-        superseded_to=restored.parent,
         now=1800000042,
     )
 
@@ -958,7 +959,7 @@ def test_the_worker_pause_travels_with_the_restore(tmp_path, monkeypatch) -> Non
     assert marker.exists(), "the fixture is wrong: the restore was never paused"
     _constrain(monkeypatch, volume, capacity=target.stat().st_size * 10)
 
-    report = install_rollback(restored, target, backup_key=BACKUP_KEY_BYTES, now=1800000042)
+    report = install_rollback(restored, target, now=1800000042)
 
     assert report["workers"] == "paused"
     installed = ControlPlaneDatabase(target)
@@ -986,53 +987,9 @@ def test_a_restore_with_no_pause_marker_is_refused_before_anything_moves(
     before = _fingerprint(volume)
 
     with pytest.raises(RollbackError, match="has no worker pause"):
-        install_rollback(restored, target, backup_key=BACKUP_KEY_BYTES, now=1800000042)
+        install_rollback(restored, target, now=1800000042)
 
     assert _fingerprint(volume) == before, "the volume was modified by a refused install"
-
-
-def test_nothing_is_deleted_when_the_superseded_archive_will_not_open(
-    tmp_path, monkeypatch
-) -> None:
-    """The read-back is the gate, and it must gate a real deletion.
-
-    Writing the archive and deleting the original on the strength of `create_backup`
-    returning would destroy the only copy of every write taken after the
-    migration if that archive were unopenable. The original still exists at this
-    point, so failing here costs nothing.
-    """
-    volume, target, restored = _rollback_fixture(tmp_path)
-    monkeypatch.setattr(backup_module, "_authenticated_digest", lambda *a, **k: None)
-    _constrain(monkeypatch, volume, capacity=target.stat().st_size * 3 // 2)
-
-    with pytest.raises(RollbackError, match="does not authenticate"):
-        install_rollback(
-            restored,
-            target,
-            backup_key=BACKUP_KEY_BYTES,
-            superseded_to=restored.parent,
-            now=1800000042,
-        )
-
-    aside = volume / "control-plane.db.superseded-1800000042"
-    assert "migrated_only" in _tables(aside), "the superseded database was destroyed"
-    assert not list(restored.parent.glob("*.superseded-*.cpb")), "a bad archive was kept"
-    assert restored.exists(), "the restore was consumed by a failed install"
-
-
-def test_archiving_onto_the_volume_being_freed_is_refused(tmp_path, monkeypatch) -> None:
-    """Staging on the same volume releases nothing and fills it further."""
-    volume, target, restored = _rollback_fixture(tmp_path)
-    _constrain(monkeypatch, volume, capacity=target.stat().st_size * 3 // 2)
-
-    with pytest.raises(RollbackError, match="on the volume being freed"):
-        install_rollback(
-            restored,
-            target,
-            backup_key=BACKUP_KEY_BYTES,
-            superseded_to=volume,
-            now=1800000042,
-        )
 
 
 def _fingerprint(directory: Path) -> dict[str, bytes]:
@@ -1090,7 +1047,7 @@ def test_an_invalid_rollback_bundle_leaves_the_volume_untouched(
     before = _fingerprint(volume)
 
     with pytest.raises(RollbackError, match=message):
-        install_rollback(restored, target, backup_key=BACKUP_KEY_BYTES, now=1800000042)
+        install_rollback(restored, target, now=1800000042)
 
     assert _fingerprint(volume) == before, "a refused install modified the volume"
 
@@ -1102,7 +1059,7 @@ def test_installing_a_database_over_itself_is_refused(tmp_path, monkeypatch) -> 
     before = _fingerprint(volume)
 
     with pytest.raises(RollbackError, match="same file"):
-        install_rollback(target, target, backup_key=BACKUP_KEY_BYTES, now=1800000042)
+        install_rollback(target, target, now=1800000042)
 
     assert _fingerprint(volume) == before
 
@@ -1123,7 +1080,7 @@ def test_the_preflight_leaves_no_sidecars_beside_the_restore(
     assert not list(staging.glob("*-wal")), "the fixture already has a WAL"
     _constrain(monkeypatch, volume, capacity=target.stat().st_size * 10)
 
-    install_rollback(restored, target, backup_key=BACKUP_KEY_BYTES, now=1800000042)
+    install_rollback(restored, target, now=1800000042)
 
     assert not (volume / "control-plane.db-wal").exists()
     assert not (volume / "control-plane.db-shm").exists()
@@ -1151,7 +1108,7 @@ def test_a_superseded_name_collision_never_overwrites_the_earlier_copy(
         path.write_bytes(sentinel)
 
     report = install_rollback(
-        restored, target, backup_key=BACKUP_KEY_BYTES, now=1800000042
+        restored, target, now=1800000042
     )
 
     for path, sentinel in earlier.items():
@@ -1181,7 +1138,7 @@ def test_a_running_writer_stops_the_install(tmp_path, monkeypatch) -> None:
     try:
         with pytest.raises(RollbackError, match="writer still owns"):
             install_rollback(
-                restored, target, backup_key=BACKUP_KEY_BYTES, now=1800000042
+                restored, target, now=1800000042
             )
     finally:
         writer.release_process_lock()
@@ -1191,7 +1148,7 @@ def test_a_running_writer_stops_the_install(tmp_path, monkeypatch) -> None:
 
     # And it succeeds once the writer lets go, so the guard is a gate rather
     # than a wall.
-    install_rollback(restored, target, backup_key=BACKUP_KEY_BYTES, now=1800000042)
+    install_rollback(restored, target, now=1800000042)
     assert "migrated_only" not in _tables(target)
 
 
@@ -1334,76 +1291,11 @@ def test_a_hard_linked_candidate_is_refused(tmp_path, monkeypatch) -> None:
     before = _fingerprint(volume)
 
     with pytest.raises(RollbackError, match="same file"):
-        install_rollback(alias, target, backup_key=BACKUP_KEY_BYTES, now=1800000042)
+        install_rollback(alias, target, now=1800000042)
 
     assert _fingerprint(volume) == before
     assert "migrated_only" in _tables(target), "the live database was replaced"
     del restored
-
-
-@pytest.mark.parametrize(
-    ("staging_for", "message"),
-    [
-        pytest.param(lambda tmp: tmp / "absent", "not a directory", id="absent"),
-        pytest.param(lambda tmp: tmp / "data", "on the volume being freed", id="on-volume"),
-    ],
-)
-def test_bad_staging_is_refused_before_the_live_bundle_moves(
-    tmp_path, monkeypatch, staging_for, message
-) -> None:
-    """The staging checks used to live inside the low-space branch.
-
-    That branch is reached only AFTER the live bundle has been renamed aside and
-    the canonical target removed, so an absent `--superseded-to` or one on the
-    volume being freed left the operator with no `/data/control-plane.db` at
-    all — and the obvious retry refused too, because its own preflight could not
-    find a target to supersede. An unusable argument has to be rejected while
-    refusing still costs nothing.
-    """
-    volume, target, restored = _rollback_fixture(tmp_path)
-    _constrain(monkeypatch, volume, capacity=target.stat().st_size * 3 // 2)
-    before = _fingerprint(volume)
-
-    with pytest.raises(RollbackError, match=message):
-        install_rollback(
-            restored,
-            target,
-            backup_key=BACKUP_KEY_BYTES,
-            superseded_to=staging_for(tmp_path),
-            now=1800000042,
-        )
-
-    assert _fingerprint(volume) == before, "the live bundle moved before the refusal"
-    assert target.exists(), "the canonical database is gone"
-    assert restored.exists(), "the candidate was consumed"
-
-
-def test_an_existing_superseded_archive_is_refused_before_anything_moves(
-    tmp_path, monkeypatch
-) -> None:
-    """`create_backup` refuses to overwrite — but only once it is called.
-
-    Called from inside the low-space branch, that refusal arrived after the live
-    database had already been removed.
-    """
-    volume, target, restored = _rollback_fixture(tmp_path)
-    staging = restored.parent
-    _constrain(monkeypatch, volume, capacity=target.stat().st_size * 3 // 2)
-    occupied = staging / "control-plane.db.superseded-1800000042.cpb"
-    occupied.write_bytes(b"an earlier generation")
-    before = _fingerprint(volume)
-
-    with pytest.raises(RollbackError, match="already holds a superseded database"):
-        install_rollback(
-            restored,
-            target,
-            backup_key=BACKUP_KEY_BYTES,
-            superseded_to=staging,
-            now=1800000042,
-        )
-
-    assert _fingerprint(volume) == before
-    assert occupied.read_bytes() == b"an earlier generation"
 
 
 def test_the_space_requirement_covers_every_bundle_member(tmp_path) -> None:
@@ -1445,37 +1337,6 @@ def test_the_space_requirement_covers_every_bundle_member(tmp_path) -> None:
     # temporary before renaming. Anything at or near the four logical bytes is
     # the underestimate that let the marker be the file that ran out of room.
     assert required >= 4 * 4096, f"{required} does not cover four allocated blocks"
-
-
-def test_a_tight_volume_still_installs_a_paused_database(tmp_path, monkeypatch) -> None:
-    """The end-to-end half: room for the database and little more.
-
-    What this does NOT prove is that a real `ENOSPC` is survived — the volume's
-    capacity is simulated at the `statvfs` seam, so writes still succeed. It
-    proves the branch runs to completion at a tight capacity and lands a bundle
-    that is paused, which is the post-condition an operator depends on. The
-    requirement arithmetic is pinned exactly by the test above.
-    """
-    volume, target, restored = _rollback_fixture(tmp_path)
-    _constrain(
-        monkeypatch,
-        volume,
-        capacity=target.stat().st_size + restored.stat().st_size,
-    )
-
-    report = install_rollback(
-        restored,
-        target,
-        backup_key=BACKUP_KEY_BYTES,
-        superseded_to=restored.parent,
-        now=1800000042,
-    )
-
-    assert report["workers"] == "paused"
-    assert _pause_marker_path(target).exists(), (
-        "the database landed without its worker pause"
-    )
-    assert "migrated_only" not in _tables(target)
 
 
 def _pause_marker_path(database: Path) -> Path:
@@ -1527,3 +1388,82 @@ def test_a_corrupt_future_dated_snapshot_does_not_hide_the_valid_ones(tmp_path) 
     # And the archive that IS reused is the valid one, readable with the key.
     valid = next(path for path in tmp_path.glob("*.bak") if path != poison)
     assert backup_module._authenticated_digest(valid, BACKUP_KEY_BYTES) is not None
+
+
+@pytest.mark.parametrize("position", ["database", "-wal", ".workers-paused"])
+@pytest.mark.parametrize("shape", ["directory", "fifo", "symlink"])
+def test_a_bundle_member_that_is_not_a_regular_file_is_refused(
+    tmp_path, monkeypatch, position, shape
+) -> None:
+    """`is_file()` follows symlinks and says nothing about the other shapes.
+
+    Each failure lands after the live database has already moved, and each is
+    different: a directory raises on the rename, a FIFO blocks the copy
+    indefinitely with the target already gone, and a symlink can leave the
+    canonical path pointing outside the volume a Machine replacement preserves.
+    `lstat` asks about the entry the installer will actually move.
+    """
+    volume, target, restored = _rollback_fixture(tmp_path)
+    _constrain(monkeypatch, volume, capacity=target.stat().st_size * 10)
+    member = (
+        restored
+        if position == "database"
+        else restored.with_name(f"{restored.name}{position}")
+    )
+    member.unlink(missing_ok=True)
+    if shape == "directory":
+        member.mkdir()
+    elif shape == "fifo":
+        os.mkfifo(member)
+    else:
+        elsewhere = tmp_path / f"elsewhere{position}"
+        elsewhere.write_bytes(target.read_bytes() if position == "database" else b"x")
+        member.symlink_to(elsewhere)
+    before = _fingerprint(volume)
+
+    with pytest.raises(RollbackError, match="not a regular file|no worker pause"):
+        install_rollback(restored, target, now=1800000042)
+
+    assert _fingerprint(volume) == before, "a refused install moved the live bundle"
+    assert "migrated_only" in _tables(target)
+
+
+def test_a_name_too_long_for_the_filesystem_is_refused_before_the_move(
+    tmp_path, monkeypatch
+) -> None:
+    """`exists()` answers False for a name the filesystem cannot hold.
+
+    So the reservation accepted a bundle whose sidecar names were over the
+    limit: on an ext4-like `NAME_MAX=255`, a 242-character basename yields a
+    255-character aside database name and a 259-character aside WAL name. The
+    database rename succeeded and the WAL rename raised `ENAMETOOLONG`, leaving
+    no canonical database — and the obvious retry refuses, because the target it
+    would supersede is missing. The name is only taken when every member of the
+    bundle is both free and expressible.
+    """
+    volume = tmp_path / "data"
+    staging = tmp_path / "staging"
+    volume.mkdir()
+    staging.mkdir()
+    limit = backup_module._name_max(volume)
+    # Long enough that ".superseded-1800000042-wal" pushes the sidecar over.
+    name = "c" * (limit - len(".superseded-1800000042-wal"))
+    target = volume / name
+    database = ControlPlaneDatabase(target)
+    database.migrate()
+    database.close()
+    (volume / f"{name}-wal").write_bytes(b"\x00" * 32)
+
+    source = ControlPlaneDatabase(staging / "rollback.db")
+    source.migrate()
+    source.pause_workers()
+    source.close()
+    restored = staging / "rollback.db"
+    _constrain(monkeypatch, volume, capacity=target.stat().st_size * 10)
+    before = _fingerprint(volume)
+
+    with pytest.raises(RollbackError, match="character limit"):
+        install_rollback(restored, target, now=1800000042)
+
+    assert _fingerprint(volume) == before
+    assert target.exists(), "the canonical database is gone"

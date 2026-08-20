@@ -120,24 +120,12 @@ read.
 ```bash
 abrolia-control-plane install-rollback \
   --restored /tmp/control-plane-rollback.db \
-  --target /data/control-plane.db \
-  --superseded-to /tmp
+  --target /data/control-plane.db
 ```
 
 This was a column of `mv` commands, and it is a command now because three of the
 steps have a failure that does not announce itself:
 
-- **The install itself can run out of room.** Staging off the volume only moved
-  where the restore was written; moving it in is a *copy*, and renaming the
-  superseded database aside frees nothing, because it is the same filesystem and
-  the same blocks. So when the copy will not fit, `install-rollback` writes the
-  superseded database to `--superseded-to` as an authenticated archive in the
-  same format as every other backup, **reads that archive back**, and only then
-  releases the blocks. Nothing is deleted before its replacement has been shown
-  to open; freeing space by dropping a restore point is the one move that turns
-  a disk problem into a data-loss problem. If `--superseded-to` is on the volume
-  being freed, or the restore still does not fit afterwards, the command stops
-  and tells you where everything is.
 - **A `-wal` left behind is replayed into the restore.** A service that was
   killed rather than stopped leaves committed frames in `control-plane.db-wal`;
   beside the installed rollback, SQLite replays them and quietly reapplies the
@@ -148,46 +136,50 @@ steps have a failure that does not announce itself:
   not follow the database unless something moves it. Moving the database alone
   resumes the workers against data nobody has reconciled. The command installs
   the marker and fails if it did not arrive.
+- **The install can run out of room.** Staging off the volume only moved where
+  the restore was written; moving it in is a *copy*, and renaming the superseded
+  database aside frees nothing, because it is the same filesystem and the same
+  blocks. The command checks this **before it moves anything** and refuses,
+  naming the bytes needed and the bytes free.
 
-It refuses before touching anything if a control-plane writer still holds
-`/data/control-plane.db.writer.lock` — the same lock `serve` takes. Renaming a
-database and its sidecars out from under a live SQLite connection does not fail
-loudly; the process keeps its descriptors on the superseded inode and its writes
-land in a file nothing will read again. **Stop the service first.**
-
-It also validates everything before the live database moves: that the candidate
-and the target are genuinely different files (by inode, so a hard link cannot
-pass as a rollback), that the target is a regular file, that the restore opens
-as SQLite and passes `integrity_check` and `foreign_key_check`, that a worker
-pause marker sits beside it — and, when the install will need to free space,
-that `--superseded-to` exists, is writable, is off the volume, and has no
-archive already under the name this run would take. A bundle that cannot be
-installed is refused with `/data` exactly as it was, so the obvious retry works.
-
-The space it reserves covers the whole bundle — database, sidecars **and** the
-pause marker — in allocated blocks. A gate that only covered the database could
-pass, copy the database, and then fail on the marker, leaving a restored
-database at the canonical path with nothing pausing the workers.
-
-Both `restore` and `install-rollback` read `ABROLIA_CONTROL_PLANE_BACKUP_KEY`
-and nothing else. They do not need the field-encryption keys, the HMAC keys, or
-any Fly setting — recovery must not require the deployment it is recovering to
-be intact.
-
-It prints what it did, including where the superseded database ended up:
-
-```json
-{"superseded_kept_as": "/tmp/control-plane.db.superseded-1800000042.cpb",
- "sidecars": [], "target": "/data/control-plane.db", "workers": "paused"}
-```
-
-Recover from that archive with the ordinary restore command and the same backup
-key, should you need anything written after the migration:
+**It does not free space for you, by design.** An earlier version archived the
+superseded database off-volume and deleted it to make room — which meant a
+command you run to move a file could destroy the only copy of every write taken
+after the migration. If it refuses for space, do this yourself, in this order,
+and only then run it again:
 
 ```bash
-abrolia-control-plane restore /tmp/control-plane.db.superseded-1800000042.cpb \
-  --target /data/control-plane-superseded.db --no-migrate
+# 1. Archive the superseded database OFF the volume, and verify it opens.
+abrolia-control-plane backup /tmp/control-plane-superseded.cpb
+abrolia-control-plane restore /tmp/control-plane-superseded.cpb \
+  --target /tmp/verify.db --no-migrate && rm -f /tmp/verify.db /tmp/verify.db*
+
+# 2. Only now release the blocks.
+rm -f /data/control-plane.db /data/control-plane.db-wal /data/control-plane.db-shm
 ```
+
+Never skip step 1. Discarding a restore point to reclaim space is the one move
+that turns a disk problem into a data-loss problem, and the pre-migrate archive
+covers the state *before* the migration — not the writes taken after it.
+
+Before anything moves, the command also refuses if a control-plane writer still
+holds `/data/control-plane.db.writer.lock` (the same lock `serve` takes —
+renaming a database out from under a live SQLite connection does not fail
+loudly), if the candidate and the target are the same file by inode, if any
+bundle member on either side is not a regular file, if the restore does not open
+as SQLite or has no pause marker, or if the superseded names it would need are
+already taken or too long for the filesystem. Every one of those leaves `/data`
+exactly as it was, so the obvious retry works.
+
+It prints what it did, including where the superseded bundle went:
+
+```json
+{"sidecars": [], "superseded_kept_as": "/data/control-plane.db.superseded-1800000042",
+ "target": "/data/control-plane.db", "workers": "paused"}
+```
+
+Nothing is deleted: the superseded database and its sidecars are renamed aside,
+intact, under that name.
 
 The alternative to installing at all is to leave the restore where it is and
 point the rolled-back release at it by setting

@@ -68,14 +68,6 @@ def _parser() -> argparse.ArgumentParser:
         required=True,
         help="the canonical path from fly.toml, currently holding the superseded database",
     )
-    install.add_argument(
-        "--superseded-to",
-        help=(
-            "directory OFF the target volume for the superseded database's archive,"
-            " used only when the install would not otherwise fit;"
-            " defaults to the directory holding --restored"
-        ),
-    )
     commands.add_parser("resume-jobs", help="remove the exact post-restore worker pause")
     return parser
 
@@ -192,13 +184,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         # it is trying to free. Same recovery-only key as `restore`, for the
         # same reason — the two are one documented procedure and must have the
         # same preconditions.
+        # No backup key either: this command reads no archive. It moves files
+        # and refuses when it cannot, so the only credential-shaped dependency
+        # it had came from the space-freeing it no longer does.
         print(json.dumps(
-            install_rollback(
-                args.restored,
-                args.target,
-                backup_key=backup_key_from_env(),
-                superseded_to=args.superseded_to,
-            ),
+            install_rollback(args.restored, args.target),
             sort_keys=True,
         ))
         return 0
