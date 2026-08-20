@@ -640,7 +640,11 @@ class RuntimeService:
         elif path in {"/v1/whatsapp/webhook", "/webhooks/whatsapp"} and method == "POST":
             probe = self._whatsapp_webhook(environ)
         elif path == "/internal/v1/consent/revoke":
-            probe = self._consent_revoke(method, str(environ.get("HTTP_AUTHORIZATION") or ""))
+            probe = self._consent_revoke(
+                method,
+                str(environ.get("HTTP_AUTHORIZATION") or ""),
+                self._request_body(environ),
+            )
         elif path in {"/internal/v1/dsar/export", "/internal/v1/dsar/delete"}:
             probe = self._dsar(path, method, str(environ.get("HTTP_AUTHORIZATION") or ""))
         elif path == "/internal/v1/email/google/revoke":
@@ -754,15 +758,70 @@ class RuntimeService:
             },
         )
 
-    def _consent_revoke(self, method: str, authorization: str) -> Probe:
+    @staticmethod
+    def _request_body(environ: dict) -> bytes:
+        try:
+            length = int(environ.get("CONTENT_LENGTH") or 0)
+        except (TypeError, ValueError):
+            return b""
+        if length <= 0:
+            return b""
+        stream = environ.get("wsgi.input")
+        if stream is None:
+            return b""
+        try:
+            return bytes(stream.read(min(length, 64 * 1024)))
+        except Exception:
+            return b""
+
+    def _is_superseded_revocation(self, body: bytes) -> bool:
+        """True only when this runtime demonstrably serves another generation."""
+        if not body:
+            return False
+        try:
+            named = json.loads(body.decode("utf-8")).get("receipt_ids")
+        except (ValueError, UnicodeDecodeError, AttributeError):
+            return False
+        named = {
+            receipt for receipt in (named or []) if isinstance(receipt, str) and receipt
+        }
+        if not named:
+            return False
+        try:
+            manifest = load_runtime_manifest(self.manifest_path, env=self.env)
+        except ManifestError:
+            return False
+        if manifest.consent is None or not manifest.consent.receipts:
+            return False
+        held = {receipt.receipt_id for receipt in manifest.consent.receipts}
+        return held.isdisjoint(named)
+
+    def _consent_revoke(
+        self, method: str, authorization: str, body: bytes = b""
+    ) -> Probe:
         """Stop serving because a consent behind this runtime was withdrawn.
 
-        Deliberately unconditional once authenticated: it must succeed on a
-        runtime that is already deleted, not yet active, or serving a manifest
-        that cannot be parsed. Withdrawal that fails because the runtime is in
-        an awkward state is withdrawal that did not happen, and Art. 7(3) gives
-        the family a right to it, not an attempt at it. Idempotent — the marker
-        is the state, and re-posting rewrites the same file.
+        Unconditional once authenticated, with ONE exception. It must succeed on
+        a runtime that is already deleted, not yet active, or serving a manifest
+        that cannot be parsed: withdrawal that fails because the runtime is in an
+        awkward state is withdrawal that did not happen, and Art. 7(3) gives the
+        family a right to it, not an attempt at it. Idempotent — the marker is
+        the state, and re-posting rewrites the same file.
+
+        The exception is a stop that names a consent generation this runtime is
+        demonstrably not serving. A withdrawal from revision A whose job is
+        unreachable, while the household re-consents and reprovisions as
+        revision B, would otherwise authenticate against B — the runtime
+        reference is the household's stable app name and does not change — and
+        suspend a runtime nobody withdrew, indefinitely.
+
+        The test is deliberately one-sided. Only a POSITIVE mismatch declines:
+        the request names receipts, the manifest parses, it declares receipts,
+        and none of them match. Anything else — no receipts named (a control
+        plane that predates this), an unreadable manifest, a manifest with no
+        consent block — marks. Fail closed toward stopping, because the cost of
+        stopping a runtime that could have kept running is recoverable and the
+        cost of not stopping one is not.
         """
         expected = self.env.get(ENV_RUNTIME_DSAR_TOKEN, "")
         if method != "POST" or not expected:
@@ -773,6 +832,10 @@ class RuntimeService:
         )
         if not supplied or not hmac.compare_digest(supplied, expected):
             return Probe(401, {"status": "unauthorized"})
+        if self._is_superseded_revocation(body):
+            # Acknowledged, not obeyed: the job is satisfied and stops retrying,
+            # and this runtime keeps serving the consent it actually holds.
+            return Probe(200, {"state": "superseded_generation"})
         try:
             atomic_write(self.consent_marker, b'{"status":"consent_withdrawn"}')
         except OSError:

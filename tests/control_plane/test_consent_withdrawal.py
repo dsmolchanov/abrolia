@@ -12,6 +12,8 @@ agree; and only the push reaches an instance that is already serving.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from control_plane.models import StepKind
@@ -46,8 +48,15 @@ class FakeRuntime:
         self.error = error
         self.calls: list[dict[str, object]] = []
 
-    def post(self, url, *, headers=None, timeout=None):
-        self.calls.append({"url": url, "headers": dict(headers or {})})
+    def post(self, url, *, headers=None, timeout=None, content=None):
+        # `content` mirrors httpx: the stop now carries the withdrawn receipt
+        # ids so the runtime can tell it from one left over by an earlier
+        # consent cycle at the same stable reference.
+        self.calls.append({
+            "url": url,
+            "headers": dict(headers or {}),
+            "body": json.loads(content.decode("utf-8")) if content else None,
+        })
         if self.error is not None:
             raise self.error
         return _Response(self.status_code)
@@ -879,3 +888,38 @@ def test_a_withdrawal_landing_after_the_barrier_still_compensates(cp_stack) -> N
         (cp_stack.household.id,),
     )
     assert identity is None or identity["status"] == "deleted"
+
+
+def test_the_stop_carries_the_withdrawn_receipt_ids(cp_stack) -> None:
+    """The generation has to survive as far as DELIVERY, not just the key.
+
+    The intent key distinguishes consent cycles, which stops a second withdrawal
+    from matching the first job. It does nothing about a first job that is still
+    retrying: a stop queued for revision A, left unreachable while the household
+    re-consents and reprovisions, authenticates against revision B — the runtime
+    reference is the household's stable app name and does not change — and
+    suspends a runtime nobody withdrew.
+    """
+    complete_onboarding(cp_stack)
+    drain(cp_stack)
+    set_runtime_ref(cp_stack)
+    revoked = [
+        str(row["id"])
+        for row in cp_stack.database.query(
+            "SELECT id FROM consent_receipts WHERE household_id = ?"
+            " AND purpose = ? AND revoked_at IS NULL",
+            (cp_stack.household.id, HOUSEHOLD_CONTENT_PURPOSE),
+        )
+    ]
+    assert revoked, "the fixture holds no receipt to withdraw"
+
+    withdrawal(cp_stack).withdraw(
+        cp_stack.household.id, HOUSEHOLD_CONTENT_PURPOSE, now=BASE_TIME
+    )
+    runtime = FakeRuntime()
+    worker = cp_stack.make_worker(now=BASE_TIME + 50)
+    worker._runtime_client = runtime
+    assert worker.run_once().status == "succeeded"
+
+    assert runtime.calls, "no stop was delivered"
+    assert sorted(runtime.calls[-1]["body"]["receipt_ids"]) == sorted(revoked)

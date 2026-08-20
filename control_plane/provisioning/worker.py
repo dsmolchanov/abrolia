@@ -390,9 +390,21 @@ class ProvisioningWorker:
             )
         token = self.configs.token_hasher.digest(f"runtime-dsar:{runtime_ref}")
         try:
+            # The withdrawn generation goes with the request so the runtime can
+            # tell a stop meant for the revision it is serving from one left
+            # over by an earlier consent cycle at the same stable reference.
+            receipt_ids = [
+                receipt
+                for receipt in (request.get("receipt_ids") or [])
+                if isinstance(receipt, str) and receipt
+            ]
             response = self.runtime_client.post(
                 f"http://{runtime_ref}.internal:8080/internal/v1/consent/revoke",
-                headers={"Authorization": f"Bearer {token}"},
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                },
+                content=json.dumps({"receipt_ids": receipt_ids}).encode("utf-8"),
                 timeout=10.0,
             )
         except Exception:

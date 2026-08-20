@@ -258,7 +258,19 @@ class ConsentWithdrawalService:
             kind="runtime",
             operation=REVOKE_CONSENT_OPERATION,
             intent_key=f"{household_id}:consent-revoke:{fingerprint}",
-            request={"runtime_ref": runtime_ref, "purpose": purpose},
+            # The receipt ids travel WITH the request, not only in the key.
+            # The key stops a second withdrawal from matching the first job; it
+            # does nothing about a first job that is still retrying. A stop
+            # queued for revision A, left unreachable while the household
+            # re-consents and reprovisions, would authenticate against revision
+            # B — `stable_app_name()` deterministically reuses the household's
+            # app name — and suspend a runtime nobody withdrew. Generation
+            # isolation has to survive as far as delivery.
+            request={
+                "runtime_ref": runtime_ref,
+                "purpose": purpose,
+                "receipt_ids": list(cycle),
+            },
             provider="dry-run-runtime",
             now=now,
         )

@@ -13,6 +13,7 @@ unparseable manifest is a withdrawal that did not happen.
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import replace
 from pathlib import Path
@@ -21,6 +22,7 @@ import pytest
 
 from hermes_cloud.core.runtime_manifest import (
     compute_config_sha256,
+    load_runtime_manifest,
     parse_runtime_manifest,
 )
 from hermes_cloud.runtime.bootstrap import (
@@ -419,3 +421,98 @@ def test_dsar_still_answers_for_a_withdrawn_or_stale_consent(tmp_path: Path) -> 
 
     assert manifest is not None, "withdrawal took the data-subject rights with it"
     assert reason == "dsar"
+
+
+def _revoke_body(service: RuntimeService, receipt_ids: list[str] | None):
+    body = b"" if receipt_ids is None else json.dumps(
+        {"receipt_ids": receipt_ids}
+    ).encode()
+    return service._consent_revoke("POST", f"Bearer {DSAR_TOKEN}", body)
+
+
+def test_a_stop_for_a_superseded_generation_is_acknowledged_not_obeyed(
+    tmp_path: Path,
+) -> None:
+    """A stale withdrawal must not suspend a re-consented runtime.
+
+    Withdraw from revision A, leave that stop unreachable, re-consent and
+    reprovision as revision B. The runtime reference is the household's stable
+    app name, so the old job authenticates against B — and unconditionally
+    marking meant a valid, currently-consented runtime was suspended
+    indefinitely by a withdrawal nobody made against it.
+
+    Acknowledged, so the job settles and stops retrying, and not obeyed, so the
+    runtime keeps serving the consent it actually holds.
+    """
+    service = active_service(tmp_path)
+    held = {
+        receipt.receipt_id
+        for receipt in load_runtime_manifest(
+            service.manifest_path, env=service.env
+        ).consent.receipts
+    }
+    assert held, "the fixture manifest declares no receipts"
+
+    probe = _revoke_body(service, ["99999999-9999-4999-8999-999999999999"])
+
+    assert probe.status_code == 200
+    assert probe.payload["state"] == "superseded_generation"
+    assert not service.consent_marker.exists(), "a stale stop suspended the runtime"
+    assert service.readyz().payload.get("reason") != "consent_withdrawn"
+
+
+def test_a_stop_naming_this_generation_still_suspends_it(tmp_path: Path) -> None:
+    """The other half: a matching stop must work exactly as before."""
+    service = active_service(tmp_path)
+    held = sorted(
+        receipt.receipt_id
+        for receipt in load_runtime_manifest(
+            service.manifest_path, env=service.env
+        ).consent.receipts
+    )
+
+    probe = _revoke_body(service, held)
+
+    assert probe.status_code == 200
+    assert probe.payload["state"] == "consent_withdrawn"
+    assert service.consent_marker.exists()
+    assert service.readyz().payload["reason"] == "consent_withdrawn"
+
+
+@pytest.mark.parametrize(
+    ("receipt_ids", "why"),
+    [
+        pytest.param(None, "a control plane that predates the generation field", id="no-body"),
+        pytest.param([], "an empty list names no generation", id="empty"),
+    ],
+)
+def test_a_stop_that_names_no_generation_still_suspends(
+    tmp_path: Path, receipt_ids, why
+) -> None:
+    """Only a POSITIVE mismatch declines. Everything else stops the runtime.
+
+    Fail closed toward stopping: the cost of suspending a runtime that could
+    have kept running is recoverable, and the cost of not suspending one is not.
+    """
+    service = active_service(tmp_path)
+
+    probe = _revoke_body(service, receipt_ids)
+
+    assert probe.status_code == 200, why
+    assert service.consent_marker.exists(), why
+
+
+def test_a_runtime_with_no_readable_manifest_still_stops(tmp_path: Path) -> None:
+    """Withdrawal must succeed on a runtime in an awkward state.
+
+    An unparseable manifest cannot prove the generation is superseded, and
+    Art. 7(3) gives the family a right to withdrawal rather than an attempt at
+    it — so an unreadable manifest marks.
+    """
+    service = active_service(tmp_path)
+    service.manifest_path.write_text("this is not a manifest", encoding="utf-8")
+
+    probe = _revoke_body(service, ["99999999-9999-4999-8999-999999999999"])
+
+    assert probe.status_code == 200
+    assert service.consent_marker.exists()
