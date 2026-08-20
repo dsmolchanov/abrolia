@@ -27,8 +27,16 @@ from control_plane.config import ControlPlaneConfig
 from control_plane.container import ControlPlaneContainer
 from control_plane.db import MIGRATIONS_DIR, ControlPlaneDatabase
 from control_plane.models import USER_STEPS, WorkflowState
+from control_plane.privacy.consent import (
+    CURRENT_RESTRICTION_RECEIPT_SQL,
+    consent_version_and_sha,
+)
 from control_plane.provisioning.contracts import ProviderRejected
 from control_plane.provisioning.fly import FlyRuntimeProvisioner
+
+#: The purpose whose receipt `_run_once` requires before dispatching a
+#: runtime job. Spelled once here, matching the worker's own literal.
+CONTENT_RESTRICTION_PURPOSE = "special_category_content_restriction"
 
 # Both are installed into the runtime sink by ProvisioningWorker._finish_runtime;
 # the bootstrap token is then deleted by the bootstrap cleanup job.
@@ -122,6 +130,21 @@ RUNTIME_WRITES_BY_WORKFLOW_STATE: dict[str, tuple[TableWrite, ...]] = {
         TableWrite("external_resources", "update"),
         TableWrite("provisioning_jobs", "update"),
     ),
+}
+
+#: What a job of this kind writes, where durable state determines it.
+#:
+#: Attached to EACH inventoried job rather than chosen for the top-level
+#: `table_writes`. The choosing is what generated findings — it meant deciding
+#: which job runs next, and defending that against `lease` in every edge case.
+#: What a given kind writes is a static fact about the code, and a fact can sit
+#: beside the job it describes without anything being ranked.
+#:
+#: Only the internal kinds are here. A provider-backed job's write set depends
+#: on an answer the provider has not given, and this report states uncertainty
+#: rather than guessing at it.
+STEP_WRITES_BY_KIND: dict[str, tuple[TableWrite, ...]] = {
+    "bootstrap_cleanup": (TableWrite("provisioning_jobs", "update"),),
 }
 
 #: Tables the COMPENSATION path writes, which any in-flight call can reach.
@@ -400,6 +423,17 @@ def _secret_names(
     return secrets
 
 
+def _holds_current_restriction(
+    container: ControlPlaneContainer, household_id: str
+) -> bool:
+    """The worker's own precondition, asked with the worker's own SQL."""
+    version, sha256 = consent_version_and_sha(CONTENT_RESTRICTION_PURPOSE)
+    return container.database.query_one(
+        CURRENT_RESTRICTION_RECEIPT_SQL,
+        (household_id, CONTENT_RESTRICTION_PURPOSE, version, sha256),
+    ) is not None
+
+
 def _now_seconds() -> float:
     """Wall clock, isolated so a test can pin an expired lease."""
     return time.time()
@@ -607,6 +641,13 @@ def plan_onboarding(
                     # worker's question.
                     "not_before": row["not_before"],
                     "lease_until": row["lease_until"],
+                    # Where the work is internal and deterministic, what it
+                    # writes is knowable and is stated. Where it depends on a
+                    # provider, the list is empty and the absence is the answer.
+                    "table_writes": [
+                        {"table": write.table, "operation": write.operation}
+                        for write in STEP_WRITES_BY_KIND.get(str(row["kind"]), ())
+                    ],
                 }
                 for row in connection.execute(
                     "SELECT id, kind, operation, status, provider, error_code,"
@@ -847,6 +888,30 @@ def plan_onboarding(
                 or already_onboarded
             ):
                 pass
+            elif already_planned and not _holds_current_restriction(
+                container, household_id
+            ):
+                # `_run_once` checks this BEFORE dispatching any provider: with
+                # the restriction receipt revoked or stale, it fails the job,
+                # revokes the revision and the bootstrap tokens, and returns the
+                # workflow to email. Reporting the ordinary success path over
+                # that described an operation whose first act is to undo itself.
+                #
+                # This is durable state, not a prediction about scheduling —
+                # the receipt either is current or is not — and the predicate is
+                # the worker's own.
+                models_an_operation = False
+                plan.rehearsal = (
+                    f"revision {issued['revision']} is issued, and the"
+                    " special-category content restriction receipt is not"
+                    " current. The runtime job is blocked on that before any"
+                    " provider call, so no write set is claimed."
+                )
+                plan.blocked_by = (
+                    "the household does not currently hold the special-category"
+                    " content restriction; the queued runtime job cannot proceed"
+                    " until it is accepted again"
+                )
             elif already_planned:
                 state = str(workflow["state"])
                 job_status = str((runtime_job or {})["status"])

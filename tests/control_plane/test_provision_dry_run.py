@@ -1798,3 +1798,76 @@ def test_an_unresolved_intent_is_reported_with_its_reason(container) -> None:
     # And nothing future-tense is advertised over it.
     assert plan.runtime_resources == []
     assert plan.secrets == []
+
+
+def test_a_deterministic_step_job_carries_its_own_write_set(container) -> None:
+    """A fact about the code, sitting beside the job it describes.
+
+    The Step E1 contract asks for the pending operation's tables where durable
+    state determines them. An earlier version satisfied that by CHOOSING a job
+    for the top-level `table_writes` — which meant deciding which one runs next
+    and defending that against `lease` in every edge case. What a given kind
+    writes is static; attached per job, nothing is ranked and nothing is
+    predicted.
+    """
+    household_id = _household_with_profile(container)
+    workflow = container.database.query_one(
+        "SELECT id FROM onboarding_workflows WHERE household_id = ?", (household_id,)
+    )
+    with container.database.write() as connection:
+        cleanup_id, _created = container.jobs.create(
+            connection,
+            household_id=household_id,
+            workflow_id=workflow["id"],
+            kind="bootstrap_cleanup",
+            operation="delete_bootstrap_secret",
+            intent_key=f"{household_id}:late-bootstrap-cleanup:probe",
+            request={"name": "HERMES_BOOTSTRAP_TOKEN"},
+            provider="internal-secret-sink",
+            now=BASE_TIME,
+        )
+
+    plan = plan_onboarding(container, household_id)
+
+    cleanup = next(
+        job for job in plan.pending_step_jobs if job["job_id"] == cleanup_id
+    )
+    assert cleanup["table_writes"] == [
+        {"table": "provisioning_jobs", "operation": "update"}
+    ]
+    # A provider-backed job states no set, and the absence IS the answer.
+    provider_backed = [
+        job for job in plan.pending_step_jobs if job["kind"] == "email_identity"
+    ]
+    assert all(job["table_writes"] == [] for job in provider_backed)
+
+
+def test_a_stale_restriction_receipt_blocks_the_runtime_report(container) -> None:
+    """`_run_once` checks this BEFORE dispatching any provider.
+
+    With the receipt revoked or stale, it fails the queued runtime job, revokes
+    the revision and the bootstrap tokens, and returns the workflow to email.
+    Reporting the ordinary success path over that describes an operation whose
+    first act is to undo itself. This is durable state, not a prediction about
+    scheduling — the receipt either is current or is not — and the report asks
+    it with the worker's own SQL.
+    """
+    household_id = _household_with_profile(container)
+    _verify_all_steps(container, household_id)
+    healthy = plan_onboarding(container, household_id)
+    assert healthy.table_writes, "the fixture reported no write set to lose"
+
+    with container.database.write() as connection:
+        connection.execute(
+            "UPDATE consent_receipts SET revoked_at = ? WHERE household_id = ?"
+            " AND purpose = 'special_category_content_restriction'",
+            (BASE_TIME, household_id),
+        )
+
+    plan = plan_onboarding(container, household_id)
+
+    assert plan.blocked_by is not None
+    assert "content restriction" in plan.blocked_by
+    assert plan.table_writes == []
+    assert plan.runtime_resources == []
+    assert plan.secrets == []

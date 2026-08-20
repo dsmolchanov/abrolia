@@ -372,13 +372,15 @@ CREATE TABLE channel_bindings (
 
 ```bash
 python -m control_plane.onboarding.provision --dry-run --household <test-uuid> 2>&1 | head -n 80
-# expect: no DB write, and a report matching the household's STATE.
-# `operation_pending` false => table_writes, runtime_resources and secrets are
-# empty, because they describe the pending operation and there is not one.
-# Otherwise: tables (the planning pass before a revision is issued; the SUCCESS
-# PATH of the pending runtime operation after; nothing at all when the next step
-# is a provider-dependent reconcile), resources from the CONFIGURED provider
-# (Fly names only under fly-runtime), and the names of currently live secrets.
+# expect: no DB write, and a report of durable state.
+# `rehearsal` says what THIS RUN rehearsed, and `table_writes` belongs to that —
+# the planning pass before a revision is issued, the SUCCESS PATH of the pending
+# runtime operation after, nothing when the next step is a provider-dependent
+# reconcile or a precondition is unmet. `pending_step_jobs` and
+# `unresolved_runtime_jobs` list every unsettled job with its status, error
+# code, not_before, lease_until, provider and — where the work is internal and
+# deterministic — its own table_writes. `workers_paused` says whether the queue
+# is moving. Resources and secrets come from the pending job's own provider.
 ```
 
 **Criterion amended 2026-08-20.** It originally read "listing exact writes" and

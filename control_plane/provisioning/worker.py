@@ -25,7 +25,10 @@ from control_plane.email.repository import EmailIdentityRepository
 from control_plane.models import StepKind, StepStatus
 from control_plane.observability import StructuredLogger
 from control_plane.onboarding.state import VERIFY_RESULT, next_status
-from control_plane.privacy.consent import consent_version_and_sha
+from control_plane.privacy.consent import (
+    CURRENT_RESTRICTION_RECEIPT_SQL,
+    consent_version_and_sha,
+)
 from control_plane.providers.email.nerve_client import email_org_external_ref
 from control_plane.provisioning.contracts import (
     InspectState,
@@ -337,8 +340,7 @@ class ProvisioningWorker:
             "special_category_content_restriction"
         )
         return self.jobs.db.query_one(
-            "SELECT 1 FROM consent_receipts WHERE household_id = ? AND purpose = ?"
-            " AND text_version = ? AND text_sha256 = ? AND revoked_at IS NULL LIMIT 1",
+            CURRENT_RESTRICTION_RECEIPT_SQL,
             (
                 household_id,
                 "special_category_content_restriction",
