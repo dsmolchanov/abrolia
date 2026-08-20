@@ -102,3 +102,33 @@ makes a review loop unable to terminate.
   A move records what it published, and anything else at that name — a
   different entry or the same entry with different bytes — is not this
   operation's to move.
+### A report describes the branch the worker will actually take
+
+- **Any job the dry-run report annotates with `blocked_by` and `table_writes`
+  must be one the worker settles WITHOUT resolving a provider, and settling it
+  must write exactly the declared tables. While any such annotation is present,
+  the report must claim no top-level `table_writes`.** Enforced by
+  `tests/control_plane/test_provision_dry_run.py::test_every_annotated_job_agrees_with_one_real_worker_call`,
+  which crosses every gated job shape with every invalid receipt state, traces
+  one real `run_once()`, and asserts the provider registry was never consulted;
+  and by `test_the_gated_shapes_cover_the_worker_s_own_predicate`, which asks
+  `requires_current_content_restriction` about every kind the schema allows so a
+  newly gated shape cannot slip past that parameter list.
+
+  Recorded after five instances of one class arrived across the E1 review
+  rounds. Each was the report describing an operation other than the one the
+  worker would perform: a stale consent receipt reported as an ordinary
+  provider call; the receipt checked for a runtime job and not for its email
+  siblings; a configuration mismatch narrated over a household being deleted or
+  an unresolved earlier intent; a cancellation label narrated over a quarantined
+  intent that had already reached its provider; and a single top-level write set
+  chosen from an unordered scan, which is a claim about which queued job the
+  worker reaches first. They are one missing rule, not five findings.
+
+  The rule has two halves and both are load-bearing. A report may state what a
+  job's next act writes only where durable state fully determines it — which is
+  exactly the case where no provider is consulted — and it may never rank jobs,
+  because `JobsRepository.lease` decides that and its answer depends on
+  `not_before`, held leases, paused workers and creation order. Every attempt to
+  predict the ranking has produced a finding; attaching facts to each job has
+  produced none.

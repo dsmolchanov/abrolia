@@ -8,6 +8,7 @@ from control_plane.provisioning.contracts import (
     InspectResult,
     InspectState,
     OutcomeUnknown,
+    PlannedWrite,
     ProviderRegistry,
     ProviderRejected,
     ProviderWaiting,
@@ -116,6 +117,28 @@ class DeterministicFakeProvisioner:
 class DryRunRuntimeProvisioner(DeterministicFakeProvisioner):
     def __init__(self) -> None:
         super().__init__("runtime")
+
+    def plan(self, spec: Any) -> list[PlannedWrite]:
+        """What this provider really creates: one synthetic reference.
+
+        Without it the rehearsal fell back to describing a Fly app, volume and
+        Machine — none of which exist in this configuration, which is the
+        allowed default for `ABROLIA_RUNTIME_PROVIDER`. An operator was being
+        shown three resources that would never be created, under the name of a
+        provider that creates one.
+        """
+        household_id = (
+            spec.household_id
+            if hasattr(spec, "household_id")
+            else str((spec or {}).get("household_id", ""))
+        )
+        return [
+            PlannedWrite(
+                "runtime_reference",
+                f"synthetic-runtime:{household_id}",
+                "record a synthetic runtime reference; no Fly resources are created",
+            )
+        ]
 
     def ensure_secret_namespace(
         self, household_id: str, idempotency_key: str
