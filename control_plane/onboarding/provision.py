@@ -161,6 +161,24 @@ STEP_WRITES_BY_KIND: dict[str, tuple[TableWrite, ...]] = {
 #: Measured, like the runtime sets, by
 #: `test_the_declared_content_restriction_writes_match_a_real_run` — which also
 #: proves no provider was reached.
+#: What the block DOES, in the same two shapes, so the sentence beside a job
+#: cannot describe a rollback that shape never performs. The shared wording said
+#: the revision and the bootstrap tokens are revoked — true of a runtime job and
+#: false of an email one, which goes through `_mark_step_problem` and revokes
+#: nothing.
+CONTENT_RESTRICTION_BLOCK_ACTION: dict[str, str] = {
+    "runtime": (
+        "fails on the special-category content restriction receipt before any"
+        " provider call: the runtime revision and the unused bootstrap tokens"
+        " are revoked and the workflow returns to email"
+    ),
+    "step": (
+        "fails on the special-category content restriction receipt before any"
+        " provider call: the job, the email identity and the onboarding step"
+        " are marked, and no revision or token is revoked"
+    ),
+}
+
 CONTENT_RESTRICTION_BLOCK_WRITES: dict[str, tuple[TableWrite, ...]] = {
     "runtime": (
         TableWrite("bootstrap_tokens", "update"),
@@ -564,13 +582,6 @@ def plan_onboarding(
     # derived claim about the household's state is what the report stopped
     # making.
     models_an_operation = True
-    # A state can rehearse no provider operation and STILL know exactly what
-    # the worker will write, because the block that runs instead is
-    # deterministic. The two used to be one flag, so the only way to say "no
-    # operation" was to say "no writes" — and the content-restriction block,
-    # whose whole point is that it happens before any provider and always does
-    # the same thing, had to be reported as an unknown.
-    declared_writes: list[TableWrite] | None = None
     plan: ProvisionPlan | None = None
     rehearsed_revision_ids: set[str] = set()
 
@@ -971,20 +982,33 @@ def plan_onboarding(
                 # and expect the rollback below.
                 models_an_operation = False
                 blocked = _describe_jobs([job for _kind, job in gated])
-                shape = "runtime" if gated[0][0] == "runtime" else "step"
-                declared_writes = list(CONTENT_RESTRICTION_BLOCK_WRITES[shape])
+                # ON EACH JOB, not chosen for the top level. Picking one meant
+                # deciding which of them the worker reaches first — `lease`
+                # takes the oldest, so a namespace job queued before a gated
+                # email job runs first and calls its provider normally, while
+                # this reported the email block as the next thing to happen.
+                # That is the prediction the narrowing removed; it came back in
+                # aggregate form. What each gated job does is a fact, and it
+                # can sit beside that job without anything being ranked.
+                for kind, job in gated:
+                    shape = "runtime" if kind == "runtime" else "step"
+                    job["table_writes"] = [
+                        {"table": write.table, "operation": write.operation}
+                        for write in CONTENT_RESTRICTION_BLOCK_WRITES[shape]
+                    ]
+                    job["blocked_by"] = CONTENT_RESTRICTION_BLOCK_ACTION[shape]
                 plan.rehearsal = (
                     "the special-category content restriction receipt is not"
                     f" current, and it gates {blocked}. The worker checks it"
-                    " before resolving any provider, so no provider call is"
-                    " rehearsed; table_writes is what the block itself writes."
+                    " before resolving any provider, so nothing is rehearsed;"
+                    " each gated entry states what its own block writes and"
+                    " does."
                 )
                 plan.blocked_by = (
                     "the household does not currently hold the special-category"
                     " content restriction. Accept it again before provisioning:"
                     f" until then the queued work ({blocked}) fails on that"
-                    " check and the runtime revision and bootstrap tokens are"
-                    " revoked."
+                    " check."
                 )
             elif provider_mismatch:
                 # Pending, and NOT executable. The job is still `pending`, the
@@ -1230,10 +1254,11 @@ def plan_onboarding(
                 # `rehearsal` sentence and the fields beneath it cannot
                 # contradict each other again.
                 #
-                # `declared_writes` is the exception a state has to earn: a set
-                # that does not depend on a provider answer, because the code
-                # that will run never asks one. Empty otherwise.
-                plan.table_writes = declared_writes or []
+                # A state that rehearses nothing claims no top-level write set.
+                # Where a specific job's next act IS deterministic — the
+                # content-restriction block — that set is attached to the job,
+                # which needs no ranking and makes no claim about order.
+                plan.table_writes = []
             raise _DryRunRollback
     except _DryRunRollback:
         pass

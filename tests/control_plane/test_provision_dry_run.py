@@ -1879,13 +1879,19 @@ def test_a_stale_restriction_receipt_blocks_the_runtime_report(container) -> Non
 
     assert plan.blocked_by is not None
     assert "content restriction" in plan.blocked_by
-    # The block's OWN writes, not an empty set. The worker never reaches a
-    # provider here, so what happens next is fully determined — and an operator
+    # The block's OWN writes, on the JOB. The worker never reaches a provider
+    # here, so what happens to that job is fully determined — and an operator
     # told "no write set" would not know the revision and the bootstrap tokens
-    # are about to be revoked.
-    assert plan.table_writes == list(
-        CONTENT_RESTRICTION_BLOCK_WRITES["runtime"]
-    )
+    # are about to be revoked. Top-level stays empty: which gated job the
+    # worker reaches first is not something this report decides.
+    assert plan.table_writes == []
+    assert plan.unresolved_runtime_jobs
+    gated = plan.unresolved_runtime_jobs[0]
+    assert gated["table_writes"] == [
+        {"table": write.table, "operation": write.operation}
+        for write in CONTENT_RESTRICTION_BLOCK_WRITES["runtime"]
+    ]
+    assert "bootstrap tokens" in gated["blocked_by"]
     assert plan.runtime_resources == []
     assert plan.secrets == []
 
@@ -2117,7 +2123,18 @@ def test_an_email_sibling_is_gated_by_the_same_receipt(container) -> None:
     plan = plan_onboarding(container, household_id)
 
     assert "content restriction" in (plan.blocked_by or ""), plan.blocked_by
-    assert plan.table_writes == list(CONTENT_RESTRICTION_BLOCK_WRITES["step"])
+    assert plan.table_writes == []
+    gated = [job for job in plan.pending_step_jobs if job.get("blocked_by")]
+    assert len(gated) == 1, plan.pending_step_jobs
+    assert gated[0]["table_writes"] == [
+        {"table": write.table, "operation": write.operation}
+        for write in CONTENT_RESTRICTION_BLOCK_WRITES["step"]
+    ]
+    # `_mark_step_problem` revokes NOTHING. The shared sentence claimed the
+    # revision and the bootstrap tokens were revoked, which is the runtime
+    # branch — a false credential-lifecycle diagnosis for an email job.
+    assert "no revision or token is revoked" in gated[0]["blocked_by"]
+    assert "bootstrap tokens" not in (plan.blocked_by or "")
     assert plan.runtime_resources == []
     assert plan.secrets == []
 
@@ -2174,4 +2191,131 @@ def test_the_receipt_gate_outranks_a_provider_mismatch(container) -> None:
 
     assert "content restriction" in (plan.blocked_by or ""), plan.blocked_by
     assert "provider mismatch" not in (plan.blocked_by or "")
-    assert plan.table_writes == list(CONTENT_RESTRICTION_BLOCK_WRITES["runtime"])
+    assert plan.table_writes == []
+    assert plan.unresolved_runtime_jobs[0]["table_writes"] == [
+        {"table": write.table, "operation": write.operation}
+        for write in CONTENT_RESTRICTION_BLOCK_WRITES["runtime"]
+    ]
+
+
+@pytest.mark.parametrize("email_provider", ["nerve-managed", "nerve-byo-domain"])
+def test_an_older_ungated_job_is_not_displaced_by_a_gated_one(
+    container, email_provider
+) -> None:
+    """`lease` takes the OLDEST job, and this report does not rank them.
+
+    `save_profile` queues `ensure_secret_namespace` before the email job.
+    Revoke the receipt and both sit unsettled — but the namespace job is older,
+    is not gated, and runs normally with a real provider call. An aggregate
+    "some gated job exists" test then assigned the email block's write set as
+    the next deterministic action, which is the ordering prediction the
+    narrowing removed, returning in another form.
+    """
+    household_id = _household_with_profile(container)
+    workflow = container.database.query_one(
+        "SELECT id FROM onboarding_workflows WHERE household_id = ?", (household_id,)
+    )
+    _revoke_restriction(container, household_id)
+    with container.database.write() as connection:
+        connection.execute(
+            "UPDATE provisioning_jobs SET status = 'cancelled', settled_at = ?"
+            " WHERE household_id = ? AND status IN"
+            " ('pending','running','waiting_user','outcome_unknown')",
+            (BASE_TIME, household_id),
+        )
+        namespace_id, _created = container.jobs.create(
+            connection,
+            household_id=household_id,
+            workflow_id=workflow["id"],
+            kind="runtime",
+            operation="ensure_secret_namespace",
+            intent_key=f"{household_id}:ensure_secret_namespace:first",
+            request={},
+            provider=container.config.runtime_provider,
+            now=BASE_TIME,
+        )
+        email_id, _also = container.jobs.create(
+            connection,
+            household_id=household_id,
+            workflow_id=workflow["id"],
+            kind="email_identity",
+            operation="provision_email_identity",
+            intent_key=f"{household_id}:provision_email_identity:{email_provider}",
+            request={},
+            provider=email_provider,
+            now=BASE_TIME + 1,
+        )
+
+    plan = plan_onboarding(container, household_id)
+
+    by_id = {job["job_id"]: job for job in plan.pending_step_jobs}
+    assert {namespace_id, email_id} <= set(by_id), by_id
+    # The gated one carries the block. The older, ungated one does not, and
+    # nothing at the top level claims either is next.
+    assert by_id[email_id]["blocked_by"], by_id[email_id]
+    assert not by_id[namespace_id].get("blocked_by"), by_id[namespace_id]
+    assert plan.table_writes == []
+
+
+def test_the_declared_step_block_writes_match_a_real_run(container) -> None:
+    """Measured for the email shape too, and no provider is reached.
+
+    The runtime set was traced and the step set was written down beside it. A
+    declared set nobody measured is the drift this file exists to prevent.
+    """
+    household_id = _household_with_profile(container)
+    workflow = container.database.query_one(
+        "SELECT id FROM onboarding_workflows WHERE household_id = ?", (household_id,)
+    )
+    # Run the real steps first, so there IS an identity row and a step row for
+    # the block to mark. Without them `_mark_step_problem` skips both branches
+    # and the trace measures a third of the real write set — declaring a set
+    # the code does not produce.
+    _verify_all_steps(container, household_id)
+    identity = container.database.query_one(
+        "SELECT id FROM email_identities WHERE household_id = ?", (household_id,)
+    )
+    assert identity is not None, "the fixture produced no email identity"
+    _revoke_restriction(container, household_id)
+    with container.database.write() as connection:
+        connection.execute(
+            "UPDATE provisioning_jobs SET status = 'cancelled', settled_at = ?"
+            " WHERE household_id = ? AND status IN"
+            " ('pending','running','waiting_user','outcome_unknown')",
+            (BASE_TIME, household_id),
+        )
+        container.jobs.create(
+            connection,
+            household_id=household_id,
+            workflow_id=workflow["id"],
+            kind="email_identity",
+            operation="provision_email_identity",
+            intent_key=f"{household_id}:provision_email_identity:measured",
+            request={
+                # The STEP KIND as the enum spells it. "email" is not one of
+                # them, and `_mark_step_problem` skips the step update for an
+                # unrecognised kind — so the trace measured a smaller set than
+                # the code writes and the declaration would have been wrong in
+                # the safe-looking direction.
+                "step_kind": StepKind.EMAIL.value,
+                "email_identity_id": identity["id"],
+            },
+            provider="nerve-managed",
+            now=BASE_TIME,
+        )
+        connection.execute(
+            "UPDATE onboarding_steps SET status = 'provisioning'"
+            " WHERE workflow_id = ? AND kind = ?",
+            (workflow["id"], StepKind.EMAIL.value),
+        )
+    asked: list[str] = []
+    real_get = container.providers.get
+    container.providers.get = lambda name: (asked.append(name), real_get(name))[1]
+
+    observed: set[TableWrite] = set()
+    with _tracing_writes(observed):
+        result = container.worker.run_once()
+
+    assert result.error_code == "content_restriction_receipt_required"
+    assert asked == [], f"a provider was resolved before the gate: {asked}"
+    assert observed == set(CONTENT_RESTRICTION_BLOCK_WRITES["step"])
