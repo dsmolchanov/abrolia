@@ -1265,39 +1265,34 @@ class ProvisioningWorker:
             inspected.error_code or "provider_absent",
         )
 
-    def _shutdown_inspect(
-        self, job: JobRecord, request: dict[str, Any], provider: Any
+    def _shutdown_probe(
+        self, job: JobRecord, request: dict[str, Any]
     ) -> WorkResult:
-        """Look, and tear down what is there. Never build.
+        """Tear down what is RECORDED, and never ask the provider.
 
-        The whole purpose of quarantining an ambiguous job is that the provider
-        MAY have created something nobody recorded. Finding out is the job; the
-        only thing forbidden is making more.
+        The previous version called `provider.inspect`, on the belief that it is
+        read-only. It is not. `NerveManagedEmailProvisioner.inspect` routes to
+        `_recover_and_probe`, which deletes and reissues the API key and rotates
+        the webhook; `GoogleOAuthEmailProvisioner.inspect_intent` calls `ensure`
+        outright. There is no reliably read-only inspector to reach for, so a
+        shutdown must not reach for one — mutating a withdrawn household's
+        provider state to find out what it has is the failure, not the remedy.
+
+        What can be done safely is done. Anything recorded in
+        `external_resources` was already scheduled for teardown by
+        `disconnect_for_withdrawal`, and a reference this job carries in its own
+        request gets one here. What remains is state the provider may hold and
+        nobody wrote down, which is genuinely undiscoverable without a call this
+        must not make — so the job stays quarantined and the error code says an
+        operator's explicit reconcile is what settles it.
         """
-        inspect = getattr(provider, "inspect", None)
-        if not callable(inspect):
-            # Nothing safe to call. Leave it for a human rather than guess.
-            return self._shutdown_refusal(job, request)
-        try:
-            inspected = inspect(request.get("stable_ref", job.intent_key))
-        except Exception:
-            return self._shutdown_refusal(job, request)
-        # An `ABSENT` answer is NOT settled here. One provider's reading at one
-        # moment does not discharge a quarantine — the established contract is
-        # that only an explicit operator reconcile settles one, and an existing
-        # test pins it. What this adds is the half that was missing: when the
-        # inspection DOES find something, it gets torn down.
-        external_ref = (
-            inspected.result.external_ref if inspected.result is not None else None
-        )
+        external_ref = request.get("external_ref")
         if isinstance(external_ref, str) and external_ref:
             cleanup = self._schedule_cancelled_waiting_cleanup(
                 job, request, external_ref
             )
             if cleanup is not None:
                 return cleanup
-        # Present but unattributable, or an inconclusive inspection: keep it
-        # quarantined and reconcilable rather than claiming either outcome.
         return self._shutdown_refusal(job, request)
 
     def _shutdown_refusal(self, job: JobRecord, request: dict[str, Any]) -> WorkResult:
@@ -1765,7 +1760,7 @@ class ProvisioningWorker:
                 #
                 # `inspect` is read-only on every email provider, so a shutdown
                 # asks it and acts on the answer.
-                return self._shutdown_inspect(job, request, provider)
+                return self._shutdown_probe(job, request)
             try:
                 result = reconcile_email(
                     provider_request,

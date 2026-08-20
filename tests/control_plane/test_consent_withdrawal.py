@@ -34,7 +34,6 @@ from control_plane.provisioning.contracts import (
     InspectState,
     ProviderRegistry,
     ProviderWaiting,
-    ProvisionResult,
 )
 from control_plane.provisioning.fakes import DeterministicFakeProvisioner
 from control_plane.provisioning.planner import DesiredSpecPlanner
@@ -1239,16 +1238,22 @@ def test_reconciling_a_quarantined_job_never_creates_a_new_resource(cp_stack) ->
     assert reconciled.error_code == "withdrawal_requires_reconciliation"
 
 
-def test_reconciling_a_quarantined_email_job_creates_nothing(cp_stack) -> None:
-    """The email branch calls `reconcile`, which for Nerve IS `ensure`.
+def test_reconciling_a_quarantined_email_job_touches_no_provider(cp_stack) -> None:
+    """A shutdown must not mutate the provider to find out what it holds.
 
-    `NerveManagedEmailProvisioner.reconcile` and its BYO-domain sibling delegate
-    straight to `ensure`, so it resumes the provisioning graph — an org, a
-    domain, an inbox, a key, a webhook. Skipping the consent precondition is
-    what lets a quarantined job be examined at all; calling `reconcile` under
-    that exemption would build new upstream state for a household that withdrew.
-    The runtime branch got this guard first and the email branch, which is the
-    one that actually creates inboxes, did not.
+    The email branch calls `reconcile`, which for Nerve delegates to `ensure`
+    and resumes the provisioning graph. The obvious remedy — inspect instead —
+    is not available: `NerveManagedEmailProvisioner.inspect` routes to
+    `_recover_and_probe`, which deletes and reissues the API key and rotates the
+    webhook, and `GoogleOAuthEmailProvisioner.inspect_intent` calls `ensure`
+    outright. There is no reliably read-only inspector, so a shutdown makes no
+    provider call at all.
+
+    That is not the same as abandoning the cleanup. Everything recorded in
+    `external_resources` was already scheduled for teardown by the withdrawal
+    itself; a reference the job carries in its own request gets one here; and
+    what is left is state nobody wrote down, which the quarantine keeps
+    explicitly reconcilable rather than silently dropping.
     """
     complete_onboarding(cp_stack)
     drain(cp_stack)
@@ -1267,48 +1272,38 @@ def test_reconciling_a_quarantined_email_job_creates_nothing(cp_stack) -> None:
         )
     withdraw_now(cp_stack, now=BASE_TIME)
 
-    created = "nerve-inbox-left-behind"
-
-    class CountingNerve(DeterministicFakeProvisioner):
-        reconciled = 0
-        inspected = 0
+    class RefusesToBeCalled(DeterministicFakeProvisioner):
+        touched: list[str] = []
 
         def reconcile(self, intent, idempotency_key=None):
-            type(self).reconciled += 1
+            type(self).touched.append("reconcile")
             return super().ensure(intent, idempotency_key)
 
         def inspect(self, stable_ref):
-            # Read-only, and it FINDS the inbox the timed-out call created —
-            # which is the situation the quarantine exists for.
-            type(self).inspected += 1
-            return InspectResult(
-                InspectState.READY,
-                result=ProvisionResult(
-                    external_ref=created, public_result={"address": "x@example.test"}
-                ),
-            )
+            # Named to match the real provider's shape: on managed Nerve this
+            # is the call that rotates a key and a webhook.
+            type(self).touched.append("inspect")
+            return InspectResult(InspectState.UNKNOWN)
 
-    provider = CountingNerve("email")
+        def ensure(self, intent, idempotency_key):
+            type(self).touched.append("ensure")
+            return super().ensure(intent, idempotency_key)
+
+    provider = RefusesToBeCalled("email")
     registry = ProviderRegistry()
     registry.register("nerve-managed", provider)
     result = cp_stack.make_worker(providers=registry, now=BASE_TIME + 50).reconcile(
         email_job
     )
 
-    assert type(provider).reconciled == 0, (
-        "a withdrawn household's email job resumed provisioning"
+    assert type(provider).touched == [], (
+        f"a withdrawn household's provider was called: {type(provider).touched}"
     )
-    # Refusing to CREATE and refusing to LOOK are not the same refusal. The
-    # first version of this guard returned before any inspection, so the inbox
-    # was never found and the job sat `outcome_unknown` forever — abandoning
-    # exactly what the quarantine exists to clean up.
-    assert type(provider).inspected > 0, "the quarantined job was never inspected"
-    torn_down = cp_stack.database.query(
+    # The teardown of what WAS recorded came from the withdrawal itself.
+    assert cp_stack.database.query(
         "SELECT id FROM provisioning_jobs WHERE household_id = ?"
         " AND operation = 'deprovision'",
         (cp_stack.household.id,),
-    )
-    assert torn_down, "the inbox the inspection found got no teardown"
-    # And the quarantine reason survives, so an operator still knows what
-    # settles it.
+    ), "the recorded inbox got no teardown"
+    # And the quarantine stays, naming what settles it.
     assert result.error_code == "withdrawal_requires_reconciliation"
