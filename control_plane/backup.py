@@ -170,13 +170,23 @@ def _reusable_pre_migrate_backup(
     candidates = sorted(
         database.path.parent.glob(
             f"{database.path.name}.pre-migrate-{revision}-*.bak"
-        )
+        ),
+        reverse=True,
     )
     if not candidates:
         return None
-    archive = candidates[-1]
-    archived = _authenticated_digest(archive, backup_key)
-    if archived is None:
+    # EVERY candidate, not just the lexicographically greatest one. That name is
+    # not authoritative: an archive left by a clock that later stepped back
+    # sorts highest forever, so a corrupt or old-key file in that position hid
+    # every valid archive beneath it. Each restart then wrote another lower-named
+    # backup that would likewise never be considered — the unbounded growth this
+    # reuse check exists to prevent, reintroduced by the way it picked.
+    authenticated = [
+        (archive, digest)
+        for archive in candidates
+        if (digest := _authenticated_digest(archive, backup_key)) is not None
+    ]
+    if not authenticated:
         return None
     scratch: Path | None = None
     try:
@@ -192,7 +202,13 @@ def _reusable_pre_migrate_backup(
     finally:
         if scratch is not None:
             scratch.unlink(missing_ok=True)
-    return archive if hmac.compare_digest(archived, current) else None
+    # The image is taken once and compared against each authenticated archive:
+    # materialising a database-sized file per candidate is exactly the disk
+    # pressure this runs under.
+    for archive, archived in authenticated:
+        if hmac.compare_digest(archived, current):
+            return archive
+    return None
 
 
 def _publish(temporary: Path, destination: Path) -> None:
@@ -376,11 +392,48 @@ def restore_backup(
             connection.close()
             for sidecar in _sidecars(temporary):
                 sidecar.unlink(missing_ok=True)
-        _publish(temporary, destination)
+        # The PAUSE FIRST, and durably, before the database it guards can be
+        # seen. `_publish` fsyncs the database and its directory; `pause_workers`
+        # only wrote and chmod'ed, so a power loss in between — or simply a
+        # failed marker write — left a published database with no
+        # `<db>.workers-paused` beside it. The retry then refuses, because the
+        # target exists; starting it instead makes `workers_paused` false and
+        # lets unreconciled jobs run against a freshly restored database, which
+        # is the one thing the marker exists to stop.
+        #
+        # Written against the TEMPORARY name and renamed with it, so the two
+        # become visible together: a marker for a database that is not there yet
+        # is harmless, and a database without its marker is not.
+        marker = Path(f"{temporary}.workers-paused")
+        try:
+            marker.write_text(
+                "restore requires explicit reconciliation\n", encoding="utf-8"
+            )
+            os.chmod(marker, 0o600)
+            with open(marker, "rb") as handle:
+                os.fsync(handle.fileno())
+            _publish(marker, _pause_marker(destination))
+        except OSError as error:
+            marker.unlink(missing_ok=True)
+            _pause_marker(destination).unlink(missing_ok=True)
+            raise BackupError(
+                f"restore could not durably pause workers: {error}"
+            ) from error
+
+        try:
+            _publish(temporary, destination)
+        except BaseException:
+            # The database never became visible, so its marker must not stay
+            # behind claiming to guard something that is not there.
+            _pause_marker(destination).unlink(missing_ok=True)
+            raise
         temporary = None
         restored = ControlPlaneDatabase(destination)
         if apply_migrations:
             restored.migrate()
+        # Idempotent, and kept so the marker's content and mode stay owned by
+        # one place. The durability above is what makes it survive; this is what
+        # makes it say the same thing every other caller writes.
         restored.pause_workers()
         return restored
     finally:

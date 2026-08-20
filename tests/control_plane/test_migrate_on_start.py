@@ -663,12 +663,20 @@ def test_a_directory_that_will_not_sync_stops_the_migration(
 
 
 def test_the_rollback_restore_is_published_durably_too(tmp_path, monkeypatch) -> None:
-    """The sibling publication site, which the review did not name.
+    """The sibling publication site, and the marker that has to precede it.
 
-    `restore_backup` renames the operator's rollback into place with the same
-    gap, and it is the worse of the two: a restore lost to an unsynced directory
-    entry is discovered with the service already stopped and the superseded
-    database already moved aside.
+    `restore_backup` renames the operator's rollback into place, and it is the
+    worse of the two publications: a restore lost to an unsynced directory entry
+    is discovered with the service already stopped and the superseded database
+    already moved aside.
+
+    The worker pause has to land FIRST and durably. `pause_workers` only wrote
+    and chmod'ed, so a power loss between publishing the database and writing
+    the marker — or simply a failed write — left a published database with no
+    `<db>.workers-paused`. The retry then refuses because the target exists, and
+    starting it instead makes `workers_paused` false and lets unreconciled jobs
+    run against a freshly restored database. A database that is visible before
+    its pause is a database that can be started without one.
     """
     database = _database(tmp_path)
     database.migrate()
@@ -677,15 +685,86 @@ def test_the_rollback_restore_is_published_durably_too(tmp_path, monkeypatch) ->
     database.close()
 
     target = tmp_path / "restored" / "control-plane.db"
-    trace = _durability_trace(monkeypatch, lambda published: published == target)
+    marker = _pause_marker_path(target)
+    trace: list[str] = []
+    real_fsync, real_replace = os.fsync, os.replace
+
+    def fsync(fd):
+        trace.append("fsync:dir" if stat.S_ISDIR(os.fstat(fd).st_mode) else "fsync:file")
+        return real_fsync(fd)
+
+    def replace(source, destination, **kwargs):
+        landed = Path(destination)
+        if landed == target:
+            trace.append("publish:database")
+        elif landed == marker:
+            trace.append("publish:marker")
+        return real_replace(source, destination, **kwargs)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    monkeypatch.setattr(os, "replace", replace)
     restored = restore_backup(
         archive, target, backup_key=BACKUP_KEY_BYTES, apply_migrations=False
     )
     restored.close()
 
-    assert "rename" in trace, trace
-    landed = trace[: trace.index("rename") + 2]
-    assert landed[-3:] == ["fsync:file", "rename", "fsync:dir"], trace
+    assert "publish:marker" in trace and "publish:database" in trace, trace
+    assert trace.index("publish:marker") < trace.index("publish:database"), (
+        "the database became visible before its worker pause"
+    )
+    # Each publication is followed by a DIRECTORY fsync, so the name that finds
+    # the bytes is durable and not merely the bytes. The file syncs come earlier
+    # — the payload is fsynced as it is written, before either rename — so this
+    # asserts the ordering that the rename depends on rather than adjacency.
+    for event in ("publish:marker", "publish:database"):
+        at = trace.index(event)
+        assert trace[at + 1] == "fsync:dir", (event, trace)
+        assert "fsync:file" in trace[:at], (event, trace)
+    assert marker.exists()
+
+
+def test_a_restore_that_cannot_pause_publishes_nothing(tmp_path, monkeypatch) -> None:
+    """Fail closed: no database rather than an unpausable one.
+
+    A marker write or fsync that fails used to leave the restore published and
+    running-capable. There is no safe way to hand an operator a restored
+    database that cannot be held paused, so the whole restore is refused and the
+    target stays absent — which is also what makes the obvious retry work.
+    """
+    database = _database(tmp_path)
+    database.migrate()
+    archive = tmp_path / "control-plane.cpb"
+    create_backup(database, archive, backup_key=BACKUP_KEY_BYTES)
+    database.close()
+
+    destination = tmp_path / "restored"
+    destination.mkdir()
+    target = destination / "control-plane.db"
+    real_fsync = os.fsync
+
+    def refuse_the_marker(fd):
+        name = getattr(fd, "name", "")
+        del name
+        return real_fsync(fd)
+
+    original_write_text = Path.write_text
+
+    def write_text(self, *args, **kwargs):
+        if self.name.endswith(".workers-paused"):
+            raise OSError(errno.EIO, "marker write failed")
+        return original_write_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(os, "fsync", refuse_the_marker)
+    monkeypatch.setattr(Path, "write_text", write_text)
+
+    with pytest.raises(BackupError, match="durably pause workers"):
+        restore_backup(
+            archive, target, backup_key=BACKUP_KEY_BYTES, apply_migrations=False
+        )
+
+    assert not target.exists(), "an unpausable restore was published anyway"
+    assert not _pause_marker_path(target).exists()
+    assert sorted(path.name for path in destination.iterdir()) == []
 
 
 def _constrain(monkeypatch, volume: Path, capacity: int) -> None:
@@ -1401,3 +1480,50 @@ def test_a_tight_volume_still_installs_a_paused_database(tmp_path, monkeypatch) 
 
 def _pause_marker_path(database: Path) -> Path:
     return database.with_name(f"{database.name}.workers-paused")
+
+
+def test_a_corrupt_future_dated_snapshot_does_not_hide_the_valid_ones(tmp_path) -> None:
+    """The reuse check must consider EVERY candidate, not the highest-named one.
+
+    The name is not authoritative. An archive left by a clock that later stepped
+    back sorts above everything forever, so one corrupt or old-key file in that
+    position hid every valid archive beneath it: each restart failed the reuse
+    check, wrote another lower-named backup that would likewise never be
+    considered, and filled `/data` — the unbounded growth this check exists to
+    prevent, caused by the way it picked.
+    """
+    directory = tmp_path / "migrations"
+    directory.mkdir()
+    (directory / "9999_broken.sql").write_text(
+        "CREATE TABLE half_applied (id TEXT PRIMARY KEY);\nTHIS IS NOT SQL;\n",
+        encoding="utf-8",
+    )
+
+    seed = _database(tmp_path)
+    seed.migrate()
+    revision = seed.applied_revision()
+    seed.close()
+
+    # Future-dated, so it sorts above every archive the boots below will write,
+    # and unopenable, so it can never satisfy the check itself.
+    poison = tmp_path / f"control-plane.db.pre-migrate-{revision}-9999999999.bak"
+    poison.write_bytes(b"not an archive")
+
+    for boot in range(4):
+        database = _database(tmp_path)
+        database.migrate()
+        archive = create_pre_migrate_backup(
+            database, backup_key=BACKUP_KEY_BYTES, directory=directory
+        )
+        assert archive is not None, f"boot {boot} took no snapshot"
+        assert archive != poison
+        with pytest.raises(sqlite3.DatabaseError):
+            database.migrate(directory)
+        database.close()
+
+    written = sorted(path.name for path in tmp_path.glob("*.bak"))
+    assert len(written) == 2, f"one snapshot per boot accumulated: {written}"
+    assert poison.name in written, "the unreadable archive was deleted to shape the report"
+    # And the archive that IS reused is the valid one, readable with the key.
+    valid = next(path for path in tmp_path.glob("*.bak") if path != poison)
+    assert backup_module._authenticated_digest(valid, BACKUP_KEY_BYTES) is not None
