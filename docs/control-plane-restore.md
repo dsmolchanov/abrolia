@@ -148,14 +148,27 @@ command you run to move a file could destroy the only copy of every write taken
 after the migration. If it refuses for space, do this yourself, in this order,
 and only then run it again:
 
+**Stop the service before step 1 and leave it stopped through step 3.** `backup`
+and `install-rollback` both take the writer lock and refuse while another
+process holds it, so those two are guarded. The `rm` between them is not — it
+is a shell command, and nothing stops it unlinking files a running `serve` still
+has open, splitting acknowledged writes across an inode nothing will read again.
+The two guarded commands bracket it, so a `backup` that succeeded means no
+writer held the lock a moment earlier; that is not the same as a guarantee.
+
 ```bash
 # 1. Archive the superseded database OFF the volume, and verify it opens.
+#    `backup` does not migrate — the reason you are here is often a migration
+#    that fails, and a command that repeats it would exit before writing.
 abrolia-control-plane backup /tmp/control-plane-superseded.cpb
 abrolia-control-plane restore /tmp/control-plane-superseded.cpb \
   --target /tmp/verify.db --no-migrate && rm -f /tmp/verify.db /tmp/verify.db*
 
-# 2. Only now release the blocks.
-rm -f /data/control-plane.db /data/control-plane.db-wal /data/control-plane.db-shm
+# 2. Only now release the blocks. ALL FOUR: the pause marker is part of the
+#    bundle, and a survivor makes step 3 refuse with "target was not freed"
+#    after the destructive step has already run.
+rm -f /data/control-plane.db /data/control-plane.db-wal \
+      /data/control-plane.db-shm /data/control-plane.db.workers-paused
 
 # 3. Install, telling the command the target is gone on purpose.
 abrolia-control-plane install-rollback \

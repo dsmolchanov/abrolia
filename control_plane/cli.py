@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import threading
 import time
@@ -16,6 +17,7 @@ from control_plane.auth.mailer import ConsoleMailer, Mailer
 from control_plane.backup import create_backup, install_rollback, restore_backup
 from control_plane.config import ControlPlaneConfig, backup_key_from_env
 from control_plane.container import ControlPlaneContainer
+from control_plane.db import ControlPlaneDatabase, ProcessAlreadyRunning
 from control_plane.observability import StructuredLogger
 
 
@@ -186,6 +188,35 @@ def main(argv: Sequence[str] | None = None) -> int:
             "migrated": not args.no_migrate,
         }, sort_keys=True))
         return 0
+    if args.command == "backup":
+        # NOT through `_container()`. That builds the whole application and
+        # `ControlPlaneContainer.build` migrates — so on the principal call path
+        # for this command, a persistently failing pending migration, it would
+        # repeat that migration and exit before writing anything. The one
+        # command an operator reaches for when a deployment is broken must not
+        # require the deployment to work.
+        #
+        # The writer lock is still taken, and the same way, because archiving a
+        # database another process is writing produces an archive of a moment
+        # that never existed.
+        database = ControlPlaneDatabase(
+            os.environ.get("ABROLIA_CONTROL_PLANE_DB", "data/control-plane.db")
+        )
+        try:
+            database.acquire_process_lock()
+        except ProcessAlreadyRunning as error:
+            raise SystemExit(
+                f"backup refused: {error}. Stop the service first."
+            ) from error
+        try:
+            result = create_backup(
+                database, args.target, backup_key=backup_key_from_env()
+            )
+        finally:
+            database.release_process_lock()
+            database.close()
+        print(json.dumps({"status": "created", "path": str(result)}))
+        return 0
     if args.command == "install-rollback":
         # No container: this command runs with the service stopped, and building
         # one would open the target and create WAL sidecars on the very volume
@@ -256,12 +287,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "invite":
             result = active.magic_links.issue(args.email)
             print(json.dumps({"status": "issued", "expires_at": result.expires_at}))
-            return 0
-        if args.command == "backup":
-            result = create_backup(
-                active.database, args.target, backup_key=active.config.backup_key
-            )
-            print(json.dumps({"status": "created", "path": str(result)}))
             return 0
         if args.command == "resume-jobs":
             active.database.resume_workers()

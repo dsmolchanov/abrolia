@@ -1547,6 +1547,26 @@ def test_the_volume_probe_cannot_collide_with_a_concurrent_one(tmp_path) -> None
     assert list(destination.iterdir()) == []
 
 
+def _documented_reclamation_paths(volume: Path) -> list[Path]:
+    """The files `docs/control-plane-restore.md` tells the operator to remove.
+
+    Parsed from the page rather than restated here, so the test cannot drift
+    away from the procedure it is meant to prove.
+    """
+    doc = (
+        Path(__file__).resolve().parents[2] / "docs/control-plane-restore.md"
+    ).read_text(encoding="utf-8")
+    block = doc[doc.index("# 2. Only now release the blocks") :]
+    block = block[: block.index("# 3.")]
+    named = [
+        token
+        for token in block.replace("\\", " ").split()
+        if token.startswith("/data/")
+    ]
+    assert named, "the runbook no longer documents a reclamation step"
+    return [volume / Path(name).name for name in named]
+
+
 def test_the_documented_low_space_recovery_runs_end_to_end(tmp_path, monkeypatch) -> None:
     """The runbook's manual reclamation, executed exactly as written.
 
@@ -1562,6 +1582,13 @@ def test_the_documented_low_space_recovery_runs_end_to_end(tmp_path, monkeypatch
     volume, target, restored = _rollback_fixture(tmp_path)
     off_volume = tmp_path / "off-volume"
     off_volume.mkdir()
+    # The superseded database is PAUSED, which is the realistic state and the
+    # one that exposes an incomplete reclamation list: a database that was
+    # itself restored carries its marker until `resume-jobs`, so rolling back a
+    # rollback — or rolling back twice — starts here. Without this the marker
+    # does not exist, omitting it from the runbook changes nothing, and the test
+    # passes over the discrepancy it exists to catch.
+    _pause_marker_path(target).write_text("paused\n", encoding="utf-8")
     _constrain(monkeypatch, volume, capacity=target.stat().st_size * 3 // 2)
 
     # Refused first, with the volume untouched — which is what sends an operator
@@ -1587,8 +1614,13 @@ def test_the_documented_low_space_recovery_runs_end_to_end(tmp_path, monkeypatch
     verify.close()
     assert "migrated_only" in _tables(off_volume / "verify.db")
 
-    # Step 2: only now release the blocks.
-    for path in _bundle_paths(target):
+    # Step 2: only now release the blocks — running the paths the RUNBOOK
+    # lists, not the bundle the code knows about. The previous version of this
+    # test unlinked `_bundle(target)` and so tested the implementation against
+    # itself: the page listed three files and the code required four, and the
+    # documented procedure failed at step 3 with the destructive step already
+    # done. A test of a documented procedure has to execute the document.
+    for path in _documented_reclamation_paths(volume):
         path.unlink(missing_ok=True)
 
     # Step 3: install, saying the target is gone on purpose.
@@ -1729,3 +1761,52 @@ def test_a_restore_target_created_after_the_check_is_not_clobbered(
         )
 
     assert target.read_bytes() == b"someone else got here first"
+
+
+def test_backup_does_not_migrate_the_database_it_archives(tmp_path, monkeypatch) -> None:
+    """The command you reach for when a deployment is broken must not need it.
+
+    `backup` ran through `_container()`, and `ControlPlaneContainer.build`
+    migrates. So on the principal call path — a persistently failing pending
+    migration, which is exactly when a superseded database must be archived
+    before its blocks are released — it repeated that migration and exited
+    before writing anything. The operator could not free space safely, and the
+    documented low-space recovery was unreachable.
+    """
+    monkeypatch.setenv("ABROLIA_CONTROL_PLANE_DB", str(tmp_path / "control-plane.db"))
+    monkeypatch.setenv("ABROLIA_CONTROL_PLANE_BACKUP_KEY", BACKUP_KEY)
+    seed = _database(tmp_path)
+    seed.migrate()
+    seed.close()
+    monkeypatch.setattr(
+        ControlPlaneDatabase,
+        "migrate",
+        lambda *a, **k: pytest.fail("backup migrated the database it was archiving"),
+    )
+
+    archive = tmp_path / "superseded.cpb"
+    assert cli_main(["backup", str(archive)]) == 0
+    assert archive.exists()
+    assert backup_module._authenticated_digest(archive, BACKUP_KEY_BYTES) is not None
+
+
+def test_backup_refuses_while_a_writer_holds_the_lock(tmp_path, monkeypatch) -> None:
+    """Archiving a database another process is writing captures a moment that
+    never existed. The manual reclamation brackets its `rm` with this command
+    and the install, so both ends must refuse rather than proceed."""
+    monkeypatch.setenv("ABROLIA_CONTROL_PLANE_DB", str(tmp_path / "control-plane.db"))
+    monkeypatch.setenv("ABROLIA_CONTROL_PLANE_BACKUP_KEY", BACKUP_KEY)
+    seed = _database(tmp_path)
+    seed.migrate()
+    seed.close()
+
+    writer = ControlPlaneDatabase(tmp_path / "control-plane.db")
+    writer.acquire_process_lock()
+    try:
+        with pytest.raises(SystemExit, match="backup refused"):
+            cli_main(["backup", str(tmp_path / "superseded.cpb")])
+    finally:
+        writer.release_process_lock()
+        writer.close()
+
+    assert not (tmp_path / "superseded.cpb").exists()
