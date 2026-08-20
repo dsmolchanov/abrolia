@@ -1552,6 +1552,16 @@ def test_an_older_unresolved_intent_blocks_the_newer_plan(container) -> None:
     assert plan.runtime_resources == []
     assert plan.secrets == []
     assert plan.table_writes == []
+    # And the NARRATIVE, which emptying the three inventories does not settle.
+    # This classifier cleared `models_an_operation` and was then left out of the
+    # exclusive-state guard, so the planning pass ran anyway and overwrote
+    # `rehearsal` with the newest job's ordinary success path. The report then
+    # said in one field that an earlier intent blocks everything and in another
+    # that the replacement job runs cleanly — which reads as "the quarantined
+    # predecessor is compatible with this", the exact conclusion the quarantine
+    # exists to stop an operator reaching.
+    assert "unresolved" in (plan.rehearsal or ""), plan.rehearsal
+    assert "SUCCESS PATH" not in (plan.rehearsal or ""), plan.rehearsal
 
 
 def test_a_reconciliation_asserts_no_resource_or_secret_lifecycle(container) -> None:

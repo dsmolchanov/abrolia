@@ -665,7 +665,8 @@ def plan_onboarding(
             # may already have created a runtime was reported alongside a clean
             # pending operation — and an operator provisioning on top of it
             # creates the conflict the quarantine exists to prevent.
-            if len(unresolved) > 1:
+            older_intent_unresolved = len(unresolved) > 1
+            if older_intent_unresolved:
                 older = ", ".join(
                     f"{job['job_id']} ({job['status']}"
                     + (f"/{job['error_code']}" if job["error_code"] else "")
@@ -673,6 +674,13 @@ def plan_onboarding(
                     for job in plan.unresolved_runtime_jobs[1:]
                 )
                 models_an_operation = False
+                plan.rehearsal = (
+                    f"an earlier runtime intent is unresolved ({older}), so"
+                    " nothing about the newest job is rehearsed. Reconciliation"
+                    " comes first: the outstanding intent may already have"
+                    " created a runtime, and what the newest job would do"
+                    " depends on what that one did."
+                )
                 plan.blocked_by = (
                     f"an earlier runtime intent is still unresolved: {older}."
                     " Reconcile it with `abrolia-control-plane reconcile"
@@ -886,6 +894,16 @@ def plan_onboarding(
                 or failed_runtime
                 or awaiting_activation
                 or already_onboarded
+                # Cleared `models_an_operation` above and was then left out of
+                # this list, so the planning pass ran anyway and overwrote the
+                # reconciliation narrative with the newest job's ordinary
+                # success path. The final gate still emptied the write set, so
+                # the report said in one field that an earlier intent blocks
+                # everything and in another that the replacement job runs
+                # cleanly — which reads as "the quarantined predecessor is
+                # compatible with this", the exact conclusion the quarantine
+                # exists to prevent an operator reaching.
+                or older_intent_unresolved
             ):
                 pass
             elif already_planned and not _holds_current_restriction(
