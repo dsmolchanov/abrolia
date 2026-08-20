@@ -674,6 +674,17 @@ def _restore_locked(
             connection.close()
             for sidecar in _sidecars(temporary):
                 sidecar.unlink(missing_ok=True)
+        # Sound is not the same as OURS. The checks above pass on any healthy
+        # SQLite file, so an archive taken of an unrelated database restored
+        # cleanly and — with migrations applied — had the control-plane schema
+        # built around a stranger's tables. Asked here, before the pause marker
+        # or the database has been published.
+        try:
+            require_control_plane_image(temporary)
+        except RollbackError as error:
+            raise BackupError(
+                f"the archive does not contain a control-plane database: {error}"
+            ) from error
         # The PAUSE FIRST, and durably, before the database it guards can be
         # seen. `_publish` fsyncs the database and its directory; `pause_workers`
         # only wrote and chmod'ed, so a power loss in between — or simply a
@@ -1195,6 +1206,10 @@ def _preflight(
             if _present(member) and not _regular_file(member):
                 raise RollbackError(f"{member} is not a regular file")
     _readable_sqlite(restored)
+    # `restore --no-migrate` hands its output straight to this command, so an
+    # archive of an unrelated database reaches the canonical path through a
+    # check that only ever asked whether the file opened.
+    require_control_plane_image(restored)
 
     aside = _reserve_aside(target, stamp)
     required = _occupied_bytes(restored, block_size=_block_size(target.parent))
@@ -1296,7 +1311,15 @@ def _is_a_copy(source: Path, destination: Path) -> bool:
                 path.unlink(missing_ok=True)
 
 
-def _reference_schema(migrations: tuple[str, ...]) -> dict[str, str]:
+def _table_names(objects: dict[str, str]) -> set[str]:
+    return {
+        name.split(":", 1)[1] for name in objects if name.startswith("table:")
+    }
+
+
+def _reference_schema(
+    migrations: tuple[str, ...],
+) -> tuple[dict[str, str], dict[str, set[str]]]:
     """The schema those migration scripts produce, by RUNNING them.
 
     Table names alone are not identity: a file with the exact ledger and
@@ -1316,9 +1339,21 @@ def _reference_schema(migrations: tuple[str, ...]) -> dict[str, str]:
             reference.executescript(
                 (MIGRATIONS_DIR / migration).read_text(encoding="utf-8")
             )
-        return _schema_objects(reference)
+        objects = _schema_objects(reference)
+        return objects, _table_columns(reference, _table_names(objects))
     finally:
         reference.close()
+
+
+def _table_columns(connection: sqlite3.Connection, tables: set[str]) -> dict[str, set[str]]:
+    """Each table's column names, for the comparison a NEWER database needs."""
+    return {
+        table: {
+            str(row[1])
+            for row in connection.execute(f"PRAGMA table_info({table})")
+        }
+        for table in tables
+    }
 
 
 def _schema_objects(connection: sqlite3.Connection) -> dict[str, str]:
@@ -1408,6 +1443,7 @@ def require_control_plane_database(path: Path) -> tuple[int, int]:
                 else []
             )
             declared = _schema_objects(connection)
+            declared_columns = _table_columns(connection, _table_names(declared))
     except RollbackError as error:
         raise BackupError(str(error)) from error
     if ledger is None:
@@ -1455,22 +1491,47 @@ def require_control_plane_database(path: Path) -> tuple[int, int]:
     # BEYOND it are ignored, so a database from a newer image than this one is
     # still recognised — the same asymmetry the ledger comparison makes, and for
     # the same reason.
-    reference = _reference_schema(tuple(applied[:shared]))
-    wrong = sorted(
-        (
+    reference, reference_columns = _reference_schema(tuple(applied[:shared]))
+    # A database whose ledger runs PAST this image is compared more loosely,
+    # and it has to be. `0009` adding a column to `accounts` changes that
+    # table's stored definition, so requiring byte-equality would reject the
+    # newer database outright — during a rollback FROM that release, which is
+    # the one situation this command exists for. The operator would be unable
+    # to archive post-migration writes before freeing the volume: the recovery
+    # procedure stopping at its own data-preservation gate.
+    #
+    # What still has to hold is that every object the recorded prefix declares
+    # is present, and that each of its tables still has at least the columns
+    # that prefix gave it. Migrations add; they have never removed. A hollow
+    # look-alike fails this exactly as it fails the strict comparison.
+    newer = [name for name in applied if name not in set(shipped)]
+    if newer:
+        wrong = sorted(
+            [name for name in reference if name not in declared]
+            + [
+                f"table:{table}"
+                for table, expected in reference_columns.items()
+                if not expected <= declared_columns.get(table, set())
+            ]
+        )
+        why = (
+            f"records migrations this image does not ship ({newer[0]}) and its"
+            " schema is missing what the ones it does ship declare"
+        )
+    else:
+        wrong = sorted(
             name
             for name, definition in reference.items()
             if declared.get(name) != definition
-        ),
+        )
+        why = "records migrations whose schema is not the one they declare"
+    if wrong:
         # TABLES first among however few are shown. Sorted plainly, `index:`
         # sorts before `table:` and an operator looking at a file whose every
         # table is wrong was told about five indexes.
-        key=lambda name: (not name.startswith("table:"), name),
-    )
-    if wrong:
+        wrong.sort(key=lambda name: (not name.startswith("table:"), name))
         raise BackupError(
-            f"{path} records migrations whose schema is not the one they"
-            f" declare ({', '.join(wrong[:5])}); its ledger describes a"
+            f"{path} {why} ({', '.join(wrong[:5])}); its ledger describes a"
             " database this file is not, so archiving it would authorise"
             " deleting the real one"
         )
@@ -1478,6 +1539,42 @@ def require_control_plane_database(path: Path) -> tuple[int, int]:
     if entry is None:
         raise BackupError(f"{path} vanished while it was being validated")
     return entry
+
+
+def require_control_plane_image(path: Path) -> None:
+    """The same identity question, asked of a candidate rather than a source.
+
+    `create_backup` will encrypt whatever `ControlPlaneDatabase` it is handed,
+    and a direct caller can hand it an unrelated file. Integrity and
+    foreign-key checks then pass on the way back out — an unrelated database
+    passes them easily — so `restore` could publish it, `restore --no-migrate`
+    could hand it to `install-rollback`, and the canonical path would end up
+    holding somebody else's schema, or nothing. Authentication proves the
+    archive was written by this key; it says nothing about what was in it.
+
+    A PRISTINE database is accepted, and has to be: `migrate --backup-first`
+    snapshots before the FIRST migration, so the archive that makes a fresh
+    boot recoverable contains an empty file with no ledger and no tables. That
+    is a control-plane database at revision zero. A file with no ledger and
+    tables in it is somebody else's.
+    """
+    with _read_only_sqlite(path) as connection:
+        objects = _schema_objects(connection)
+        ledger = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table'"
+            " AND name = 'schema_migrations'"
+        ).fetchone()
+    if ledger is None:
+        if objects:
+            raise RollbackError(
+                f"{path} has no migration ledger but is not empty either, so"
+                " it is not a control-plane database at any revision"
+            )
+        return
+    try:
+        require_control_plane_database(path)
+    except BackupError as error:
+        raise RollbackError(str(error)) from error
 
 
 def install_rollback(
@@ -1670,6 +1767,15 @@ def _undo(moved: list[_Move]) -> list[_Move]:
         source, destination = move.source, move.destination
         try:
             if not _present(destination):
+                if move.source_removed and not _present(source):
+                    # Published, its source removed, and then the destination
+                    # taken away by something else: BOTH names are empty and
+                    # that member is gone. Treating an absent destination as
+                    # "already reversed" meant `_undo` returned nothing
+                    # outstanding, so `IncompleteReversal` and its fail-safe
+                    # pause were skipped and the locks were released over a
+                    # bundle missing a file.
+                    unreversed.append(move)
                 continue
             if _inode(destination) != move.published_inode:
                 # Somebody else holds this name now. Removing it or moving it

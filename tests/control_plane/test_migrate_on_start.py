@@ -2546,18 +2546,35 @@ def test_a_database_stopped_at_a_failed_migration_is_still_this_database(
         backup_module.require_control_plane_database(tmp_path / "control-plane.db")
 
 
-def test_a_newer_database_than_this_image_is_still_this_database(tmp_path) -> None:
+@pytest.mark.parametrize(
+    "forward_migration",
+    [
+        "ALTER TABLE accounts ADD COLUMN added_by_0009 TEXT",
+        "CREATE INDEX accounts_added_by_0009 ON accounts (id)",
+        "CREATE TABLE entirely_new_in_0009 (id TEXT PRIMARY KEY)",
+    ],
+)
+def test_a_newer_database_than_this_image_is_still_this_database(
+    tmp_path, forward_migration
+) -> None:
     """An image rolled back sees migrations it does not ship.
 
     Refusing there denies the operator the backup command at the moment a bad
-    deploy is being undone. The shared prefix establishes identity; the tail
-    beyond it only says which side is newer.
+    deploy is being undone — and a forward migration that ALTERS a known object
+    changes that object's stored definition, so a byte-equal schema comparison
+    rejected exactly the database the rollback procedure has to archive before
+    freeing the volume. The recovery stopped at its own data-preservation gate.
+
+    The shared prefix establishes identity. Past it, the requirement is that
+    every object the prefix declares is still present and its tables still have
+    at least the columns it gave them: migrations add, they do not remove.
     """
     seed = _database(tmp_path)
     seed.migrate()
     seed.close()
     raw = sqlite3.connect(tmp_path / "control-plane.db")
     try:
+        raw.execute(forward_migration)
         raw.execute(
             "INSERT INTO schema_migrations VALUES"
             " ('9999_from_a_newer_image.sql', '2026-09-01T00:00:00Z')"
@@ -2567,6 +2584,31 @@ def test_a_newer_database_than_this_image_is_still_this_database(tmp_path) -> No
         raw.close()
 
     backup_module.require_control_plane_database(tmp_path / "control-plane.db")
+
+
+def test_a_newer_ledger_does_not_excuse_a_missing_schema(tmp_path) -> None:
+    """The looser comparison is looser, not absent.
+
+    A copied ledger with an unknown tail must not become a way past the schema
+    check — otherwise the impostor test is defeated by adding one row.
+    """
+    impostor = tmp_path / "control-plane.db"
+    shipped = backup_module._shipped_migrations()
+    raw = sqlite3.connect(impostor)
+    try:
+        raw.execute("CREATE TABLE schema_migrations (name TEXT, applied_at TEXT)")
+        for migration in (*shipped, "9999_from_a_newer_image.sql"):
+            raw.execute(
+                "INSERT INTO schema_migrations VALUES (?, '2026-01-01T00:00:00Z')",
+                (migration,),
+            )
+        raw.execute("CREATE TABLE accounts (x TEXT)")
+        raw.commit()
+    finally:
+        raw.close()
+
+    with pytest.raises(backup_module.BackupError, match="schema is missing"):
+        backup_module.require_control_plane_database(impostor)
 
 
 def test_validation_does_not_delete_a_dangling_sidecar_symlink(
@@ -2916,14 +2958,18 @@ def test_the_reference_schema_is_the_one_the_migrator_produces(tmp_path) -> None
     same source of truth the migrator uses.
     """
     shipped = backup_module._shipped_migrations()
-    reference = backup_module._reference_schema(shipped)
+    reference, reference_columns = backup_module._reference_schema(shipped)
 
     seed = _database(tmp_path)
     seed.migrate()
     actual = backup_module._schema_objects(seed.connection)
+    actual_columns = backup_module._table_columns(
+        seed.connection, backup_module._table_names(actual)
+    )
     seed.close()
 
     assert reference, "no schema was parsed out of the shipped migrations"
+    assert reference_columns == actual_columns
     assert reference == actual, (
         "the schema this check compares against is not the schema `migrate()`"
         " builds: "
@@ -2948,7 +2994,7 @@ def test_a_look_alike_schema_is_not_this_database(tmp_path, monkeypatch) -> None
     """
     impostor = tmp_path / "control-plane.db"
     shipped = backup_module._shipped_migrations()
-    expected = backup_module._reference_schema(shipped)
+    expected, _columns = backup_module._reference_schema(shipped)
     raw = sqlite3.connect(impostor)
     try:
         raw.execute("CREATE TABLE schema_migrations (name TEXT, applied_at TEXT)")
@@ -3396,3 +3442,171 @@ def test_an_unreversible_install_fails_with_the_bundle_paused(
         "the locks were released over a mixed bundle with no worker pause"
     )
     assert "by hand" in str(raised.value)
+
+
+def _stranger_archive(tmp_path: Path, name: str = "stranger.cpb") -> Path:
+    """An authenticated archive of a perfectly healthy, unrelated database."""
+    stranger = tmp_path / "stranger.db"
+    raw = sqlite3.connect(stranger)
+    try:
+        raw.execute("CREATE TABLE invoices (id TEXT PRIMARY KEY, total REAL)")
+        raw.execute("INSERT INTO invoices VALUES ('a', 1.0)")
+        raw.commit()
+    finally:
+        raw.close()
+    archive = tmp_path / name
+    handle = ControlPlaneDatabase(stranger)
+    try:
+        backup_module.create_backup(handle, archive, backup_key=BACKUP_KEY_BYTES)
+    finally:
+        handle.close()
+    for sidecar in _sidecars_of(stranger):
+        sidecar.unlink(missing_ok=True)
+    return archive
+
+
+@pytest.mark.parametrize("apply_migrations", [True, False])
+def test_restore_refuses_an_archive_of_an_unrelated_database(
+    tmp_path, apply_migrations
+) -> None:
+    """Authentication proves who wrote the archive, not what was in it.
+
+    `create_backup` encrypts whatever database it is handed. The integrity and
+    foreign-key checks on the way back out pass on any healthy SQLite file, so
+    a stranger's database restored cleanly — and with migrations applied, the
+    control-plane schema was built around their tables.
+    """
+    archive = _stranger_archive(tmp_path)
+    destination = tmp_path / "restored" / "control-plane.db"
+    destination.parent.mkdir()
+
+    with pytest.raises(
+        backup_module.BackupError, match="does not contain a control-plane database"
+    ):
+        backup_module.restore_backup(
+            archive,
+            destination,
+            backup_key=BACKUP_KEY_BYTES,
+            apply_migrations=apply_migrations,
+        )
+
+    assert not destination.exists(), "a stranger's database was published"
+    assert not backup_module._pause_marker(destination).exists()
+    # The writer lock is excluded, as in `_fingerprint`: taking it is the guard
+    # working, not the refusal leaving something behind.
+    left = [
+        path.name
+        for path in destination.parent.iterdir()
+        if not path.name.endswith(".writer.lock")
+    ]
+    assert left == [], left
+
+
+def test_install_rollback_refuses_a_candidate_that_is_not_ours(
+    tmp_path, monkeypatch
+) -> None:
+    """`restore --no-migrate` feeds this command directly.
+
+    Its own check only ever asked whether the file opened as sound SQLite, so a
+    candidate produced from an unrelated archive reached the canonical path and
+    replaced the control-plane database with somebody else's schema.
+    """
+    volume, target, restored = _rollback_fixture(tmp_path)
+    _constrain(monkeypatch, volume, capacity=target.stat().st_size * 10)
+    # A stranger's database standing in for the restored candidate, with the
+    # pause marker the preflight requires.
+    raw = sqlite3.connect(restored)
+    try:
+        raw.execute("DROP TABLE IF EXISTS accounts")
+        for row in raw.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall():
+            raw.execute(f"DROP TABLE IF EXISTS {row[0]}")
+        raw.execute("CREATE TABLE invoices (id TEXT PRIMARY KEY)")
+        raw.commit()
+    finally:
+        raw.close()
+    for sidecar in _sidecars_of(restored):
+        sidecar.unlink(missing_ok=True)
+    before = _fingerprint(volume)
+
+    with pytest.raises(RollbackError, match="not a control-plane database"):
+        install_rollback(restored, target, now=1800000042)
+
+    assert _fingerprint(volume) == before, "the live bundle was disturbed"
+
+
+def test_a_pristine_bootstrap_snapshot_is_still_restorable(tmp_path) -> None:
+    """`migrate --backup-first` snapshots BEFORE the first migration.
+
+    The archive that makes a fresh boot recoverable holds an empty file with no
+    ledger and no tables — a control-plane database at revision zero. An
+    identity check that demanded a ledger would refuse the one restore point a
+    first deployment has.
+    """
+    pristine = tmp_path / "pristine.db"
+    handle = ControlPlaneDatabase(pristine)
+    archive = tmp_path / "bootstrap.cpb"
+    try:
+        backup_module.create_backup(handle, archive, backup_key=BACKUP_KEY_BYTES)
+    finally:
+        handle.close()
+    destination = tmp_path / "restored" / "control-plane.db"
+    destination.parent.mkdir()
+
+    restored = backup_module.restore_backup(
+        archive, destination, backup_key=BACKUP_KEY_BYTES
+    )
+    try:
+        assert destination.exists()
+        assert restored.query_one(
+            "SELECT COUNT(*) AS n FROM schema_migrations"
+        )["n"] > 0, "the restore did not migrate the pristine database"
+    finally:
+        restored.close()
+
+
+def test_a_move_whose_destination_vanished_is_reported_as_unreversed(
+    tmp_path, monkeypatch
+) -> None:
+    """Both names empty is a LOST member, not a reversed one.
+
+    `_undo` skipped any move whose destination was gone, on the reasoning that
+    there was nothing to put back. For a move that never published that is
+    right; for a completed one it means the file exists under neither name. The
+    reversal then reported nothing outstanding, so `IncompleteReversal` and its
+    fail-safe pause were skipped and the writer locks were released over a
+    bundle missing a member.
+    """
+    volume, target, restored = _rollback_fixture(tmp_path)
+    _constrain(monkeypatch, volume, capacity=target.stat().st_size * 10)
+    backup_module._pause_marker(target).unlink(missing_ok=True)
+    real_claim = backup_module._claim
+    calls: list[Path] = []
+
+    def claim(source, destination, journal=None):
+        if ".volume-probe-" in Path(source).name:
+            return real_claim(source, destination, journal)
+        if calls:
+            # The second move fails, sending the install into reversal — by
+            # which time the first move's destination is gone.
+            raise OSError(errno.EIO, "the install failed mid-bundle")
+        real_claim(source, destination, journal)
+        calls.append(Path(destination))
+        # Something else removes the file this move had just published.
+        Path(destination).unlink()
+        return None
+
+    monkeypatch.setattr(backup_module, "_claim", claim)
+
+    with pytest.raises(backup_module.IncompleteReversal) as raised:
+        install_rollback(restored, target, now=1800000042)
+
+    monkeypatch.undo()
+    assert calls, "the fixture never completed a move to lose"
+    lost = calls[0]
+    assert any(move.destination == lost for move in raised.value.unreversed), (
+        f"the lost member was not reported: {raised.value.unreversed}"
+    )
+    assert raised.value.paused, "no fail-safe pause was written"
+    assert backup_module._pause_marker(target).exists()
