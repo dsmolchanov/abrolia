@@ -2342,8 +2342,14 @@ EMAIL_PROVIDERS = ["nerve-managed", "nerve-byo-domain", "google-oauth"]
 #: `provision_email_identity` and used the invention on both sides of the
 #: coverage comparison below, so the check agreed with itself and exercised
 #: neither real call path.
+#: Both runtime providers, for the same reason both non-fake email providers
+#: are here. The gate is checked BEFORE any provider is resolved, so a
+#: `fly-runtime` job is blocked without Fly ever being contacted — which makes
+#: it exercisable, and therefore something this check has no excuse to skip.
+RUNTIME_PROVIDERS = ["dry-run-runtime", "fly-runtime"]
+
 GATED_SHAPES = [
-    ("runtime", "ensure_runtime", "dry-run-runtime"),
+    *(("runtime", "ensure_runtime", provider) for provider in RUNTIME_PROVIDERS),
     *(
         ("email_identity", operation, provider)
         for operation in ("ensure", "inspect")
@@ -2519,7 +2525,7 @@ def test_the_gated_shapes_cover_the_worker_s_own_predicate() -> None:
         "email_identity": [*EMAIL_PROVIDERS, "fake-email"],
         "whatsapp_identity": ["fake-whatsapp"],
         "channel_binding": ["fake-channel"],
-        "runtime": ["dry-run-runtime", "fly-runtime"],
+        "runtime": RUNTIME_PROVIDERS,
         "cleanup": ["dry-run-runtime", *EMAIL_PROVIDERS],
         "bootstrap_cleanup": ["internal-secret-sink"],
     }
@@ -2531,11 +2537,12 @@ def test_the_gated_shapes_cover_the_worker_s_own_predicate() -> None:
     }
     exercised = set(GATED_SHAPES)
 
-    # Every gated (kind, operation) must be exercised, and every email shape
-    # for every provider that makes it gated — comparing only the pairs let a
-    # provider slip through.
-    assert {(k, o) for k, o, _p in gated} == {(k, o) for k, o, _p in exercised}, (
-        "the worker gates a shape the class check does not exercise"
-    )
-    email_gated = {(k, o, p) for k, o, p in gated if k == "email_identity"}
-    assert email_gated <= exercised, sorted(email_gated - exercised)
+    # EVERY tuple, provider included. Asserting on the (kind, operation) pairs
+    # and then re-checking providers for email only was a subset check that
+    # knowingly discarded the runtime provider dimension — `fly-runtime` was in
+    # `gated` and absent from the exercised set, so a Fly-specific regression in
+    # this classification would have passed the gate meant to catch it.
+    assert gated == exercised, {
+        "gated but never exercised": sorted(gated - exercised),
+        "exercised but not gated": sorted(exercised - gated),
+    }
