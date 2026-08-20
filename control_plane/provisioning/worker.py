@@ -203,6 +203,7 @@ class ProvisioningWorker:
             return self._revoke_runtime_consent(job, request)
         if (
             self._requires_current_email_content_restriction(job)
+            and not self._is_shutdown_action(job)
             and self._missing_current_consent_purpose(job) is not None
         ):
             return self._block_for_missing_content_restriction(job, request)
@@ -1264,6 +1265,26 @@ class ProvisioningWorker:
             inspected.error_code or "provider_absent",
         )
 
+    def _is_shutdown_action(self, job: JobRecord) -> bool:
+        """Work that exists BECAUSE a consent went away.
+
+        `revoke_consent` was already exempt from the consent precondition, with
+        the reasoning that gating it on holding the withdrawn consent would make
+        withdrawal unenforceable. A quarantined job is the same kind of work:
+        withdrawal settles an ambiguous provider call `outcome_unknown` so an
+        operator can reconcile it, and reconciling it means finding and tearing
+        down whatever the provider may have created. Requiring the consent that
+        the withdrawal necessarily revoked made that teardown unreachable — the
+        job settled `failed` at the precondition without the inbox ever being
+        inspected.
+        """
+        if job.operation == REVOKE_CONSENT_OPERATION:
+            return True
+        current = self.jobs.db.query_one(
+            "SELECT error_code FROM provisioning_jobs WHERE id = ?", (job.id,)
+        )
+        return current is not None and requires_reconciliation(current["error_code"])
+
     def _superseded(self, current: JobRecord | None) -> bool:
         """Has this intent stopped being the one the household still wants?
 
@@ -1515,6 +1536,7 @@ class ProvisioningWorker:
             return self._revoke_runtime_consent(job, request)
         if (
             self._requires_current_email_content_restriction(job)
+            and not self._is_shutdown_action(job)
             and self._missing_current_consent_purpose(job) is not None
         ):
             return self._block_for_missing_content_restriction(job, request)
@@ -1634,6 +1656,19 @@ class ProvisioningWorker:
                         inspected.error_code or "provider_rejected",
                     )
                 if inspected.state in {InspectState.ABSENT, InspectState.PENDING}:
+                    if self._is_shutdown_action(job):
+                        # A quarantined job is reconciled to find and remove
+                        # provider state, never to make more of it. Skipping the
+                        # consent precondition above is what lets the INSPECTION
+                        # happen; re-running `prepare` under that exemption
+                        # would hand a withdrawn household a brand-new resource,
+                        # which is the opposite of what the quarantine is for.
+                        return self._mark_step_problem(
+                            job,
+                            request,
+                            "outcome_unknown",
+                            "shutdown_requires_no_new_resource",
+                        )
                     prepared = (
                         provider.prepare(request, job.intent_key)
                         if split_runtime

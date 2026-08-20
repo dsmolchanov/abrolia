@@ -29,7 +29,12 @@ from control_plane.privacy.withdraw import (
     ConsentNotHeld,
     ConsentWithdrawalService,
 )
-from control_plane.provisioning.contracts import ProviderRegistry, ProviderWaiting
+from control_plane.provisioning.contracts import (
+    InspectResult,
+    InspectState,
+    ProviderRegistry,
+    ProviderWaiting,
+)
 from control_plane.provisioning.fakes import DeterministicFakeProvisioner
 from control_plane.provisioning.planner import DesiredSpecPlanner
 from control_plane.provisioning.worker import COMPENSATED_STEP_KINDS
@@ -1118,3 +1123,114 @@ def test_an_existing_quarantine_reason_is_not_overwritten(cp_stack) -> None:
         (cp_stack.household.id,),
     )
     assert all(row["error_code"] == "reset_requires_reconciliation" for row in kept)
+
+
+def test_a_quarantined_email_job_reconciles_past_the_consent_check(cp_stack) -> None:
+    """The teardown must not require the consent whose loss demands it.
+
+    Withdrawal settles an ambiguous provider call `outcome_unknown` so an
+    operator can reconcile it, and reconciling means finding and tearing down
+    whatever the provider may have created. `_reconcile` checked for a current
+    content-restriction consent BEFORE inspecting — and withdrawal necessarily
+    revoked it — so the job settled `failed` at the precondition and the inbox
+    that may exist was never inspected, never recorded, never deleted.
+    """
+    complete_onboarding(cp_stack)
+    drain(cp_stack)
+    set_runtime_ref(cp_stack)
+    email_job = cp_stack.database.query_one(
+        "SELECT id FROM provisioning_jobs WHERE household_id = ?"
+        " AND kind = 'email_identity' ORDER BY created_at DESC LIMIT 1",
+        (cp_stack.household.id,),
+    )["id"]
+    with cp_stack.database.write() as connection:
+        connection.execute(
+            # A REAL provider. `_requires_current_email_content_restriction`
+            # exempts `fake-email`, so the precondition this test is about never
+            # applies to the synthetic path — which is how an earlier version
+            # passed without exercising the exemption at all.
+            "UPDATE provisioning_jobs SET status = 'outcome_unknown',"
+            " error_code = 'outcome_unknown', settled_at = NULL,"
+            " provider = 'nerve-managed' WHERE id = ?",
+            (email_job,),
+        )
+
+    withdraw_now(cp_stack, now=BASE_TIME)
+    quarantined = cp_stack.database.query_one(
+        "SELECT error_code FROM provisioning_jobs WHERE id = ?", (email_job,)
+    )
+    assert quarantined["error_code"] == "withdrawal_requires_reconciliation"
+
+    class RecordingEmail(DeterministicFakeProvisioner):
+        inspected = 0
+
+        def inspect(self, intent, idempotency_key=None):
+            type(self).inspected += 1
+            return InspectResult(InspectState.ABSENT)
+
+    provider = RecordingEmail("email")
+    registry = ProviderRegistry()
+    registry.register("nerve-managed", provider)
+    cp_stack.make_worker(providers=registry, now=BASE_TIME + 50).reconcile(email_job)
+
+    # The property, asserted positively: the provider was ASKED. Asserting that
+    # some error code did not appear is weaker than it looks — the precondition
+    # settles with a code of its own choosing, and a test that names one string
+    # passes when the code changes. What matters is that the inspection the
+    # teardown depends on actually happened.
+    assert type(provider).inspected > 0, (
+        "the teardown was refused for want of the consent that was withdrawn,"
+        " so the inbox that may exist was never inspected"
+    )
+
+
+def test_reconciling_a_quarantined_job_never_creates_a_new_resource(cp_stack) -> None:
+    """Skipping the consent check lets the INSPECTION happen, nothing more.
+
+    `_reconcile` re-runs `prepare`/`ensure` when an inspection comes back
+    `ABSENT` or `PENDING`. Under the exemption above that would hand a withdrawn
+    household a brand-new resource — the opposite of what the quarantine exists
+    for. A shutdown action inspects and removes; it never makes more.
+    """
+    complete_onboarding(cp_stack)
+    drain(cp_stack)
+    # The `ensure_runtime` job specifically — an `ensure_secret_namespace` one
+    # exits at a different branch entirely, which is how the first version of
+    # this test passed without ever reaching the guard it exists to check.
+    runtime_job = cp_stack.database.query_one(
+        "SELECT id FROM provisioning_jobs WHERE household_id = ?"
+        " AND kind = 'runtime' AND operation = 'ensure_runtime'"
+        " ORDER BY created_at DESC LIMIT 1",
+        (cp_stack.household.id,),
+    )
+    assert runtime_job is not None, "the fixture minted no ensure_runtime job"
+    with cp_stack.database.write() as connection:
+        connection.execute(
+            "UPDATE provisioning_jobs SET status = 'outcome_unknown',"
+            " error_code = 'withdrawal_requires_reconciliation', settled_at = NULL"
+            " WHERE id = ?",
+            (runtime_job["id"],),
+        )
+
+    class AbsentThenCreate(DeterministicFakeProvisioner):
+        created = 0
+
+        def inspect(self, intent, idempotency_key=None):
+            del intent, idempotency_key
+            return InspectResult(InspectState.ABSENT)
+
+        def ensure(self, intent, idempotency_key):
+            type(self).created += 1
+            return super().ensure(intent, idempotency_key)
+
+    provider = AbsentThenCreate("runtime")
+    registry = ProviderRegistry()
+    registry.register("dry-run-runtime", provider)
+    reconciled = cp_stack.make_worker(
+        providers=registry, now=BASE_TIME + 60
+    ).reconcile(runtime_job["id"])
+
+    assert type(provider).created == 0, (
+        "reconciling a quarantined job created a new resource"
+    )
+    assert reconciled.error_code == "shutdown_requires_no_new_resource"
