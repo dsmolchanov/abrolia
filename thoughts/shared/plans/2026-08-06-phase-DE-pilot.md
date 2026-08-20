@@ -167,7 +167,7 @@ After `codex/phase-E-pilotization` merges, the system can onboard a pilot househ
 
 #### Step E1 — Durable 3-step onboarding machine
 
-**Files:** `control_plane/onboarding/state.py`, `control_plane/onboarding/provision.py`, `control_plane/onboarding/transitions.py`, `control_plane/migrations/0001_control_plane.sql` (if new columns needed), `docs/onboarding-runbook.md`, `control_plane/container.py`, `control_plane/db.py`, `control_plane/provisioning/fakes.py`, `control_plane/privacy/consent.py`, `control_plane/provisioning/worker.py`, `tests/control_plane/test_provision_dry_run.py`, `tests/control_plane/test_plan_inventory.py`.
+**Files:** `control_plane/onboarding/state.py`, `control_plane/onboarding/provision.py`, `control_plane/onboarding/transitions.py`, `control_plane/migrations/0001_control_plane.sql` (if new columns needed), `docs/onboarding-runbook.md`, `control_plane/container.py`, `control_plane/db.py`, `control_plane/provisioning/fakes.py`, `control_plane/privacy/consent.py`, `control_plane/provisioning/worker.py`, `tests/control_plane/test_provision_dry_run.py`, `tests/control_plane/test_plan_inventory.py`, `AGENTS.repo-invariants.md`.
 
 **Branches:** `codex/phase-E-provision-dry-run`.
 
@@ -216,6 +216,12 @@ blocker under the repository rules. Four were missing rather than unnecessary:
   `CURRENT_RESTRICTION_RECEIPT_SQL`, which now lives beside the consent rules it
   is about and is read by `_holds_current_restriction` in `provision.py` and by
   `ProvisioningWorker._has_current_email_content_restriction` alike.
+
+`AGENTS.repo-invariants.md` — **added 2026-08-21.** Five rounds reported the
+same class: the report describing an operation other than the one the worker
+would perform. `AGENTS.md` says a class that recurs is one missing rule, so the
+rule is written down there and enforced by a parameterised check in this step's
+own suite.
 
 Three corrections in three rounds is a mechanism failing, not three oversights.
 `tests/control_plane/test_plan_inventory.py` now compares this branch's changed

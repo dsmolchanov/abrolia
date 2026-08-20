@@ -37,6 +37,7 @@ from control_plane.onboarding.provision import (
 from control_plane.privacy.consent import consent_version_and_sha
 from control_plane.provisioning.fly import FlyRuntimeProvisioner
 from control_plane.provisioning.secrets import InMemorySecretSink
+from control_plane.provisioning.worker import requires_current_content_restriction
 from tests.control_plane.conftest import BASE_TIME
 
 _RESTRICTION_VERSION, _RESTRICTION_SHA = consent_version_and_sha(
@@ -2319,3 +2320,168 @@ def test_the_declared_step_block_writes_match_a_real_run(container) -> None:
     assert result.error_code == "content_restriction_receipt_required"
     assert asked == [], f"a provider was resolved before the gate: {asked}"
     assert observed == set(CONTENT_RESTRICTION_BLOCK_WRITES["step"])
+
+
+# --------------------------------------------------------------------------
+# The class-level check for the report/worker agreement invariant recorded in
+# `AGENTS.repo-invariants.md`. Everything below enforces the RULE, not the
+# instances that produced it.
+# --------------------------------------------------------------------------
+
+#: Every job shape `_run_once` gates on the special-category receipt. Derived
+#: from the worker's own predicate rather than listed by hand, so a kind added
+#: to the gate is covered here without anyone remembering to add it.
+GATED_SHAPES = [
+    ("runtime", "ensure_runtime", "dry-run-runtime"),
+    ("email_identity", "provision_email_identity", "nerve-managed"),
+    ("email_identity", "provision_email_identity", "nerve-byo-domain"),
+]
+
+
+def _receipt_state(container, household_id: str, state: str) -> None:
+    with container.database.write() as connection:
+        if state == "absent":
+            connection.execute(
+                "DELETE FROM consent_receipts WHERE household_id = ?"
+                " AND purpose = 'special_category_content_restriction'",
+                (household_id,),
+            )
+        elif state == "revoked":
+            connection.execute(
+                "UPDATE consent_receipts SET revoked_at = ? WHERE household_id = ?"
+                " AND purpose = 'special_category_content_restriction'",
+                (BASE_TIME, household_id),
+            )
+        elif state == "stale":
+            connection.execute(
+                "UPDATE consent_receipts SET text_version = 'v0-superseded'"
+                " WHERE household_id = ?"
+                " AND purpose = 'special_category_content_restriction'",
+                (household_id,),
+            )
+        else:  # pragma: no cover - a typo in the parameter list
+            raise AssertionError(state)
+
+
+@pytest.mark.parametrize("receipt", ["absent", "stale", "revoked"])
+@pytest.mark.parametrize("kind, operation, provider", GATED_SHAPES)
+def test_every_annotated_job_agrees_with_one_real_worker_call(
+    container, receipt, kind, operation, provider
+) -> None:
+    """The invariant, not the instances.
+
+    Five rounds of P1s on this pull request were the same defect wearing
+    different clothes: the report described an operation other than the one the
+    worker would actually perform on a job — the wrong branch, the wrong write
+    set, the wrong recovery, or a claim about which job runs next. `AGENTS.md`
+    says that once a class recurs it is one missing rule, not N findings.
+
+    The rule: a job the report ANNOTATES is a job whose next act is determined
+    by durable state, so settling it must write exactly the declared tables and
+    resolve no provider at all; and while any annotation is present, the report
+    must claim no top-level write set, because which annotated job the worker
+    reaches first is not something it can know.
+    """
+    household_id = _household_with_profile(container)
+    _verify_all_steps(container, household_id)
+    identity = container.database.query_one(
+        "SELECT id FROM email_identities WHERE household_id = ?", (household_id,)
+    )
+    assert identity is not None, "the fixture produced no email identity"
+    workflow = container.database.query_one(
+        "SELECT id FROM onboarding_workflows WHERE household_id = ?", (household_id,)
+    )
+    _receipt_state(container, household_id, receipt)
+    with container.database.write() as connection:
+        connection.execute(
+            "UPDATE provisioning_jobs SET status = 'cancelled', settled_at = ?"
+            " WHERE household_id = ? AND status IN"
+            " ('pending','running','waiting_user','outcome_unknown')",
+            (BASE_TIME, household_id),
+        )
+        job_id, _created = container.jobs.create(
+            connection,
+            household_id=household_id,
+            workflow_id=workflow["id"],
+            kind=kind,
+            operation=operation,
+            intent_key=f"{household_id}:{operation}:{provider}:class-check",
+            request={
+                "step_kind": StepKind.EMAIL.value,
+                "email_identity_id": identity["id"],
+            },
+            provider=provider,
+            now=BASE_TIME,
+        )
+        connection.execute(
+            "UPDATE onboarding_steps SET status = 'provisioning'"
+            " WHERE workflow_id = ? AND kind = ?",
+            (workflow["id"], StepKind.EMAIL.value),
+        )
+        if kind == "runtime":
+            connection.execute(
+                "UPDATE onboarding_workflows SET state = 'runtime_provisioning'"
+                " WHERE id = ?",
+                (workflow["id"],),
+            )
+
+    plan = plan_onboarding(container, household_id)
+
+    annotated = {
+        job["job_id"]: job
+        for job in (*plan.unresolved_runtime_jobs, *plan.pending_step_jobs)
+        if job.get("blocked_by")
+    }
+    assert job_id in annotated, (
+        f"the {kind}/{provider} job is gated by the worker and the report did"
+        f" not annotate it: {plan.pending_step_jobs} {plan.unresolved_runtime_jobs}"
+    )
+    # No top-level claim while a specific job's next act is being described.
+    assert plan.table_writes == [], plan.table_writes
+
+    asked: list[str] = []
+    real_get = container.providers.get
+    container.providers.get = lambda name: (asked.append(name), real_get(name))[1]
+
+    observed: set[TableWrite] = set()
+    with _tracing_writes(observed):
+        result = container.worker.run_once()
+
+    assert result is not None and result.job_id == job_id, result
+    assert asked == [], f"a provider was resolved for an annotated job: {asked}"
+    declared = {
+        TableWrite(write["table"], write["operation"])
+        for write in annotated[job_id]["table_writes"]
+    }
+    assert observed == declared, (
+        "the report's declared write set is not what settling that job wrote"
+    )
+
+
+def test_the_gated_shapes_cover_the_worker_s_own_predicate() -> None:
+    """A kind added to the gate must not slip past the check above.
+
+    The parameter list is a list, and a list goes stale. This asks the worker's
+    predicate directly about every kind the schema allows, so a new gated shape
+    fails here rather than silently narrowing the class check.
+    """
+    allowed = [
+        ("email_identity", "provision_email_identity"),
+        ("whatsapp_identity", "provision_whatsapp_identity"),
+        ("channel_binding", "bind_primary_channel"),
+        ("runtime", "ensure_runtime"),
+        ("runtime", "ensure_secret_namespace"),
+        ("cleanup", "deprovision"),
+        ("bootstrap_cleanup", "delete_bootstrap_secret"),
+    ]
+    providers = ["fake-email", "nerve-managed", "nerve-byo-domain", "dry-run-runtime"]
+    gated = {
+        (kind, operation)
+        for kind, operation in allowed
+        for provider in providers
+        if requires_current_content_restriction(kind, operation, provider)
+    }
+
+    assert gated == {(kind, operation) for kind, operation, _p in GATED_SHAPES}, (
+        "the worker gates a shape the class check does not exercise"
+    )
