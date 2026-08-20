@@ -16,8 +16,10 @@ import pytest
 
 from control_plane.models import StepKind
 from control_plane.privacy.consent import (
+    CONSENT_TEXTS,
     CONTENT_RESTRICTION_PURPOSE,
     HOUSEHOLD_CONTENT_PURPOSE,
+    WITHDRAWAL_SCOPES,
 )
 from control_plane.privacy.withdraw import (
     REVOKE_CONSENT_OPERATION,
@@ -690,3 +692,128 @@ def test_withdrawal_does_not_supersede_the_households_other_work(cp_stack) -> No
     )
     assert stop["status"] == "pending"
     assert stop["error_code"] is None
+
+
+def test_every_consent_declares_what_its_withdrawal_terminates() -> None:
+    """A purpose with no declared scope must not fall back to a full teardown.
+
+    Falling back is what caused the damage: `withdraw()` ran one teardown for
+    every purpose, so withdrawing a WhatsApp consent deprovisioned the
+    household's inbox. This pairs the two maps so adding a consent without
+    deciding what withdrawing it ends fails here rather than in production.
+    """
+    assert set(WITHDRAWAL_SCOPES) == set(CONSENT_TEXTS)
+    for purpose, scope in WITHDRAWAL_SCOPES.items():
+        assert scope["resource_types"], f"{purpose} terminates nothing"
+        assert isinstance(scope["stops_runtime"], bool), purpose
+
+
+def test_an_undeclared_purpose_is_refused_rather_than_defaulted(
+    cp_stack, monkeypatch
+) -> None:
+    """A consent whose scope nobody decided must not inherit the full teardown.
+
+    The purpose has to be a REAL one for this to prove anything: an unknown
+    purpose is already rejected a few lines earlier, so testing with one would
+    pass whatever the scope guard did. So a fourth consent is introduced, with
+    no entry in `WITHDRAWAL_SCOPES` — the exact situation the next person to add
+    a consent creates.
+    """
+    complete_onboarding(cp_stack)
+    drain(cp_stack)
+    set_runtime_ref(cp_stack)
+    monkeypatch.setitem(
+        CONSENT_TEXTS, "an_unscoped_consent", ("unscoped-v1", "text nobody scoped")
+    )
+    service = ConsentWithdrawalService(
+        cp_stack.database, jobs=cp_stack.jobs, onboarding=cp_stack.service
+    )
+
+    with pytest.raises(KeyError, match="no withdrawal scope"):
+        service.withdraw(cp_stack.household.id, "an_unscoped_consent", now=BASE_TIME)
+
+    # And it defaulted to nothing, rather than to the content teardown.
+    assert all(
+        status not in {"deleting", "deleted"}
+        for status in _resources(cp_stack, "email_identity")
+    ), "an unscoped withdrawal tore down the inbox anyway"
+    assert cp_stack.database.query_one(
+        "SELECT 1 FROM provisioning_jobs WHERE household_id = ? AND operation = ?",
+        (cp_stack.household.id, REVOKE_CONSENT_OPERATION),
+    ) is None
+
+
+def _resources(cp_stack, resource_type: str) -> list[str]:
+    return [
+        row["status"]
+        for row in cp_stack.database.query(
+            "SELECT status FROM external_resources WHERE household_id = ?"
+            " AND resource_type = ?",
+            (cp_stack.household.id, resource_type),
+        )
+    ]
+
+
+def test_a_channel_withdrawal_leaves_the_inbox_alone(cp_stack) -> None:
+    """Art. 7(3) stops the processing a consent authorised — not other processing.
+
+    `withdraw()` ran one teardown for every purpose: disconnect the email inbox,
+    revoke every active revision, stop the runtime. So withdrawing
+    `whatsapp_channel_privacy` deprovisioned the household's Gmail or Nerve
+    inbox and the mail stored in it, while never touching the WhatsApp resource
+    the consent was actually about — damage in one direction and a no-op in the
+    other, from the same missing distinction.
+    """
+    complete_onboarding(cp_stack)
+    drain(cp_stack)
+    set_runtime_ref(cp_stack)
+    service = ConsentWithdrawalService(
+        cp_stack.database, jobs=cp_stack.jobs, onboarding=cp_stack.service
+    )
+
+    result = service.withdraw(
+        cp_stack.household.id, "whatsapp_channel_privacy", now=BASE_TIME
+    )
+
+    # The receipt is withdrawn — that part is unconditional.
+    assert result.receipts_revoked == 1
+    # The inbox is untouched: not disconnecting, no cleanup, still live.
+    assert all(status not in {"deleting", "deleted"}
+               for status in _resources(cp_stack, "email_identity"))
+    identity = cp_stack.database.query_one(
+        "SELECT status FROM email_identities WHERE household_id = ?",
+        (cp_stack.household.id,),
+    )
+    assert identity is None or identity["status"] != "disconnecting"
+    # The runtime keeps serving the household's other channels, and the
+    # revisions that carry them stay standing.
+    assert result.runtime_job_id is None
+    assert result.revisions_revoked == 0
+    # And the resource the consent WAS about is torn down.
+    assert any(status == "deleting" for status in _resources(cp_stack, "whatsapp_identity")), (
+        "the WhatsApp resource the consent covered was never scheduled for teardown"
+    )
+
+
+def test_the_content_consent_still_terminates_everything(cp_stack) -> None:
+    """Scoping must not weaken the withdrawal that matters.
+
+    The Art 9(2)(a) condition is the lawful basis for processing household
+    content at all, so withdrawing it keeps the full teardown: inbox
+    disconnected, revisions revoked, runtime told to stop.
+    """
+    complete_onboarding(cp_stack)
+    drain(cp_stack)
+    set_runtime_ref(cp_stack)
+    service = ConsentWithdrawalService(
+        cp_stack.database, jobs=cp_stack.jobs, onboarding=cp_stack.service
+    )
+
+    result = service.withdraw(
+        cp_stack.household.id, HOUSEHOLD_CONTENT_PURPOSE, now=BASE_TIME
+    )
+
+    assert result.email_disconnected
+    assert result.revisions_revoked > 0
+    assert result.runtime_job_id is not None
+    assert any(status == "deleting" for status in _resources(cp_stack, "email_identity"))

@@ -225,28 +225,29 @@ class RuntimeService:
     ) -> tuple[RuntimeManifest | None, str]:
         """Resolve the manifest, and whether this runtime may serve from it.
 
-        `for_data_subject_request` relaxes exactly one condition: a withdrawn
-        consent. Withdrawal under Art. 7(3) stops PROCESSING; it does not
-        extinguish the Art. 15 and Art. 17 rights over data already held, and an
-        arrangement in which exercising one right destroys the others is not a
-        rights regime. Deletion still takes precedence — there is then nothing
-        left to export, and the caller is told exactly that.
+        `for_data_subject_request` relaxes exactly two CONSENT conditions: a
+        withdrawn consent, and consent currency. Withdrawal under Art. 7(3)
+        stops PROCESSING; it does not extinguish the Art. 15 and Art. 17 rights
+        over data already held, and an arrangement in which exercising one right
+        destroys the others is not a rights regime. Currency is relaxed for the
+        same reason and one more: bumping the restriction copy makes every
+        pre-existing runtime's receipt stale, which would take export and
+        deletion down for exactly the households that had been running longest.
+        Deletion still takes precedence — there is then nothing left to export,
+        and the caller is told exactly that.
+
+        It relaxes nothing about IDENTITY. The activation status, the runtime
+        reference and the manifest revision are checked on every path, DSAR
+        included. Returning the manifest before them let an export run against a
+        runtime that was never validly activated for this instance, and let a
+        delete or a Google revocation act on a stale provider binding — wiping
+        data while revoking the wrong credential and leaving the current one
+        live. "Which data subject\'s runtime is this" is not a consent question,
+        and it is the one question a DSAR must get right.
         """
         if self.deletion_marker.is_file():
             return None, "runtime_deleted"
-        if for_data_subject_request:
-            # DSAR loads the manifest and stops. Not the withdrawal marker, and
-            # not the consent-currency checks below either: bumping the
-            # restriction copy to v2 makes every pre-existing runtime's receipt
-            # stale, which would have taken export and deletion down for exactly
-            # the households that had been running longest. Art. 15 and Art. 17
-            # are about data already held; whether the consent covering further
-            # PROCESSING is current has no bearing on them.
-            try:
-                return load_runtime_manifest(self.manifest_path, env=self.env), "dsar"
-            except ManifestError:
-                return None, "manifest_missing_or_invalid"
-        if self.consent_marker.is_file():
+        if not for_data_subject_request and self.consent_marker.is_file():
             # Checked before the manifest is even loaded: the manifest cannot
             # express this state, and the Art 9(2)(a) copy promises withdrawal
             # "stops further processing", not "stops it at the next delivery".
@@ -255,59 +256,63 @@ class RuntimeService:
             manifest = load_runtime_manifest(self.manifest_path, env=self.env)
         except ManifestError:
             return None, "manifest_missing_or_invalid"
-        # Enforce EVERY purpose the manifest declares authoritative, not one
-        # hard-coded name. The control plane already decides which consents a
-        # household owes — including the Art. 9(2)(a) household-content consent
-        # for real-email households — and naming a single purpose here meant a
-        # runtime stayed ready while any other required consent was revoked or
-        # superseded.
-        if manifest.consent is None:
-            # A manifest with no consent block is the legacy shape, and it is
-            # the S5 restriction it is missing — keep the established reason.
-            return None, "content_restriction_not_current"
-        if REQUIRED_CONTENT_RESTRICTION_PURPOSE not in (
-            manifest.consent.required_purposes
-        ):
-            # The S5 boundary is required of every household, synthetic or not,
-            # so a manifest that omits it is malformed rather than permissive.
-            return None, "content_restriction_not_current"
-        # What the household OWES is derived from the provider, exactly as the
-        # control plane derives it — not read back from what the manifest
-        # happens to declare. A schema-v1 manifest issued before the Art 9(2)(a)
-        # purpose existed can name `nerve-managed` or `gmail` and declare only
-        # the restriction; validating "every declared purpose" then found
-        # nothing wrong with it and kept serving real family content with no
-        # Art. 9 condition at all.
-        owed = set(manifest.consent.required_purposes)
-        if processes_real_household_content(manifest.email.provider_kind):
-            owed.add(HOUSEHOLD_CONTENT_PURPOSE)
-        for purpose in sorted(owed):
-            if purpose not in manifest.consent.required_purposes:
-                # Owed but not declared: the manifest predates the purpose and
-                # carries no receipt for it. Only a new revision can fix that.
-                return None, "consent_not_current"
-            # A manifest may legitimately name a purpose this build does not
-            # know: during a rolling addition the control plane issues the new
-            # purpose before every runtime carries the copy for it. The parser
-            # accepts any non-empty string, so this lookup would raise KeyError
-            # — and readiness is not the only caller. `can_start_workers` reads
-            # it OUTSIDE the worker loops' exception handlers, so the raise
-            # terminated ingress worker threads rather than returning a 503.
-            # An unknown purpose is unverifiable, which is not-current, which is
-            # the fail-closed answer.
-            try:
-                version, sha256 = consent_version_and_sha(purpose)
-            except KeyError:
-                return None, "consent_not_current"
-            if not any(
-                receipt.purpose == purpose
-                and receipt.text_version == version
-                and hmac.compare_digest(receipt.text_sha256, sha256)
-                for receipt in manifest.consent.receipts
+        # Consent currency is the second and last thing a DSAR relaxes.
+        # Everything below this block is identity, and applies to every
+        # caller.
+        if not for_data_subject_request:
+            # Enforce EVERY purpose the manifest declares authoritative, not one
+            # hard-coded name. The control plane already decides which consents a
+            # household owes — including the Art. 9(2)(a) household-content consent
+            # for real-email households — and naming a single purpose here meant a
+            # runtime stayed ready while any other required consent was revoked or
+            # superseded.
+            if manifest.consent is None:
+                # A manifest with no consent block is the legacy shape, and it is
+                # the S5 restriction it is missing — keep the established reason.
+                return None, "content_restriction_not_current"
+            if REQUIRED_CONTENT_RESTRICTION_PURPOSE not in (
+                manifest.consent.required_purposes
             ):
-                if purpose == REQUIRED_CONTENT_RESTRICTION_PURPOSE:
-                    return None, "content_restriction_not_current"
-                return None, "consent_not_current"
+                # The S5 boundary is required of every household, synthetic or not,
+                # so a manifest that omits it is malformed rather than permissive.
+                return None, "content_restriction_not_current"
+            # What the household OWES is derived from the provider, exactly as the
+            # control plane derives it — not read back from what the manifest
+            # happens to declare. A schema-v1 manifest issued before the Art 9(2)(a)
+            # purpose existed can name `nerve-managed` or `gmail` and declare only
+            # the restriction; validating "every declared purpose" then found
+            # nothing wrong with it and kept serving real family content with no
+            # Art. 9 condition at all.
+            owed = set(manifest.consent.required_purposes)
+            if processes_real_household_content(manifest.email.provider_kind):
+                owed.add(HOUSEHOLD_CONTENT_PURPOSE)
+            for purpose in sorted(owed):
+                if purpose not in manifest.consent.required_purposes:
+                    # Owed but not declared: the manifest predates the purpose and
+                    # carries no receipt for it. Only a new revision can fix that.
+                    return None, "consent_not_current"
+                # A manifest may legitimately name a purpose this build does not
+                # know: during a rolling addition the control plane issues the new
+                # purpose before every runtime carries the copy for it. The parser
+                # accepts any non-empty string, so this lookup would raise KeyError
+                # — and readiness is not the only caller. `can_start_workers` reads
+                # it OUTSIDE the worker loops' exception handlers, so the raise
+                # terminated ingress worker threads rather than returning a 503.
+                # An unknown purpose is unverifiable, which is not-current, which is
+                # the fail-closed answer.
+                try:
+                    version, sha256 = consent_version_and_sha(purpose)
+                except KeyError:
+                    return None, "consent_not_current"
+                if not any(
+                    receipt.purpose == purpose
+                    and receipt.text_version == version
+                    and hmac.compare_digest(receipt.text_sha256, sha256)
+                    for receipt in manifest.consent.receipts
+                ):
+                    if purpose == REQUIRED_CONTENT_RESTRICTION_PURPOSE:
+                        return None, "content_restriction_not_current"
+                    return None, "consent_not_current"
         try:
             state = load_activation_state(self.activation_path)
         except BootstrapError:
@@ -318,7 +323,7 @@ class RuntimeService:
             return None, "runtime_ref_mismatch"
         if not state_matches_manifest(state, manifest):
             return None, "revision_mismatch"
-        return manifest, "active"
+        return manifest, "dsar" if for_data_subject_request else "active"
 
     def readyz(self) -> Probe:
         manifest, reason = self._ready_manifest()

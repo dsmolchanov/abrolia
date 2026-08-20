@@ -41,7 +41,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from control_plane.db import ControlPlaneDatabase
-from control_plane.privacy.consent import CONSENT_TEXTS
+from control_plane.privacy.consent import CONSENT_TEXTS, WITHDRAWAL_SCOPES
 from control_plane.privacy.runtime import RUNTIME_REF
 from control_plane.repositories.jobs import JobsRepository
 
@@ -96,6 +96,17 @@ class ConsentWithdrawalService:
     ) -> WithdrawalResult:
         if purpose not in CONSENT_TEXTS:
             raise KeyError(purpose)
+        scope = WITHDRAWAL_SCOPES.get(purpose)
+        if scope is None:
+            # Fail closed rather than fall back to the full teardown. Defaulting
+            # is precisely what caused the damage: every purpose ran the content
+            # teardown, so a WhatsApp withdrawal deprovisioned the inbox. A
+            # purpose whose scope nobody has decided is one this cannot safely
+            # act on, and saying so is better than guessing at it.
+            raise KeyError(
+                f"{purpose} has no withdrawal scope; declare what it terminates"
+                " in WITHDRAWAL_SCOPES before it can be withdrawn"
+            )
 
         with self.database.write() as connection:
             # Capture WHICH receipts are being withdrawn before revoking them:
@@ -143,32 +154,46 @@ class ConsentWithdrawalService:
                 if held is None:
                     raise ConsentNotHeld(f"{household_id} holds no {purpose} receipt")
 
-            # Any revision still standing embeds the withdrawn receipt and would
-            # otherwise remain activatable.
-            revisions = connection.execute(
-                "UPDATE config_revisions SET status = 'revoked'"
-                " WHERE household_id = ? AND status IN ('planned','issued','claimed','active')",
-                (household_id,),
-            ).rowcount
+            # Any revision still standing embeds the withdrawn receipt and
+            # would otherwise remain activatable — but only where the withdrawn
+            # consent is what the revision depends on. A revision does not embed
+            # the WhatsApp channel consents, so revoking every revision for a
+            # channel withdrawal stopped the household's unrelated processing
+            # and forced a re-onboarding nobody asked for.
+            revisions = 0
+            if scope["stops_runtime"]:
+                revisions = connection.execute(
+                    "UPDATE config_revisions SET status = 'revoked'"
+                    " WHERE household_id = ?"
+                    " AND status IN ('planned','issued','claimed','active')",
+                    (household_id,),
+                ).rowcount
 
-            # Disconnect the inbox BEFORE queuing the runtime stop, so the
-            # ordering in the job table matches the order the effects matter in:
-            # stop accepting new content, then stop processing what arrived.
-            email_cleanup_job_ids: list[str] = []
+            # Disconnect the provider resources BEFORE queuing the runtime stop,
+            # so the ordering in the job table matches the order the effects
+            # matter in: stop accepting new content, then stop processing what
+            # arrived.
+            cleanup_job_ids: list[str] = []
             if self.onboarding is not None:
-                email_cleanup_job_ids = (
-                    self.onboarding.disconnect_email_for_withdrawal(
-                        connection, household_id, now=now
-                    )
+                cleanup_job_ids = self.onboarding.disconnect_for_withdrawal(
+                    connection,
+                    household_id,
+                    resource_types=scope["resource_types"],
+                    now=now,
                 )
 
-            runtime_job_id = self._enqueue_runtime_stop(
-                connection,
-                household_id=household_id,
-                purpose=purpose,
-                cycle=cycle,
-                now=now,
-            )
+            # Only the authoritative content consent stops the runtime. It
+            # processes household CONTENT; withdrawing a channel-specific
+            # consent ends that channel, not the processing.
+            runtime_job_id = None
+            if scope["stops_runtime"]:
+                runtime_job_id = self._enqueue_runtime_stop(
+                    connection,
+                    household_id=household_id,
+                    purpose=purpose,
+                    cycle=cycle,
+                    now=now,
+                )
 
         return WithdrawalResult(
             household_id=household_id,
@@ -176,7 +201,7 @@ class ConsentWithdrawalService:
             receipts_revoked=revoked,
             revisions_revoked=revisions,
             runtime_job_id=runtime_job_id,
-            email_cleanup_job_ids=tuple(email_cleanup_job_ids),
+            email_cleanup_job_ids=tuple(cleanup_job_ids),
         )
 
     def _enqueue_runtime_stop(

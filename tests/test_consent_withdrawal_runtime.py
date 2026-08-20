@@ -14,6 +14,7 @@ unparseable manifest is a withdrawal that did not happen.
 from __future__ import annotations
 
 import re
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -25,6 +26,7 @@ from hermes_cloud.core.runtime_manifest import (
 from hermes_cloud.runtime.bootstrap import (
     ActivationState,
     atomic_write,
+    load_activation_state,
     write_activation_state,
 )
 from hermes_cloud.runtime.service import (
@@ -354,3 +356,66 @@ def test_dsar_survives_a_stale_consent_version(tmp_path: Path) -> None:
         "/internal/v1/dsar/export", "POST", f"Bearer {DSAR_TOKEN}"
     )
     assert export.status_code != 503
+
+
+@pytest.mark.parametrize(
+    ("damage", "reason"),
+    [
+        pytest.param(
+            lambda state: replace(state, status="pending"),
+            "activation_pending",
+            id="activation-pending",
+        ),
+        pytest.param(
+            lambda state: replace(state, runtime_ref="abrolia-hh-" + "z" * 26),
+            "runtime_ref_mismatch",
+            id="runtime-ref-mismatch",
+        ),
+        pytest.param(
+            lambda state: replace(state, config_revision=state.config_revision + 1),
+            "revision_mismatch",
+            id="revision-mismatch",
+        ),
+    ],
+)
+def test_dsar_keeps_every_identity_check(tmp_path: Path, damage, reason) -> None:
+    """Relaxing consent must not relax "whose runtime is this".
+
+    The DSAR branch loaded the manifest and returned, skipping the activation
+    status, runtime-reference and revision checks along with the consent checks
+    it meant to skip. With a valid credential but a pending activation, a
+    different `runtime_ref`, or a revision that does not match, export ran
+    against a runtime that was never validly activated for this instance, and
+    delete and Google revocation could act through a stale provider binding —
+    wiping data while revoking the wrong credential and leaving the current one
+    live.
+
+    Consent is a question about processing; identity is a question about whose
+    data this is, and a DSAR has to get the second one right.
+    """
+    service = active_service(tmp_path)
+    state = load_activation_state(service.activation_path)
+    assert state is not None
+    write_activation_state(service.activation_path, damage(state))
+
+    manifest, actual = service._ready_manifest(for_data_subject_request=True)
+
+    assert manifest is None, "a DSAR was served from an unverified runtime"
+    assert actual == reason
+
+
+def test_dsar_still_answers_for_a_withdrawn_or_stale_consent(tmp_path: Path) -> None:
+    """The two relaxations that are correct must survive the tightening.
+
+    Withdrawal and consent staleness still have to leave export and deletion
+    reachable — Art. 15 and Art. 17 are about data already held — so this pins
+    the boundary from the other side.
+    """
+    service = active_service(tmp_path)
+    assert revoke(service).status_code == 200
+    assert service.readyz().payload["reason"] == "consent_withdrawn"
+
+    manifest, reason = service._ready_manifest(for_data_subject_request=True)
+
+    assert manifest is not None, "withdrawal took the data-subject rights with it"
+    assert reason == "dsar"

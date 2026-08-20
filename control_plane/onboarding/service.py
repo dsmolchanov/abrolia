@@ -908,23 +908,39 @@ class OnboardingService:
             )
             return CommandResult(snapshot)
 
-    def disconnect_email_for_withdrawal(
-        self, connection, household_id: str, *, now: float
+    def disconnect_for_withdrawal(
+        self,
+        connection,
+        household_id: str,
+        *,
+        resource_types: frozenset[str],
+        now: float,
     ) -> list[str]:
-        """Tear down the upstream inbox because consent was withdrawn.
+        """Tear down the provider resources a withdrawn consent authorised.
 
         Stopping the runtime stops OUR processing. It does nothing about the
-        mailbox already provisioned at Nerve or Google, which keeps receiving
-        and storing whatever is forwarded to it — so without this, withdrawal
-        left processing running at the processor boundary, which is the boundary
-        the family cannot see and the one the DPA covers.
+        mailbox already provisioned at Nerve or Google, or the WhatsApp identity
+        already registered, which keep receiving and storing whatever is sent to
+        them — so without this, withdrawal left processing running at the
+        processor boundary, which is the boundary the family cannot see and the
+        one the DPA covers.
+
+        `resource_types` comes from `WITHDRAWAL_SCOPES` and is what makes this
+        specific to the consent withdrawn. It used to be `{"email_identity"}`
+        unconditionally, for every purpose, so withdrawing a WhatsApp consent
+        deprovisioned the household's inbox and the mail in it while leaving the
+        WhatsApp resource alone.
 
         Reuses the same cleanup the onboarding reset schedules, rather than a
-        second teardown path: two ways to disconnect an inbox is two ways for
-        one of them to be wrong.
+        second teardown path: two ways to disconnect a provider resource is two
+        ways for one of them to be wrong.
         """
-        if self.email_identities is None:
+        if not resource_types:
             return []
+        if "email_identity" in resource_types and self.email_identities is None:
+            resource_types = resource_types - {"email_identity"}
+            if not resource_types:
+                return []
         row = connection.execute(
             "SELECT id, version FROM onboarding_workflows WHERE household_id = ?",
             (household_id,),
@@ -951,7 +967,10 @@ class OnboardingService:
             household_id=household_id,
             reason="withdrawal",
             now=now,
-            kinds={"email_identity"},
+            # The job kinds match the resource types one for one: a resource is
+            # torn down and the in-flight job that would create another one is
+            # quarantined, for the same consent and no other.
+            kinds=set(resource_types),
         )
         job_ids = self._schedule_registered_cleanup(
             connection,
@@ -959,12 +978,13 @@ class OnboardingService:
             workflow_id=row["id"],
             workflow_version=row["version"],
             now=now,
-            resource_types={"email_identity"},
+            resource_types=set(resource_types),
         )
-        self.email_identities.repository.begin_disconnect(
-            connection, household_id, now=now
-        )
-        self._finish_safe_email_disconnect(connection, household_id, now=now)
+        if "email_identity" in resource_types and self.email_identities is not None:
+            self.email_identities.repository.begin_disconnect(
+                connection, household_id, now=now
+            )
+            self._finish_safe_email_disconnect(connection, household_id, now=now)
         return job_ids
 
     def _schedule_registered_cleanup(

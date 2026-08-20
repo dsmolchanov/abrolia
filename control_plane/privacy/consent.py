@@ -66,6 +66,51 @@ def consent_version_and_text(purpose: str) -> tuple[str, str]:
     return CONSENT_TEXTS[purpose]
 
 
+#: What withdrawing each consent must actually terminate.
+#:
+#: `withdraw()` ran ONE teardown for every purpose: disconnect the email inbox,
+#: revoke every active revision, stop the runtime. So withdrawing
+#: `whatsapp_channel_privacy` deprovisioned the household's Gmail or Nerve inbox
+#: and the mail stored in it, while never touching the WhatsApp resource the
+#: consent was actually about. Art. 7(3) requires that withdrawing a consent
+#: stop the processing it authorised — not processing it did not.
+#:
+#: `resource_types` names the `external_resources` rows to tear down.
+#: `stops_runtime` says whether the household's runtime is told to stop, which
+#: only the authoritative content consent warrants: the runtime processes
+#: household content, and a channel-specific withdrawal does not end that.
+#:
+#: A purpose absent from this map is refused rather than defaulted, because
+#: defaulting is what caused the damage — the safe default for "I do not know
+#: what this terminates" is to do nothing and say so.
+WITHDRAWAL_SCOPES: dict[str, dict[str, object]] = {
+    # The Art 9(2)(a) condition is the lawful basis for processing household
+    # content at all. Withdrawing it ends the processing, so everything goes.
+    "special_category_household_content": {
+        "resource_types": frozenset({"email_identity"}),
+        "stops_runtime": True,
+    },
+    # The restriction acknowledgement is a condition ON content processing, and
+    # the planner refuses to issue a revision without a current one. Withdrawing
+    # it therefore stops content processing by the same route.
+    "special_category_content_restriction": {
+        "resource_types": frozenset({"email_identity"}),
+        "stops_runtime": True,
+    },
+    # Channel-scoped. These consent to WhatsApp's metadata exposure and its
+    # linked-device risk; neither authorises the inbox, and neither withdrawal
+    # is a reason to stop the runtime serving the household's other channels.
+    "whatsapp_channel_privacy": {
+        "resource_types": frozenset({"whatsapp_identity", "channel_binding"}),
+        "stops_runtime": False,
+    },
+    "whatsapp_linked_device_risk": {
+        "resource_types": frozenset({"whatsapp_identity", "channel_binding"}),
+        "stops_runtime": False,
+    },
+}
+
+
 CONTENT_RESTRICTION_PURPOSE = "special_category_content_restriction"
 HOUSEHOLD_CONTENT_PURPOSE = "special_category_household_content"
 
