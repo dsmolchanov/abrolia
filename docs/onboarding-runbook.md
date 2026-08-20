@@ -183,12 +183,18 @@ are empty**, since neither case describes work that will happen as written.
 
 `pending_step_jobs` lists unsettled jobs that run BEFORE `ensure_runtime` — the
 secret-namespace job the profile step queues, and each user step's own provider
-job — each with an `executable` flag saying whether the worker can lease it now.
-`pending` can; `running` only once its lease has expired; `waiting_user` waits on
-the OWNER, not the worker; and an `outcome_unknown` job carrying a
-`_requires_reconciliation` code waits on an explicit reconcile. A report is never
-"nothing is pending" while any unsettled intent exists — step job or runtime —
-even when the planner refuses because those very steps have not verified yet.
+job — each with an `executable` flag answering whether the worker can lease it
+right now. That answer comes from `JobsRepository.lease`'s own SQL rather than a
+restatement of its rules, so the report and the worker cannot disagree: a
+`pending` job whose `not_before` is in the future is not executable, a due
+`waiting_user`/`inspect` DNS recheck is, an `outcome_unknown` job never is, and
+nothing is while the workers are paused.
+
+A report is never "nothing is pending" while any unsettled intent exists — step
+job or runtime — even when the planner refuses because those very steps have not
+verified yet. That refusal is **not** a blockage: it is the normal state while
+the steps' own jobs are still queued, so `operation_blocked` stays false as long
+as something is leasable.
 
 `unresolved_runtime_jobs` lists **every** unsettled `ensure_runtime` intent, not
 just the next one. A reset preserves a started job as `outcome_unknown` with

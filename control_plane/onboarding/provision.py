@@ -29,6 +29,7 @@ from control_plane.db import MIGRATIONS_DIR
 from control_plane.models import USER_STEPS, WorkflowState
 from control_plane.provisioning.contracts import ProviderRejected
 from control_plane.provisioning.fly import FlyRuntimeProvisioner
+from control_plane.repositories.jobs import LEASABLE_SQL
 
 # Both are installed into the runtime sink by ProvisioningWorker._finish_runtime;
 # the bootstrap token is then deleted by the bootstrap cleanup job.
@@ -397,33 +398,6 @@ def _secret_names(
     return secrets
 
 
-def _is_executable(row: Any) -> bool:
-    """Can the worker lease this job right now.
-
-    `pending` always. `running` only once its lease has expired, because that is
-    when the reclaimer takes it — a live lease means another worker holds it.
-    `waiting_user` never: it waits on the owner. `outcome_unknown` only when it
-    is not quarantined, since `retry_later` refuses to revive a
-    `_requires_reconciliation` intent and only an explicit reconcile settles it.
-    """
-    status = str(row["status"])
-    if status == "pending":
-        return True
-    if status == "running":
-        return (row["lease_until"] or 0) <= _now_seconds()
-    if status == "outcome_unknown":
-        # A quarantined intent is not leasable: `retry_later` refuses to revive
-        # a `_requires_reconciliation` code and only an explicit reconcile
-        # settles it. Matched by SUFFIX rather than by listing `cancel` and
-        # `reset`, because `_supersede_unsettled_jobs` builds the code from a
-        # reason and a fourth reason should not need an edit here.
-        code = row["error_code"]
-        return not (
-            isinstance(code, str) and code.endswith("_requires_reconciliation")
-        )
-    return False
-
-
 def _now_seconds() -> float:
     """Wall clock, isolated so a test can pin an expired lease."""
     return time.time()
@@ -599,6 +573,10 @@ def plan_onboarding(
             # while `JobsRepository.lease` could execute the omitted job
             # immediately. "No pending work" was said about a worker with work
             # in hand.
+            now = _now_seconds()
+            # `lease` returns nothing at all while the workers are paused, so
+            # neither can anything here be executable.
+            paused = container.database.workers_paused
             plan.pending_step_jobs = [
                 {
                     "job_id": row["id"],
@@ -607,27 +585,26 @@ def plan_onboarding(
                     "status": row["status"],
                     "provider": row["provider"],
                     "error_code": row["error_code"],
-                    # Whether the worker can actually pick this up next. The
-                    # first version collapsed pending, held and expired
-                    # `running`, `waiting_user` and quarantined
-                    # `outcome_unknown` into one list, and the planner's
-                    # expected unverified-step error then marked every one
-                    # blocked — so a leasable `ensure_secret_namespace` right
-                    # after `save_profile` was reported as unable to execute
-                    # while `JobsRepository.lease` would take it immediately.
-                    #
-                    # `waiting_user` is deliberately NOT executable: it waits on
-                    # the owner, not on the worker.
-                    "executable": _is_executable(row),
+                    # Whether the worker can pick this up next, asked with
+                    # `JobsRepository.lease`'s OWN predicate rather than a
+                    # restatement of it. The restatement disagreed in three
+                    # ways: a `pending` job with a future `not_before` is not
+                    # leasable and was called executable, a due
+                    # `waiting_user/inspect` DNS job IS leasable and was called
+                    # blocked, and `outcome_unknown` is never selected at all.
+                    # A report about what the worker will do has to ask the
+                    # worker's question.
+                    "executable": bool(row["executable"]) and not paused,
                 }
                 for row in connection.execute(
                     "SELECT id, kind, operation, status, provider, error_code,"
-                    " lease_until FROM provisioning_jobs"
+                    f" CASE WHEN ({LEASABLE_SQL}) THEN 1 ELSE 0 END AS executable"
+                    " FROM provisioning_jobs"
                     " WHERE household_id = ? AND workflow_id = ?"
                     " AND NOT (kind = 'runtime' AND operation = 'ensure_runtime')"
                     " AND status IN ('pending','running','waiting_user','outcome_unknown')"
                     " ORDER BY created_at, id",
-                    (household_id, workflow["id"]),
+                    (now, now, now, household_id, workflow["id"]),
                 ).fetchall()
             ]
             # More than one unresolved intent means an EARLIER provider effect
@@ -1007,7 +984,16 @@ def plan_onboarding(
                     plan.operation_pending = bool(
                         plan.pending_step_jobs or plan.unresolved_runtime_jobs
                     )
-                    plan.operation_blocked = True
+                    # Blocked only when nothing can actually run. Setting it
+                    # unconditionally made the report contradict itself: a job
+                    # listed with `executable: true` in the same document the
+                    # flag declared unable to proceed. The planner refusing for
+                    # unverified steps is the NORMAL state while those steps'
+                    # own jobs are still queued — that is work in progress, not
+                    # a blockage.
+                    plan.operation_blocked = not any(
+                        job["executable"] for job in plan.pending_step_jobs
+                    )
                     plan.blocked_by = str(error)
                 finally:
                     connection.set_trace_callback(None)
@@ -1033,7 +1019,13 @@ def plan_onboarding(
                     )
                 except KeyError:
                     spec = None
-            if plan.operation_pending and not plan.operation_blocked:
+            # `spec is not None` as well: these two fields describe the RUNTIME
+            # operation, and before a revision is planned or issued there is no
+            # runtime operation to describe. Reporting a provider entry that
+            # says "nothing is asserted about what it creates" is noise dressed
+            # as a plan, and the rule everywhere else in this report is that a
+            # field describes the pending operation or is empty.
+            if spec is not None and plan.operation_pending and not plan.operation_blocked:
                 plan.runtime_resources = _runtime_resources(
                     container,
                     household_id,

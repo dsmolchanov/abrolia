@@ -26,7 +26,7 @@ from control_plane.onboarding.provision import (
     RUNTIME_DSAR_SECRET,
     RUNTIME_WRITES_BY_WORKFLOW_STATE,
     TableWrite,
-    _is_executable,
+    _now_seconds,
     _parser,
     _record_writes,
     _runtime_resources,
@@ -1626,9 +1626,14 @@ def test_a_pending_step_job_is_not_reported_as_no_work(container) -> None:
         row["id"] for row in queued
     }
     assert plan.operation_pending is True
-    # Blocked, so nothing future-tense is claimed — the difference is whether an
-    # operator is told there is no work or told what the work is.
-    assert plan.operation_blocked is True
+    # NOT blocked. The planner refusing for unverified steps is the normal state
+    # while those steps' own jobs are still queued — that is work in progress.
+    # Marking it blocked made the report contradict itself: a job listed with
+    # `executable: true` in the same document the flag declared unable to
+    # proceed.
+    assert plan.operation_blocked is False
+    # Still nothing future-tense: no revision is planned yet, so there is no
+    # runtime operation to describe resources or secrets for.
     assert plan.runtime_resources == []
     assert plan.secrets == []
 
@@ -1724,35 +1729,92 @@ def test_a_leasable_step_job_is_reported_as_executable(container) -> None:
 
 
 @pytest.mark.parametrize(
-    ("status", "error_code", "executable"),
+    ("status", "operation", "not_before", "lease_until", "executable"),
     [
-        pytest.param("pending", None, True, id="pending"),
-        pytest.param("waiting_user", None, False, id="waiting-on-the-owner"),
-        pytest.param("outcome_unknown", "outcome_unknown", True, id="reconcilable"),
+        pytest.param("pending", "ensure", None, None, True, id="pending-now"),
+        pytest.param("pending", "ensure", 1e12, None, False, id="pending-not-yet"),
+        pytest.param("running", "ensure", None, 1e12, False, id="lease-held"),
+        pytest.param("running", "ensure", None, 1.0, True, id="lease-expired"),
         pytest.param(
-            "outcome_unknown", "reset_requires_reconciliation", False, id="quarantined"
+            "waiting_user", "inspect", 1.0, None, True, id="dns-recheck-due"
         ),
         pytest.param(
-            "outcome_unknown",
-            "withdrawal_requires_reconciliation",
-            False,
-            id="quarantined-by-a-reason-added-later",
+            "waiting_user", "inspect", 1e12, None, False, id="dns-recheck-not-due"
+        ),
+        pytest.param("waiting_user", "ensure", 1.0, None, False, id="waits-on-owner"),
+        pytest.param(
+            "outcome_unknown", "ensure", None, None, False, id="never-selected"
         ),
     ],
 )
-def test_executability_is_decided_per_state(status, error_code, executable) -> None:
-    """`waiting_user` waits on the OWNER; a quarantine waits on a reconcile.
+def test_executability_matches_what_the_worker_would_lease(
+    container, status, operation, not_before, lease_until, executable
+) -> None:
+    """The report's answer and `JobsRepository.lease` must be the same answer.
 
-    The quarantine case is matched by suffix, so a reason added later needs no
-    edit here — which is the shape of bug that put `withdrawal` outside three
-    separate literal lists elsewhere in this codebase.
+    Restating the rules in Python is what produced three disagreements: a
+    `pending` job with a future `not_before` called executable when it is not, a
+    due `waiting_user/inspect` DNS recheck called blocked when the worker takes
+    it, and `outcome_unknown` called leasable when nothing selects it at all.
+    Each case here is checked BOTH ways — what the report says, and whether
+    `lease` actually returns that job — so the two cannot drift again.
     """
-    row = {
-        "status": status,
-        "error_code": error_code,
-        "lease_until": None,
-    }
-    assert _is_executable(row) is executable
+    household_id = _household_with_profile(container)
+    with container.database.write() as connection:
+        connection.execute(
+            "UPDATE provisioning_jobs SET status = ?, operation = ?,"
+            " not_before = ?, lease_until = ? WHERE household_id = ?",
+            (status, operation, not_before, lease_until, household_id),
+        )
+        connection.execute(
+            "DELETE FROM provisioning_jobs WHERE household_id != ?", (household_id,)
+        )
+
+    plan = plan_onboarding(container, household_id)
+    reported = [job["executable"] for job in plan.pending_step_jobs]
+    assert reported == [executable], reported
+
+    leased = container.jobs.lease("probe", now=_now_seconds())
+    assert (leased is not None) is executable, (
+        "the report and the worker disagree about the same job"
+    )
+
+
+def test_paused_workers_make_nothing_executable(container) -> None:
+    """`lease` returns nothing at all while the workers are paused.
+
+    A restored database stays paused until `resume-jobs`, and a report telling
+    an operator that work is about to run — while the pause they deliberately
+    left in place guarantees it will not — is the same class of false statement
+    as any other disagreement with the worker.
+    """
+    household_id = _household_with_profile(container)
+    account_id, session_id = _PRINCIPALS[household_id]
+    container.onboarding.select(
+        household_id,
+        StepKind.EMAIL,
+        EMAIL_SELECTION,
+        context=_context(
+            container, household_id, "select-0",
+            account_id=account_id, session_id=session_id,
+        ),
+    )
+    running = plan_onboarding(container, household_id)
+    assert any(job["executable"] for job in running.pending_step_jobs), (
+        "the fixture queued nothing leasable, so pausing proves nothing"
+    )
+
+    container.database.pause_workers()
+    try:
+        paused = plan_onboarding(container, household_id)
+        assert container.jobs.lease("probe", now=_now_seconds()) is None
+    finally:
+        container.database.resume_workers()
+
+    assert paused.pending_step_jobs, "the pause emptied the inventory"
+    assert not any(job["executable"] for job in paused.pending_step_jobs), (
+        "work was reported as about to run while the workers are paused"
+    )
 
 
 def test_a_quarantined_runtime_intent_keeps_the_operation_pending(container) -> None:
