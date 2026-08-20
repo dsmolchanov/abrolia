@@ -574,14 +574,27 @@ def _rename_or_exdev(source: Path, destination: Path) -> bool:
 
 
 def _copy_install(source: Path, destination: Path) -> None:
-    """Chunked, because the Machine has 512 MiB against a 1 GiB volume."""
-    temporary = destination.with_name(f".{destination.name}.installing")
+    """Chunked, because the Machine has 512 MiB against a 1 GiB volume.
+
+    The temporary name comes from the kernel, not from the destination. A
+    predictable `<destination>.installing` was a path anything could already
+    occupy: a directory or unwritable entry there raised only AFTER the live
+    database had been renamed aside, and a regular file or symlink was followed
+    and truncated — so the failure was either an outage with no canonical
+    database or the destruction of an unrelated file. `mkstemp` creates it with
+    `O_EXCL`, so this call owns the name it is about to publish from.
+    """
+    handle, name = tempfile.mkstemp(
+        prefix=f".{destination.name}.installing.", dir=destination.parent
+    )
+    temporary = Path(name)
     try:
-        with open(source, "rb") as reader, open(temporary, "wb") as writer:
+        with open(source, "rb") as reader, os.fdopen(handle, "wb") as writer:
             for chunk in iter(lambda: reader.read(CHUNK_BYTES), b""):
                 writer.write(chunk)
             writer.flush()
             os.fsync(writer.fileno())
+        os.chmod(temporary, 0o600)
         _publish(temporary, destination)
     except BaseException:
         temporary.unlink(missing_ok=True)
@@ -624,6 +637,18 @@ def _readable_sqlite(path: Path) -> None:
         for sidecar in _sidecars(path):
             if sidecar not in before:
                 sidecar.unlink(missing_ok=True)
+
+
+def _present(path: Path) -> bool:
+    """Does an ENTRY exist here, link or not.
+
+    `Path.exists()` follows symlinks, so a dangling one answers False — and a
+    dangling `-wal` therefore skipped validation entirely, survived the
+    superseded move, and sat beside the installed rollback where the next SQLite
+    write follows it out of the volume. `lexists` asks about the entry, which is
+    what the installer is going to move.
+    """
+    return os.path.lexists(path)
 
 
 def _regular_file(path: Path) -> bool:
@@ -675,7 +700,7 @@ def _reserve_aside(target: Path, stamp: int) -> str:
                 f" filesystem's {limit}-character limit; rename the database to"
                 " something shorter before rolling back"
             )
-        if not any(target.with_name(name).exists() for name in members):
+        if not any(_present(target.with_name(name)) for name in members):
             return candidate
     raise RollbackError(
         f"every superseded name for {target.name} at {stamp} is taken;"
@@ -755,7 +780,7 @@ def _preflight(
     # once the database has already gone.
     for bundle in (_bundle(restored), _bundle(target)):
         for member in bundle[1:]:
-            if member.exists() and not _regular_file(member):
+            if _present(member) and not _regular_file(member):
                 raise RollbackError(f"{member} is not a regular file")
     _readable_sqlite(restored)
 
@@ -957,15 +982,22 @@ def _install_rollback_locked(
     # be started without one. Installing in bundle order put the database at the
     # canonical path and then the marker, so a crash or a failed copy in between
     # left a startable, unreconciled rollback.
+    # Marker, then sidecars, then the DATABASE LAST. The database becoming
+    # visible is what makes the rollback real, so everything belonging to that
+    # generation has to be in place first. Publishing it before its sidecars
+    # meant that a crash in between left a canonical database whose committed
+    # WAL frames — a candidate inspected by a process that was then killed still
+    # has them — were sitting at the staging path, so the next open silently
+    # read a database missing its own latest commits.
     ordered = (
         _pause_marker(restored_path),
-        restored_path,
         *_sidecars(restored_path),
+        restored_path,
     )
     destinations = (
         _pause_marker(target_path),
-        target_path,
         *_sidecars(target_path),
+        target_path,
     )
     for source, destination in zip(ordered, destinations, strict=True):
         if source.exists() and not _rename_or_exdev(source, destination):

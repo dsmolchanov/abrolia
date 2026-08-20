@@ -1677,13 +1677,18 @@ def test_a_missing_target_without_the_flag_says_what_to_do(tmp_path, monkeypatch
 
 
 def test_the_pause_marker_is_installed_before_the_database(tmp_path, monkeypatch) -> None:
-    """A database visible before its marker is one that can be started unpaused.
+    """The database is published LAST, after its marker and its sidecars.
 
-    Installing in bundle order put the database at the canonical path first, so
-    a crash or a failed copy before the marker arrived left a startable,
-    unreconciled rollback.
+    A database visible before its marker can be started unpaused. A database
+    visible before its sidecars is worse and quieter: a staged candidate
+    inspected by a process that was then killed still has committed frames in
+    its `-wal`, and a crash between the two publications leaves a canonical
+    database whose own latest commits are back at the staging path, which the
+    next open reads straight past.
     """
     volume, target, restored = _rollback_fixture(tmp_path)
+    # Give the candidate a WAL, so there is a sidecar to order against.
+    restored.with_name(f"{restored.name}-wal").write_bytes(b"\x00" * 4096)
     _constrain(monkeypatch, volume, capacity=target.stat().st_size * 10)
     order: list[str] = []
     real_replace = os.replace
@@ -1694,6 +1699,8 @@ def test_the_pause_marker_is_installed_before_the_database(tmp_path, monkeypatch
             order.append("database")
         elif landed == _pause_marker_path(target):
             order.append("marker")
+        elif landed.name.endswith(("-wal", "-shm")):
+            order.append("sidecar")
         return real_replace(source, destination, **kwargs)
 
     monkeypatch.setattr(os, "replace", replace)
@@ -1701,11 +1708,13 @@ def test_the_pause_marker_is_installed_before_the_database(tmp_path, monkeypatch
 
     # Two entries per file: `_rename_or_exdev` attempts the rename, and on
     # `EXDEV` `_copy_install` publishes the temporary. What matters is that
-    # EVERY marker event precedes every database event — the marker is durably
-    # in place before the database it guards becomes visible.
-    assert set(order) == {"marker", "database"}, order
-    assert max(i for i, v in enumerate(order) if v == "marker") < min(
-        i for i, v in enumerate(order) if v == "database"
+    # EVERY marker and sidecar event precedes every database event — the
+    # database becoming visible is what makes the rollback real, so everything
+    # belonging to that generation is in place first.
+    assert "database" in order and "marker" in order, order
+    first_database = min(i for i, v in enumerate(order) if v == "database")
+    assert all(
+        i < first_database for i, v in enumerate(order) if v != "database"
     ), order
 
 
@@ -1810,3 +1819,58 @@ def test_backup_refuses_while_a_writer_holds_the_lock(tmp_path, monkeypatch) -> 
         writer.close()
 
     assert not (tmp_path / "superseded.cpb").exists()
+
+
+@pytest.mark.parametrize("shape", ["directory", "file", "symlink"])
+def test_an_occupied_copy_temporary_cannot_break_the_install(
+    tmp_path, monkeypatch, shape
+) -> None:
+    """The temporary name came from the destination, so anything could hold it.
+
+    A directory or unwritable entry at `<destination>.installing` raised only
+    AFTER the live database had been renamed aside; a regular file or symlink
+    was followed and truncated. Either an outage with no canonical database, or
+    an unrelated file destroyed. `mkstemp` takes the name from the kernel with
+    `O_EXCL`, so the install owns what it publishes from.
+    """
+    volume, target, restored = _rollback_fixture(tmp_path)
+    _constrain(monkeypatch, volume, capacity=target.stat().st_size * 10)
+    squatter = volume / f".{target.name}.installing"
+    bystander = tmp_path / "bystander"
+    bystander.write_bytes(b"not part of this rollback")
+    if shape == "directory":
+        squatter.mkdir()
+    elif shape == "file":
+        squatter.write_bytes(b"someone else's file")
+    else:
+        squatter.symlink_to(bystander)
+
+    report = install_rollback(restored, target, now=1800000042)
+
+    assert report["workers"] == "paused"
+    assert "migrated_only" not in _tables(target), "the rollback was not installed"
+    assert bystander.read_bytes() == b"not part of this rollback"
+    if shape == "file":
+        assert squatter.read_bytes() == b"someone else's file"
+
+
+def test_a_dangling_symlink_in_the_bundle_is_refused(tmp_path, monkeypatch) -> None:
+    """`exists()` follows symlinks, so a dangling one answered False.
+
+    It therefore skipped every validation, survived the superseded move, and sat
+    beside the installed rollback — where the next SQLite write follows it out
+    of the volume a Machine replacement preserves.
+    """
+    volume, target, restored = _rollback_fixture(tmp_path)
+    _constrain(monkeypatch, volume, capacity=target.stat().st_size * 10)
+    dangling = volume / f"{target.name}-wal"
+    dangling.symlink_to(tmp_path / "nothing-is-here")
+    assert not dangling.exists(), "the fixture link is not dangling"
+    assert os.path.lexists(dangling), "the fixture link does not exist as an entry"
+    before = _fingerprint(volume)
+
+    with pytest.raises(RollbackError, match="not a regular file"):
+        install_rollback(restored, target, now=1800000042)
+
+    assert _fingerprint(volume) == before
+    assert os.path.lexists(dangling), "the refusal removed the entry it objected to"
