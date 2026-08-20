@@ -1,107 +1,52 @@
 name: codex-review-window
-
+# This file is a STUB. The gate itself lives in dsmolchanov/codex-review-gate,
+# a PUBLIC repository holding the workflow and its executable tests
+# (tests/test_gate_behavior.py runs the gate's shell under a stubbed gh and
+# asserts exit codes). It must be public: a PUBLIC consumer cannot call a
+# reusable workflow from a private repository — the run fails with zero jobs
+# and no annotation. Verified by probe, not by documentation. Keeping the body here put one file in front of eight
+# independent reviewers at once and produced 21 blocking findings, no two
+# repositories agreeing and several asking for tests that exist in two of the
+# eight. A change to the gate is now reviewed once, where it can be tested.
+#
+# DO NOT paste the gate body back into this file. If you need to change the
+# gate, change it in dev-agent and move the tag below.
 on:
   pull_request:
     types: [opened, reopened, synchronize, ready_for_review]
+  # A review that lands after the wait window expired must re-open the gate;
+  # `pull_request` events alone never fire again for a late review.
+  pull_request_review:
+    types: [submitted]
 
-# This workflow is a required status check. It accepts only a Codex review of
-# the current PR head. A time-bounded operator exception permits unavailable
-# reviews until the subscription resets; P1/[BLOCKER] findings never bypass.
+# `issue_comment` is DELIBERATELY ABSENT: a comment event runs from the default
+# branch, so its check run can never satisfy a PR's required check, and it would
+# cancel the real PR-associated run through the concurrency group below. The
+# gate posts its own anchor comment, which made an earlier revision
+# self-cancelling.
+concurrency:
+  group: codex-review-window-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
+  # The job key sets the check-run name branch protection matches. A reusable
+  # workflow reports as `<caller job> / <called job>`, so both are named
+  # `codex-review-window` and the required context becomes
+  # `codex-review-window / codex-review-window`. Renaming either half silently
+  # removes the gate — branch protection waits on a context that never reports.
   codex-review-window:
-    if: ${{ !github.event.pull_request.draft }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # PINNED TO A COMMIT SHA, not to `@v1`. This caller forwards
+    # CODEX_REQUEST_TOKEN, SLACK_WEBHOOK and a write-capable workflow token to
+    # whatever that ref resolves to. A tag is mutable: retagging `v1` — by
+    # compromise or by accident — would silently change the code holding those
+    # secrets in every consumer at once, with no diff anywhere to review.
+    # The SHA below is tag v1 of dsmolchanov/codex-review-gate. To move it,
+    # read the host diff first, then change this line: the bump is the review.
+    uses: dsmolchanov/codex-review-gate/.github/workflows/codex-review-window.yml@8cafcd277cff80a4ae9b097a106afd252fea6af2  # v1
     permissions:
+      contents: read
+      issues: read
       pull-requests: write
-    env:
-      GH_TOKEN: ${{ github.token }}
-      REPO: ${{ github.repository }}
-      PR: ${{ github.event.pull_request.number }}
-      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-      CODEX_BOT: chatgpt-codex-connector[bot]
-      REVIEW_FAIL_OPEN_UNTIL_EPOCH: "1786323600" # 2026-08-10T01:00:00Z
-    steps:
-      - name: Gate on Codex verdict for this commit
-        run: |
-          set -euo pipefail
-          echo "Waiting for Codex review of ${HEAD_SHA} on PR #${PR}"
-
-          review_id_for_head() {
-            gh api "repos/${REPO}/pulls/${PR}/reviews" --paginate \
-              --jq "[.[] | select(.user.login == \"${CODEX_BOT}\" and .commit_id == \"${HEAD_SHA}\")] | (last | .id) // empty"
-          }
-
-          green_comment_for_head() {
-            local head_short="${HEAD_SHA:0:10}"
-            gh api "repos/${REPO}/issues/${PR}/comments" --paginate \
-              --jq "[.[] | select(.user.login == \"${CODEX_BOT}\" and ((.body | contains(\"Codex Review: Didn't find any major issues.\")) and (.body | contains(\"${head_short}\"))))] | (last | .id) // empty"
-          }
-
-          fail_open_is_active() {
-            [ "$(date -u +%s)" -lt "${REVIEW_FAIL_OPEN_UNTIL_EPOCH}" ]
-          }
-
-          codex_limit_reported() {
-            gh api "repos/${REPO}/issues/${PR}/comments" --paginate \
-              --jq "[.[] | select(.user.login == \"${CODEX_BOT}\" and (.body | contains(\"usage limits for code reviews\")))] | length"
-          }
-
-          # Opening/readying is covered by Codex Automatic Reviews. A push
-          # changes HEAD, so request a fresh review when none exists yet.
-          if [ "${{ github.event.action }}" = "synchronize" ] && [ -z "$(review_id_for_head)" ]; then
-            gh api "repos/${REPO}/issues/${PR}/comments" -f body="@codex review" >/dev/null
-            echo "Posted '@codex review' for the new head."
-          fi
-
-          DEADLINE=$((SECONDS + 480))
-          RID=""
-          GREEN_COMMENT_ID=""
-          while [ ${SECONDS} -lt ${DEADLINE} ]; do
-            RID="$(review_id_for_head)"
-            [ -n "${RID}" ] && break
-            GREEN_COMMENT_ID="$(green_comment_for_head)"
-            [ -n "${GREEN_COMMENT_ID}" ] && break
-            if fail_open_is_active && [ "$(codex_limit_reported)" -gt 0 ]; then
-              echo "::warning::Codex reported exhausted review limits. Review is temporarily advisory until 2026-08-10T01:00:00Z; CI remains required."
-              exit 0
-            fi
-            sleep 20
-          done
-
-          if [ -z "${RID}" ] && [ -n "${GREEN_COMMENT_ID}" ]; then
-            # A formal review can arrive concurrently with the comment. Give
-            # GitHub time to publish it, then make it authoritative if present.
-            sleep 15
-            RID="$(review_id_for_head)"
-            if [ -z "${RID}" ]; then
-              echo "Codex green comment matches current head ${HEAD_SHA}."
-              exit 0
-            fi
-          fi
-
-          if [ -z "${RID}" ]; then
-            if fail_open_is_active; then
-              echo "::warning::No Codex review arrived. Review is temporarily advisory until 2026-08-10T01:00:00Z; CI remains required."
-              exit 0
-            fi
-            echo "::error::No Codex review arrived for ${HEAD_SHA}. Verify that Codex Automatic Reviews is enabled; merge remains blocked."
-            exit 1
-          fi
-
-          # Inline comments may land just after the review object.
-          sleep 15
-
-          PATTERN='\[BLOCKER\]|badge/P1|P1 Badge'
-          INLINE=$(gh api "repos/${REPO}/pulls/${PR}/comments" --paginate \
-            --jq ".[] | select(.pull_request_review_id == ${RID}) | .body" \
-            | grep -cE "${PATTERN}" || true)
-          BODY=$(gh api "repos/${REPO}/pulls/${PR}/reviews/${RID}" --jq '.body' \
-            | grep -cE "${PATTERN}" || true)
-
-          if [ "$((INLINE + BODY))" -gt 0 ]; then
-            echo "::error::Codex reports P1/[BLOCKER] findings on ${HEAD_SHA}. Auto-fix must push a fix; the gate will re-run on the new head."
-            exit 1
-          fi
-
-          echo "Codex review is green for ${HEAD_SHA}."
+    secrets:
+      CODEX_REQUEST_TOKEN: ${{ secrets.CODEX_REQUEST_TOKEN }}
+      SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
