@@ -3059,3 +3059,130 @@ def test_install_rollback_refuses_a_hard_linked_bundle_member(
 
     assert _fingerprint(volume) == volume_before
     assert _fingerprint(restored.parent) == staging_before
+
+
+def test_a_restore_does_not_delete_another_operation_s_pause_marker(
+    tmp_path, monkeypatch
+) -> None:
+    """`_publish` fails with EEXIST precisely when somebody else got there first.
+
+    The cleanup then unlinked that marker BY NAME, destroying the pause
+    belonging to another restore while reporting only this one's error. The
+    other restore's database is then startable against unreconciled data.
+    """
+    seed = _database(tmp_path)
+    seed.migrate()
+    archive = tmp_path / "restore-point.cpb"
+    backup_module.create_backup(seed, archive, backup_key=BACKUP_KEY_BYTES)
+    seed.close()
+    destination = tmp_path / "restored" / "control-plane.db"
+    destination.parent.mkdir()
+    interloper = backup_module._pause_marker(destination)
+    real_publish = backup_module._publish
+
+    def publish(temporary, target):
+        # Somebody else's restore claims the marker name in the instant between
+        # the last occupancy check and this publication.
+        if Path(target) == interloper and not interloper.exists():
+            interloper.write_bytes(b"another restore's pause")
+        return real_publish(temporary, target)
+
+    monkeypatch.setattr(backup_module, "_publish", publish)
+
+    with pytest.raises(backup_module.BackupError, match="could not durably pause"):
+        backup_module.restore_backup(
+            archive, destination, backup_key=BACKUP_KEY_BYTES
+        )
+
+    monkeypatch.undo()
+    assert interloper.read_bytes() == b"another restore's pause", (
+        "the cleanup deleted a pause marker this restore never created"
+    )
+    assert not destination.exists()
+
+
+def test_a_database_arriving_at_the_target_keeps_the_pause(
+    tmp_path, monkeypatch
+) -> None:
+    """Removing the pause is the one thing that must not happen here.
+
+    The marker was published, this restore's own database publication then
+    failed, and the cleanup unlinked the marker by name — but by then something
+    else had arrived at the target path. A database with no `workers-paused`
+    beside it is a database that starts unpaused, which is the whole reason the
+    marker exists.
+    """
+    seed = _database(tmp_path)
+    seed.migrate()
+    archive = tmp_path / "restore-point.cpb"
+    backup_module.create_backup(seed, archive, backup_key=BACKUP_KEY_BYTES)
+    seed.close()
+    destination = tmp_path / "restored" / "control-plane.db"
+    destination.parent.mkdir()
+    marker = backup_module._pause_marker(destination)
+    real_publish = backup_module._publish
+
+    def publish(temporary, target):
+        if Path(target) == destination and not destination.exists():
+            # Another operation lands its database first, so this publication
+            # fails `EEXIST` with a database now sitting at the target.
+            destination.write_bytes(b"another operation's database")
+        return real_publish(temporary, target)
+
+    monkeypatch.setattr(backup_module, "_publish", publish)
+
+    with pytest.raises(FileExistsError):
+        backup_module.restore_backup(
+            archive, destination, backup_key=BACKUP_KEY_BYTES
+        )
+
+    monkeypatch.undo()
+    assert destination.read_bytes() == b"another operation's database"
+    assert marker.exists(), (
+        "a database stands at the target with its worker pause removed"
+    )
+
+
+def test_a_pause_marker_replaced_after_publication_is_left_alone(
+    tmp_path, monkeypatch
+) -> None:
+    """Publishing it is not the same as still owning it.
+
+    Between this restore publishing its marker and its database publication
+    failing, another operation can replace that marker with its own. Removing it
+    then takes away a pause this invocation no longer owns — the same
+    delete-by-name defect as the `EEXIST` case, one step further along.
+    """
+    seed = _database(tmp_path)
+    seed.migrate()
+    archive = tmp_path / "restore-point.cpb"
+    backup_module.create_backup(seed, archive, backup_key=BACKUP_KEY_BYTES)
+    seed.close()
+    destination = tmp_path / "restored" / "control-plane.db"
+    destination.parent.mkdir()
+    marker = backup_module._pause_marker(destination)
+    real_publish = backup_module._publish
+
+    def publish(temporary, target):
+        if Path(target) == destination:
+            # Written elsewhere and renamed in, so the replacement's inode is
+            # allocated while the original is still linked and the two cannot
+            # collide by recycling.
+            replacement = marker.with_name("a-successor")
+            replacement.write_bytes(b"another restore's pause")
+            os.replace(replacement, marker)
+            raise OSError(errno.EIO, "the database publication failed")
+        return real_publish(temporary, target)
+
+    monkeypatch.setattr(backup_module, "_publish", publish)
+
+    with pytest.raises(OSError, match="database publication failed"):
+        backup_module.restore_backup(
+            archive, destination, backup_key=BACKUP_KEY_BYTES
+        )
+
+    monkeypatch.undo()
+    assert not destination.exists(), "the fixture published a database after all"
+    assert marker.read_bytes() == b"another restore's pause", (
+        "the cleanup removed a pause marker this restore no longer owned"
+    )

@@ -526,6 +526,32 @@ def restore_backup(
         guard.close()
 
 
+def _withdraw_pause(destination: Path, owned: tuple[int, int] | None) -> None:
+    """Take back the pause THIS invocation published, and no other.
+
+    Three ways not to remove it, and the asymmetry is deliberate: a spare pause
+    marker beside nothing is a harmless puzzle, while a missing one is a
+    database that starts unpaused against unreconciled data.
+
+    * Nothing was published — including the `EEXIST` case, where the marker at
+      that path is another restore's.
+    * The entry is no longer the one that was published.
+    * A database now occupies the target. Whatever put it there, it is better
+      paused than not, and this invocation cannot tell which.
+
+    Not fsynced, unlike `_withdraw`. An unsynced removal can be resurrected by a
+    crash, and a marker that comes back beside no database is the safe
+    direction; raising `AmbiguousPublication` from a cleanup path would replace
+    the caller's diagnosis with a symptom.
+    """
+    if owned is None:
+        return
+    pause = _pause_marker(destination)
+    if _inode(pause) != owned or _present(destination):
+        return
+    pause.unlink(missing_ok=True)
+
+
 def _require_free_bundle(destination: Path) -> None:
     """No member of the destination bundle may exist.
 
@@ -638,6 +664,9 @@ def _restore_locked(
         # not claim.
         _require_free_bundle(destination)
         marker = Path(f"{temporary}.workers-paused")
+        # The inode THIS invocation publishes, so the cleanups below can tell
+        # the marker they created from one that arrived while they were working.
+        owned_marker: tuple[int, int] | None = None
         try:
             marker.write_text(
                 "restore requires explicit reconciliation\n", encoding="utf-8"
@@ -646,9 +675,15 @@ def _restore_locked(
             with open(marker, "rb") as handle:
                 os.fsync(handle.fileno())
             _publish(marker, _pause_marker(destination))
+            owned_marker = _inode(_pause_marker(destination))
         except OSError as error:
             marker.unlink(missing_ok=True)
-            _pause_marker(destination).unlink(missing_ok=True)
+            # `owned_marker` is None on EVERY failure here, which is the point.
+            # `_publish` fails with `EEXIST` precisely when another process
+            # created that marker after the last occupancy check, and the
+            # cleanup used to unlink it by name — destroying the pause belonging
+            # to somebody else's restore while reporting only this one's error.
+            _withdraw_pause(destination, owned_marker)
             raise BackupError(
                 f"restore could not durably pause workers: {error}"
             ) from error
@@ -661,9 +696,12 @@ def _restore_locked(
             # database that starts unpaused.
             raise
         except BaseException:
-            # The database definitely never became visible, so its marker must
-            # not stay behind claiming to guard something that is not there.
-            _pause_marker(destination).unlink(missing_ok=True)
+            # This restore's database definitely never became visible, so the
+            # marker this restore published must not stay behind claiming to
+            # guard something that is not there — unless something else has
+            # arrived at that path in the meantime, in which case removing the
+            # pause is the one thing that must not happen.
+            _withdraw_pause(destination, owned_marker)
             raise
         temporary = None
         restored = ControlPlaneDatabase(destination)
