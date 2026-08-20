@@ -1245,7 +1245,12 @@ def test_a_provider_configuration_mismatch_is_reported_as_blocked(container) -> 
 
     plan = plan_onboarding(container, household_id)
 
-    assert plan.operation_pending is False
+    # PENDING, and not executable. The job is still `pending` and the worker can
+    # still lease it, so reporting "nothing is pending" told an operator there
+    # was no live work while the worker was about to stall on it. Two facts,
+    # two flags.
+    assert plan.operation_pending is True
+    assert plan.operation_blocked is True
     assert plan.blocked_by is not None
     # Both sides named: which is queued, and which the deployment is set to.
     assert other in plan.blocked_by and configured in plan.blocked_by
@@ -1255,6 +1260,7 @@ def test_a_provider_configuration_mismatch_is_reported_as_blocked(container) -> 
     assert plan.table_writes == []
     # The job is still reported, so an operator can see what to restore.
     assert plan.pending_runtime_job["provider"] == other
+    assert [job["provider"] for job in plan.unresolved_runtime_jobs] == [other]
 
 
 def test_a_job_naming_an_unregistered_provider_is_blocked_too(container) -> None:
@@ -1277,7 +1283,8 @@ def test_a_job_naming_an_unregistered_provider_is_blocked_too(container) -> None
 
     plan = plan_onboarding(container, household_id)
 
-    assert plan.operation_pending is False
+    assert plan.operation_pending is True
+    assert plan.operation_blocked is True
     assert plan.runtime_resources == []
     assert plan.secrets == []
     assert "a-provider-nobody-registers" in (plan.blocked_by or "")
@@ -1417,3 +1424,66 @@ def test_a_canonical_household_argument_is_accepted() -> None:
     household_id = "10000000-0000-4000-8000-000000000031"
     args = _parser().parse_args(["--dry-run", "--household", household_id])
     assert args.household == household_id
+
+
+def test_every_unresolved_runtime_intent_is_inventoried(container) -> None:
+    """`LIMIT 1` answered "what runs next" and hid what is still outstanding.
+
+    A reset preserves a running runtime job as `outcome_unknown` with
+    `reset_requires_reconciliation` — deliberately, because it may have created
+    provider state. The owner can then complete the steps again and mint a NEWER
+    job, and a single-row view showed only that one. An operator reading the
+    report sees a clean pending job and proceeds past a provider effect nobody
+    has reconciled.
+    """
+    household_id = _household_with_profile(container)
+    _verify_all_steps(container, household_id)
+    account_id, session_id = _PRINCIPALS[household_id]
+    quarantined = container.database.query_one(
+        "SELECT id FROM provisioning_jobs WHERE household_id = ?"
+        " AND kind = 'runtime' AND operation = 'ensure_runtime'"
+        " ORDER BY created_at DESC LIMIT 1",
+        (household_id,),
+    )["id"]
+    # The state a reset leaves behind for a job that had already started.
+    with container.database.write() as connection:
+        connection.execute(
+            "UPDATE provisioning_jobs SET status = 'outcome_unknown',"
+            " error_code = 'reset_requires_reconciliation' WHERE id = ?",
+            (quarantined,),
+        )
+    container.onboarding.reset_from(
+        household_id,
+        StepKind.EMAIL,
+        context=_context(
+            container, household_id, "reset", account_id=account_id,
+            session_id=session_id,
+        ),
+    )
+    # The reset schedules an email cleanup, and reconnecting before it finishes
+    # is refused — drain it, as a real operator's worker would.
+    for _ in range(10):
+        if container.worker.run_once() is None:
+            break
+    _verify_all_steps(container, household_id, label="again")
+    newest = container.database.query_one(
+        "SELECT id FROM provisioning_jobs WHERE household_id = ?"
+        " AND kind = 'runtime' AND operation = 'ensure_runtime'"
+        " AND id != ? ORDER BY created_at DESC LIMIT 1",
+        (household_id, quarantined),
+    )
+    assert newest is not None, "the fixture did not mint a second runtime job"
+
+    plan = plan_onboarding(container, household_id)
+
+    reported = {job["job_id"] for job in plan.unresolved_runtime_jobs}
+    assert quarantined in reported, (
+        "a runtime intent still awaiting reconciliation was hidden by a newer job"
+    )
+    assert newest["id"] in reported
+    # And the quarantine reason travels with it, so the operator knows which
+    # command settles it.
+    quarantine = next(
+        job for job in plan.unresolved_runtime_jobs if job["job_id"] == quarantined
+    )
+    assert quarantine["error_code"] == "reset_requires_reconciliation"

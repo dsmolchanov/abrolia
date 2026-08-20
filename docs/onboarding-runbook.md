@@ -174,10 +174,20 @@ Always reported: the workflow state and per-step statuses, and — when a step i
 not yet verified — `blocked_by` and `unverified_steps` naming exactly what is
 missing.
 
-`operation_pending` says whether an operation is pending at all. **When it is
-false, `table_writes`, `runtime_resources` and `secrets` are empty**, because
-they describe the pending operation and there is not one. Read `rehearsal` for
-which case you are in:
+Two flags, answering two questions. `operation_pending` says whether durable
+state holds work the worker can still pick up. `operation_blocked` says whether
+that work can execute as recorded — a runtime job left behind by a configuration
+change is pending *and* blocked, because the worker will lease it and stall.
+**When either is unfavourable, `table_writes`, `runtime_resources` and `secrets`
+are empty**, since neither case describes work that will happen as written.
+
+`unresolved_runtime_jobs` lists **every** unsettled `ensure_runtime` intent, not
+just the next one. A reset preserves a started job as `outcome_unknown` with
+`reset_requires_reconciliation`, and the owner can complete the steps again and
+mint a newer job on top of it — the older one is still provider state nobody has
+reconciled, and `error_code` says which command settles it.
+
+Read `rehearsal` for which case you are in:
 
 | State | What is reported |
 |---|---|

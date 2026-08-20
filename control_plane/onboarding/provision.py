@@ -140,12 +140,24 @@ class ProvisionPlan:
     #: What, if anything, this run rehearsed — so `table_writes` is never
     #: read as the write set of an operation that was not rehearsed.
     rehearsal: str = ""
-    #: True only while some operation is actually pending. Every future-tense
-    #: field — `table_writes`, `runtime_resources`, `secrets` — belongs to THAT
-    #: operation, so when there is none they are empty rather than describing
-    #: work nobody is going to do. Reported so a consumer can tell the two
-    #: apart without parsing the `rehearsal` prose.
+    #: True while some operation is actually pending — meaning durable state
+    #: holds work the worker can still pick up. Reported so a consumer can tell
+    #: that from a terminal or complete household without parsing prose.
     operation_pending: bool = True
+    #: True when that pending operation cannot execute as recorded. The two are
+    #: separate because they answer different questions and were briefly
+    #: conflated: a runtime job queued under one provider and left behind by a
+    #: configuration change is still `pending`, the worker can still lease it,
+    #: and reporting "nothing is pending" told an operator there was no live
+    #: work while the worker was about to stall on it. Future-tense fields are
+    #: suppressed for either, because neither describes work that will happen
+    #: as written.
+    operation_blocked: bool = False
+    #: Every unsettled runtime intent, not only the newest. A reset preserves a
+    #: running job as `outcome_unknown` needing reconciliation, and the owner
+    #: can then complete the steps again and mint a NEWER job — so a single-row
+    #: view showed the new one and hid a provider effect still outstanding.
+    unresolved_runtime_jobs: list[dict[str, Any]] = field(default_factory=list)
     uncommitted_revision_delta: int = 0
     committed: bool = False
 
@@ -503,15 +515,32 @@ def plan_onboarding(
                         container, household_id, issued["revision"]
                     ),
                 }
-            runtime_job = connection.execute(
-                "SELECT id, status, desired_revision, lease_until, provider"
-                " FROM provisioning_jobs"
+            # ALL of them, newest first. `LIMIT 1` answered "what runs next"
+            # and silently dropped the rest: a reset preserves a running job as
+            # `outcome_unknown` with `reset_requires_reconciliation`, the owner
+            # can complete the steps again and mint a newer job, and the older
+            # one still represents provider state nobody has reconciled. An
+            # operator shown only the new job proceeds past it.
+            unresolved = connection.execute(
+                "SELECT id, status, desired_revision, lease_until, provider,"
+                " error_code FROM provisioning_jobs"
                 " WHERE household_id = ? AND workflow_id = ? AND kind = 'runtime'"
                 " AND operation = 'ensure_runtime'"
                 " AND status IN ('pending','running','waiting_user','outcome_unknown')"
-                " ORDER BY created_at DESC LIMIT 1",
+                " ORDER BY created_at DESC, id DESC",
                 (household_id, workflow["id"]),
-            ).fetchone()
+            ).fetchall()
+            plan.unresolved_runtime_jobs = [
+                {
+                    "job_id": row["id"],
+                    "status": row["status"],
+                    "desired_revision": row["desired_revision"],
+                    "provider": row["provider"],
+                    "error_code": row["error_code"],
+                }
+                for row in unresolved
+            ]
+            runtime_job = unresolved[0] if unresolved else None
             if runtime_job is not None:
                 plan.pending_runtime_job = {
                     "job_id": runtime_job["id"],
@@ -643,7 +672,11 @@ def plan_onboarding(
                 runtime_job is not None and job_provider != configured_provider
             )
             if provider_mismatch:
-                plan.operation_pending = False
+                # Pending, and NOT executable. The job is still `pending`, the
+                # worker can still lease it, and saying "nothing is pending"
+                # told an operator there was no live work while the worker was
+                # about to stall on it. The two facts are reported separately.
+                plan.operation_blocked = True
                 plan.rehearsal = (
                     f"the pending runtime job is recorded against"
                     f" `{job_provider}` and this deployment is configured for"
@@ -857,7 +890,7 @@ def plan_onboarding(
                     )
                 except KeyError:
                     spec = None
-            if plan.operation_pending:
+            if plan.operation_pending and not plan.operation_blocked:
                 plan.runtime_resources = _runtime_resources(
                     container,
                     household_id,
