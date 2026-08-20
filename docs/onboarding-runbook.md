@@ -192,10 +192,17 @@ which case you are in:
 `runtime_resources` comes from the provider of the **pending job**, which is not
 always the configured one. A job carries its provider durably and the worker
 dispatches through it, so a job queued under `dry-run-runtime` still runs
-synthetically after a restart with `ABROLIA_RUNTIME_PROVIDER=fly-runtime` — and
-the report follows the job, not the environment. `pending_runtime_job.provider`
-names it. Only before a revision is issued, when there is no job to disagree
-with, does the configured provider apply.
+synthetically after a restart with `ABROLIA_RUNTIME_PROVIDER=fly-runtime`.
+`pending_runtime_job.provider` names it.
+
+**A job whose provider is not the configured one is reported as blocked.** The
+provider is durable but the secret sink is not — the container builds one sink
+from the current configuration — so the worker would dispatch the job's provider
+and then hand its reference to the other provider's sink, passing
+`synthetic-runtime:<household-id>` to `fly secrets import --app` and stalling the
+job at `outcome_unknown`. The two are usable only as a pair. `blocked_by` names
+both sides; restore the configuration the job was queued under, or cancel and
+re-plan it.
 
 Under a Fly job it is the deterministic app, volume and Machine names; under
 `dry-run-runtime` the single `synthetic-runtime:<household-id>` reference that

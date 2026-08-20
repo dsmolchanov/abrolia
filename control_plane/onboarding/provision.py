@@ -621,6 +621,45 @@ def plan_onboarding(
                     " provisioned"
                 )
 
+            # A job's provider is durable; the SECRET SINK is not. `build`
+            # selects one sink from the current configuration, so after a
+            # restart under a different `ABROLIA_RUNTIME_PROVIDER` the worker
+            # dispatches the job's own provider and then hands its reference to
+            # the configured provider's sink — `synthetic-runtime:<household>`
+            # to `FlySecretSink.install`, which shells out to
+            # `fly secrets import --app` and settles the job `outcome_unknown`.
+            #
+            # The previous round made the report follow the job's provider,
+            # which is right about what the worker dispatches and silent about
+            # this: the operator got a runnable-looking plan for an onboarding
+            # that stalls at secret installation. The provider and its sink are
+            # only usable as a durable PAIR, and this command cannot repair the
+            # pairing — it can refuse to describe the operation as pending.
+            configured_provider = container.config.runtime_provider
+            job_provider = (
+                str(runtime_job["provider"]) if runtime_job is not None else ""
+            )
+            provider_mismatch = (
+                runtime_job is not None and job_provider != configured_provider
+            )
+            if provider_mismatch:
+                plan.operation_pending = False
+                plan.rehearsal = (
+                    f"the pending runtime job is recorded against"
+                    f" `{job_provider}` and this deployment is configured for"
+                    f" `{configured_provider}`. The worker dispatches the job's"
+                    " provider but installs secrets through the configured"
+                    " provider's sink, so the operation would stall at secret"
+                    " installation. Nothing is rehearsed and no write set,"
+                    " resource or secret is claimed."
+                )
+                plan.blocked_by = (
+                    f"runtime provider mismatch: the queued job is"
+                    f" `{job_provider}` and ABROLIA_RUNTIME_PROVIDER is"
+                    f" `{configured_provider}`. Restore the configuration the"
+                    " job was queued under, or cancel and re-plan it."
+                )
+
             cancelled_workflow = str(workflow["state"]) == WorkflowState.CANCELLED.value
             if cancelled_workflow:
                 plan.operation_pending = False
@@ -672,6 +711,7 @@ def plan_onboarding(
             # "does this state advertise future work" was answered twice.
             if (
                 being_deleted
+                or provider_mismatch
                 or cancelled_workflow
                 or failed_runtime
                 or awaiting_activation
@@ -824,8 +864,11 @@ def plan_onboarding(
                     spec,
                     # The pending job's provider when there is one; the
                     # configured provider only for a planning pass that has not
-                    # happened yet and so has no job to disagree with.
-                    str(runtime_job["provider"]) if runtime_job is not None else None,
+                    # happened yet and so has no job to disagree with. A job
+                    # whose provider DIFFERS from the configuration never
+                    # reaches here — it is blocked above, because its sink and
+                    # its provider do not pair.
+                    job_provider or None,
                 )
                 plan.secrets = _secret_names(
                     container, household_id, plan.runtime_resources

@@ -1212,19 +1212,22 @@ def test_a_household_under_deletion_advertises_no_onboarding(container) -> None:
     assert plan.uncommitted_revision_delta == 0
 
 
-def test_the_report_follows_the_jobs_provider_not_the_configuration(container) -> None:
-    """A queued job carries its provider; the worker dispatches through it.
+def test_a_provider_configuration_mismatch_is_reported_as_blocked(container) -> None:
+    """A job's provider is durable; the secret SINK is not.
 
-    Queue `ensure_runtime` under one provider, restart with
-    `ABROLIA_RUNTIME_PROVIDER` naming another, and `_dispatch` still routes
-    through `job.provider` — while this reported the newly CONFIGURED provider's
-    resources and targeted both runtime secrets at them. An operator preparing
-    from that prepares the wrong resources for the exact operation queued.
+    `ControlPlaneContainer.build` selects one sink from the current
+    configuration, so after a restart under a different
+    `ABROLIA_RUNTIME_PROVIDER` the worker dispatches the job's own provider and
+    then hands its reference to the configured provider's sink —
+    `synthetic-runtime:<household>` to `FlySecretSink.install`, which shells out
+    to `fly secrets import --app` and settles the job `outcome_unknown`.
 
-    The job is moved rather than the configuration because `ControlPlaneConfig`
-    is frozen; the divergence being tested is the same either way, and this
-    direction keeps the whole rehearsal in the assertion rather than only
-    `_runtime_resources`.
+    An earlier round made the report FOLLOW the job's provider, which is right
+    about what the worker dispatches and silent about this: the operator got a
+    runnable-looking plan for an onboarding that stalls at secret installation.
+    The provider and its sink are usable only as a durable pair, and this
+    command cannot repair the pairing — so it refuses to describe the operation
+    as pending, and names both sides so the mismatch is actionable.
     """
     household_id = _household_with_profile(container)
     _verify_all_steps(container, household_id)
@@ -1242,15 +1245,42 @@ def test_the_report_follows_the_jobs_provider_not_the_configuration(container) -
 
     plan = plan_onboarding(container, household_id)
 
+    assert plan.operation_pending is False
+    assert plan.blocked_by is not None
+    # Both sides named: which is queued, and which the deployment is set to.
+    assert other in plan.blocked_by and configured in plan.blocked_by
+    # And nothing future-tense, because the operation cannot run as recorded.
+    assert plan.runtime_resources == []
+    assert plan.secrets == []
+    assert plan.table_writes == []
+    # The job is still reported, so an operator can see what to restore.
     assert plan.pending_runtime_job["provider"] == other
-    assert {resource["provider"] for resource in plan.runtime_resources} == {other}, (
-        "the report followed the configuration instead of the queued job"
-    )
-    # And the secret targets come from those resources, so they move with them.
-    assert all(
-        secret["target"] != FlyRuntimeProvisioner.stable_app_name(household_id)
-        for secret in plan.secrets
-    )
+
+
+def test_a_job_naming_an_unregistered_provider_is_blocked_too(container) -> None:
+    """An unregistered provider is a mismatch by the same rule.
+
+    It cannot equal the configured one, so it takes the same path — which is
+    stricter than the previous behaviour of reporting an "unavailable" resource
+    entry, and correct for the same reason: the deployment cannot run the job as
+    recorded.
+    """
+    household_id = _household_with_profile(container)
+    _verify_all_steps(container, household_id)
+    with container.database.write() as connection:
+        connection.execute(
+            "UPDATE provisioning_jobs SET provider = 'a-provider-nobody-registers'"
+            " WHERE household_id = ? AND kind = 'runtime'"
+            " AND operation = 'ensure_runtime'",
+            (household_id,),
+        )
+
+    plan = plan_onboarding(container, household_id)
+
+    assert plan.operation_pending is False
+    assert plan.runtime_resources == []
+    assert plan.secrets == []
+    assert "a-provider-nobody-registers" in (plan.blocked_by or "")
 
 
 def test_the_planning_pass_uses_the_configured_provider(container) -> None:
@@ -1269,24 +1299,6 @@ def test_the_planning_pass_uses_the_configured_provider(container) -> None:
         assert {resource["provider"] for resource in plan.runtime_resources} == {
             container.config.runtime_provider
         }
-
-
-def test_a_job_naming_an_unregistered_provider_asserts_nothing(container) -> None:
-    """Guessing from configuration is how the wrong resources got reported."""
-    household_id = _household_with_profile(container)
-    _verify_all_steps(container, household_id)
-    with container.database.write() as connection:
-        connection.execute(
-            "UPDATE provisioning_jobs SET provider = 'a-provider-nobody-registers'"
-            " WHERE household_id = ? AND kind = 'runtime'"
-            " AND operation = 'ensure_runtime'",
-            (household_id,),
-        )
-
-    plan = plan_onboarding(container, household_id)
-
-    assert [resource["kind"] for resource in plan.runtime_resources] == ["unavailable"]
-    assert all(not resource["stable_name"] for resource in plan.runtime_resources)
 
 
 def test_the_snapshot_touches_only_the_shared_memory_index(
