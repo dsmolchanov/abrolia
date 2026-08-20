@@ -222,9 +222,14 @@ def test_the_rollback_procedure_matches_the_paths_it_depends_on() -> None:
     # before anything is deleted.
     archive_at = doc.index("abrolia-control-plane backup /tmp/control-plane-superseded.cpb")
     verify_at = doc.index('--target "$verify/control-plane.db" --no-migrate')
+    offsite_at = doc.index("upload /tmp/control-plane-superseded.cpb")
     delete_at = doc.index("rm -f /data/control-plane.db /data/control-plane.db-wal")
-    assert archive_at < verify_at < delete_at, (
-        "the documented order lets an operator delete before verifying"
+    # Archive, verify, get it OFF the machine, and only then delete. After the
+    # delete this archive is the only copy of every write made since the
+    # pre-migrate snapshot, so it must not still be sitting on ephemeral
+    # storage the next Machine replacement discards.
+    assert archive_at < verify_at < offsite_at < delete_at, (
+        "the documented order deletes the source before the archive is durable"
     )
 
     # Check the space BEFORE restoring: at that point /data holds the live
@@ -1921,3 +1926,104 @@ def test_a_symlinked_snapshot_is_not_accepted_as_the_restore_point(tmp_path) -> 
     assert archive != link, "a symlink off the volume was reused as the restore point"
     assert not archive.is_symlink()
     assert archive.parent == tmp_path
+
+
+def test_a_restore_refuses_a_destination_with_stale_sidecars(tmp_path) -> None:
+    """A `-wal` from another database replays into the authenticated restore.
+
+    An interrupted cleanup or a killed process leaves `<target>-wal` behind with
+    the database itself gone. The existence check looked only at the database,
+    so publication put the restore beside those frames — and opening it replays
+    them, silently replacing restored rows while `integrity_check` still reports
+    `ok`. Nothing downstream notices, which is what makes it worth refusing.
+    """
+    seed = _database(tmp_path)
+    seed.migrate()
+    archive = tmp_path / "control-plane.cpb"
+    create_backup(seed, archive, backup_key=BACKUP_KEY_BYTES)
+    seed.close()
+
+    destination = tmp_path / "restored"
+    destination.mkdir()
+    target = destination / "control-plane.db"
+    stale = destination / "control-plane.db-wal"
+    stale.write_bytes(b"\x00" * 4096)
+
+    with pytest.raises(BackupError, match="leftover SQLite state"):
+        restore_backup(
+            archive, target, backup_key=BACKUP_KEY_BYTES, apply_migrations=False
+        )
+
+    assert not target.exists(), "the restore was published beside foreign state"
+    assert stale.read_bytes() == b"\x00" * 4096, "the refusal deleted what it objected to"
+
+
+def test_backup_refuses_a_missing_database_rather_than_archiving_nothing(
+    tmp_path, monkeypatch
+) -> None:
+    """An empty database passes every check the verification step runs.
+
+    `sqlite3.connect` creates a missing file, so an unset, mistyped or unmounted
+    `ABROLIA_CONTROL_PLANE_DB` produced a new empty database, a valid
+    authenticated archive of nothing, and a verification restore that passed —
+    an empty database satisfies `integrity_check` and `foreign_key_check`. The
+    operator then deletes the real `/data` bundle believing it is archived.
+    """
+    absent = tmp_path / "not-mounted" / "control-plane.db"
+    monkeypatch.setenv("ABROLIA_CONTROL_PLANE_DB", str(absent))
+    monkeypatch.setenv("ABROLIA_CONTROL_PLANE_BACKUP_KEY", BACKUP_KEY)
+
+    with pytest.raises(SystemExit, match="found no database"):
+        cli_main(["backup", str(tmp_path / "superseded.cpb")])
+
+    assert not (tmp_path / "superseded.cpb").exists()
+    assert not absent.exists(), "the refusal created the database it refused to find"
+    assert not absent.parent.exists()
+
+
+def test_an_unreadable_migration_ledger_is_not_treated_as_empty(tmp_path) -> None:
+    """"Nothing applied" is a claim, and only a missing table supports it.
+
+    Any `DatabaseError` reading `schema_migrations` was read as "nothing has been
+    applied", so a malformed or unreadable ledger made the boot attempt every
+    migration from 0001 — which on a production schema fails on objects that
+    already exist, and with an idempotent script would redo work whose ledger
+    entry it simply could not read.
+    """
+    database = _database(tmp_path)
+    database.migrate()
+    applied = database.query("SELECT name FROM schema_migrations")
+    assert applied, "the fixture applied no migrations"
+    with database.write() as connection:
+        # A ledger that exists and cannot be read as one.
+        connection.execute("DROP TABLE schema_migrations")
+        connection.execute("CREATE TABLE schema_migrations (wrong_column TEXT)")
+    database.close()
+
+    probe = _database(tmp_path)
+    try:
+        # The LEDGER's own error, raised where it happened. Asserting only
+        # `DatabaseError` proves nothing: treating the unreadable ledger as
+        # empty also raises one, from a `CREATE TABLE` for an object that
+        # already exists, several migrations later and with a message that
+        # sends an operator to the wrong place entirely.
+        with pytest.raises(sqlite3.DatabaseError, match="no such column"):
+            probe.migrate()
+    finally:
+        probe.close()
+
+    # And nothing was applied on top of the existing schema.
+    after = _database(tmp_path)
+    try:
+        assert "pilot_probe" not in _table_names(after)
+    finally:
+        after.close()
+
+
+def _table_names(database) -> set[str]:
+    return {
+        row["name"]
+        for row in database.query(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )
+    }

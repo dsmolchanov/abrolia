@@ -157,7 +157,7 @@ The two guarded commands bracket it, so a `backup` that succeeded means no
 writer held the lock a moment earlier; that is not the same as a guarantee.
 
 ```bash
-# 1. Archive the superseded database OFF the volume, and verify it opens.
+# 1. Archive the superseded database off the volume, and verify it opens.
 #    `backup` does not migrate — the reason you are here is often a migration
 #    that fails, and a command that repeats it would exit before writing.
 abrolia-control-plane backup /tmp/control-plane-superseded.cpb
@@ -166,6 +166,15 @@ abrolia-control-plane backup /tmp/control-plane-superseded.cpb
 #    else that happens to share the prefix.
 verify=$(mktemp -d) && abrolia-control-plane restore /tmp/control-plane-superseded.cpb \
   --target "$verify/control-plane.db" --no-migrate && rm -rf "$verify"
+
+# 1b. GET IT OFF THE MACHINE, and confirm it landed, BEFORE step 2 deletes the
+#     source. `/tmp` does not survive a Machine replacement — this page says so
+#     a few paragraphs up — and after step 2 this archive is the only copy of
+#     every write made since the pre-migrate snapshot. A crash between here and
+#     there loses them permanently, including after a rollback that otherwise
+#     succeeded. Use the same EU object storage the backup boundary describes.
+<upload /tmp/control-plane-superseded.cpb to EU object storage>
+<confirm the uploaded object's size and digest match the local file>
 
 # 2. Only now release the blocks. ALL FOUR: the pause marker is part of the
 #    bundle, and a survivor makes step 3 refuse with "target was not freed"
@@ -180,9 +189,11 @@ abrolia-control-plane install-rollback \
   --target-already-freed
 ```
 
-Never skip step 1. Discarding a restore point to reclaim space is the one move
-that turns a disk problem into a data-loss problem, and the pre-migrate archive
-covers the state *before* the migration — not the writes taken after it.
+Never skip step 1 or step 1b. Discarding a restore point to reclaim space is the
+one move that turns a disk problem into a data-loss problem, and the pre-migrate
+archive covers the state *before* the migration — not the writes taken after it.
+Those writes exist in exactly one place once step 2 runs, so that place must not
+be the machine you are about to replace.
 
 Step 3 needs the flag because step 2 deleted the database the command would
 otherwise supersede, and a missing `--target` is far more often a typo than a

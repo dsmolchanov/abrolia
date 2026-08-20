@@ -176,7 +176,17 @@ class ControlPlaneDatabase:
                         "SELECT name FROM schema_migrations"
                     )
                 }
-            except sqlite3.DatabaseError:
+            except sqlite3.OperationalError as error:
+                # ONLY "no such table". A missing ledger genuinely means nothing
+                # has been applied — that is a fresh database. Any other
+                # `DatabaseError` was also being read as "nothing applied", so a
+                # malformed or unreadable `schema_migrations` made the boot
+                # attempt every migration from 0001: on a production schema that
+                # fails on objects that already exist, and with an idempotent
+                # script it would redo work whose ledger entry it could not
+                # read. An unreadable ledger is not an empty one.
+                if "no such table" not in str(error).lower():
+                    raise
                 applied = set()
             pending = [
                 script

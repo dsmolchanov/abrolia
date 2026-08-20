@@ -338,6 +338,20 @@ def restore_backup(
     destination = Path(target)
     if destination.exists():
         raise FileExistsError(destination)
+    # The whole BUNDLE, not just the database. A `-wal` or `-shm` left by an
+    # earlier database at that path — an interrupted cleanup, a killed
+    # process — survives publication, and opening the result replays those
+    # committed frames into the authenticated restore. Rows are silently
+    # replaced and `integrity_check` still reports `ok`, so nothing downstream
+    # notices. The pause marker too: one left behind would make a restore that
+    # failed to write its own marker look paused.
+    stale = [path for path in _bundle(destination)[1:] if _present(path)]
+    if stale:
+        raise BackupError(
+            "restore refuses a destination with leftover SQLite state:"
+            f" {', '.join(str(path) for path in stale)}."
+            " Move them aside; they belong to a different database."
+        )
     # Exclusive ownership of the path being written, for the same reason
     # `install-rollback` takes it: publishing a database and its pause marker
     # under a live writer means the two can interleave with whatever that writer

@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 from collections.abc import Sequence
+from pathlib import Path
 
 import uvicorn
 
@@ -199,9 +200,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         # The writer lock is still taken, and the same way, because archiving a
         # database another process is writing produces an archive of a moment
         # that never existed.
-        database = ControlPlaneDatabase(
+        database_path = Path(
             os.environ.get("ABROLIA_CONTROL_PLANE_DB", "data/control-plane.db")
         )
+        if not database_path.is_file():
+            # `sqlite3.connect` CREATES a missing file, so an unset, mistyped or
+            # unmounted path produced a new empty database, a valid
+            # authenticated archive of nothing, and a verification restore that
+            # passed — an empty database satisfies `integrity_check` and
+            # `foreign_key_check`. The operator then deletes the real `/data`
+            # bundle believing it is archived.
+            raise SystemExit(
+                f"backup found no database at {database_path};"
+                " refusing rather than archiving an empty one"
+            )
+        database = ControlPlaneDatabase(database_path)
         try:
             database.acquire_process_lock()
         except ProcessAlreadyRunning as error:
