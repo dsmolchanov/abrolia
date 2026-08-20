@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 import subprocess
 import sys
@@ -62,6 +63,8 @@ CHANNEL_SELECTION = {
     "chat_id": "synthetic-dry-run-chat",
 }
 # Owner principal per household, so each command carries the real session.
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+
 _PRINCIPALS: dict[str, tuple[str, str]] = {}
 
 
@@ -2328,13 +2331,24 @@ def test_the_declared_step_block_writes_match_a_real_run(container) -> None:
 # instances that produced it.
 # --------------------------------------------------------------------------
 
-#: Every job shape `_run_once` gates on the special-category receipt. Derived
-#: from the worker's own predicate rather than listed by hand, so a kind added
-#: to the gate is covered here without anyone remembering to add it.
+#: Every non-fake email provider the container registers. `fake-email` is
+#: exempt from the gate and is covered by its own test.
+EMAIL_PROVIDERS = ["nerve-managed", "nerve-byo-domain", "google-oauth"]
+
+#: Every job shape `_run_once` gates on the special-category receipt, spelled
+#: as the SERVICE spells it. `OnboardingService.select` and `retry` create
+#: `email_identity/ensure`; `check` and `schedule_waiting_inspect` create
+#: `email_identity/inspect`. An earlier version of this list invented
+#: `provision_email_identity` and used the invention on both sides of the
+#: coverage comparison below, so the check agreed with itself and exercised
+#: neither real call path.
 GATED_SHAPES = [
     ("runtime", "ensure_runtime", "dry-run-runtime"),
-    ("email_identity", "provision_email_identity", "nerve-managed"),
-    ("email_identity", "provision_email_identity", "nerve-byo-domain"),
+    *(
+        ("email_identity", operation, provider)
+        for operation in ("ensure", "inspect")
+        for provider in EMAIL_PROVIDERS
+    ),
 ]
 
 
@@ -2405,7 +2419,7 @@ def test_every_annotated_job_agrees_with_one_real_worker_call(
             workflow_id=workflow["id"],
             kind=kind,
             operation=operation,
-            intent_key=f"{household_id}:{operation}:{provider}:class-check",
+            intent_key=f"{household_id}:{kind}:{operation}:{provider}:class-check",
             request={
                 "step_kind": StepKind.EMAIL.value,
                 "email_identity_id": identity["id"],
@@ -2465,23 +2479,63 @@ def test_the_gated_shapes_cover_the_worker_s_own_predicate() -> None:
     predicate directly about every kind the schema allows, so a new gated shape
     fails here rather than silently narrowing the class check.
     """
-    allowed = [
-        ("email_identity", "provision_email_identity"),
-        ("whatsapp_identity", "provision_whatsapp_identity"),
-        ("channel_binding", "bind_primary_channel"),
+    # The pairs the SERVICE actually creates. `kind` comes from the step kinds
+    # and the internal kinds; `operation` from the literals in the source, which
+    # is also what stops this list inventing one: the previous version named
+    # `provision_email_identity`, a string that appears nowhere in production,
+    # and used it on both sides of this comparison so the check agreed with
+    # itself.
+    real_operations = {
+        match.strip('"')
+        for source in (
+            REPOSITORY_ROOT / "control_plane" / "onboarding" / "service.py",
+            REPOSITORY_ROOT / "control_plane" / "provisioning" / "worker.py",
+        )
+        for match in re.findall(
+            r'operation="[a-z_]+"', source.read_text(encoding="utf-8")
+        )
+        for match in [match.split("=", 1)[1]]
+    }
+    pairs = [
+        ("email_identity", "ensure"),
+        ("email_identity", "inspect"),
+        ("whatsapp_identity", "ensure"),
+        ("whatsapp_identity", "inspect"),
+        ("channel_binding", "ensure"),
+        ("channel_binding", "inspect"),
         ("runtime", "ensure_runtime"),
         ("runtime", "ensure_secret_namespace"),
         ("cleanup", "deprovision"),
+        ("cleanup", "delete_email_secret"),
         ("bootstrap_cleanup", "delete_bootstrap_secret"),
     ]
-    providers = ["fake-email", "nerve-managed", "nerve-byo-domain", "dry-run-runtime"]
+    invented = sorted({operation for _k, operation in pairs} - real_operations)
+    assert not invented, f"these operations exist nowhere in production: {invented}"
+
+    # Per KIND. A flat cross-product pairs an email job with `fly-runtime`,
+    # which the service never creates, and then demands the class check
+    # exercise it.
+    providers_by_kind = {
+        "email_identity": [*EMAIL_PROVIDERS, "fake-email"],
+        "whatsapp_identity": ["fake-whatsapp"],
+        "channel_binding": ["fake-channel"],
+        "runtime": ["dry-run-runtime", "fly-runtime"],
+        "cleanup": ["dry-run-runtime", *EMAIL_PROVIDERS],
+        "bootstrap_cleanup": ["internal-secret-sink"],
+    }
     gated = {
-        (kind, operation)
-        for kind, operation in allowed
-        for provider in providers
+        (kind, operation, provider)
+        for kind, operation in pairs
+        for provider in providers_by_kind[kind]
         if requires_current_content_restriction(kind, operation, provider)
     }
+    exercised = set(GATED_SHAPES)
 
-    assert gated == {(kind, operation) for kind, operation, _p in GATED_SHAPES}, (
+    # Every gated (kind, operation) must be exercised, and every email shape
+    # for every provider that makes it gated — comparing only the pairs let a
+    # provider slip through.
+    assert {(k, o) for k, o, _p in gated} == {(k, o) for k, o, _p in exercised}, (
         "the worker gates a shape the class check does not exercise"
     )
+    email_gated = {(k, o, p) for k, o, p in gated if k == "email_identity"}
+    assert email_gated <= exercised, sorted(email_gated - exercised)
