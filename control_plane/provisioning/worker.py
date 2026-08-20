@@ -49,7 +49,11 @@ from control_plane.provisioning.contracts import (
 from control_plane.provisioning.planner import DesiredSpecPlanner
 from control_plane.repositories.configs import ConfigRepository
 from control_plane.repositories.households import HouseholdsRepository
-from control_plane.repositories.jobs import JobRecord, JobsRepository
+from control_plane.repositories.jobs import (
+    JobRecord,
+    JobsRepository,
+    requires_reconciliation,
+)
 from control_plane.repositories.onboarding import OnboardingRepository, WorkflowRecord
 
 
@@ -207,7 +211,7 @@ class ProvisioningWorker:
                     )
                 result = ensure_namespace(request["household_id"], job.intent_key)
                 current = self.jobs.get(job.id)
-                if current is None or current.status == "cancelled":
+                if self._superseded(current):
                     return self._cleanup_cancelled_namespace(job, result, provider)
                 return self._finish_secret_namespace(job, result)
             provider_request = request
@@ -292,7 +296,7 @@ class ProvisioningWorker:
                     else provider.ensure(provider_request, job.intent_key)
                 )
             current = self.jobs.get(job.id)
-            if current is None or current.status == "cancelled":
+            if self._superseded(current):
                 return self._cleanup_cancelled_result(job, result, provider)
             if job.kind == "runtime":
                 return self._finish_runtime(job, request, result, provider)
@@ -313,6 +317,13 @@ class ProvisioningWorker:
             return self._cleanup_cancelled_result(job, result, provider)
         except ProviderRateLimited as error:
             current = self.jobs.get(job.id)
+            # Deliberately NOT `_superseded` here. That predicate answers "was
+            # anything created that must be undone", and a rate-limited call
+            # created nothing. A quarantined job falls through instead, where
+            # `retry_later` already refuses to revive a `_requires_reconciliation`
+            # intent and `_durable_work_result` reports the quarantine it is
+            # actually in — which is strictly more informative than collapsing
+            # it to "cancelled" here.
             if current is None or current.status == "cancelled":
                 return WorkResult(job.id, "cancelled")
             if job.attempts >= self.max_safe_attempts:
@@ -611,8 +622,7 @@ class ProvisioningWorker:
         if (
             current is None
             or current["status"] != "outcome_unknown"
-            or current["error_code"]
-            not in {"cancel_requires_reconciliation", "reset_requires_reconciliation"}
+            or not requires_reconciliation(current["error_code"])
         ):
             return None
         with self.jobs.db.write() as connection:
@@ -1222,6 +1232,24 @@ class ProvisioningWorker:
             inspected.error_code or "provider_absent",
         )
 
+    def _superseded(self, current: JobRecord | None) -> bool:
+        """Has this intent stopped being the one the household still wants?
+
+        Every barrier below asks the same question after a provider call
+        returns, and each used to ask it as `current.status == "cancelled"`.
+        That missed the quarantine: cancel, reset and withdrawal supersede a
+        RUNNING job by settling it `outcome_unknown` with a
+        `_requires_reconciliation` code, never `cancelled`. A result arriving
+        afterwards was therefore recorded as an ordinary success, which for a
+        withdrawn household meant an inbox that kept receiving with no teardown
+        job attached to it.
+        """
+        return (
+            current is None
+            or current.status == "cancelled"
+            or requires_reconciliation(current.error_code)
+        )
+
     def _cleanup_cancelled_result(
         self, job: JobRecord, result: ProvisionResult, provider
     ) -> WorkResult:
@@ -1527,7 +1555,7 @@ class ProvisioningWorker:
                 try:
                     result = ensure_namespace(request["household_id"], job.intent_key)
                     current = self.jobs.get(job.id)
-                    if current is None or current.status == "cancelled":
+                    if self._superseded(current):
                         return self._cleanup_cancelled_namespace(job, result, provider)
                     return self._finish_secret_namespace(job, result)
                 except _ProjectionCancelled:
@@ -1727,11 +1755,7 @@ class ProvisioningWorker:
                 return WorkResult(job.id, "outcome_unknown", error_code)
             if (
                 current["status"] == "outcome_unknown"
-                and current["error_code"]
-                in {
-                    "cancel_requires_reconciliation",
-                    "reset_requires_reconciliation",
-                }
+                and requires_reconciliation(current["error_code"])
                 and job_status == "waiting_user"
             ):
                 # cancel/reset deliberately quarantined this in-flight intent.

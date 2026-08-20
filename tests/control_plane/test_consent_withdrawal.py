@@ -24,6 +24,8 @@ from control_plane.privacy.withdraw import (
     ConsentNotHeld,
     ConsentWithdrawalService,
 )
+from control_plane.provisioning.contracts import ProviderRegistry
+from control_plane.provisioning.fakes import DeterministicFakeProvisioner
 from control_plane.provisioning.planner import DesiredSpecPlanner
 
 from .test_art9_household_consent import complete_onboarding, real_email_selection
@@ -591,3 +593,100 @@ def test_the_teardown_survives_a_later_reset(cp_stack) -> None:
             "SELECT status FROM provisioning_jobs WHERE id = ?", (job_id,)
         )
         assert row["status"] != "cancelled"
+
+
+def live_email_resources(cp_stack) -> list:
+    """Inbox references that are neither being torn down nor already gone."""
+    return cp_stack.database.query(
+        "SELECT id, status FROM external_resources WHERE household_id = ?"
+        " AND resource_type = 'email_identity'"
+        " AND status NOT IN ('deleting','deleted')",
+        (cp_stack.household.id,),
+    )
+
+
+def withdraw_now(cp_stack, *, now: float) -> None:
+    ConsentWithdrawalService(
+        cp_stack.database, jobs=cp_stack.jobs, onboarding=cp_stack.service
+    ).withdraw(cp_stack.household.id, HOUSEHOLD_CONTENT_PURPOSE, now=now)
+
+
+def test_an_inbox_that_arrives_after_withdrawal_is_torn_down(cp_stack) -> None:
+    """The gap between "crossed the boundary" and "recorded a row".
+
+    `disconnect_email_for_withdrawal` schedules teardown from
+    `external_resources`, so it can only see inboxes that have already been
+    written down. An `ensure` that has reached Nerve or Google and not yet
+    returned has no row to find, so the scan walked straight past it — and the
+    result then took the ordinary success path, because the barrier after the
+    provider call asked `status == "cancelled"` while withdrawal quarantines the
+    job as `outcome_unknown`. The household was left with a mailbox that kept
+    receiving, with nothing recorded that would ever delete it.
+
+    The barrier here is real, not a sleep: withdrawal happens INSIDE `ensure`,
+    so the provider's result cannot arrive before it.
+    """
+    cp_stack.complete_profile()
+    cp_stack.service.select(
+        cp_stack.household.id,
+        StepKind.EMAIL,
+        real_email_selection(),
+        context=cp_stack.context(),
+        now=BASE_TIME + 2,
+    )
+
+    class WithdrawThenSucceed(DeterministicFakeProvisioner):
+        def ensure(self, intent, idempotency_key):
+            withdraw_now(cp_stack, now=BASE_TIME + 3)
+            return super().ensure(intent, idempotency_key)
+
+    registry = ProviderRegistry()
+    registry.register("fake-email", WithdrawThenSucceed("email"))
+    worker = cp_stack.make_worker(providers=registry, now=BASE_TIME + 3)
+
+    late = worker.run_once()
+
+    # The intent is settled as compensated, not as a successful step.
+    stored = cp_stack.jobs.get(late.job_id)
+    assert stored is not None
+    assert stored.error_code == "cancelled_and_compensated"
+
+    # And the inbox the provider actually created is gone, rather than sitting
+    # in `external_resources` as ready with nothing pointed at it. This is the
+    # assertion that matters: everything else is bookkeeping about it.
+    assert live_email_resources(cp_stack) == [], (
+        "an inbox provisioned during withdrawal is still live"
+    )
+    drain(cp_stack, now=BASE_TIME + 60)
+    identity = cp_stack.database.query_one(
+        "SELECT status FROM email_identities WHERE household_id = ?"
+        " ORDER BY created_at DESC LIMIT 1",
+        (cp_stack.household.id,),
+    )
+    assert identity is None or identity["status"] == "deleted"
+
+
+def test_withdrawal_does_not_supersede_the_households_other_work(cp_stack) -> None:
+    """Withdrawal tears down the inbox; it is not a household-wide cancel.
+
+    The quarantine is deliberately narrowed to `email_identity`, because the
+    same sweep serves `cancel` and `reset`, where it covers every kind. Widening
+    it here would settle unrelated in-flight jobs as needing reconciliation and
+    strand them — and the revocation push itself is one of the jobs that must
+    survive, or withdrawal could never be enforced.
+    """
+    complete_onboarding(cp_stack)
+    drain(cp_stack)
+    set_runtime_ref(cp_stack)
+
+    result = ConsentWithdrawalService(
+        cp_stack.database, jobs=cp_stack.jobs, onboarding=cp_stack.service
+    ).withdraw(cp_stack.household.id, HOUSEHOLD_CONTENT_PURPOSE, now=BASE_TIME)
+
+    assert result.runtime_job_id is not None
+    stop = cp_stack.database.query_one(
+        "SELECT status, error_code FROM provisioning_jobs WHERE id = ?",
+        (result.runtime_job_id,),
+    )
+    assert stop["status"] == "pending"
+    assert stop["error_code"] is None

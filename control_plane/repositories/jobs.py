@@ -10,6 +10,22 @@ from control_plane.crypto import canonical_json
 from control_plane.db import new_id
 from control_plane.repositories.base import Repository
 
+RECONCILIATION_SUFFIX = "_requires_reconciliation"
+
+
+def requires_reconciliation(error_code: object) -> bool:
+    """True for an in-flight intent that was deliberately quarantined.
+
+    `_supersede_unsettled_jobs` builds this code as `<reason>_requires_reconciliation`,
+    and every consumer used to enumerate the reasons it knew about — "cancel"
+    and "reset". Withdrawal became a third way to supersede an in-flight job and
+    all three call sites still listed two, so a withdrawn household's late
+    provider result took the ordinary success path and its inbox was never torn
+    down. Match the property the producer guarantees instead of a list that has
+    to be found and updated in four places whenever a fourth reason appears.
+    """
+    return isinstance(error_code, str) and error_code.endswith(RECONCILIATION_SUFFIX)
+
 
 @dataclass(frozen=True)
 class JobRecord:
@@ -275,8 +291,8 @@ class JobsRepository(Repository):
                 " error_code = ?, lease_until = NULL, leased_by = NULL, settled_at = NULL,"
                 " updated_at = ?"
                 " WHERE id = ? AND status IN ('running','outcome_unknown')"
-                " AND NOT (status = 'outcome_unknown' AND COALESCE(error_code, '') IN"
-                " ('cancel_requires_reconciliation','reset_requires_reconciliation'))",
+                " AND NOT (status = 'outcome_unknown' AND COALESCE(error_code, '')"
+                " LIKE '%!_requires!_reconciliation' ESCAPE '!')",
                 (not_before, error_code, now, job_id),
             )
 

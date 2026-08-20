@@ -931,6 +931,28 @@ class OnboardingService:
         ).fetchone()
         if row is None:
             return []
+        # Quarantine BEFORE enumerating what to tear down, because the two
+        # cover different things and the gap between them was the bug. The
+        # cleanup scan below can only schedule teardown for resources already
+        # recorded in `external_resources`; an `ensure` or `inspect` that has
+        # crossed the Nerve/Google boundary and not yet come back has no row to
+        # find, so the scan cannot see it and withdrawal left it running.
+        #
+        # Superseding the in-flight job first hands that case to the worker's
+        # existing compensation: `_superseded` now sees the quarantine at the
+        # barrier and routes a ready result to `_cleanup_cancelled_result`
+        # instead of `_finish_step`, and `_schedule_cancelled_waiting_cleanup`
+        # attaches a teardown job to a late `ProviderWaiting` reference. Both
+        # already existed for cancel and reset. This is the same disconnect,
+        # so it is the same path — two ways to disconnect an inbox is two ways
+        # for one of them to be wrong.
+        self._supersede_unsettled_jobs(
+            connection,
+            household_id=household_id,
+            reason="withdrawal",
+            now=now,
+            kinds={"email_identity"},
+        )
         job_ids = self._schedule_registered_cleanup(
             connection,
             household_id=household_id,
@@ -1049,6 +1071,7 @@ class OnboardingService:
         household_id: str,
         reason: str,
         now: float,
+        kinds: set[str] | None = None,
     ) -> None:
         # A pending job has never crossed the provider boundary and is safe to
         # cancel. Running and waiting-user jobs may already have created
@@ -1061,13 +1084,22 @@ class OnboardingService:
         # runtime processing indefinitely, since nothing would re-enqueue the
         # stop; an owner resetting an unrelated step must not silently undo a
         # withdrawal.
+        #
+        # `kinds` narrows the sweep to one part of the workflow. Withdrawal
+        # tears down the inbox, and superseding the household's unrelated
+        # in-flight jobs is not part of that.
+        restriction = ""
+        parameters: tuple = ()
+        if kinds is not None:
+            restriction = f" AND kind IN ({','.join('?' * len(kinds))})"
+            parameters = tuple(sorted(kinds))
         connection.execute(
             "UPDATE provisioning_jobs SET status = 'cancelled', settled_at = ?,"
             " updated_at = ?, lease_until = NULL, leased_by = NULL,"
             " error_code = ? WHERE household_id = ? AND status = 'pending'"
             " AND kind NOT IN ('cleanup','bootstrap_cleanup')"
-            " AND operation != 'revoke_consent'",
-            (now, now, f"{reason}_before_provider_call", household_id),
+            " AND operation != 'revoke_consent'" + restriction,
+            (now, now, f"{reason}_before_provider_call", household_id, *parameters),
         )
         connection.execute(
             "UPDATE provisioning_jobs SET status = 'outcome_unknown', settled_at = ?,"
@@ -1075,8 +1107,8 @@ class OnboardingService:
             " error_code = ? WHERE household_id = ?"
             " AND status IN ('running','waiting_user')"
             " AND kind NOT IN ('cleanup','bootstrap_cleanup')"
-            " AND operation != 'revoke_consent'",
-            (now, now, f"{reason}_requires_reconciliation", household_id),
+            " AND operation != 'revoke_consent'" + restriction,
+            (now, now, f"{reason}_requires_reconciliation", household_id, *parameters),
         )
 
     def _finish_safe_email_disconnect(

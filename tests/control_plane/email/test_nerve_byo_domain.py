@@ -7,7 +7,11 @@ import pytest
 
 from control_plane.email.models import EmailIdentityStatus, EmailOption
 from control_plane.models import StepKind
-from control_plane.privacy.consent import consent_version_and_sha
+from control_plane.privacy.consent import (
+    HOUSEHOLD_CONTENT_PURPOSE,
+    consent_version_and_sha,
+)
+from control_plane.privacy.withdraw import ConsentWithdrawalService
 from control_plane.providers.email.nerve_byo_domain import NerveByoDomainProvisioner
 from control_plane.providers.email.nerve_managed import NERVE_SECRET_BINDING
 from control_plane.provisioning.contracts import (
@@ -696,3 +700,74 @@ def test_byo_provisioner_never_calls_service_tokens() -> None:
     assert ("POST", "/v1/keys") in bootstrap
     assert ("POST", "/v1/webhooks") in bootstrap
     assert not any("service-tokens" in p for _, p, _ in captured)
+
+
+def test_withdrawal_during_domain_call_persists_late_waiting_cleanup(cp_stack) -> None:
+    """The other half of the in-flight withdrawal race: `ProviderWaiting`.
+
+    A BYO domain call comes back "waiting for the owner to publish DNS" while
+    having already created the upstream domain, and the reference arrives only
+    with that response. `_handle_provider_waiting` records it — and used to
+    attach no teardown, because `_schedule_cancelled_waiting_cleanup` fired only
+    for the two reasons it listed, `cancel` and `reset`. Withdrawal was a third,
+    so a withdrawn household kept a domain nothing would ever delete.
+
+    Its sibling — a READY result arriving after withdrawal — is
+    `test_an_inbox_that_arrives_after_withdrawal_is_torn_down` in
+    `tests/control_plane/test_consent_withdrawal.py`. Both barriers are the
+    provider call itself, so the late response cannot precede the withdrawal.
+    """
+    cp_stack.complete_profile()
+    _select(cp_stack)
+
+    class WithdrawDuringDomainEnsure(FakeByoNerveAdmin):
+        withdrawn = False
+
+        def ensure_domain(self, *, org_id, domain, external_ref):
+            if not self.withdrawn:
+                self.withdrawn = True
+                ConsentWithdrawalService(
+                    cp_stack.database,
+                    jobs=cp_stack.jobs,
+                    onboarding=cp_stack.service,
+                ).withdraw(
+                    cp_stack.household.id,
+                    HOUSEHOLD_CONTENT_PURPOSE,
+                    now=BASE_TIME + 4,
+                )
+            return super().ensure_domain(
+                org_id=org_id, domain=domain, external_ref=external_ref
+            )
+
+    client = WithdrawDuringDomainEnsure()
+    registry = ProviderRegistry()
+    registry.register("nerve-byo-domain", NerveByoDomainProvisioner(client))
+    registry.register("dry-run-runtime", DryRunRuntimeProvisioner())
+    worker = cp_stack.make_worker(providers=registry)
+
+    late = worker.run_once()
+
+    assert late.status == "outcome_unknown"
+    assert late.error_code == "withdrawal_requires_reconciliation"
+    cleanup = cp_stack.database.query_one(
+        "SELECT id FROM provisioning_jobs WHERE intent_key = ?",
+        (f"{cp_stack.household.id}:late-waiting-cleanup:{late.job_id}",),
+    )
+    assert cleanup is not None, "the late domain reference got no teardown job"
+
+    # A scheduled teardown nobody can drain is not a disconnection.
+    for _ in range(6):
+        if worker.run_once() is None:
+            break
+    identity = cp_stack.database.query_one(
+        "SELECT status FROM email_identities WHERE household_id = ?",
+        (cp_stack.household.id,),
+    )
+    assert identity is None or identity["status"] == EmailIdentityStatus.DELETED.value
+    live = cp_stack.database.query(
+        "SELECT id FROM external_resources WHERE household_id = ?"
+        " AND resource_type = 'email_identity'"
+        " AND status NOT IN ('deleting','deleted')",
+        (cp_stack.household.id,),
+    )
+    assert live == [], "a domain created during withdrawal is still live"
