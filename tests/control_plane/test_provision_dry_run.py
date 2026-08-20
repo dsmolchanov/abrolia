@@ -21,10 +21,12 @@ from control_plane.db import ControlPlaneDatabase
 from control_plane.models import ProfileInput, StepKind
 from control_plane.onboarding.contracts import CommandContext
 from control_plane.onboarding.provision import (
+    COMPENSATION_WRITES,
     RUNTIME_BOOTSTRAP_SECRET,
     RUNTIME_DSAR_SECRET,
     RUNTIME_WRITES_BY_WORKFLOW_STATE,
     TableWrite,
+    _is_executable,
     _parser,
     _record_writes,
     _runtime_resources,
@@ -177,9 +179,13 @@ def test_dry_run_lists_exact_writes_and_commits_nothing(container) -> None:
     # The real operation UPDATES the issued revision.
     assert TableWrite("config_revisions", "update") in plan.table_writes
     assert TableWrite("config_revisions", "insert") not in plan.table_writes
+    # The success path PLUS the compensation a mid-call cancel triggers: the
+    # set is an upper bound on what the pending call can write, and a
+    # cancellation landing inside `provider.prepare` is one of the things it
+    # can do.
     assert set(plan.table_writes) == set(
         RUNTIME_WRITES_BY_WORKFLOW_STATE["runtime_provisioning"]
-    )
+    ) | set(COMPENSATION_WRITES)
     assert "already issued" in plan.rehearsal
     assert plan.uncommitted_revision_delta == 0
     # And the config_revision diff the Phase E1 plan requires, key paths only.
@@ -688,9 +694,13 @@ def test_the_write_set_is_labelled_as_the_success_path(container) -> None:
     assert plan.pending_runtime_job
     assert "SUCCESS PATH" in plan.rehearsal
     assert "subset" in plan.rehearsal
+    # The success path PLUS the compensation a mid-call cancel triggers: the
+    # set is an upper bound on what the pending call can write, and a
+    # cancellation landing inside `provider.prepare` is one of the things it
+    # can do.
     assert set(plan.table_writes) == set(
         RUNTIME_WRITES_BY_WORKFLOW_STATE["runtime_provisioning"]
-    )
+    ) | set(COMPENSATION_WRITES)
 
 
 def test_the_secret_target_is_the_configured_provider_s_reference(container) -> None:
@@ -814,9 +824,13 @@ def test_a_held_lease_is_still_reported_as_the_success_path(container) -> None:
     plan = plan_onboarding(container, household_id)
 
     assert "SUCCESS PATH" in plan.rehearsal
+    # The success path PLUS the compensation a mid-call cancel triggers: the
+    # set is an upper bound on what the pending call can write, and a
+    # cancellation landing inside `provider.prepare` is one of the things it
+    # can do.
     assert set(plan.table_writes) == set(
         RUNTIME_WRITES_BY_WORKFLOW_STATE["runtime_provisioning"]
-    )
+    ) | set(COMPENSATION_WRITES)
 
 
 def test_the_cli_leaves_the_live_database_files_byte_identical(
@@ -1654,3 +1668,129 @@ def test_an_unusable_database_path_fails_with_the_commands_own_diagnostic(
 
     with pytest.raises(SystemExit, match=message):
         main(["--dry-run", "--household", "10000000-0000-4000-8000-000000000031"])
+
+
+def test_a_leasable_step_job_is_reported_as_executable(container) -> None:
+    """Pending, held, waiting and quarantined are not one state.
+
+    The first inventory collapsed them, and the planner's expected
+    unverified-step error then marked every one blocked — so a leasable
+    `ensure_secret_namespace` right after `save_profile` was reported as unable
+    to execute while `JobsRepository.lease` would take it immediately.
+    """
+    household_id = _household_with_profile(container)
+    # `_household_with_profile` drains the namespace job, so queue a fresh one
+    # by selecting a step and leaving it alone.
+    account_id, session_id = _PRINCIPALS[household_id]
+    container.onboarding.select(
+        household_id,
+        StepKind.EMAIL,
+        EMAIL_SELECTION,
+        context=_context(
+            container, household_id, "select-0",
+            account_id=account_id, session_id=session_id,
+        ),
+    )
+
+    plan = plan_onboarding(container, household_id)
+
+    assert plan.pending_step_jobs, "the queued step job was not inventoried"
+    assert all(job["executable"] for job in plan.pending_step_jobs), (
+        "a pending job the worker can lease right now is reported as unable to run"
+    )
+    assert plan.operation_pending is True
+
+    # And the other direction, through the same inventory: quarantine that job
+    # and it must be reported as NOT executable. Asserting only that something
+    # is executable passes just as well when everything is hard-coded true,
+    # which is how the first version of this test proved nothing.
+    with container.database.write() as connection:
+        connection.execute(
+            "UPDATE provisioning_jobs SET status = 'outcome_unknown',"
+            " error_code = 'reset_requires_reconciliation'"
+            " WHERE household_id = ? AND kind = 'email_identity'",
+            (household_id,),
+        )
+
+    quarantined = plan_onboarding(container, household_id)
+
+    email_jobs = [
+        job for job in quarantined.pending_step_jobs if job["kind"] == "email_identity"
+    ]
+    assert email_jobs, "the quarantined job left the inventory"
+    assert not any(job["executable"] for job in email_jobs), (
+        "a quarantined intent is reported as leasable"
+    )
+
+
+@pytest.mark.parametrize(
+    ("status", "error_code", "executable"),
+    [
+        pytest.param("pending", None, True, id="pending"),
+        pytest.param("waiting_user", None, False, id="waiting-on-the-owner"),
+        pytest.param("outcome_unknown", "outcome_unknown", True, id="reconcilable"),
+        pytest.param(
+            "outcome_unknown", "reset_requires_reconciliation", False, id="quarantined"
+        ),
+        pytest.param(
+            "outcome_unknown",
+            "withdrawal_requires_reconciliation",
+            False,
+            id="quarantined-by-a-reason-added-later",
+        ),
+    ],
+)
+def test_executability_is_decided_per_state(status, error_code, executable) -> None:
+    """`waiting_user` waits on the OWNER; a quarantine waits on a reconcile.
+
+    The quarantine case is matched by suffix, so a reason added later needs no
+    edit here — which is the shape of bug that put `withdrawal` outside three
+    separate literal lists elsewhere in this codebase.
+    """
+    row = {
+        "status": status,
+        "error_code": error_code,
+        "lease_until": None,
+    }
+    assert _is_executable(row) is executable
+
+
+def test_a_quarantined_runtime_intent_keeps_the_operation_pending(container) -> None:
+    """Reset a leased runtime job, drain, and rehearse before re-verifying.
+
+    The revoked revision forces the planning branch, the planner raises for the
+    unverified steps, and considering only the STEP jobs reported "nothing is
+    pending" while `unresolved_runtime_jobs` was listing an intent that still
+    needs reconciling.
+    """
+    household_id = _household_with_profile(container)
+    _verify_all_steps(container, household_id)
+    account_id, session_id = _PRINCIPALS[household_id]
+    with container.database.write() as connection:
+        connection.execute(
+            "UPDATE provisioning_jobs SET status = 'outcome_unknown',"
+            " error_code = 'reset_requires_reconciliation' WHERE household_id = ?"
+            " AND kind = 'runtime' AND operation = 'ensure_runtime'",
+            (household_id,),
+        )
+    container.onboarding.reset_from(
+        household_id,
+        StepKind.EMAIL,
+        context=_context(
+            container, household_id, "reset", account_id=account_id,
+            session_id=session_id,
+        ),
+    )
+    for _ in range(10):
+        if container.worker.run_once() is None:
+            break
+
+    plan = plan_onboarding(container, household_id)
+
+    assert plan.unresolved_runtime_jobs, "the fixture settled the quarantined intent"
+    assert plan.operation_pending is True, (
+        "an unresolved provider intent was reported as no pending work"
+    )
+    assert plan.operation_blocked is True
+    assert plan.runtime_resources == []
+    assert plan.secrets == []

@@ -124,6 +124,23 @@ RUNTIME_WRITES_BY_WORKFLOW_STATE: dict[str, tuple[TableWrite, ...]] = {
     ),
 }
 
+#: Tables the COMPENSATION path writes, which any in-flight call can reach.
+#:
+#: If the API cancels or resets while the worker is inside `provider.prepare`,
+#: `_run_once` re-reads the job after the provider returns and routes even an
+#: ordinary first attempt through `_cleanup_cancelled_result` — which records
+#: the resource as deleting, and on an inconclusive deprovision or a failed
+#: bootstrap-secret deletion inserts a cleanup job. Those writes fell outside
+#: the advertised set, so a set described as the success-path UPPER BOUND was
+#: not one. It is a bound over what the pending call can write, and a
+#: cancellation landing mid-call is one of the things it can do.
+COMPENSATION_WRITES: tuple[TableWrite, ...] = (
+    TableWrite("external_resources", "insert"),
+    TableWrite("external_resources", "update"),
+    TableWrite("provisioning_jobs", "insert"),
+    TableWrite("provisioning_jobs", "update"),
+)
+
 
 @dataclass
 class ProvisionPlan:
@@ -380,6 +397,33 @@ def _secret_names(
     return secrets
 
 
+def _is_executable(row: Any) -> bool:
+    """Can the worker lease this job right now.
+
+    `pending` always. `running` only once its lease has expired, because that is
+    when the reclaimer takes it — a live lease means another worker holds it.
+    `waiting_user` never: it waits on the owner. `outcome_unknown` only when it
+    is not quarantined, since `retry_later` refuses to revive a
+    `_requires_reconciliation` intent and only an explicit reconcile settles it.
+    """
+    status = str(row["status"])
+    if status == "pending":
+        return True
+    if status == "running":
+        return (row["lease_until"] or 0) <= _now_seconds()
+    if status == "outcome_unknown":
+        # A quarantined intent is not leasable: `retry_later` refuses to revive
+        # a `_requires_reconciliation` code and only an explicit reconcile
+        # settles it. Matched by SUFFIX rather than by listing `cancel` and
+        # `reset`, because `_supersede_unsettled_jobs` builds the code from a
+        # reason and a fourth reason should not need an edit here.
+        code = row["error_code"]
+        return not (
+            isinstance(code, str) and code.endswith("_requires_reconciliation")
+        )
+    return False
+
+
 def _now_seconds() -> float:
     """Wall clock, isolated so a test can pin an expired lease."""
     return time.time()
@@ -562,10 +606,23 @@ def plan_onboarding(
                     "operation": row["operation"],
                     "status": row["status"],
                     "provider": row["provider"],
+                    "error_code": row["error_code"],
+                    # Whether the worker can actually pick this up next. The
+                    # first version collapsed pending, held and expired
+                    # `running`, `waiting_user` and quarantined
+                    # `outcome_unknown` into one list, and the planner's
+                    # expected unverified-step error then marked every one
+                    # blocked — so a leasable `ensure_secret_namespace` right
+                    # after `save_profile` was reported as unable to execute
+                    # while `JobsRepository.lease` would take it immediately.
+                    #
+                    # `waiting_user` is deliberately NOT executable: it waits on
+                    # the owner, not on the worker.
+                    "executable": _is_executable(row),
                 }
                 for row in connection.execute(
-                    "SELECT id, kind, operation, status, provider"
-                    " FROM provisioning_jobs"
+                    "SELECT id, kind, operation, status, provider, error_code,"
+                    " lease_until FROM provisioning_jobs"
                     " WHERE household_id = ? AND workflow_id = ?"
                     " AND NOT (kind = 'runtime' AND operation = 'ensure_runtime')"
                     " AND status IN ('pending','running','waiting_user','outcome_unknown')"
@@ -862,6 +919,16 @@ def plan_onboarding(
                     writes = None
                 else:
                     writes = RUNTIME_WRITES_BY_WORKFLOW_STATE.get(state)
+                    if writes is not None:
+                        # Union, deduplicated, order preserved: the bound has to
+                        # cover a cancellation arriving mid-call.
+                        merged = list(writes)
+                        merged.extend(
+                            write
+                            for write in COMPENSATION_WRITES
+                            if write not in merged
+                        )
+                        writes = tuple(merged)
                 if writes is None:
                     if plan.rehearsal == "":
                         # A state the runtime operation does not run from. Say
@@ -879,7 +946,9 @@ def plan_onboarding(
                         " UPDATES that revision rather than inserting another. A"
                         " provider that rate-limits, rejects or times out takes a"
                         " branch writing a subset of these; none writes outside"
-                        " them."
+                        " them. The set also covers the COMPENSATION a cancel or"
+                        " reset arriving mid-call triggers, which records the"
+                        " resource as deleting and can insert a cleanup job."
                     )
                     observed.extend(writes)
             else:
@@ -928,7 +997,16 @@ def plan_onboarding(
                     # yet. Blocked either way, so nothing future-tense is
                     # claimed; the difference is whether an operator is told
                     # there is no work or told what the work is.
-                    plan.operation_pending = bool(plan.pending_step_jobs)
+                    # Any unresolved durable intent keeps this pending, not
+                    # just the step jobs. Reset a leased `ensure_runtime`, drain
+                    # the cleanup, and rehearse before re-verifying: the revoked
+                    # revision forces this branch, the planner raises for the
+                    # unverified steps, and considering only step jobs reported
+                    # "nothing is pending" while `unresolved_runtime_jobs` was
+                    # listing an intent that still needs reconciling.
+                    plan.operation_pending = bool(
+                        plan.pending_step_jobs or plan.unresolved_runtime_jobs
+                    )
                     plan.operation_blocked = True
                     plan.blocked_by = str(error)
                 finally:
