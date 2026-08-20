@@ -1145,7 +1145,7 @@ def _refuse_overlap(restored: Path, target: Path) -> None:
 
 def _preflight(
     restored: Path, target: Path, stamp: int, *, target_already_freed: bool
-) -> str:
+) -> tuple[str, dict[Path, tuple[int, int] | None]]:
     """Everything that can be known before the live database is touched.
 
     The first version checked `restored.is_file()` and `target.exists()` and
@@ -1157,7 +1157,9 @@ def _preflight(
     back. The checks that remain after the install stay as defence in depth.
 
     Returns the reserved superseded-bundle name, because reserving it is part of
-    deciding whether the install can proceed at all.
+    deciding whether the install can proceed at all — and the ENTRY behind each
+    candidate pathname, so the install can require that what it moves is what
+    was validated here rather than whatever holds the name by then.
     """
     # Re-asked under the locks. The check before them runs unlocked, so a
     # symlink retargeted in between could alias the two namespaces after the
@@ -1165,7 +1167,11 @@ def _preflight(
     _refuse_overlap(restored, target)
     if not _regular_file(restored):
         raise RollbackError(f"{restored} is not a regular file")
-    if not target.exists():
+    # `lexists`, like every other member check. `exists()` follows symlinks, so
+    # a DANGLING one at `--target` answered "nothing here", took the
+    # already-freed branch, and the install then moved that unowned link under
+    # a superseded name and published over a path that was never free.
+    if not _present(target):
         if not target_already_freed:
             raise RollbackError(
                 f"nothing to supersede at {target}. If the superseded database"
@@ -1181,7 +1187,7 @@ def _preflight(
         # that a mistyped `--target` cannot silently install a rollback at a
         # path nobody meant.
         for member in _bundle(target):
-            if member.exists():
+            if _present(member):
                 raise RollbackError(
                     f"{member} is still present, so the target was not freed;"
                     " remove --target-already-freed"
@@ -1189,7 +1195,7 @@ def _preflight(
     elif not _regular_file(target):
         raise RollbackError(f"{target} is not a regular file")
     marker = _pause_marker(restored)
-    if not marker.exists():
+    if not _present(marker):
         # Checked HERE rather than after the install. `restore` writes this
         # marker, so its absence means the candidate did not come from a
         # restore — and installing it would resume workers on a database nobody
@@ -1210,6 +1216,9 @@ def _preflight(
     # archive of an unrelated database reaches the canonical path through a
     # check that only ever asked whether the file opened.
     require_control_plane_image(restored)
+
+    # Read AFTER every validation above, so these are the entries that passed.
+    candidate = {member: _inode(member) for member in _bundle(restored)}
 
     aside = _reserve_aside(target, stamp)
     required = _occupied_bytes(restored, block_size=_block_size(target.parent))
@@ -1235,7 +1244,7 @@ def _preflight(
             " archive restores, and only then delete it. Nothing has been"
             " changed."
         )
-    return aside
+    return aside, candidate
 
 
 def _inode(path: Path) -> tuple[int, int] | None:
@@ -1665,14 +1674,14 @@ def install_rollback(
                 guard.close()
                 raise RollbackError(message) from error
             guards.append(guard)
-        aside = _preflight(
+        aside, candidate = _preflight(
             restored_path,
             target_path,
             stamp,
             target_already_freed=target_already_freed,
         )
         return _install_rollback_locked(
-            restored_path, target_path, aside=aside
+            restored_path, target_path, aside=aside, candidate=candidate
         )
     finally:
         for guard in reversed(guards):
@@ -1723,13 +1732,31 @@ def _install_failsafe_pause(target: Path) -> bool:
     """
     marker = _pause_marker(target)
     try:
-        marker.write_text(
-            "an interrupted rollback install left this bundle mixed;"
-            " reconcile it by hand before starting anything\n",
-            encoding="utf-8",
+        # `O_EXCL | O_NOFOLLOW`, not `write_text`. Writing by name FOLLOWS an
+        # alias: a symlink or hard link left at the marker path — and this
+        # function runs precisely when the volume is in a state nobody planned
+        # — was opened and TRUNCATED, so error handling for a recoverable move
+        # failure could erase an unrelated file, or the surviving database
+        # itself if the link pointed there.
+        descriptor = os.open(
+            marker,
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW,
+            0o600,
         )
-        os.chmod(marker, 0o600)
-        with open(marker, "rb") as handle:
+    except FileExistsError:
+        # Something already occupies the name. If it is an ordinary file the
+        # pause is established — that entry is what `workers_paused` reads —
+        # and this must not touch it. Anything else, and no safe pause exists.
+        return _regular_file(marker)
+    except OSError:
+        return False
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(
+                b"an interrupted rollback install left this bundle mixed;"
+                b" reconcile it by hand before starting anything\n"
+            )
+            handle.flush()
             os.fsync(handle.fileno())
         _fsync_directory(marker.parent)
     except OSError:
@@ -1821,7 +1848,11 @@ def _undo(moved: list[_Move]) -> list[_Move]:
 
 
 def _install_rollback_locked(
-    restored_path: Path, target_path: Path, *, aside: str
+    restored_path: Path,
+    target_path: Path,
+    *,
+    aside: str,
+    candidate: dict[Path, tuple[int, int] | None],
 ) -> dict[str, object]:
     volume = target_path.parent
     superseded = _bundle(target_path)
@@ -1899,16 +1930,33 @@ def _install_rollback_locked(
             target_path,
         )
         for source, destination in zip(ordered, destinations, strict=True):
-            if _present(source) and not _rename_or_exdev(
-                source, destination, moved
-            ):
+            # The ENTRY that passed preflight, not whatever holds the name now.
+            # Between validation and this loop an external actor can remove a
+            # candidate member — the loop skipped it silently, so the database
+            # could simply not be installed and the command still reported
+            # success — or replace it, in which case an unvalidated file went to
+            # the canonical path beside the validated generation's sidecars.
+            validated = candidate.get(source)
+            if _inode(source) != validated:
+                raise RollbackError(
+                    f"{source} is not the entry that passed validation; the"
+                    " rollback candidate changed under this command and"
+                    " nothing further will be installed"
+                )
+            if validated is None:
+                continue
+            if not _rename_or_exdev(source, destination, moved):
                 _copy_install(source, destination, moved)
 
-        if not _present(_pause_marker(target_path)):
-            raise RollbackError(
-                "the restore is installed but its worker pause did not travel;"
-                f" write {_pause_marker(target_path)} before starting anything"
-            )
+        # Both REQUIRED members, inside the boundary. A missing marker is a
+        # startable unreconciled rollback; a missing database is an outage
+        # reported as a success.
+        for required in (_pause_marker(target_path), target_path):
+            if not _present(required):
+                raise RollbackError(
+                    f"the rollback install is incomplete: {required} is not"
+                    " there. Nothing at that path may be started."
+                )
     except BaseException as error:
         # Back to the original bundle, in reverse: the installed members return
         # to the candidate, and the superseded members return to the canonical

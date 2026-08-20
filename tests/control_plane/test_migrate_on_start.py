@@ -3610,3 +3610,163 @@ def test_a_move_whose_destination_vanished_is_reported_as_unreversed(
     )
     assert raised.value.paused, "no fail-safe pause was written"
     assert backup_module._pause_marker(target).exists()
+
+
+@pytest.mark.parametrize("member", ["", ".workers-paused"])
+def test_a_candidate_member_removed_after_preflight_stops_the_install(
+    tmp_path, monkeypatch, member
+) -> None:
+    """The loop consumed pathnames, not the entries that passed validation.
+
+    A candidate member removed between preflight and its move was silently
+    SKIPPED — so the database could simply not be installed and the command
+    still reported success, leaving the canonical path empty after the live
+    bundle had been moved aside.
+    """
+    volume, target, restored = _rollback_fixture(tmp_path)
+    _constrain(monkeypatch, volume, capacity=target.stat().st_size * 10)
+    before = _fingerprint(volume)
+    victim = Path(f"{restored}{member}")
+    real_preflight = backup_module._preflight
+
+    def preflight(*arguments, **keywords):
+        result = real_preflight(*arguments, **keywords)
+        victim.unlink()
+        return result
+
+    monkeypatch.setattr(backup_module, "_preflight", preflight)
+
+    with pytest.raises(RollbackError, match="not the entry that passed"):
+        install_rollback(restored, target, now=1800000042)
+
+    monkeypatch.undo()
+    assert _fingerprint(volume) == before, "the live bundle did not come back"
+
+
+def test_a_candidate_replaced_after_preflight_is_not_installed(
+    tmp_path, monkeypatch
+) -> None:
+    """A same-path replacement is a file nobody validated.
+
+    Installed, it lands at the canonical path beside the validated
+    generation's sidecars — a mixed SQLite generation, reported as a
+    successful rollback.
+    """
+    volume, target, restored = _rollback_fixture(tmp_path)
+    _constrain(monkeypatch, volume, capacity=target.stat().st_size * 10)
+    before = _fingerprint(volume)
+    real_preflight = backup_module._preflight
+
+    def preflight(*arguments, **keywords):
+        result = real_preflight(*arguments, **keywords)
+        # Written elsewhere and renamed in, so the replacement's inode is
+        # allocated while the original is still linked.
+        replacement = restored.with_name("a-successor")
+        replacement.write_bytes(b"a database nobody validated")
+        os.replace(replacement, restored)
+        return result
+
+    monkeypatch.setattr(backup_module, "_preflight", preflight)
+
+    with pytest.raises(RollbackError, match="not the entry that passed"):
+        install_rollback(restored, target, now=1800000042)
+
+    monkeypatch.undo()
+    assert _fingerprint(volume) == before
+    assert restored.read_bytes() == b"a database nobody validated"
+
+
+@pytest.mark.parametrize("sentinel", ["symlink", "hard-link"])
+def test_the_failsafe_pause_does_not_follow_an_alias(tmp_path, sentinel) -> None:
+    """This runs when the volume is already in a state nobody planned.
+
+    `write_text` follows an alias, so a symlink or hard link sitting at the
+    marker path was opened and TRUNCATED — error handling for a recoverable
+    move failure erasing an unrelated file, or the surviving database itself.
+    """
+    volume = tmp_path / "data"
+    volume.mkdir()
+    target = volume / "control-plane.db"
+    target.write_bytes(b"the database that survived")
+    bystander = volume / "somebody-elses.txt"
+    bystander.write_bytes(b"not yours to truncate")
+    marker = backup_module._pause_marker(target)
+    if sentinel == "symlink":
+        marker.symlink_to(bystander)
+    else:
+        os.link(bystander, marker)
+
+    paused = backup_module._install_failsafe_pause(target)
+
+    assert bystander.read_bytes() == b"not yours to truncate", (
+        "the fail-safe pause truncated a file it did not own"
+    )
+    assert target.read_bytes() == b"the database that survived"
+    # A symlink is not a pause anything reads; a regular file at that name is.
+    assert paused is (sentinel == "hard-link")
+
+
+def test_a_dangling_target_symlink_is_not_a_freed_target(tmp_path, monkeypatch) -> None:
+    """`--target-already-freed` promises the whole bundle is absent.
+
+    `exists()` follows symlinks, so a DANGLING one at `--target` answered
+    "nothing here". The install then moved that unowned link under a superseded
+    name and published over a path that was never free.
+    """
+    volume, target, restored = _rollback_fixture(tmp_path)
+    _constrain(monkeypatch, volume, capacity=target.stat().st_size * 10)
+    for member in backup_module._bundle(target):
+        member.unlink(missing_ok=True)
+    target.symlink_to(volume / "nothing-is-here")
+    before = _fingerprint(volume)
+
+    # Refused as an OCCUPIED entry rather than accepted as an empty name. The
+    # message names the shape because that is what the check now asks about.
+    with pytest.raises(RollbackError, match="is not a regular file"):
+        install_rollback(restored, target, now=1800000042, target_already_freed=True)
+
+    assert os.path.lexists(target), "the refusal removed the operator's entry"
+    assert target.is_symlink()
+    assert _fingerprint(volume) == before
+
+
+def test_a_canonical_member_removed_after_it_lands_is_not_a_success(
+    tmp_path, monkeypatch
+) -> None:
+    """Pinning the candidate covers the way IN; this covers the way out.
+
+    A member can be published and then removed by something else before the
+    install finishes. Reporting `workers: paused` and a sidecar list at that
+    point tells an operator the rollback is installed when the canonical
+    database is not there — an outage described as a success.
+    """
+    volume, target, restored = _rollback_fixture(tmp_path)
+    _constrain(monkeypatch, volume, capacity=target.stat().st_size * 10)
+    before = _fingerprint(volume)
+    # Interposed on `_publish`, which BOTH publication routes go through:
+    # `_constrain` makes this a cross-filesystem install, so `_rename_or_exdev`
+    # answers EXDEV and the copy path runs — patching the rename alone caught
+    # nothing and the test never reached its own subject.
+    real_publish = backup_module._publish
+
+    def publish(temporary, destination):
+        real_publish(temporary, destination)
+        if Path(destination) == target:
+            # Somebody removes the canonical database the instant it lands.
+            Path(destination).unlink()
+
+    monkeypatch.setattr(backup_module, "_publish", publish)
+
+    with pytest.raises(backup_module.IncompleteReversal) as raised:
+        install_rollback(restored, target, now=1800000042)
+
+    monkeypatch.undo()
+    # Three mechanisms in sequence, which is what the state deserves. The
+    # post-move check notices the canonical database is gone; the reversal
+    # cannot put it back, because the fixture deleted it and both its names are
+    # now empty; and the caller therefore pauses whatever remains rather than
+    # releasing the locks over a bundle missing a member.
+    assert raised.value.unreversed, "the lost member went unreported"
+    assert raised.value.paused, "no fail-safe pause was written"
+    assert backup_module._pause_marker(target).exists()
+    assert before, "the fixture volume was empty"
