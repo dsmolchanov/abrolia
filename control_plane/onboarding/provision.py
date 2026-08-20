@@ -25,6 +25,7 @@ from control_plane.config import ControlPlaneConfig
 from control_plane.container import ControlPlaneContainer
 from control_plane.db import MIGRATIONS_DIR
 from control_plane.models import USER_STEPS, WorkflowState
+from control_plane.provisioning.contracts import ProviderRejected
 from control_plane.provisioning.fly import FlyRuntimeProvisioner
 
 # Both are installed into the runtime sink by ProvisioningWorker._finish_runtime;
@@ -167,10 +168,50 @@ def _record_writes(sql: str, observed: list[TableWrite]) -> None:
 
 
 def _runtime_resources(
-    container: ControlPlaneContainer, household_id: str, spec: Any | None
+    container: ControlPlaneContainer,
+    household_id: str,
+    spec: Any | None,
+    provider_name: str | None = None,
 ) -> list[dict[str, str]]:
-    provider_name = container.config.runtime_provider
-    provider = container.providers.get(provider_name)
+    """What the operation about to run will create, per ITS provider.
+
+    `provider_name` is the pending job's durable provider, not the current
+    configuration. They can differ, and the worker follows the job: queue
+    `ensure_runtime` under `dry-run-runtime`, restart with
+    `ABROLIA_RUNTIME_PROVIDER=fly-runtime`, and `_dispatch` still routes through
+    `job.provider` to the synthetic provider while this reported Fly app, volume
+    and Machine names — and targeted both runtime secrets at a Fly app that will
+    never exist. An operator preparing from that prepares the wrong resources
+    for the exact operation queued.
+
+    The configured provider is correct only for a planning pass that has not
+    happened yet, because there is no job to disagree with.
+    """
+    provider_name = provider_name or container.config.runtime_provider
+    try:
+        provider = container.providers.get(provider_name)
+    except ProviderRejected:
+        # `ProviderRegistry.get` RAISES for an unregistered name rather than
+        # returning None, and this command must never propagate that: the
+        # rehearsal's job is to describe the situation, including the one where
+        # a durable job names a provider this deployment has disabled.
+        provider = None
+    if provider is None:
+        # A durable job naming a provider this deployment does not register: the
+        # operation cannot run as recorded, and guessing from configuration is
+        # how the wrong resources got reported in the first place.
+        return [
+            {
+                "provider": provider_name,
+                "kind": "unavailable",
+                "stable_name": "",
+                "summary": (
+                    f"the pending operation is recorded against `{provider_name}`,"
+                    " which this deployment does not register; nothing can be"
+                    " asserted about what it would create"
+                ),
+            }
+        ]
     planner = getattr(provider, "plan", None)
     if spec is not None and callable(planner):
         return [
@@ -462,7 +503,7 @@ def plan_onboarding(
                     ),
                 }
             runtime_job = connection.execute(
-                "SELECT id, status, desired_revision, lease_until"
+                "SELECT id, status, desired_revision, lease_until, provider"
                 " FROM provisioning_jobs"
                 " WHERE household_id = ? AND workflow_id = ? AND kind = 'runtime'"
                 " AND operation = 'ensure_runtime'"
@@ -475,6 +516,9 @@ def plan_onboarding(
                     "job_id": runtime_job["id"],
                     "status": runtime_job["status"],
                     "desired_revision": runtime_job["desired_revision"],
+                    # Reported because it is what the worker will dispatch
+                    # through, and it can differ from the configured provider.
+                    "provider": runtime_job["provider"],
                 }
 
             # IDs, not a count. The API worker can be waiting on this
@@ -550,6 +594,32 @@ def plan_onboarding(
             # planning branch below, successfully rehearsed a revision N+1 and
             # reported no blocker at all — a ready-to-provision report for an
             # onboarding that can never resume.
+            # A household under deletion is terminal in a way the workflow
+            # cannot show. `DeletionService.delete` sets `households.status` and
+            # deliberately preserves a leased `ensure_runtime` job, leaving the
+            # workflow in `runtime_provisioning` — so every classification below
+            # read a live provisioning operation and advertised the runtime
+            # success path and its secret installs for a household whose only
+            # valid path is deletion. The status lives on `households`, which
+            # this query never joined.
+            household = connection.execute(
+                "SELECT status FROM households WHERE id = ?", (household_id,)
+            ).fetchone()
+            household_status = str((household or {})["status"] or "") if household else ""
+            being_deleted = household_status in {"deleting", "deleted"}
+            if being_deleted:
+                plan.operation_pending = False
+                plan.rehearsal = (
+                    f"the household is `{household_status}`; there is no"
+                    " onboarding operation to rehearse. Any runtime job still"
+                    " recorded is preserved for reconciliation by the deletion,"
+                    " not for provisioning."
+                )
+                plan.blocked_by = (
+                    f"the household is {household_status}; it cannot be"
+                    " provisioned"
+                )
+
             cancelled_workflow = str(workflow["state"]) == WorkflowState.CANCELLED.value
             if cancelled_workflow:
                 plan.operation_pending = False
@@ -600,7 +670,8 @@ def plan_onboarding(
             # shape had the cancelled case return through a second mechanism, so
             # "does this state advertise future work" was answered twice.
             if (
-                cancelled_workflow
+                being_deleted
+                or cancelled_workflow
                 or failed_runtime
                 or awaiting_activation
                 or already_onboarded
@@ -719,7 +790,13 @@ def plan_onboarding(
                     spec = None
             if plan.operation_pending:
                 plan.runtime_resources = _runtime_resources(
-                    container, household_id, spec
+                    container,
+                    household_id,
+                    spec,
+                    # The pending job's provider when there is one; the
+                    # configured provider only for a planning pass that has not
+                    # happened yet and so has no job to disagree with.
+                    str(runtime_job["provider"]) if runtime_job is not None else None,
                 )
                 plan.secrets = _secret_names(
                     container, household_id, plan.runtime_resources

@@ -162,6 +162,14 @@ rehearses against a read-only snapshot of the database rather than the live
 file, which is what makes "mutates nothing" structural rather than a list of
 closed holes.
 
+The guarantee is precise rather than absolute: **the database file and its
+`-wal` are left byte-identical; the `-shm` shared-memory index is not covered.**
+SQLite must map `-shm` to read a WAL database at all, so a read-only open
+creates one where a crashed writer left none and refreshes one that exists. It
+holds no durable data and is rebuilt from the WAL. Two things follow: the
+rehearsal needs permission to create that file beside the database, and a
+fingerprint taken over `/data` will show it.
+
 Always reported: the workflow state and per-step statuses, and — when a step is
 not yet verified — `blocked_by` and `unverified_steps` naming exactly what is
 missing.

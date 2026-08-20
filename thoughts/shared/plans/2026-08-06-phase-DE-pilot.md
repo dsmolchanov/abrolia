@@ -195,6 +195,20 @@ blocker under the repository rules. Four were missing rather than unnecessary:
 
   Naming one branch as "exact" is false precision, and an operator acting on it is worse off than one told to go and look. So the promise is now: exact where it is knowable, explicit uncertainty where it is not, and never a guess presented as a fact.
 
+**The guarantee, stated exactly.** The database file and its `-wal` are left
+byte-identical. The `-shm` shared-memory index is not covered: SQLite must map
+it to read a WAL database at all, so a read-only open creates one where a
+crashed writer left none, and refreshes one that exists. That file holds no
+durable data and is rebuilt from the WAL, but it IS a change to the directory,
+and a fingerprint over `/data` will see it.
+
+Two consequences an operator should know. A rehearsal needs permission to create
+`-shm` beside the database, and will fail without it rather than silently
+reading stale pages. And "mutates nothing" is a claim about the data, not about
+every inode — the earlier unconditional wording promised more than any
+implementation that opens the file through SQLite can deliver, and promising it
+is how the guarantee stops being checkable.
+
   The no-mutation half is unchanged and was **strengthened** in the same rounds, because it turned out to be doing less than it claimed. The command must not migrate the database (`ControlPlaneContainer.build` did, before its own transaction opened), must not create one that is absent (`sqlite3.connect` did), must not rewrite the journal mode (`PRAGMA journal_mode=WAL` is persistent), must roll its rehearsal back, and must attribute only rows it minted itself — a count taken across the rollback blamed the API worker's concurrent commits on the dry-run.
 - Fix-before-effect: advancing a step is a durable `onboarding_transitions` append before any provider effect; stale `version` → `409 conflict`.
 - Downstream invalidation: if `email` step is reset (delete/reconnect), `whatsapp` and `primary` steps that depended on that `config_revision` are invalidated (`needs_revalidation`) and must be re-confirmed.

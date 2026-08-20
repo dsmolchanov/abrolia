@@ -1167,3 +1167,170 @@ def test_a_database_path_with_uri_syntax_is_rehearsed_not_created(
             and not path.name.endswith(("-wal", "-shm"))
         }
         assert created == set(), f"{name}: the dry-run created {created}"
+
+
+def test_a_household_under_deletion_advertises_no_onboarding(container) -> None:
+    """Deletion is terminal in a way the WORKFLOW cannot show.
+
+    `DeletionService.delete` sets `households.status` and deliberately preserves
+    a leased `ensure_runtime` job, leaving the workflow in
+    `runtime_provisioning`. Every classification therefore read a live
+    provisioning operation and advertised the runtime success path and its
+    secret installs — a provisioning plan for a household whose only valid path
+    is deletion. The status lives on `households`, which this query never
+    joined.
+    """
+    household_id = _household_with_profile(container)
+    _verify_all_steps(container, household_id)
+    with container.database.write() as connection:
+        connection.execute(
+            "UPDATE households SET status = 'deleting' WHERE id = ?", (household_id,)
+        )
+
+    plan = plan_onboarding(container, household_id)
+
+    assert plan.operation_pending is False
+    assert plan.blocked_by is not None and "deleting" in plan.blocked_by
+    assert plan.table_writes == []
+    assert plan.runtime_resources == []
+    assert plan.secrets == []
+    assert plan.uncommitted_revision_delta == 0
+
+
+def test_the_report_follows_the_jobs_provider_not_the_configuration(container) -> None:
+    """A queued job carries its provider; the worker dispatches through it.
+
+    Queue `ensure_runtime` under one provider, restart with
+    `ABROLIA_RUNTIME_PROVIDER` naming another, and `_dispatch` still routes
+    through `job.provider` — while this reported the newly CONFIGURED provider's
+    resources and targeted both runtime secrets at them. An operator preparing
+    from that prepares the wrong resources for the exact operation queued.
+
+    The job is moved rather than the configuration because `ControlPlaneConfig`
+    is frozen; the divergence being tested is the same either way, and this
+    direction keeps the whole rehearsal in the assertion rather than only
+    `_runtime_resources`.
+    """
+    household_id = _household_with_profile(container)
+    _verify_all_steps(container, household_id)
+    configured = container.config.runtime_provider
+    other = "fake-channel"
+    assert other != configured
+    with container.database.write() as connection:
+        connection.execute(
+            "UPDATE provisioning_jobs SET provider = ?"
+            " WHERE household_id = ? AND kind = 'runtime'"
+            " AND operation = 'ensure_runtime'"
+            " AND status IN ('pending','running','waiting_user','outcome_unknown')",
+            (other, household_id),
+        )
+
+    plan = plan_onboarding(container, household_id)
+
+    assert plan.pending_runtime_job["provider"] == other
+    assert {resource["provider"] for resource in plan.runtime_resources} == {other}, (
+        "the report followed the configuration instead of the queued job"
+    )
+    # And the secret targets come from those resources, so they move with them.
+    assert all(
+        secret["target"] != FlyRuntimeProvisioner.stable_app_name(household_id)
+        for secret in plan.secrets
+    )
+
+
+def test_the_planning_pass_uses_the_configured_provider(container) -> None:
+    """No job yet means nothing to disagree with, so configuration is right.
+
+    The fix must not overcorrect: before a revision is issued there is no
+    durable operation, and the next one will be created under the provider this
+    deployment is configured with.
+    """
+    household_id = _household_with_profile(container)
+
+    plan = plan_onboarding(container, household_id)
+
+    assert plan.pending_runtime_job == {}
+    if plan.runtime_resources:
+        assert {resource["provider"] for resource in plan.runtime_resources} == {
+            container.config.runtime_provider
+        }
+
+
+def test_a_job_naming_an_unregistered_provider_asserts_nothing(container) -> None:
+    """Guessing from configuration is how the wrong resources got reported."""
+    household_id = _household_with_profile(container)
+    _verify_all_steps(container, household_id)
+    with container.database.write() as connection:
+        connection.execute(
+            "UPDATE provisioning_jobs SET provider = 'a-provider-nobody-registers'"
+            " WHERE household_id = ? AND kind = 'runtime'"
+            " AND operation = 'ensure_runtime'",
+            (household_id,),
+        )
+
+    plan = plan_onboarding(container, household_id)
+
+    assert [resource["kind"] for resource in plan.runtime_resources] == ["unavailable"]
+    assert all(not resource["stable_name"] for resource in plan.runtime_resources)
+
+
+def test_the_snapshot_touches_only_the_shared_memory_index(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The guarantee, fingerprinted, including the case that has no `-shm` yet.
+
+    A crashed writer leaves committed `-wal` frames and no `-shm`, and reading a
+    WAL database requires one — so the rehearsal CREATES it. That is a change to
+    the directory, and the plan's unconditional "mutates nothing" did not admit
+    it. Both documents now say `-shm` is outside the guarantee; this pins what
+    is inside it: the database and its `-wal`, byte for byte.
+    """
+    config = ControlPlaneConfig.for_test(tmp_path)
+    seed = ControlPlaneDatabase(config.database_path)
+    seed.migrate()
+    seed.close()
+
+    # A writer that DIES, so committed frames stay in the WAL with no live
+    # connection — the only way to reach this state.
+    writer = textwrap.dedent(
+        f"""
+        import os, sqlite3
+        c = sqlite3.connect({str(config.database_path)!r}, isolation_level=None)
+        c.execute("PRAGMA journal_mode=WAL")
+        c.execute("CREATE TABLE canary (id TEXT PRIMARY KEY)")
+        c.execute("INSERT INTO canary VALUES ('uncheckpointed')")
+        os._exit(0)
+        """
+    )
+    subprocess.run([sys.executable, "-c", writer], check=True)
+
+    shm = config.database_path.with_name(f"{config.database_path.name}-shm")
+    wal = config.database_path.with_name(f"{config.database_path.name}-wal")
+    shm.unlink(missing_ok=True)
+    assert wal.exists() and wal.stat().st_size > 0, (
+        "the fixture must leave uncheckpointed frames, or this proves nothing"
+    )
+    assert not shm.exists(), "the fixture must start with no shared-memory index"
+
+    covered = {
+        path.name: path.read_bytes()
+        for path in sorted(tmp_path.iterdir())
+        if path.is_file() and not path.name.endswith("-shm")
+    }
+
+    monkeypatch.setattr(ControlPlaneConfig, "from_env", staticmethod(lambda: config))
+    with pytest.raises(SystemExit):
+        main(["--dry-run", "--household", "10000000-0000-4000-8000-000000000031"])
+
+    after = {
+        path.name: path.read_bytes()
+        for path in sorted(tmp_path.iterdir())
+        if path.is_file() and not path.name.endswith("-shm")
+    }
+    assert after == covered, "the database or its WAL changed"
+    # And the one file the guarantee excludes is named, so a future reader of
+    # this test knows the exclusion is deliberate rather than an oversight.
+    assert shm.exists(), (
+        "the rehearsal did not create the index it needs; if SQLite stops"
+        " requiring one, the documented exclusion can be removed"
+    )
