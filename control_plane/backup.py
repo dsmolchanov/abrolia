@@ -6,6 +6,7 @@ import errno
 import hashlib
 import hmac
 import os
+import re
 import sqlite3
 import stat
 import sys
@@ -306,7 +307,20 @@ def _claim(
     record = _Move(source, destination, published_inode=_inode(destination))
     if journal is not None:
         journal.append(record)
-    source.unlink(missing_ok=True)
+    try:
+        source.unlink(missing_ok=True)
+    except OSError:
+        # Somebody has to reverse this. A journalled caller does it in `_undo`,
+        # which can also put back the members that moved before this one — so
+        # the exception goes there untouched. NOBODY is watching an unjournaled
+        # call, and `_publish` is exactly that: the destination is published,
+        # the exception escapes before the directory is even synced, and the
+        # caller's cleanup unlinks a temporary that has already moved. Restore
+        # then withdrew its pause marker over a database that was standing.
+        if journal is not None:
+            raise
+        _withdraw(destination)
+        raise
     record.source_removed = True
 
 
@@ -325,6 +339,21 @@ class AmbiguousPublication(BackupError):
             " leaving the worker pause in place"
         )
         self.destination = destination
+
+
+def _withdraw(destination: Path) -> None:
+    """Take a published name away, and make the ABSENCE durable too.
+
+    Unlinking without syncing the directory leaves the same ambiguity the
+    publication was careful to avoid: the entry may or may not survive a crash,
+    so a caller that then removes a pause marker can leave a database present
+    and unpaused. Sync, and say the state is ambiguous if even that fails.
+    """
+    destination.unlink(missing_ok=True)
+    try:
+        _fsync_directory(destination.parent)
+    except OSError as error:
+        raise AmbiguousPublication(destination) from error
 
 
 def _publish(temporary: Path, destination: Path) -> None:
@@ -358,11 +387,7 @@ def _publish(temporary: Path, destination: Path) -> None:
     try:
         _fsync_directory(destination.parent)
     except OSError:
-        # Undo the rename, and make the REMOVAL durable too. Unlinking without
-        # syncing the directory leaves the same ambiguity one level down: the
-        # entry may or may not survive a crash, so a caller that then removes
-        # the pause marker can leave a database present and unpaused. Sync, and
-        # tell the caller it is ambiguous if even that fails.
+        # Undo the rename, durably — see `_withdraw`.
         #
         # Leaving the file behind is worse than not writing it:
         # `_reusable_pre_migrate_backup` would find this archive on the next
@@ -371,11 +396,7 @@ def _publish(temporary: Path, destination: Path) -> None:
         # fail-open one, which is the exact shape of bug this module keeps
         # finding in itself. The caller's `finally` cannot do it: the temporary
         # path no longer exists, so its `unlink(missing_ok=True)` is a no-op.
-        destination.unlink(missing_ok=True)
-        try:
-            _fsync_directory(destination.parent)
-        except OSError as error:
-            raise AmbiguousPublication(destination) from error
+        _withdraw(destination)
         raise
 
 
@@ -785,7 +806,18 @@ def _copy_install(
     record = _Move(source, destination, published_inode=_inode(destination))
     if journal is not None:
         journal.append(record)
-    source.unlink(missing_ok=True)
+    try:
+        source.unlink(missing_ok=True)
+    except OSError:
+        # Somebody has to reverse this. A journalled caller does it in `_undo`,
+        # which can also put back the members that moved before this one — so
+        # the exception goes there untouched. NOBODY is watching an unjournaled
+        # call — `_undo`'s own cross-filesystem reversal is one — so the copy
+        # it just published has to go away here or stand forever.
+        if journal is not None:
+            raise
+        _withdraw(destination)
+        raise
     record.source_removed = True
 
 
@@ -1101,6 +1133,33 @@ def _is_a_copy(source: Path, destination: Path) -> bool:
                 path.unlink(missing_ok=True)
 
 
+#: `CREATE TABLE [IF NOT EXISTS] name`, in any of the quotings SQLite accepts.
+_CREATE_TABLE = re.compile(
+    r"""CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?["'`\[]?(\w+)""",
+    re.IGNORECASE,
+)
+#: A `--` comment, so a commented-out statement is not read as a real one.
+_SQL_COMMENT = re.compile(r"--[^\n]*")
+
+
+def _tables_created_by(migrations: tuple[str, ...]) -> set[str]:
+    """Every table these migration scripts create.
+
+    Derived from the scripts rather than listed here, so it cannot fall behind
+    them, and so it answers for EVERY historical revision without a table of
+    revisions to maintain. No migration in this schema has ever dropped or
+    renamed a table, which is what makes "created by an applied migration"
+    equivalent to "present now".
+    """
+    names: set[str] = set()
+    for migration in migrations:
+        script = _SQL_COMMENT.sub(
+            "", (MIGRATIONS_DIR / migration).read_text(encoding="utf-8")
+        )
+        names.update(_CREATE_TABLE.findall(script))
+    return names
+
+
 def _shipped_migrations() -> tuple[str, ...]:
     """Every migration in this image, in the order `db.migrate` applies them.
 
@@ -1166,6 +1225,12 @@ def require_control_plane_database(path: Path) -> None:
                 if ledger is not None
                 else []
             )
+            tables = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
     except RollbackError as error:
         raise BackupError(str(error)) from error
     if ledger is None:
@@ -1196,6 +1261,19 @@ def require_control_plane_database(path: Path) -> None:
         raise BackupError(
             f"{path} records migrations this schema does not have ({recorded});"
             " it is some other application's database, not the control plane's"
+        )
+    # The ledger NAMES a schema; this is the schema itself. A file holding
+    # nothing but `schema_migrations` and the row `0001_control_plane.sql`
+    # satisfied every check above — it passes integrity and foreign-key checks
+    # precisely because it has no rows and no references — and a copied ledger
+    # is the easiest thing in the world to produce by accident. What the
+    # recorded migrations created has to actually be there.
+    missing = sorted(_tables_created_by(tuple(applied[:shared])) - tables)
+    if missing:
+        raise BackupError(
+            f"{path} records migrations whose tables are not in it"
+            f" ({', '.join(missing)}); its ledger describes a schema the file"
+            " does not have, so it is not the control-plane database"
         )
 
 
@@ -1341,11 +1419,24 @@ def _undo(moved: list[_Move]) -> None:
                 _fsync_directory(destination.parent)
             elif _present(source):
                 unreversed.append(destination)
-            elif not _rename_or_exdev(destination, source):
-                # The forward direction crossed a filesystem, so the reverse
-                # does too: `os.link` answers `EXDEV` and a copy is the only
-                # way back. Both paths fsync the directory they publish into.
-                _copy_install(destination, source)
+            else:
+                if not _rename_or_exdev(destination, source):
+                    # The forward direction crossed a filesystem, so the reverse
+                    # does too: `os.link` answers `EXDEV` and a copy is the only
+                    # way back. Both paths fsync the directory they publish
+                    # into.
+                    _copy_install(destination, source)
+                if destination.parent != source.parent:
+                    # And the directory the reversal EMPTIED. Both helpers sync
+                    # only where they land, which is enough when a member moves
+                    # within one directory and not enough when it does not —
+                    # `install-rollback` moves between the staging directory and
+                    # the volume. With no superseded bundle to restore
+                    # afterwards, as in `--target-already-freed`, nothing else
+                    # syncs the volume, so a crash could resurrect an arbitrary
+                    # subset of the canonical members `_undo` had just reported
+                    # gone: the database without its pause marker among them.
+                    _fsync_directory(destination.parent)
         except OSError:
             unreversed.append(destination)
             continue

@@ -2740,3 +2740,190 @@ def test_sidecar_cleanup_removes_only_the_entry_it_created(
     assert successor.read_bytes() == b"a live writer's frames", (
         "cleanup unlinked by name and destroyed an entry it never created"
     )
+
+
+def test_an_unjournalled_publication_withdraws_itself(tmp_path, monkeypatch) -> None:
+    """`_publish` passes no journal, so nothing else can reverse it.
+
+    `_claim` links and then unlinks, and the unlink can fail on its own — `EIO`,
+    `EPERM`, a read-only remount. A journalled caller reverses that in `_undo`.
+    `_publish` is not one: the destination was published, the exception escaped
+    before the directory was even synced, and the caller's cleanup unlinked a
+    temporary that had already moved. Restore then withdrew its pause marker
+    over a database that was standing there.
+    """
+    source = tmp_path / "temporary"
+    source.write_bytes(b"the published generation")
+    destination = tmp_path / "canonical.db"
+    real_unlink = Path.unlink
+
+    def refuse(self, **keywords):
+        if self == source:
+            raise OSError(errno.EIO, "the unlink failed after the link succeeded")
+        return real_unlink(self, **keywords)
+
+    monkeypatch.setattr(Path, "unlink", refuse)
+
+    with pytest.raises(OSError, match="unlink failed"):
+        backup_module._publish(source, destination)
+
+    monkeypatch.undo()
+    assert not destination.exists(), (
+        "a publication nobody journalled left its destination standing"
+    )
+    assert source.read_bytes() == b"the published generation"
+
+
+def test_a_restore_whose_publication_half_fails_keeps_its_pause(
+    tmp_path, monkeypatch
+) -> None:
+    """The invariant, end to end: no database ever stands without its marker."""
+    seed = _database(tmp_path)
+    seed.migrate()
+    archive = tmp_path / "restore-point.cpb"
+    backup_module.create_backup(seed, archive, backup_key=BACKUP_KEY_BYTES)
+    seed.close()
+    destination = tmp_path / "restored" / "control-plane.db"
+    destination.parent.mkdir()
+    real_unlink = Path.unlink
+
+    # The DATABASE's own temporary, named EXACTLY, not by prefix. Everything in
+    # that directory shares the prefix — the marker's temporary, and the
+    # temporary's own `-wal` and `-shm`, which the integrity check unlinks well
+    # before publication — so a prefix match fired on the wrong step every time
+    # and the test proved nothing about the publication it names.
+    published: dict[str, Path] = {}
+    real_publish = backup_module._publish
+
+    def publish(temporary, target):
+        if Path(target) == destination:
+            published["temporary"] = Path(temporary)
+        return real_publish(temporary, target)
+
+    def refuse(self, **keywords):
+        if self == published.get("temporary"):
+            raise OSError(errno.EIO, "the unlink failed after the link succeeded")
+        return real_unlink(self, **keywords)
+
+    monkeypatch.setattr(backup_module, "_publish", publish)
+    monkeypatch.setattr(Path, "unlink", refuse)
+
+    with pytest.raises(OSError, match="unlink failed"):
+        backup_module.restore_backup(
+            archive, destination, backup_key=BACKUP_KEY_BYTES
+        )
+
+    monkeypatch.undo()
+    # The publication failing takes the marker with it — that branch is already
+    # there and correct. What it cannot do is take back a database it does not
+    # know became visible, and a marker withdrawn over a standing database is
+    # the exact state the marker exists to prevent.
+    assert not destination.exists(), (
+        "the database was published and never withdrawn"
+    )
+    assert not (
+        destination.exists()
+        and not backup_module._pause_marker(destination).exists()
+    ), "a restored database is startable with no worker pause beside it"
+
+
+def test_a_reversal_across_directories_syncs_the_one_it_emptied(
+    tmp_path, monkeypatch
+) -> None:
+    """Both helpers sync where they LAND, and neither syncs where they left.
+
+    Within one directory that is the same entry and the gap does not show. The
+    rollback install moves between the staging directory and the volume, and in
+    `--target-already-freed` there is no superseded bundle to restore
+    afterwards — so nothing else ever syncs the volume, and a crash could
+    resurrect an arbitrary subset of the canonical members `_undo` had just
+    reported gone.
+    """
+    staging = tmp_path / "staging"
+    volume = tmp_path / "volume"
+    staging.mkdir()
+    volume.mkdir()
+    source = staging / "control-plane.db"
+    destination = volume / "control-plane.db"
+    destination.write_bytes(b"the installed generation")
+    journal = [
+        backup_module._Move(
+            source,
+            destination,
+            published_inode=(destination.lstat().st_dev, destination.lstat().st_ino),
+            source_removed=True,
+        )
+    ]
+    synced: list[Path] = []
+    real_fsync_directory = backup_module._fsync_directory
+
+    def record(directory):
+        synced.append(Path(directory))
+        return real_fsync_directory(directory)
+
+    monkeypatch.setattr(backup_module, "_fsync_directory", record)
+
+    backup_module._undo(journal)
+
+    assert source.read_bytes() == b"the installed generation"
+    assert not destination.exists()
+    assert volume in synced, (
+        "the directory the reversal emptied was never made durable, so the"
+        f" canonical entry can come back after a crash: {synced}"
+    )
+    assert staging in synced, "the restored entry was never made durable either"
+
+
+def test_a_ledger_without_its_schema_is_not_this_database(tmp_path, monkeypatch) -> None:
+    """A copied ledger is the easiest thing in the world to produce by accident.
+
+    A file holding nothing but `schema_migrations` and the row
+    `0001_control_plane.sql` passed every earlier check — including integrity
+    and foreign-key checks, which it passes precisely BECAUSE it has no rows and
+    no references. The ledger names a schema; the schema has to be there.
+    """
+    impostor = tmp_path / "control-plane.db"
+    shipped = backup_module._shipped_migrations()
+    raw = sqlite3.connect(impostor)
+    try:
+        raw.execute("CREATE TABLE schema_migrations (name TEXT, applied_at TEXT)")
+        raw.execute(
+            "INSERT INTO schema_migrations VALUES (?, '2026-01-01T00:00:00Z')",
+            (shipped[0],),
+        )
+        raw.commit()
+    finally:
+        raw.close()
+    monkeypatch.setenv("ABROLIA_CONTROL_PLANE_DB", str(impostor))
+    monkeypatch.setenv("ABROLIA_CONTROL_PLANE_BACKUP_KEY", BACKUP_KEY)
+
+    with pytest.raises(SystemExit, match="tables are not in it"):
+        cli_main(["backup", str(tmp_path / "superseded.cpb")])
+
+    assert not (tmp_path / "superseded.cpb").exists()
+
+
+def test_the_schema_sentinels_come_from_the_migrations_themselves(tmp_path) -> None:
+    """A hand-kept list of tables falls behind the scripts that create them."""
+    shipped = backup_module._shipped_migrations()
+    created = backup_module._tables_created_by(shipped)
+
+    seed = _database(tmp_path)
+    seed.migrate()
+    present = {
+        row["name"]
+        for row in seed.connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )
+    }
+    seed.close()
+
+    assert created, "no CREATE TABLE was parsed out of the shipped migrations"
+    assert created <= present, sorted(created - present)
+    # And COMPLETE. A sentinel set that names one or two tables passes the
+    # subset check while checking almost nothing, so the only tables allowed to
+    # be present without appearing in a migration script are the ones no script
+    # writes: the ledger `migrate()` creates itself, and SQLite's own.
+    assert present - created <= {"schema_migrations", "sqlite_sequence"}, sorted(
+        present - created
+    )
