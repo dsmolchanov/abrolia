@@ -182,6 +182,12 @@ blocker under the repository rules. Four were missing rather than unnecessary:
   states what it will create, so the report describes the CONFIGURED provider
   rather than assuming Fly.
 - `tests/control_plane/test_provision_dry_run.py` — the step's own suite.
+- `control_plane/repositories/jobs.py` — **added 2026-08-20.** `LEASABLE_SQL`,
+  the condition `JobsRepository.lease` selects on. The rehearsal reports whether
+  the worker can pick a job up next, and it did that by restating those rules in
+  Python — where they disagreed three ways. A report about what the worker will
+  do has to ask the worker's own question, so the predicate is shared from where
+  the worker asks it.
 
 **Durable 3-step machine:** `email → WhatsApp → primary`.
 

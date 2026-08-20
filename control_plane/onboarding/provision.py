@@ -25,7 +25,7 @@ from typing import Any
 
 from control_plane.config import ControlPlaneConfig
 from control_plane.container import ControlPlaneContainer
-from control_plane.db import MIGRATIONS_DIR
+from control_plane.db import MIGRATIONS_DIR, ControlPlaneDatabase
 from control_plane.models import USER_STEPS, WorkflowState
 from control_plane.provisioning.contracts import ProviderRejected
 from control_plane.provisioning.fly import FlyRuntimeProvisioner
@@ -396,6 +396,14 @@ def _secret_names(
         for row in installed
     )
     return secrets
+
+
+def _next_executable(jobs: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """The first job the worker could lease, in the order `lease` would take."""
+    for job in jobs:
+        if job["executable"]:
+            return job
+    return None
 
 
 def _now_seconds() -> float:
@@ -991,10 +999,27 @@ def plan_onboarding(
                     # unverified steps is the NORMAL state while those steps'
                     # own jobs are still queued — that is work in progress, not
                     # a blockage.
-                    plan.operation_blocked = not any(
-                        job["executable"] for job in plan.pending_step_jobs
-                    )
-                    plan.blocked_by = str(error)
+                    runnable = _next_executable(plan.pending_step_jobs)
+                    plan.operation_blocked = runnable is None
+                    if runnable is not None:
+                        # And the report must describe THAT job. Leaving the
+                        # planner's prerequisite error in `blocked_by`, and a
+                        # rehearsal sentence claiming a planning pass, described
+                        # a future operation while the actual next one — the job
+                        # the worker is about to lease — went unnamed.
+                        plan.rehearsal = (
+                            f"the next operation is the queued"
+                            f" `{runnable['kind']}` job {runnable['job_id']}"
+                            f" ({runnable['operation']}), which the worker can"
+                            " lease now. The planning pass comes after the"
+                            " steps it depends on verify, so no write set is"
+                            " claimed for it yet."
+                        )
+                    # Only when there is genuinely nothing to run. Assigning it
+                    # unconditionally — as the line below this block used to —
+                    # put the planner's prerequisite error back over the
+                    # description of the job that is actually queued.
+                    plan.blocked_by = str(error) if runnable is None else None
                 finally:
                     connection.set_trace_callback(None)
 
@@ -1058,6 +1083,15 @@ def plan_onboarding(
         pass
 
     assert plan is not None
+    # Terminal states set `operation_pending = False` from the WORKFLOW's point
+    # of view, and the workflow is not the only thing that queues work: after
+    # activation completes, `BootstrapService._enqueue_cleanup` leaves a pending
+    # `bootstrap_cleanup` job while the workflow is already `complete`. Reported
+    # as "no pending operation", that job is one the worker leases immediately.
+    # Decided once, here, over the inventory every branch shares.
+    if _next_executable(plan.pending_step_jobs) is not None:
+        plan.operation_pending = True
+
     # After the rollback, and asking only about rows THIS rehearsal minted.
     # Anything else in the table belongs to the worker and is none of this
     # command's business to report as its own.
@@ -1197,6 +1231,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             ) from None
         finally:
             source.close()
+        # The pause marker travels with the snapshot. `backup()` copies SQLite
+        # DATA, and the worker pause is a sibling FILE — so redirecting
+        # `database_path` at the scratch copy pointed `worker_pause_path` at a
+        # directory where no marker exists, and the rehearsal reported
+        # SQL-leasable jobs as executable while the live repository, paused,
+        # returns nothing at all. A restored database stays paused until
+        # `resume-jobs`, which is exactly when an operator reaches for this
+        # command.
+        live_pause = ControlPlaneDatabase(live.database_path).worker_pause_path
+        if live_pause.is_file():
+            (rehearsal_path.parent / live_pause.name).write_bytes(
+                live_pause.read_bytes()
+            )
         config = replace(live, database_path=rehearsal_path)
         return _rehearse(config, args.household)
 

@@ -19,6 +19,7 @@ from control_plane.config import ControlPlaneConfig
 from control_plane.container import ControlPlaneContainer
 from control_plane.db import ControlPlaneDatabase
 from control_plane.models import ProfileInput, StepKind
+from control_plane.onboarding import provision as provision_module
 from control_plane.onboarding.contracts import CommandContext
 from control_plane.onboarding.provision import (
     COMPENSATION_WRITES,
@@ -373,8 +374,13 @@ def test_a_reset_workflow_is_not_reported_as_already_planned(container) -> None:
 
     assert plan.config_revision == {}
     assert plan.pending_runtime_job == {}
-    assert plan.blocked_by is not None
     assert plan.unverified_steps
+    # `blocked_by` is deliberately NOT asserted here. A reset queues its own
+    # cleanup jobs, and the report now names the one the worker will lease
+    # instead of repeating the planner's prerequisite error — which is the
+    # point: this test is about not claiming a PLAN, not about the shape of the
+    # explanation.
+    assert "already issued" not in plan.rehearsal
     assert set(plan.table_writes) != set(
         RUNTIME_WRITES_BY_WORKFLOW_STATE["runtime_provisioning"]
     )
@@ -1089,7 +1095,13 @@ def test_a_cancelled_workflow_advertises_no_future_work(container) -> None:
 
     plan = plan_onboarding(container, household_id)
 
-    assert plan.operation_pending is False
+    # `operation_pending` follows what the WORKER can lease, and cancelling
+    # schedules teardown jobs — so it is true here, and it should be: that work
+    # is real and about to run. What the cancellation ends is the ONBOARDING,
+    # which is why nothing future-tense is claimed.
+    assert plan.operation_pending is bool(
+        [job for job in plan.pending_step_jobs if job["executable"]]
+    )
     assert plan.blocked_by is not None and "cancelled" in plan.blocked_by
     assert plan.table_writes == []
     assert plan.runtime_resources == []
@@ -1135,8 +1147,10 @@ def test_no_state_advertises_resources_it_is_not_rehearsing(container) -> None:
     )
     cancelled = plan_onboarding(container, household_id)
 
-    assert settled.operation_pending is False, settled.rehearsal
-    assert cancelled.operation_pending is False, cancelled.rehearsal
+    # Neither describes future onboarding work. `operation_pending` may be true
+    # for either if a teardown or bootstrap-cleanup job is queued — that is the
+    # worker's business, not the onboarding's — so the assertion that matters is
+    # about what is ADVERTISED.
     for plan in (settled, cancelled):
         assert plan.runtime_resources == [], plan.rehearsal
         assert plan.secrets == [], plan.rehearsal
@@ -1856,3 +1870,118 @@ def test_a_quarantined_runtime_intent_keeps_the_operation_pending(container) -> 
     assert plan.operation_blocked is True
     assert plan.runtime_resources == []
     assert plan.secrets == []
+
+
+def test_the_snapshot_carries_the_live_worker_pause(tmp_path, monkeypatch) -> None:
+    """`backup()` copies SQLite DATA; the pause is a sibling FILE.
+
+    Redirecting `database_path` at the scratch copy pointed
+    `worker_pause_path` at a directory where no marker exists, so the report
+    labelled SQL-leasable jobs executable while the live repository, paused,
+    returns nothing at all. A restored database stays paused until
+    `resume-jobs` — which is exactly when an operator reaches for this command.
+    """
+    config = ControlPlaneConfig.for_test(tmp_path)
+    seed = ControlPlaneDatabase(config.database_path)
+    seed.migrate()
+    seed.pause_workers()
+    seed.close()
+    assert config.database_path.with_name(
+        f"{config.database_path.name}.workers-paused"
+    ).is_file()
+
+    seen: dict[str, bool] = {}
+    real_rehearse = provision_module._rehearse
+
+    def record(rehearsal_config, household_id):
+        seen["paused"] = ControlPlaneDatabase(
+            rehearsal_config.database_path
+        ).workers_paused
+        return real_rehearse(rehearsal_config, household_id)
+
+    monkeypatch.setattr(ControlPlaneConfig, "from_env", staticmethod(lambda: config))
+    monkeypatch.setattr(provision_module, "_rehearse", record)
+    with pytest.raises(SystemExit):
+        main(["--dry-run", "--household", "10000000-0000-4000-8000-000000000031"])
+
+    assert seen.get("paused") is True, (
+        "the rehearsal read an unpaused snapshot of a paused deployment"
+    )
+
+
+def test_a_queued_cleanup_after_completion_is_still_pending(container) -> None:
+    """The workflow is not the only thing that queues work.
+
+    After activation completes, `BootstrapService._enqueue_cleanup` leaves a
+    pending `bootstrap_cleanup` job while the workflow is already `complete`.
+    The terminal branches set `operation_pending = False` from the workflow's
+    point of view and reported "no pending operation" over a job the worker
+    leases immediately.
+    """
+    household_id = _household_with_profile(container)
+    _verify_all_steps(container, household_id)
+    while container.worker.run_once() is not None:
+        pass
+    workflow = container.database.query_one(
+        "SELECT id, state FROM onboarding_workflows WHERE household_id = ?",
+        (household_id,),
+    )
+    with container.database.write() as connection:
+        connection.execute(
+            "UPDATE onboarding_workflows SET state = 'complete' WHERE id = ?",
+            (workflow["id"],),
+        )
+        # Through the repository, so the row is shaped exactly as
+        # `BootstrapService._enqueue_cleanup` shapes it.
+        cleanup_id, _created = container.jobs.create(
+            connection,
+            household_id=household_id,
+            workflow_id=workflow["id"],
+            kind="bootstrap_cleanup",
+            operation="delete_bootstrap_secret",
+            intent_key=f"{household_id}:late-bootstrap-cleanup:probe",
+            request={"name": "HERMES_BOOTSTRAP_TOKEN"},
+            provider="internal-secret-sink",
+            now=BASE_TIME,
+        )
+
+    plan = plan_onboarding(container, household_id)
+
+    assert any(
+        job["job_id"] == cleanup_id for job in plan.pending_step_jobs
+    ), "the queued cleanup was not inventoried"
+    assert plan.operation_pending is True, (
+        "a job the worker leases immediately was reported as no pending work"
+    )
+    # And still nothing future-tense: the onboarding really is over.
+    assert plan.runtime_resources == []
+    assert plan.secrets == []
+
+
+def test_the_report_names_the_job_the_worker_will_actually_lease(container) -> None:
+    """Describing a future planning pass while a job is queued now.
+
+    With `operation_blocked` correctly false, `rehearsal` still claimed a
+    planning pass and `blocked_by` still held the planner's prerequisite error —
+    so the report described an operation that comes later while the actual next
+    one, the job about to be leased, went unnamed.
+    """
+    household_id = _household_with_profile(container)
+    account_id, session_id = _PRINCIPALS[household_id]
+    container.onboarding.select(
+        household_id,
+        StepKind.EMAIL,
+        EMAIL_SELECTION,
+        context=_context(
+            container, household_id, "select-0",
+            account_id=account_id, session_id=session_id,
+        ),
+    )
+
+    plan = plan_onboarding(container, household_id)
+
+    runnable = next(job for job in plan.pending_step_jobs if job["executable"])
+    assert plan.operation_blocked is False
+    assert plan.blocked_by is None, plan.blocked_by
+    assert runnable["job_id"] in plan.rehearsal, plan.rehearsal
+    assert "planning pass" not in plan.rehearsal.split("The planning pass")[0]
