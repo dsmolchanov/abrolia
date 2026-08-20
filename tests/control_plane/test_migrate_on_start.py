@@ -2714,8 +2714,16 @@ def test_sidecar_cleanup_removes_only_the_entry_it_created(
         def close(self):
             self._connection.close()
             # Somebody else's `-wal`, at the same name, after this open let go.
-            successor.unlink(missing_ok=True)
-            successor.write_bytes(b"a live writer's frames")
+            #
+            # Written elsewhere and renamed in, so the replacement's inode is
+            # allocated while the original is still linked. Unlinking first and
+            # writing after passed here and failed on CI, where the filesystem
+            # handed the freed inode straight back and the two entries were
+            # indistinguishable — a test whose subject was inode identity,
+            # deciding it by luck.
+            replacement = successor.with_name("a-successor")
+            replacement.write_bytes(b"a live writer's frames")
+            os.replace(replacement, successor)
 
     def connect(*arguments, **keywords):
         return SwapOnClose(real_connect(*arguments, **keywords))
@@ -2724,7 +2732,11 @@ def test_sidecar_cleanup_removes_only_the_entry_it_created(
     with backup_module._read_only_sqlite(database) as connection:
         connection.execute("PRAGMA integrity_check").fetchone()
         assert successor.exists(), "the read-only open created no sidecar to own"
+        owned = backup_module._inode(successor)
 
+    assert backup_module._inode(successor) != owned, (
+        "the fixture did not actually replace the entry, so this proves nothing"
+    )
     assert successor.read_bytes() == b"a live writer's frames", (
         "cleanup unlinked by name and destroyed an entry it never created"
     )
