@@ -6,8 +6,10 @@ import errno
 import hashlib
 import hmac
 import os
+import re
 import sqlite3
 import stat
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -251,7 +253,11 @@ def _reusable_pre_migrate_backup(
     return None
 
 
-def _claim(source: Path, destination: Path) -> None:
+def _claim(
+    source: Path,
+    destination: Path,
+    journal: list[tuple[Path, Path]] | None = None,
+) -> None:
     """Move `source` onto `destination`, refusing to replace anything.
 
     `os.replace` is atomic and CLOBBERS, so guarding it with a check leaves a
@@ -265,6 +271,13 @@ def _claim(source: Path, destination: Path) -> None:
     `_rename_or_exdev` reporting `EXDEV` instead.
     """
     os.link(source, destination)
+    # Journal the move BEFORE the unlink, which can fail on its own — `EIO`,
+    # `EPERM`, a read-only remount. Unlinking first meant a caller could not
+    # know the destination now existed, so `_undo` would not reverse it and the
+    # bundle stayed half-apart. The link is the move; the unlink is tidying
+    # after it.
+    if journal is not None:
+        journal.append((source, destination))
     source.unlink(missing_ok=True)
 
 
@@ -594,6 +607,9 @@ def _restore_locked(
 
 SIDECAR_SUFFIXES = ("-wal", "-shm")
 
+#: A control-plane migration filename, as `db.migrate` records it.
+_MIGRATION_NAME = re.compile(r"\d{4}_[a-z0-9_]+\.sql")
+
 
 def _sidecars(database: Path) -> tuple[Path, ...]:
     """The files SQLite keeps beside a database and treats as part of it.
@@ -666,7 +682,11 @@ def _fsync_directory(directory: Path) -> None:
         os.close(handle)
 
 
-def _rename_or_exdev(source: Path, destination: Path) -> bool:
+def _rename_or_exdev(
+    source: Path,
+    destination: Path,
+    journal: list[tuple[Path, Path]] | None = None,
+) -> bool:
     """Rename if the filesystems allow it; report rather than raise if not.
 
     `EXDEV` is the kernel's answer to "is this a free rename or a full copy?",
@@ -676,7 +696,7 @@ def _rename_or_exdev(source: Path, destination: Path) -> bool:
     is what makes it safe to ask first and decide afterwards.
     """
     try:
-        _claim(source, destination)
+        _claim(source, destination, journal)
     except OSError as error:
         if error.errno == errno.EXDEV:
             return False
@@ -685,7 +705,11 @@ def _rename_or_exdev(source: Path, destination: Path) -> bool:
     return True
 
 
-def _copy_install(source: Path, destination: Path) -> None:
+def _copy_install(
+    source: Path,
+    destination: Path,
+    journal: list[tuple[Path, Path]] | None = None,
+) -> None:
     """Chunked, because the Machine has 512 MiB against a 1 GiB volume.
 
     The temporary name comes from the kernel, not from the destination. A
@@ -711,6 +735,8 @@ def _copy_install(source: Path, destination: Path) -> None:
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise
+    if journal is not None:
+        journal.append((source, destination))
     source.unlink(missing_ok=True)
 
 
@@ -923,6 +949,20 @@ def _preflight(
     return aside
 
 
+def _inode(path: Path) -> tuple[int, int] | None:
+    """Which filesystem entry this name refers to, or None if it refers to none.
+
+    Compared before a cleanup unlink: a NAME can be reused by another process
+    between creating a temporary and removing it, and deleting by name alone
+    then removes somebody else's file.
+    """
+    try:
+        info = path.lstat()
+    except OSError:
+        return None
+    return (info.st_dev, info.st_ino)
+
+
 def _is_a_copy(source: Path, destination: Path) -> bool:
     """Whether moving a file between these directories costs blocks.
 
@@ -953,20 +993,33 @@ def _is_a_copy(source: Path, destination: Path) -> bool:
         return True
     os.close(claim)
     landed = Path(landed_name)
+    # The INODES this call owns. Both names can be taken by somebody else in the
+    # windows below — `landed` after an `EXDEV` result, `probe` after a
+    # successful move vacates it — and the cleanup used to unlink both
+    # unconditionally, deleting an interloper's file. Cleanup now removes a name
+    # only while it still refers to the entry this call created.
+    owned = {probe: _inode(probe), landed: _inode(landed)}
     # `mkstemp` reserved the destination name so a concurrent probe could not
     # take it; release it just before claiming, because `_claim` refuses to
     # replace an existing entry and would otherwise refuse our own reservation.
     landed.unlink(missing_ok=True)
+    owned[landed] = None
     try:
-        return not _rename_or_exdev(probe, landed)
+        moved = _rename_or_exdev(probe, landed)
+        if moved:
+            # The probe's inode is at `landed` now, and `probe` is vacant.
+            owned[landed] = owned[probe]
+            owned[probe] = None
+        return not moved
     except FileExistsError:
         # Something took the name in that instant. The question cannot be
         # answered, and "assume it is a copy" is the conservative answer: it
         # leads to the space check rather than past it.
         return True
     finally:
-        probe.unlink(missing_ok=True)
-        landed.unlink(missing_ok=True)
+        for path, inode in owned.items():
+            if inode is not None and _inode(path) == inode:
+                path.unlink(missing_ok=True)
 
 
 def require_control_plane_database(path: Path) -> None:
@@ -998,6 +1051,18 @@ def require_control_plane_database(path: Path) -> None:
             "SELECT name FROM sqlite_master WHERE type = 'table'"
             " AND name = 'schema_migrations'"
         ).fetchone()
+        ledger_columns = (
+            connection.execute("PRAGMA table_info(schema_migrations)").fetchall()
+            if ledger is not None
+            else []
+        )
+        applied = (
+            connection.execute(
+                "SELECT name FROM schema_migrations ORDER BY name LIMIT 5"
+            ).fetchall()
+            if ledger is not None
+            else []
+        )
     finally:
         connection.close()
         for sidecar in _sidecars(path):
@@ -1007,6 +1072,25 @@ def require_control_plane_database(path: Path) -> None:
         raise BackupError(
             f"{path} opens as SQLite but carries no migration ledger, so it is"
             " not the control-plane database"
+        )
+    # The ledger's SHAPE and CONTENT, not just its name. `CREATE TABLE
+    # schema_migrations(name TEXT)` in an unrelated database passed the
+    # existence check, and so did a malformed one with the wrong columns — after
+    # which the operator verifies a perfectly good archive of the wrong file and
+    # deletes the real one.
+    columns = {row[1] for row in ledger_columns}
+    if not {"name", "applied_at"} <= columns:
+        raise BackupError(
+            f"{path} has a `schema_migrations` table with columns {sorted(columns)},"
+            " which is not the control-plane ledger"
+        )
+    if not applied or not all(
+        isinstance(row[0], str) and _MIGRATION_NAME.fullmatch(row[0])
+        for row in applied
+    ):
+        raise BackupError(
+            f"{path} has a control-plane-shaped ledger with no recognisable"
+            " migration in it, so it is not the control-plane database"
         )
 
 
@@ -1121,12 +1205,27 @@ def _undo(moved: list[tuple[Path, Path]]) -> None:
     prevent the rest. The original exception is what the caller sees; a failure
     in here would replace a diagnosis with a symptom.
     """
+    unreversed: list[Path] = []
     for source, destination in reversed(moved):
         try:
             if _present(destination) and not _present(source):
                 _claim(destination, source)
+                # Durable, like every other move this module makes. An
+                # unsynced reversal leaves the same ambiguity the forward
+                # publication was careful to avoid.
+                _fsync_directory(source.parent)
         except OSError:
+            unreversed.append(destination)
             continue
+    if unreversed:
+        # Reported, not swallowed. The original exception still propagates —
+        # that is the diagnosis — but an operator needs to know the volume is
+        # not back where it started, and which files to look at.
+        print(
+            "rollback could not be fully reversed; these are not where they"
+            f" started: {', '.join(str(path) for path in unreversed)}",
+            file=sys.stderr,
+        )
 
 
 def _install_rollback_locked(
@@ -1158,9 +1257,10 @@ def _install_rollback_locked(
                 # Claimed, not renamed: `_reserve_aside` checks the whole bundle
                 # is free and another process can still take one of those names
                 # before this loop reaches it. The reservation narrows the
-                # window; only the claim closes it.
-                _claim(path, landed)
-                moved.append((path, landed))
+                # window; only the claim closes it. The journal is passed IN so
+                # the move is recorded the instant the link succeeds, before the
+                # unlink that can fail after it.
+                _claim(path, landed, moved)
     except BaseException:
         _undo(moved)
         raise
@@ -1200,12 +1300,10 @@ def _install_rollback_locked(
     )
     try:
         for source, destination in zip(ordered, destinations, strict=True):
-            if _present(source):
-                if _rename_or_exdev(source, destination):
-                    moved.append((source, destination))
-                else:
-                    _copy_install(source, destination)
-                    moved.append((source, destination))
+            if _present(source) and not _rename_or_exdev(
+                source, destination, moved
+            ):
+                _copy_install(source, destination, moved)
     except BaseException:
         # Back to the original bundle, in reverse: the installed members return
         # to the candidate, and the superseded members return to the canonical

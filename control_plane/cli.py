@@ -223,10 +223,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         # carries the migration ledger every control-plane database has. A
         # recovery command archiving the wrong file is worse than one that
         # refuses.
-        try:
-            require_control_plane_database(database_path)
-        except BackupError as error:
-            raise SystemExit(f"backup refused: {error}") from error
+        # A side-effect-free existence check first, because acquiring the lock
+        # CREATES the parent directory and the lock file — and doing that for an
+        # unmounted or mistyped path is itself the mutation this command must
+        # not make.
+        if not os.path.lexists(database_path):
+            raise SystemExit(
+                f"backup found no database at {database_path};"
+                " refusing rather than archiving an empty one"
+            )
+        # Then LOCK, then validate. Validating and then locking leaves a
+        # window in which another process replaces the database, so the command
+        # authenticates one file and archives another — and `_readable_sqlite`
+        # can remove sidecars a writer starting in that window has just created.
+        # Exclusive ownership is a precondition of the check, not a companion
+        # to it.
         database = ControlPlaneDatabase(database_path)
         try:
             database.acquire_process_lock()
@@ -234,6 +245,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise SystemExit(
                 f"backup refused: {error}. Stop the service first."
             ) from error
+        try:
+            require_control_plane_database(database_path)
+        except BackupError as error:
+            database.release_process_lock()
+            database.close()
+            raise SystemExit(f"backup refused: {error}") from error
         try:
             result = create_backup(
                 database, args.target, backup_key=backup_key_from_env()

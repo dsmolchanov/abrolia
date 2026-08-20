@@ -1975,7 +1975,11 @@ def test_backup_refuses_a_missing_database_rather_than_archiving_nothing(
     monkeypatch.setenv("ABROLIA_CONTROL_PLANE_DB", str(absent))
     monkeypatch.setenv("ABROLIA_CONTROL_PLANE_BACKUP_KEY", BACKUP_KEY)
 
-    with pytest.raises(SystemExit, match="backup refused"):
+    # "found no database", not "refused": the existence check runs BEFORE the
+    # lock, because acquiring the lock creates the parent directory and the lock
+    # file — doing that for an unmounted path is itself a mutation this command
+    # must not make.
+    with pytest.raises(SystemExit, match="found no database"):
         cli_main(["backup", str(tmp_path / "superseded.cpb")])
 
     assert not (tmp_path / "superseded.cpb").exists()
@@ -2282,3 +2286,135 @@ def test_publication_claims_a_name_and_never_replaces_one(tmp_path) -> None:
     backup_module._claim(source, free)
     assert free.read_bytes() == b"the new archive"
     assert not source.exists()
+
+
+def test_the_ledger_check_looks_past_the_table_name(tmp_path, monkeypatch) -> None:
+    """An unrelated database can have a table called `schema_migrations`.
+
+    `CREATE TABLE schema_migrations(name TEXT)` in somebody else's database
+    passed integrity, foreign keys and the existence check, and was archived
+    successfully — after which the operator verifies a perfectly good archive of
+    the wrong file and deletes the real one. The ledger's columns and its
+    contents are what make it the control-plane one.
+    """
+    impostor = tmp_path / "control-plane.db"
+    raw = sqlite3.connect(impostor)
+    try:
+        raw.execute("CREATE TABLE schema_migrations (name TEXT)")
+        raw.execute("INSERT INTO schema_migrations VALUES ('not a migration')")
+        raw.commit()
+    finally:
+        raw.close()
+    monkeypatch.setenv("ABROLIA_CONTROL_PLANE_DB", str(impostor))
+    monkeypatch.setenv("ABROLIA_CONTROL_PLANE_BACKUP_KEY", BACKUP_KEY)
+
+    with pytest.raises(SystemExit, match="not the control-plane ledger"):
+        cli_main(["backup", str(tmp_path / "superseded.cpb")])
+
+    assert not (tmp_path / "superseded.cpb").exists()
+
+
+def test_backup_takes_the_lock_before_it_validates(tmp_path, monkeypatch) -> None:
+    """Exclusive ownership is a precondition of the check, not a companion.
+
+    Validating and then locking leaves a window in which another process
+    replaces the database, so the command authenticates one file and archives
+    another — and `_readable_sqlite` can remove sidecars a writer starting in
+    that window has just created.
+    """
+    seed = _database(tmp_path)
+    seed.migrate()
+    seed.close()
+    monkeypatch.setenv("ABROLIA_CONTROL_PLANE_DB", str(tmp_path / "control-plane.db"))
+    monkeypatch.setenv("ABROLIA_CONTROL_PLANE_BACKUP_KEY", BACKUP_KEY)
+
+    order: list[str] = []
+    real_acquire = ControlPlaneDatabase.acquire_process_lock
+    real_require = backup_module.require_control_plane_database
+
+    def acquire(self):
+        order.append("lock")
+        return real_acquire(self)
+
+    def require(path):
+        order.append("validate")
+        return real_require(path)
+
+    monkeypatch.setattr(ControlPlaneDatabase, "acquire_process_lock", acquire)
+    monkeypatch.setattr(backup_module, "require_control_plane_database", require)
+    monkeypatch.setattr(
+        "control_plane.cli.require_control_plane_database", require, raising=False
+    )
+
+    assert cli_main(["backup", str(tmp_path / "archive.cpb")]) == 0
+
+    assert order[:2] == ["lock", "validate"], order
+
+
+def test_the_volume_probe_deletes_only_what_it_created(tmp_path, monkeypatch) -> None:
+    """A NAME can be reused between creating a temporary and removing it.
+
+    The cleanup unlinked both probe names unconditionally: after a successful
+    move the source name is vacant, and after `EXDEV` the destination is — so
+    another process creating either in that window had its file deleted by a
+    preflight that never owned it.
+    """
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.mkdir()
+    destination.mkdir()
+    real_rename = backup_module._rename_or_exdev
+    interlopers: list[Path] = []
+
+    def rename_then_squat(probe, landed, journal=None):
+        moved = real_rename(probe, landed, journal)
+        # Somebody else takes the name this call has just vacated.
+        vacated = probe if moved else landed
+        vacated.write_bytes(b"somebody else's file")
+        interlopers.append(vacated)
+        return moved
+
+    monkeypatch.setattr(backup_module, "_rename_or_exdev", rename_then_squat)
+    backup_module._is_a_copy(source, destination)
+
+    assert interlopers, "the fixture never created an interloper"
+    for path in interlopers:
+        assert path.exists(), f"the probe deleted {path}, which it did not create"
+        assert path.read_bytes() == b"somebody else's file"
+
+
+def test_a_move_is_journalled_before_its_source_unlink(tmp_path, monkeypatch) -> None:
+    """The link IS the move; the unlink is tidying after it.
+
+    `_claim` unlinked the source before recording that the destination now
+    existed, so an unlink failing on its own — `EIO`, `EPERM`, a read-only
+    remount — left the caller's journal unaware of a move that had already
+    happened, and `_undo` could not reverse it.
+
+    Tested directly on `_claim`. Driving it through a whole install kept
+    intercepting one of the several other `os.link` sites — the volume probe
+    among them — and a race test aimed at the wrong call proves nothing, which
+    is a mistake this session has already made more than once.
+    """
+    source = tmp_path / "moving"
+    source.write_bytes(b"the bundle member")
+    destination = tmp_path / "landed"
+    journal: list[tuple[Path, Path]] = []
+    real_unlink = Path.unlink
+
+    def refuse(self, **kwargs):
+        if self == source:
+            raise OSError(errno.EIO, "the unlink failed after the link succeeded")
+        return real_unlink(self, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", refuse)
+
+    with pytest.raises(OSError, match="unlink failed"):
+        backup_module._claim(source, destination, journal)
+
+    monkeypatch.undo()
+    assert journal == [(source, destination)], (
+        "a move that had already happened went unrecorded, so a reversal would"
+        " not know to undo it"
+    )
+    assert destination.exists(), "the link that succeeded is not there"
