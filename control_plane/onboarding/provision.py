@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sqlite3
 import tempfile
@@ -153,6 +154,10 @@ class ProvisionPlan:
     #: suppressed for either, because neither describes work that will happen
     #: as written.
     operation_blocked: bool = False
+    #: Unsettled jobs that run BEFORE `ensure_runtime` — the namespace job, and
+    #: each step's own provider job. They are work the worker can lease right
+    #: now, so "nothing is pending" cannot be said while one exists.
+    pending_step_jobs: list[dict[str, Any]] = field(default_factory=list)
     #: Every unsettled runtime intent, not only the newest. A reset preserves a
     #: running job as `outcome_unknown` needing reconciliation, and the owner
     #: can then complete the steps again and mint a NEWER job — so a single-row
@@ -541,6 +546,33 @@ def plan_onboarding(
                 for row in unresolved
             ]
             runtime_job = unresolved[0] if unresolved else None
+            # The step and namespace jobs that run BEFORE `ensure_runtime`.
+            # This query asked only about `ensure_runtime`, so after
+            # `save_profile` queues `ensure_secret_namespace`, or while a
+            # selected email/WhatsApp/channel job is still pending, it found
+            # nothing — the planner then failed on unverified steps and the
+            # report said `operation_pending=false` with an empty inventory,
+            # while `JobsRepository.lease` could execute the omitted job
+            # immediately. "No pending work" was said about a worker with work
+            # in hand.
+            plan.pending_step_jobs = [
+                {
+                    "job_id": row["id"],
+                    "kind": row["kind"],
+                    "operation": row["operation"],
+                    "status": row["status"],
+                    "provider": row["provider"],
+                }
+                for row in connection.execute(
+                    "SELECT id, kind, operation, status, provider"
+                    " FROM provisioning_jobs"
+                    " WHERE household_id = ? AND workflow_id = ?"
+                    " AND NOT (kind = 'runtime' AND operation = 'ensure_runtime')"
+                    " AND status IN ('pending','running','waiting_user','outcome_unknown')"
+                    " ORDER BY created_at, id",
+                    (household_id, workflow["id"]),
+                ).fetchall()
+            ]
             # More than one unresolved intent means an EARLIER provider effect
             # is still outstanding. The previous round inventoried them and went
             # on classifying from the newest, so a reset-quarantined job that
@@ -890,7 +922,14 @@ def plan_onboarding(
                     # operation the same report says cannot run — the exact
                     # contradiction the flag exists to prevent, surviving in the
                     # one branch that reaches it by raising.
-                    plan.operation_pending = False
+                    # Pending if the worker has anything to lease — the
+                    # step jobs are exactly that, and the planner failing on
+                    # unverified steps is often BECAUSE one of them has not run
+                    # yet. Blocked either way, so nothing future-tense is
+                    # claimed; the difference is whether an operator is told
+                    # there is no work or told what the work is.
+                    plan.operation_pending = bool(plan.pending_step_jobs)
+                    plan.operation_blocked = True
                     plan.blocked_by = str(error)
                 finally:
                     connection.set_trace_callback(None)
@@ -1045,6 +1084,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"dry-run found no database at {live.database_path};"
                 " refusing rather than creating one"
             )
+        if not live.database_path.is_file():
+            # A directory passes `exists()` and then fails inside SQLite. Every
+            # operator-supplied boundary should fail with this command's own
+            # diagnostic, not a traceback from three layers down.
+            raise SystemExit(
+                f"{live.database_path} is not a regular file; ABROLIA_CONTROL_PLANE_DB"
+                " must name the control-plane database"
+            )
+        if not os.access(live.database_path, os.R_OK):
+            raise SystemExit(f"{live.database_path} is not readable")
         # `as_uri()`, not interpolation. `ABROLIA_CONTROL_PLANE_DB` is a
         # pathname, and `?` and `#` are legal in one: `/data/control?plane.db`
         # interpolated here parses as the filename `/data/control` with
@@ -1054,9 +1103,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         # the real one is never read. Percent-encoding closes both halves at
         # once — the no-mutation guarantee and the "rehearse the right file"
         # one. `resolve()` because `as_uri()` requires an absolute path.
-        source = sqlite3.connect(
-            f"{live.database_path.resolve().as_uri()}?mode=ro", uri=True
-        )
+        try:
+            source = sqlite3.connect(
+                f"{live.database_path.resolve().as_uri()}?mode=ro", uri=True
+            )
+        except sqlite3.Error as error:
+            # Outside the `try` below, this leaked an `OperationalError`
+            # traceback for anything SQLite could not open — an encrypted file,
+            # a socket, a path on a filesystem it cannot map. The command has a
+            # deliberate diagnostic and should use it for every one of them.
+            raise SystemExit(
+                f"dry-run could not open {live.database_path}: {error}"
+            ) from None
         try:
             snapshot = sqlite3.connect(rehearsal_path)
             try:

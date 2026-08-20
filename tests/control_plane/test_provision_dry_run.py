@@ -1564,3 +1564,93 @@ def test_a_reconciliation_asserts_no_resource_or_secret_lifecycle(container) -> 
     assert plan.table_writes == []
     assert plan.runtime_resources == [], plan.rehearsal
     assert plan.secrets == [], plan.rehearsal
+
+
+def test_a_pending_step_job_is_not_reported_as_no_work(container) -> None:
+    """"Nothing is pending" was said about a worker with work in hand.
+
+    The inventory asked only about `ensure_runtime`, so after `save_profile`
+    queues `ensure_secret_namespace` — or while a selected email, WhatsApp or
+    channel job is still pending — it found nothing. `planner.issue` then failed
+    on unverified steps, and the report declared no pending operation and an
+    empty inventory while `JobsRepository.lease` could execute the omitted job
+    immediately.
+    """
+    account = container.accounts.create_verified("pending@family.test", now=BASE_TIME)
+    household = container.households.create_for_owner(account.id, now=BASE_TIME)
+    session = container.sessions.issue(account.id, now=BASE_TIME)
+    _PRINCIPALS[household.id] = (account.id, session.id)
+    container.onboarding.save_profile(
+        household.id,
+        ProfileInput.model_validate({
+            "first_name": "Dry",
+            "last_name": "Run",
+            "family_language": "en",
+            "timezone": "Europe/Prague",
+            "country_code": "CZ",
+            "residency_mode": "eu-app",
+        }),
+        context=_context(
+            container, household.id, "profile",
+            account_id=account.id, session_id=session.id,
+        ),
+        now=BASE_TIME + 1,
+    )
+    # Deliberately NOT drained: the namespace job the profile step queues is
+    # exactly the work the report used to omit.
+    queued = container.database.query(
+        "SELECT id FROM provisioning_jobs WHERE household_id = ?"
+        " AND status IN ('pending','running','waiting_user','outcome_unknown')",
+        (household.id,),
+    )
+    assert queued, "the fixture queued nothing to be omitted"
+
+    plan = plan_onboarding(container, household.id)
+
+    assert plan.pending_step_jobs, "a leasable job was reported as no work"
+    assert {job["job_id"] for job in plan.pending_step_jobs} == {
+        row["id"] for row in queued
+    }
+    assert plan.operation_pending is True
+    # Blocked, so nothing future-tense is claimed — the difference is whether an
+    # operator is told there is no work or told what the work is.
+    assert plan.operation_blocked is True
+    assert plan.runtime_resources == []
+    assert plan.secrets == []
+
+
+@pytest.mark.parametrize(
+    ("make", "message"),
+    [
+        pytest.param(
+            lambda path: path.mkdir(parents=True),
+            "not a regular file",
+            id="directory",
+        ),
+        pytest.param(
+            lambda path: path.write_bytes(b"this is not a database"),
+            "could not",
+            id="not-a-database",
+        ),
+    ],
+)
+def test_an_unusable_database_path_fails_with_the_commands_own_diagnostic(
+    tmp_path: Path, monkeypatch, make, message
+) -> None:
+    """A traceback from three layers down is not a diagnostic.
+
+    A directory passes `exists()` and then fails inside SQLite; anything else
+    SQLite cannot open did the same, because the source connection sat outside
+    the guarded block. Every operator-supplied boundary fails with this
+    command's own message.
+    """
+    database_path = tmp_path / "data" / "control-plane.db"
+    database_path.parent.mkdir(parents=True, exist_ok=True)
+    make(database_path)
+    config = replace(
+        ControlPlaneConfig.for_test(tmp_path), database_path=database_path
+    )
+    monkeypatch.setattr(ControlPlaneConfig, "from_env", staticmethod(lambda: config))
+
+    with pytest.raises(SystemExit, match=message):
+        main(["--dry-run", "--household", "10000000-0000-4000-8000-000000000031"])
