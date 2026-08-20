@@ -1265,6 +1265,41 @@ class ProvisioningWorker:
             inspected.error_code or "provider_absent",
         )
 
+    def _shutdown_inspect(
+        self, job: JobRecord, request: dict[str, Any], provider: Any
+    ) -> WorkResult:
+        """Look, and tear down what is there. Never build.
+
+        The whole purpose of quarantining an ambiguous job is that the provider
+        MAY have created something nobody recorded. Finding out is the job; the
+        only thing forbidden is making more.
+        """
+        inspect = getattr(provider, "inspect", None)
+        if not callable(inspect):
+            # Nothing safe to call. Leave it for a human rather than guess.
+            return self._shutdown_refusal(job, request)
+        try:
+            inspected = inspect(request.get("stable_ref", job.intent_key))
+        except Exception:
+            return self._shutdown_refusal(job, request)
+        # An `ABSENT` answer is NOT settled here. One provider's reading at one
+        # moment does not discharge a quarantine — the established contract is
+        # that only an explicit operator reconcile settles one, and an existing
+        # test pins it. What this adds is the half that was missing: when the
+        # inspection DOES find something, it gets torn down.
+        external_ref = (
+            inspected.result.external_ref if inspected.result is not None else None
+        )
+        if isinstance(external_ref, str) and external_ref:
+            cleanup = self._schedule_cancelled_waiting_cleanup(
+                job, request, external_ref
+            )
+            if cleanup is not None:
+                return cleanup
+        # Present but unattributable, or an inconclusive inspection: keep it
+        # quarantined and reconcilable rather than claiming either outcome.
+        return self._shutdown_refusal(job, request)
+
     def _shutdown_refusal(self, job: JobRecord, request: dict[str, Any]) -> WorkResult:
         """Refuse to create, and keep the reason the job already carries.
 
@@ -1720,13 +1755,17 @@ class ProvisioningWorker:
                 # `NerveManagedEmailProvisioner.reconcile` and its BYO-domain
                 # sibling delegate straight to `ensure`, which resumes the
                 # provisioning graph and can create an org, a domain, an inbox,
-                # a key or a webhook. Skipping the consent precondition is what
-                # lets a quarantined job be examined at all; letting it call
-                # `reconcile` under that exemption would build new upstream
-                # state for a household that withdrew. The runtime branch got
-                # this guard and the email branch — the one the finding is
-                # actually about — did not.
-                return self._shutdown_refusal(job, request)
+                # a key or a webhook. So this must not call `reconcile` — but
+                # the first version of this guard simply returned, which refused
+                # the INSPECTION too and left the job permanently
+                # `outcome_unknown` with the inbox never found. Refusing to
+                # create and refusing to look are not the same refusal, and the
+                # second one abandons exactly what the quarantine exists to
+                # clean up.
+                #
+                # `inspect` is read-only on every email provider, so a shutdown
+                # asks it and acts on the answer.
+                return self._shutdown_inspect(job, request, provider)
             try:
                 result = reconcile_email(
                     provider_request,

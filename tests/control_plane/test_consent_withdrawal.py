@@ -34,6 +34,7 @@ from control_plane.provisioning.contracts import (
     InspectState,
     ProviderRegistry,
     ProviderWaiting,
+    ProvisionResult,
 )
 from control_plane.provisioning.fakes import DeterministicFakeProvisioner
 from control_plane.provisioning.planner import DesiredSpecPlanner
@@ -1266,12 +1267,26 @@ def test_reconciling_a_quarantined_email_job_creates_nothing(cp_stack) -> None:
         )
     withdraw_now(cp_stack, now=BASE_TIME)
 
+    created = "nerve-inbox-left-behind"
+
     class CountingNerve(DeterministicFakeProvisioner):
         reconciled = 0
+        inspected = 0
 
         def reconcile(self, intent, idempotency_key=None):
             type(self).reconciled += 1
             return super().ensure(intent, idempotency_key)
+
+        def inspect(self, stable_ref):
+            # Read-only, and it FINDS the inbox the timed-out call created —
+            # which is the situation the quarantine exists for.
+            type(self).inspected += 1
+            return InspectResult(
+                InspectState.READY,
+                result=ProvisionResult(
+                    external_ref=created, public_result={"address": "x@example.test"}
+                ),
+            )
 
     provider = CountingNerve("email")
     registry = ProviderRegistry()
@@ -1283,6 +1298,17 @@ def test_reconciling_a_quarantined_email_job_creates_nothing(cp_stack) -> None:
     assert type(provider).reconciled == 0, (
         "a withdrawn household's email job resumed provisioning"
     )
+    # Refusing to CREATE and refusing to LOOK are not the same refusal. The
+    # first version of this guard returned before any inspection, so the inbox
+    # was never found and the job sat `outcome_unknown` forever — abandoning
+    # exactly what the quarantine exists to clean up.
+    assert type(provider).inspected > 0, "the quarantined job was never inspected"
+    torn_down = cp_stack.database.query(
+        "SELECT id FROM provisioning_jobs WHERE household_id = ?"
+        " AND operation = 'deprovision'",
+        (cp_stack.household.id,),
+    )
+    assert torn_down, "the inbox the inspection found got no teardown"
     # And the quarantine reason survives, so an operator still knows what
     # settles it.
     assert result.error_code == "withdrawal_requires_reconciliation"
