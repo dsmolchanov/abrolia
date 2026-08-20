@@ -10,22 +10,6 @@ from control_plane.crypto import canonical_json
 from control_plane.db import new_id
 from control_plane.repositories.base import Repository
 
-#: The condition `lease` selects on, as SQL taking three `now` parameters.
-#:
-#: Shared rather than restated. The dry-run rehearsal reports whether the worker
-#: can pick a job up next, and it did that by reimplementing these rules in
-#: Python — where they promptly disagreed: a `pending` job with a future
-#: `not_before` was called executable and is not, a due `waiting_user/inspect`
-#: DNS job was called blocked and is not, and `outcome_unknown` was treated as
-#: leasable when nothing selects it at all. A report about what the worker will
-#: do has to ask the worker's own question.
-LEASABLE_SQL = (
-    "(status = 'pending' AND (not_before IS NULL OR not_before <= ?))"
-    " OR (status = 'running' AND lease_until <= ?)"
-    " OR (status = 'waiting_user' AND operation = 'inspect'"
-    "     AND not_before IS NOT NULL AND not_before <= ?)"
-)
-
 
 @dataclass(frozen=True)
 class JobRecord:
@@ -165,7 +149,11 @@ class JobsRepository(Repository):
         now = time.time() if now is None else now
         with self.db.write() as connection:
             row = connection.execute(
-                f"SELECT * FROM provisioning_jobs WHERE ({LEASABLE_SQL})"
+                "SELECT * FROM provisioning_jobs WHERE"
+                " ((status = 'pending' AND (not_before IS NULL OR not_before <= ?))"
+                "  OR (status = 'running' AND lease_until <= ?)"
+                "  OR (status = 'waiting_user' AND operation = 'inspect'"
+                "      AND not_before IS NOT NULL AND not_before <= ?))"
                 " ORDER BY created_at, id LIMIT 1",
                 (now, now, now),
             ).fetchone()

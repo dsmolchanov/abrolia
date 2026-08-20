@@ -23,6 +23,7 @@ from control_plane.onboarding import provision as provision_module
 from control_plane.onboarding.contracts import CommandContext
 from control_plane.onboarding.provision import (
     COMPENSATION_WRITES,
+    CONTENT_RESTRICTION_BLOCK_WRITES,
     RUNTIME_BOOTSTRAP_SECRET,
     RUNTIME_DSAR_SECRET,
     RUNTIME_WRITES_BY_WORKFLOW_STATE,
@@ -1878,7 +1879,13 @@ def test_a_stale_restriction_receipt_blocks_the_runtime_report(container) -> Non
 
     assert plan.blocked_by is not None
     assert "content restriction" in plan.blocked_by
-    assert plan.table_writes == []
+    # The block's OWN writes, not an empty set. The worker never reaches a
+    # provider here, so what happens next is fully determined — and an operator
+    # told "no write set" would not know the revision and the bootstrap tokens
+    # are about to be revoked.
+    assert plan.table_writes == list(
+        CONTENT_RESTRICTION_BLOCK_WRITES["runtime"]
+    )
     assert plan.runtime_resources == []
     assert plan.secrets == []
 
@@ -2034,3 +2041,137 @@ def test_an_older_unresolved_intent_outranks_a_provider_mismatch(container) -> N
         "a configuration diagnostic displaced an outstanding provider effect"
     )
     assert plan.table_writes == []
+
+
+def _revoke_restriction(container, household_id: str) -> None:
+    with container.database.write() as connection:
+        connection.execute(
+            "UPDATE consent_receipts SET revoked_at = ? WHERE household_id = ?"
+            " AND purpose = 'special_category_content_restriction'",
+            (BASE_TIME, household_id),
+        )
+
+
+def test_the_declared_content_restriction_writes_match_a_real_run(container) -> None:
+    """Measured, and the provider registry proves it was never consulted.
+
+    The gate runs before any provider is resolved, so this set is not a guess
+    about a provider answer — it is the whole of what happens. Declaring it by
+    hand would let it drift from `_block_for_missing_content_restriction`; this
+    traces an actual worker call instead.
+    """
+    household_id = _household_with_profile(container)
+    _verify_all_steps(container, household_id)
+    _revoke_restriction(container, household_id)
+    asked: list[str] = []
+    real_get = container.providers.get
+
+    def get(name):
+        asked.append(name)
+        return real_get(name)
+
+    container.providers.get = get
+
+    observed: set[TableWrite] = set()
+    with _tracing_writes(observed):
+        result = container.worker.run_once()
+
+    assert result.error_code == "content_restriction_receipt_required"
+    assert asked == [], f"a provider was resolved before the gate: {asked}"
+    assert observed == set(CONTENT_RESTRICTION_BLOCK_WRITES["runtime"])
+
+
+def test_an_email_sibling_is_gated_by_the_same_receipt(container) -> None:
+    """The gate covers every non-`fake-email` email-identity job.
+
+    The report asked the receipt question only about an already-planned runtime
+    job, so an operator with a queued `nerve-managed` email job and a revoked
+    receipt was told the write set was provider-dependent — when the worker's
+    next act is to fail that job on the receipt and never call a provider at
+    all.
+    """
+    household_id = _household_with_profile(container)
+    workflow = container.database.query_one(
+        "SELECT id FROM onboarding_workflows WHERE household_id = ?", (household_id,)
+    )
+    _revoke_restriction(container, household_id)
+    with container.database.write() as connection:
+        connection.execute(
+            "UPDATE provisioning_jobs SET status = 'cancelled', settled_at = ?"
+            " WHERE household_id = ? AND status IN"
+            " ('pending','running','waiting_user','outcome_unknown')",
+            (BASE_TIME, household_id),
+        )
+        container.jobs.create(
+            connection,
+            household_id=household_id,
+            workflow_id=workflow["id"],
+            kind="email_identity",
+            operation="provision_email_identity",
+            intent_key=f"{household_id}:provision_email_identity:managed",
+            request={},
+            provider="nerve-managed",
+            now=BASE_TIME,
+        )
+
+    plan = plan_onboarding(container, household_id)
+
+    assert "content restriction" in (plan.blocked_by or ""), plan.blocked_by
+    assert plan.table_writes == list(CONTENT_RESTRICTION_BLOCK_WRITES["step"])
+    assert plan.runtime_resources == []
+    assert plan.secrets == []
+
+
+def test_a_fake_email_job_is_not_gated(container) -> None:
+    """`fake-email` is exempt in the worker, so it must be exempt here.
+
+    Reporting a block the worker will not perform is the mirror of the defect
+    above, and a restatement of the predicate would eventually make one of the
+    two mistakes.
+    """
+    household_id = _household_with_profile(container)
+    workflow = container.database.query_one(
+        "SELECT id FROM onboarding_workflows WHERE household_id = ?", (household_id,)
+    )
+    _revoke_restriction(container, household_id)
+    with container.database.write() as connection:
+        connection.execute(
+            "UPDATE provisioning_jobs SET status = 'cancelled', settled_at = ?"
+            " WHERE household_id = ? AND status IN"
+            " ('pending','running','waiting_user','outcome_unknown')",
+            (BASE_TIME, household_id),
+        )
+        container.jobs.create(
+            connection,
+            household_id=household_id,
+            workflow_id=workflow["id"],
+            kind="email_identity",
+            operation="provision_email_identity",
+            intent_key=f"{household_id}:provision_email_identity:fake",
+            request={},
+            provider="fake-email",
+            now=BASE_TIME,
+        )
+
+    plan = plan_onboarding(container, household_id)
+
+    assert "content restriction" not in (plan.blocked_by or ""), plan.blocked_by
+
+
+def test_the_receipt_gate_outranks_a_provider_mismatch(container) -> None:
+    """Durable state before configuration diagnostics.
+
+    An operator with a revoked receipt AND a job queued under another provider
+    was told to restore the configuration. Restoring it changes nothing: the
+    worker still fails that job on the receipt before it resolves any provider.
+    """
+    household_id = _household_with_profile(container)
+    _verify_all_steps(container, household_id)
+    _revoke_restriction(container, household_id)
+    _requeue_under_another_provider(container, household_id)
+
+    plan = plan_onboarding(container, household_id)
+
+    assert "content restriction" in (plan.blocked_by or ""), plan.blocked_by
+    assert "provider mismatch" not in (plan.blocked_by or "")
+    assert plan.table_writes == list(CONTENT_RESTRICTION_BLOCK_WRITES["runtime"])

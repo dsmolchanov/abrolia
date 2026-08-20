@@ -63,6 +63,22 @@ DNS_POLL_MAX_SECONDS = 300.0
 DNS_POLL_MAX_JOB_ATTEMPTS = 5
 
 
+def requires_current_content_restriction(
+    kind: str, operation: str, provider: str
+) -> bool:
+    """Whether `_run_once` gates this job on the special-category receipt.
+
+    Shared with `onboarding.provision`, which reports what the worker will do
+    and therefore has to ask the worker's own question rather than restate it —
+    the same remedy `CURRENT_RESTRICTION_RECEIPT_SQL` gave the receipt lookup.
+    Restating it meant the report checked only an already-planned runtime job
+    while the gate also covers every non-fake email-identity job.
+    """
+    return (kind == "email_identity" and provider != "fake-email") or (
+        kind == "runtime" and operation != "ensure_secret_namespace"
+    )
+
+
 class ProvisioningWorker:
     def __init__(
         self,
@@ -351,10 +367,8 @@ class ProvisioningWorker:
 
     @staticmethod
     def _requires_current_email_content_restriction(job: JobRecord) -> bool:
-        return (
-            job.kind == "email_identity" and job.provider != "fake-email"
-        ) or (
-            job.kind == "runtime" and job.operation != "ensure_secret_namespace"
+        return requires_current_content_restriction(
+            job.kind, job.operation, job.provider
         )
 
     def _block_for_missing_content_restriction(

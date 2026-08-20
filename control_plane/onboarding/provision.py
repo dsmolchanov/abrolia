@@ -33,6 +33,7 @@ from control_plane.privacy.consent import (
 )
 from control_plane.provisioning.contracts import ProviderRejected
 from control_plane.provisioning.fly import FlyRuntimeProvisioner
+from control_plane.provisioning.worker import requires_current_content_restriction
 
 #: The purpose whose receipt `_run_once` requires before dispatching a
 #: runtime job. Spelled once here, matching the worker's own literal.
@@ -145,6 +146,35 @@ RUNTIME_WRITES_BY_WORKFLOW_STATE: dict[str, tuple[TableWrite, ...]] = {
 #: rather than guessing at it.
 STEP_WRITES_BY_KIND: dict[str, tuple[TableWrite, ...]] = {
     "bootstrap_cleanup": (TableWrite("provisioning_jobs", "update"),),
+}
+
+#: What `_block_for_missing_content_restriction` writes, by the shape of job it
+#: is given. Not a prediction: the gate is checked BEFORE any provider is
+#: resolved, the receipt either is current or is not, and both branches are
+#: deterministic from there.
+#:
+#: A runtime job is failed, its revisions and unused bootstrap tokens revoked,
+#: the household returned to `onboarding` and the workflow sent back to email
+#: with a transition recorded. Anything else goes through `_mark_step_problem`,
+#: which fails the job, marks the email identity and updates the step row.
+#:
+#: Measured, like the runtime sets, by
+#: `test_the_declared_content_restriction_writes_match_a_real_run` — which also
+#: proves no provider was reached.
+CONTENT_RESTRICTION_BLOCK_WRITES: dict[str, tuple[TableWrite, ...]] = {
+    "runtime": (
+        TableWrite("bootstrap_tokens", "update"),
+        TableWrite("config_revisions", "update"),
+        TableWrite("households", "update"),
+        TableWrite("onboarding_transitions", "insert"),
+        TableWrite("onboarding_workflows", "update"),
+        TableWrite("provisioning_jobs", "update"),
+    ),
+    "step": (
+        TableWrite("email_identities", "update"),
+        TableWrite("onboarding_steps", "update"),
+        TableWrite("provisioning_jobs", "update"),
+    ),
 }
 
 #: Tables the COMPENSATION path writes, which any in-flight call can reach.
@@ -534,6 +564,13 @@ def plan_onboarding(
     # derived claim about the household's state is what the report stopped
     # making.
     models_an_operation = True
+    # A state can rehearse no provider operation and STILL know exactly what
+    # the worker will write, because the block that runs instead is
+    # deterministic. The two used to be one flag, so the only way to say "no
+    # operation" was to say "no writes" — and the content-restriction block,
+    # whose whole point is that it happens before any provider and always does
+    # the same thing, had to be reported as an unknown.
+    declared_writes: list[TableWrite] | None = None
     plan: ProvisionPlan | None = None
     rehearsed_revision_ids: set[str] = set()
 
@@ -819,6 +856,37 @@ def plan_onboarding(
             provider_mismatch = (
                 runtime_job is not None and job_provider != configured_provider
             )
+            # `_run_once` checks the special-category receipt BEFORE resolving
+            # any provider, and the gate covers every non-fake email-identity
+            # job as well as `ensure_runtime`. Asked here with the worker's own
+            # predicate, over every unsettled job, so the report cannot cover a
+            # narrower set than the worker does — the previous version asked
+            # only about an already-planned runtime job and left every email
+            # sibling describing provider-dependent work that will not happen.
+            # `unresolved_runtime_jobs` entries carry no `kind`/`operation`:
+            # the query that built them fixed both. Resolving them here rather
+            # than defaulting at each use is what stops one call site reading a
+            # runtime job as a step — which it did, and reported the wrong write
+            # set for it.
+            gated = [
+                (kind, job)
+                for kind, operation, job in (
+                    *(
+                        ("runtime", "ensure_runtime", job)
+                        for job in plan.unresolved_runtime_jobs
+                    ),
+                    *(
+                        (str(job["kind"]), str(job["operation"]), job)
+                        for job in plan.pending_step_jobs
+                    ),
+                )
+                if requires_current_content_restriction(
+                    kind, operation, str(job.get("provider") or "")
+                )
+            ]
+            restriction_missing = bool(gated) and not _holds_current_restriction(
+                container, household_id
+            )
             cancelled_workflow = str(workflow["state"]) == WorkflowState.CANCELLED.value
             failed_runtime = (
                 issued is not None
@@ -892,6 +960,32 @@ def plan_onboarding(
                     "the onboarding workflow is cancelled; start a new one"
                     " rather than provisioning from this"
                 )
+            elif restriction_missing:
+                # BEFORE the provider branches, because this is durable state
+                # and they are not. With the receipt absent, stale or revoked,
+                # the worker's next act on any of these jobs is the block — it
+                # never reaches a provider, so neither a provider mismatch nor
+                # provider uncertainty is the thing to tell an operator about.
+                # They were being told to restore a configuration or to expect
+                # provider-dependent writes when the answer is to renew consent
+                # and expect the rollback below.
+                models_an_operation = False
+                blocked = _describe_jobs([job for _kind, job in gated])
+                shape = "runtime" if gated[0][0] == "runtime" else "step"
+                declared_writes = list(CONTENT_RESTRICTION_BLOCK_WRITES[shape])
+                plan.rehearsal = (
+                    "the special-category content restriction receipt is not"
+                    f" current, and it gates {blocked}. The worker checks it"
+                    " before resolving any provider, so no provider call is"
+                    " rehearsed; table_writes is what the block itself writes."
+                )
+                plan.blocked_by = (
+                    "the household does not currently hold the special-category"
+                    " content restriction. Accept it again before provisioning:"
+                    f" until then the queued work ({blocked}) fails on that"
+                    " check and the runtime revision and bootstrap tokens are"
+                    " revoked."
+                )
             elif provider_mismatch:
                 # Pending, and NOT executable. The job is still `pending`, the
                 # worker can still lease it, and saying "nothing is pending"
@@ -947,30 +1041,6 @@ def plan_onboarding(
             # "does this state advertise future work" was answered twice.
             if not models_an_operation:
                 pass
-            elif already_planned and not _holds_current_restriction(
-                container, household_id
-            ):
-                # `_run_once` checks this BEFORE dispatching any provider: with
-                # the restriction receipt revoked or stale, it fails the job,
-                # revokes the revision and the bootstrap tokens, and returns the
-                # workflow to email. Reporting the ordinary success path over
-                # that described an operation whose first act is to undo itself.
-                #
-                # This is durable state, not a prediction about scheduling —
-                # the receipt either is current or is not — and the predicate is
-                # the worker's own.
-                models_an_operation = False
-                plan.rehearsal = (
-                    f"revision {issued['revision']} is issued, and the"
-                    " special-category content restriction receipt is not"
-                    " current. The runtime job is blocked on that before any"
-                    " provider call, so no write set is claimed."
-                )
-                plan.blocked_by = (
-                    "the household does not currently hold the special-category"
-                    " content restriction; the queued runtime job cannot proceed"
-                    " until it is accepted again"
-                )
             elif already_planned:
                 state = str(workflow["state"])
                 job_status = str((runtime_job or {})["status"])
@@ -1159,7 +1229,11 @@ def plan_onboarding(
                 # does not exist. One flag decides it for every state, so the
                 # `rehearsal` sentence and the fields beneath it cannot
                 # contradict each other again.
-                plan.table_writes = []
+                #
+                # `declared_writes` is the exception a state has to earn: a set
+                # that does not depend on a provider answer, because the code
+                # that will run never asks one. Empty otherwise.
+                plan.table_writes = declared_writes or []
             raise _DryRunRollback
     except _DryRunRollback:
         pass

@@ -167,7 +167,7 @@ After `codex/phase-E-pilotization` merges, the system can onboard a pilot househ
 
 #### Step E1 — Durable 3-step onboarding machine
 
-**Files:** `control_plane/onboarding/state.py`, `control_plane/onboarding/provision.py`, `control_plane/onboarding/transitions.py`, `control_plane/migrations/0001_control_plane.sql` (if new columns needed), `docs/onboarding-runbook.md`, `control_plane/container.py`, `control_plane/db.py`, `control_plane/provisioning/fakes.py`, `control_plane/repositories/jobs.py`, `control_plane/privacy/consent.py`, `control_plane/provisioning/worker.py`, `tests/control_plane/test_provision_dry_run.py`, `tests/control_plane/test_plan_inventory.py`.
+**Files:** `control_plane/onboarding/state.py`, `control_plane/onboarding/provision.py`, `control_plane/onboarding/transitions.py`, `control_plane/migrations/0001_control_plane.sql` (if new columns needed), `docs/onboarding-runbook.md`, `control_plane/container.py`, `control_plane/db.py`, `control_plane/provisioning/fakes.py`, `control_plane/privacy/consent.py`, `control_plane/provisioning/worker.py`, `tests/control_plane/test_provision_dry_run.py`, `tests/control_plane/test_plan_inventory.py`.
 
 **Branches:** `codex/phase-E-provision-dry-run`.
 
@@ -199,12 +199,13 @@ blocker under the repository rules. Four were missing rather than unnecessary:
   states what it will create, so the report describes the CONFIGURED provider
   rather than assuming Fly.
 - `tests/control_plane/test_provision_dry_run.py` — the step's own suite.
-- `control_plane/repositories/jobs.py` — **added 2026-08-20.** `LEASABLE_SQL`,
-  the condition `JobsRepository.lease` selects on. The rehearsal reports whether
-  the worker can pick a job up next, and it did that by restating those rules in
-  Python — where they disagreed three ways. A report about what the worker will
-  do has to ask the worker's own question, so the predicate is shared from where
-  the worker asks it.
+- `control_plane/repositories/jobs.py` — **added and then reverted
+  2026-08-20.** `LEASABLE_SQL` was extracted so the rehearsal could ask
+  `JobsRepository.lease`'s own question instead of restating it. The narrowing
+  above then removed the prediction entirely, and with it the only consumer:
+  the report states `not_before`, `lease_until` and `status` and leaves the
+  conclusion to the reader. An extraction with no caller is an unrelated
+  refactor riding along in this step, so the file is back as it was.
 - `control_plane/privacy/consent.py` and `control_plane/provisioning/worker.py`
   — **added 2026-08-20**, for the same reason and by the same remedy.
   `_run_once` checks the special-category content restriction BEFORE dispatching
