@@ -1122,10 +1122,26 @@ class OnboardingService:
             (now, now, f"{reason}_before_provider_call", household_id, *parameters),
         )
         connection.execute(
+            # `outcome_unknown` belongs in this sweep too. A provider call that
+            # timed out after possibly creating a resource leaves exactly that
+            # state with no `external_resources` row, and the sweep rewrote only
+            # `running` and `waiting_user` — so the job never received the
+            # quarantine. A later reconcile then either failed the real-email
+            # job at the missing-consent precheck without inspecting or
+            # deprovisioning the inbox that may exist, or let a WhatsApp or
+            # channel result pass `_finish_step` as an ordinary success. The
+            # ambiguity is the reason to quarantine it, not a reason to skip it.
+            #
+            # A job ALREADY carrying a `_requires_reconciliation` code keeps it:
+            # it is quarantined, both reasons route to the same compensation,
+            # and overwriting would erase which command an operator was told to
+            # run.
             "UPDATE provisioning_jobs SET status = 'outcome_unknown', settled_at = ?,"
             " updated_at = ?, lease_until = NULL, leased_by = NULL,"
             " error_code = ? WHERE household_id = ?"
-            " AND status IN ('running','waiting_user')"
+            " AND status IN ('running','waiting_user','outcome_unknown')"
+            " AND COALESCE(error_code, '') NOT LIKE '%!_requires!_reconciliation'"
+            " ESCAPE '!'"
             " AND kind NOT IN ('cleanup','bootstrap_cleanup')"
             " AND operation != 'revoke_consent'" + restriction,
             (now, now, f"{reason}_requires_reconciliation", household_id, *parameters),

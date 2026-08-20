@@ -1057,3 +1057,64 @@ def test_a_late_waiting_whatsapp_reference_is_recorded_and_torn_down(
     )
     assert recorded, "the reference the provider created was never recorded"
     assert all(row["status"] in {"deleting", "deleted"} for row in recorded)
+
+
+def test_an_already_ambiguous_job_is_quarantined_by_withdrawal(cp_stack) -> None:
+    """The ambiguity is the reason to quarantine it, not a reason to skip it.
+
+    A provider call that timed out after possibly creating a resource leaves the
+    job `outcome_unknown` with no `external_resources` row. The sweep rewrote
+    only `running` and `waiting_user`, so withdrawal never reached it — and a
+    later reconcile either failed the real-email job at the missing-consent
+    precheck without inspecting or deprovisioning the inbox that may exist, or
+    let a WhatsApp or channel result pass `_finish_step` as an ordinary success.
+    """
+    complete_onboarding(cp_stack)
+    drain(cp_stack)
+    set_runtime_ref(cp_stack)
+    with cp_stack.database.write() as connection:
+        connection.execute(
+            "UPDATE provisioning_jobs SET status = 'outcome_unknown',"
+            " error_code = 'outcome_unknown', settled_at = NULL"
+            " WHERE household_id = ? AND kind = 'email_identity'",
+            (cp_stack.household.id,),
+        )
+
+    withdraw_now(cp_stack, now=BASE_TIME)
+
+    ambiguous = cp_stack.database.query(
+        "SELECT error_code FROM provisioning_jobs WHERE household_id = ?"
+        " AND kind = 'email_identity'",
+        (cp_stack.household.id,),
+    )
+    assert ambiguous, "the fixture left no ambiguous job"
+    assert all(
+        row["error_code"] == "withdrawal_requires_reconciliation" for row in ambiguous
+    ), [row["error_code"] for row in ambiguous]
+
+
+def test_an_existing_quarantine_reason_is_not_overwritten(cp_stack) -> None:
+    """Both reasons route to the same compensation; the reason is the message.
+
+    Overwriting `reset_requires_reconciliation` would erase which command an
+    operator had been told to run, for no gain — the job is already quarantined.
+    """
+    complete_onboarding(cp_stack)
+    drain(cp_stack)
+    set_runtime_ref(cp_stack)
+    with cp_stack.database.write() as connection:
+        connection.execute(
+            "UPDATE provisioning_jobs SET status = 'outcome_unknown',"
+            " error_code = 'reset_requires_reconciliation'"
+            " WHERE household_id = ? AND kind = 'email_identity'",
+            (cp_stack.household.id,),
+        )
+
+    withdraw_now(cp_stack, now=BASE_TIME)
+
+    kept = cp_stack.database.query(
+        "SELECT error_code FROM provisioning_jobs WHERE household_id = ?"
+        " AND kind = 'email_identity'",
+        (cp_stack.household.id,),
+    )
+    assert all(row["error_code"] == "reset_requires_reconciliation" for row in kept)
