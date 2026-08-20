@@ -15,7 +15,13 @@ import uvicorn
 
 from control_plane.api.app import create_app
 from control_plane.auth.mailer import ConsoleMailer, Mailer
-from control_plane.backup import create_backup, install_rollback, restore_backup
+from control_plane.backup import (
+    BackupError,
+    create_backup,
+    install_rollback,
+    require_control_plane_database,
+    restore_backup,
+)
 from control_plane.config import ControlPlaneConfig, backup_key_from_env
 from control_plane.container import ControlPlaneContainer
 from control_plane.db import ControlPlaneDatabase, ProcessAlreadyRunning
@@ -203,17 +209,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         database_path = Path(
             os.environ.get("ABROLIA_CONTROL_PLANE_DB", "data/control-plane.db")
         )
-        if not database_path.is_file():
-            # `sqlite3.connect` CREATES a missing file, so an unset, mistyped or
-            # unmounted path produced a new empty database, a valid
-            # authenticated archive of nothing, and a verification restore that
-            # passed — an empty database satisfies `integrity_check` and
-            # `foreign_key_check`. The operator then deletes the real `/data`
-            # bundle believing it is archived.
-            raise SystemExit(
-                f"backup found no database at {database_path};"
-                " refusing rather than archiving an empty one"
-            )
+        # `sqlite3.connect` CREATES a missing file, so an unset, mistyped or
+        # unmounted path produced a new empty database, a valid authenticated
+        # archive of nothing, and a verification restore that PASSED — an empty
+        # database satisfies `integrity_check` and `foreign_key_check`. The
+        # operator then deletes the real `/data` bundle believing it is
+        # archived.
+        #
+        # `is_file()` alone did not close that: a zero-byte file, an unrelated
+        # SQLite database, or a symlink to either all pass it. What this command
+        # must establish is that the path IS the control-plane database, so it
+        # checks the shape of the entry, that it opens as SQLite, and that it
+        # carries the migration ledger every control-plane database has. A
+        # recovery command archiving the wrong file is worse than one that
+        # refuses.
+        try:
+            require_control_plane_database(database_path)
+        except BackupError as error:
+            raise SystemExit(f"backup refused: {error}") from error
         database = ControlPlaneDatabase(database_path)
         try:
             database.acquire_process_lock()

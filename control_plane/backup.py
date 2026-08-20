@@ -243,6 +243,12 @@ def _publish(temporary: Path, destination: Path) -> None:
     will not sync stops the migration instead of silently proceeding without a
     durable restore point.
     """
+    if _present(destination):
+        # Re-checked HERE, not only before the work. Materialising an image and
+        # encrypting it takes as long as the database is big, and an entry
+        # created in that window was invisible to the check at the top —
+        # `os.replace` would then destroy it without a word.
+        raise FileExistsError(destination)
     os.replace(temporary, destination)
     try:
         _fsync_directory(destination.parent)
@@ -272,7 +278,11 @@ def create_backup(
     identically.
     """
     destination = Path(target)
-    if destination.exists():
+    if _present(destination):
+        # `lexists`, because a DANGLING symlink is reported absent by
+        # `Path.exists()` — and `_publish`'s `os.replace` would then silently
+        # replace that entry, destroying a link the operation does not own and
+        # publishing the archive under a name that meant something else.
         raise FileExistsError(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary_archive: Path | None = None
@@ -336,7 +346,7 @@ def restore_backup(
     """
     source = Path(archive)
     destination = Path(target)
-    if destination.exists():
+    if _present(destination):
         raise FileExistsError(destination)
     # The whole BUNDLE, not just the database. A `-wal` or `-shm` left by an
     # earlier database at that path — an interrupted cleanup, a killed
@@ -870,6 +880,47 @@ def _is_a_copy(source: Path, destination: Path) -> bool:
     finally:
         probe.unlink(missing_ok=True)
         landed.unlink(missing_ok=True)
+
+
+def require_control_plane_database(path: Path) -> None:
+    """Establish that `path` IS the control-plane database, not merely a file.
+
+    A recovery command that archives the wrong file is worse than one that
+    refuses: the operator verifies the archive, it passes, and they delete the
+    real bundle. `is_file()` does not establish this — a zero-byte file, an
+    unrelated SQLite database and a symlink to either all satisfy it — so this
+    checks the entry's shape, that it opens as SQLite, and that it carries the
+    migration ledger every control-plane database has.
+
+    Leaves nothing behind: the read-only open is the same one `_readable_sqlite`
+    makes, with the same sidecar cleanup.
+    """
+    if not _regular_file(path):
+        raise BackupError(
+            f"{path} is not a regular file; ABROLIA_CONTROL_PLANE_DB must name"
+            " the control-plane database itself, not a link or a directory"
+        )
+    try:
+        _readable_sqlite(path)
+    except RollbackError as error:
+        raise BackupError(str(error)) from error
+    before = {sidecar for sidecar in _sidecars(path) if _present(sidecar)}
+    connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+    try:
+        ledger = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+            " AND name = 'schema_migrations'"
+        ).fetchone()
+    finally:
+        connection.close()
+        for sidecar in _sidecars(path):
+            if sidecar not in before:
+                sidecar.unlink(missing_ok=True)
+    if ledger is None:
+        raise BackupError(
+            f"{path} opens as SQLite but carries no migration ledger, so it is"
+            " not the control-plane database"
+        )
 
 
 def install_rollback(

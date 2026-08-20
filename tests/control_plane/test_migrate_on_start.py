@@ -1973,7 +1973,7 @@ def test_backup_refuses_a_missing_database_rather_than_archiving_nothing(
     monkeypatch.setenv("ABROLIA_CONTROL_PLANE_DB", str(absent))
     monkeypatch.setenv("ABROLIA_CONTROL_PLANE_BACKUP_KEY", BACKUP_KEY)
 
-    with pytest.raises(SystemExit, match="found no database"):
+    with pytest.raises(SystemExit, match="backup refused"):
         cli_main(["backup", str(tmp_path / "superseded.cpb")])
 
     assert not (tmp_path / "superseded.cpb").exists()
@@ -2027,3 +2027,100 @@ def _table_names(database) -> set[str]:
             "SELECT name FROM sqlite_master WHERE type = 'table'"
         )
     }
+
+
+@pytest.mark.parametrize(
+    ("make", "message"),
+    [
+        # A zero-byte file IS a valid empty SQLite database, so the ledger
+        # check is what catches it — which is exactly the case the previous
+        # `is_file()` guard let through and the operator then deleted `/data`
+        # believing it was archived.
+        pytest.param(lambda p: p.write_bytes(b""), "no migration ledger", id="empty-file"),
+        pytest.param(lambda p: p.write_bytes(b"not sqlite at all"), "not a valid SQLite|does not open", id="not-sqlite"),
+        pytest.param(
+            lambda p: _foreign_sqlite(p), "no migration ledger", id="another-database"
+        ),
+        pytest.param(lambda p: p.symlink_to("/dev/null"), "not a regular file", id="symlink"),
+    ],
+)
+def test_backup_refuses_anything_that_is_not_the_control_plane_database(
+    tmp_path, monkeypatch, make, message
+) -> None:
+    """Archiving the wrong file is worse than refusing.
+
+    The operator verifies the archive, it passes, and they delete the real
+    bundle. `is_file()` established nothing useful: a zero-byte file, an
+    unrelated SQLite database and a symlink to either all satisfy it. What has
+    to be true is that this IS the control-plane database.
+    """
+    database_path = tmp_path / "control-plane.db"
+    make(database_path)
+    monkeypatch.setenv("ABROLIA_CONTROL_PLANE_DB", str(database_path))
+    monkeypatch.setenv("ABROLIA_CONTROL_PLANE_BACKUP_KEY", BACKUP_KEY)
+
+    with pytest.raises(SystemExit, match=message):
+        cli_main(["backup", str(tmp_path / "superseded.cpb")])
+
+    assert not (tmp_path / "superseded.cpb").exists()
+
+
+def _foreign_sqlite(path: Path) -> None:
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("CREATE TABLE somebody_elses (id TEXT)")
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def test_a_dangling_symlink_at_a_publication_path_is_refused(tmp_path) -> None:
+    """`Path.exists()` reports a dangling link absent, and `os.replace` eats it.
+
+    The archive would publish over an entry the operation does not own,
+    destroying a link that meant something else and taking its name.
+    """
+    seed = _database(tmp_path)
+    seed.migrate()
+    try:
+        occupied = tmp_path / "taken.cpb"
+        occupied.symlink_to(tmp_path / "nothing-here")
+        assert not occupied.exists() and os.path.lexists(occupied)
+
+        with pytest.raises(FileExistsError):
+            create_backup(seed, occupied, backup_key=BACKUP_KEY_BYTES)
+
+        assert os.path.lexists(occupied), "the refusal consumed the entry"
+        assert occupied.is_symlink()
+    finally:
+        seed.close()
+
+
+def test_an_entry_created_during_the_backup_is_not_replaced(tmp_path, monkeypatch) -> None:
+    """The check at the top cannot see what appears while the work runs.
+
+    Materialising an image and encrypting it takes as long as the database is
+    big, and an entry created at the destination in that window was invisible to
+    it — `os.replace` then destroyed the file without a word and took its name.
+    """
+    seed = _database(tmp_path)
+    seed.migrate()
+    destination = tmp_path / "racing.cpb"
+    real_materialise = backup_module._materialise
+
+    def materialise_then_race(database, target):
+        real_materialise(database, target)
+        # Somebody else claims the name while this backup is still working.
+        destination.write_bytes(b"not this backup's file")
+
+    monkeypatch.setattr(backup_module, "_materialise", materialise_then_race)
+    try:
+        with pytest.raises(FileExistsError):
+            create_backup(seed, destination, backup_key=BACKUP_KEY_BYTES)
+    finally:
+        seed.close()
+
+    assert destination.read_bytes() == b"not this backup's file", (
+        "the backup replaced a file that appeared while it was running"
+    )
+    assert not list(tmp_path.glob(".racing.cpb.*")), "a temporary was left behind"
