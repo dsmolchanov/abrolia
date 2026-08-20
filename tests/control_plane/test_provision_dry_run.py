@@ -1487,3 +1487,80 @@ def test_every_unresolved_runtime_intent_is_inventoried(container) -> None:
         job for job in plan.unresolved_runtime_jobs if job["job_id"] == quarantined
     )
     assert quarantine["error_code"] == "reset_requires_reconciliation"
+
+
+def test_an_older_unresolved_intent_blocks_the_newer_plan(container) -> None:
+    """Inventorying an outstanding intent is not the same as refusing to plan on it.
+
+    The previous round listed every unresolved runtime job and went on
+    classifying from the newest, so a reset-quarantined job — which may already
+    have created a runtime — was reported alongside a clean pending operation.
+    An operator provisioning on top of that creates exactly the conflict the
+    quarantine exists to prevent.
+    """
+    household_id = _household_with_profile(container)
+    _verify_all_steps(container, household_id)
+    account_id, session_id = _PRINCIPALS[household_id]
+    quarantined = container.database.query_one(
+        "SELECT id FROM provisioning_jobs WHERE household_id = ?"
+        " AND kind = 'runtime' AND operation = 'ensure_runtime'"
+        " ORDER BY created_at DESC LIMIT 1",
+        (household_id,),
+    )["id"]
+    with container.database.write() as connection:
+        connection.execute(
+            "UPDATE provisioning_jobs SET status = 'outcome_unknown',"
+            " error_code = 'reset_requires_reconciliation' WHERE id = ?",
+            (quarantined,),
+        )
+    container.onboarding.reset_from(
+        household_id,
+        StepKind.EMAIL,
+        context=_context(
+            container, household_id, "reset", account_id=account_id,
+            session_id=session_id,
+        ),
+    )
+    for _ in range(10):
+        if container.worker.run_once() is None:
+            break
+    _verify_all_steps(container, household_id, label="again")
+
+    plan = plan_onboarding(container, household_id)
+
+    assert len(plan.unresolved_runtime_jobs) > 1, "the fixture left only one intent"
+    assert plan.operation_blocked is True
+    assert quarantined in (plan.blocked_by or "")
+    # Nothing future-tense while an earlier effect is outstanding.
+    assert plan.runtime_resources == []
+    assert plan.secrets == []
+    assert plan.table_writes == []
+
+
+def test_a_reconciliation_asserts_no_resource_or_secret_lifecycle(container) -> None:
+    """`table_writes` was cleared here and the other two were not.
+
+    After a `prepare` times out, or a secret install returns unknown, the next
+    operation is a reconcile whose write set depends on a provider inspection
+    this command does not perform. The report still described resources as
+    though they will be created and both secrets as though they will be
+    installed — when the inspection may find the resource already exists,
+    failed, or needs cleanup. One uncertainty, three fields.
+    """
+    household_id = _household_with_profile(container)
+    _verify_all_steps(container, household_id)
+    with container.database.write() as connection:
+        connection.execute(
+            "UPDATE provisioning_jobs SET status = 'outcome_unknown',"
+            " error_code = 'outcome_unknown' WHERE household_id = ?"
+            " AND kind = 'runtime' AND operation = 'ensure_runtime'",
+            (household_id,),
+        )
+
+    plan = plan_onboarding(container, household_id)
+
+    assert plan.operation_blocked is True
+    assert "reconcile" in plan.rehearsal
+    assert plan.table_writes == []
+    assert plan.runtime_resources == [], plan.rehearsal
+    assert plan.secrets == [], plan.rehearsal

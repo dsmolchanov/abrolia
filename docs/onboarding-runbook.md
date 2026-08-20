@@ -184,8 +184,10 @@ are empty**, since neither case describes work that will happen as written.
 `unresolved_runtime_jobs` lists **every** unsettled `ensure_runtime` intent, not
 just the next one. A reset preserves a started job as `outcome_unknown` with
 `reset_requires_reconciliation`, and the owner can complete the steps again and
-mint a newer job on top of it — the older one is still provider state nobody has
-reconciled, and `error_code` says which command settles it.
+mint a newer job on top of it. **More than one entry blocks the plan**: the older
+job may already have created a runtime, and provisioning on top of it makes the
+conflict the quarantine exists to prevent. `error_code` says which command
+settles it.
 
 Read `rehearsal` for which case you are in:
 

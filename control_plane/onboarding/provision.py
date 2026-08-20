@@ -541,6 +541,25 @@ def plan_onboarding(
                 for row in unresolved
             ]
             runtime_job = unresolved[0] if unresolved else None
+            # More than one unresolved intent means an EARLIER provider effect
+            # is still outstanding. The previous round inventoried them and went
+            # on classifying from the newest, so a reset-quarantined job that
+            # may already have created a runtime was reported alongside a clean
+            # pending operation — and an operator provisioning on top of it
+            # creates the conflict the quarantine exists to prevent.
+            if len(unresolved) > 1:
+                older = ", ".join(
+                    f"{job['job_id']} ({job['status']}"
+                    + (f"/{job['error_code']}" if job["error_code"] else "")
+                    + ")"
+                    for job in plan.unresolved_runtime_jobs[1:]
+                )
+                plan.operation_blocked = True
+                plan.blocked_by = (
+                    f"an earlier runtime intent is still unresolved: {older}."
+                    " Reconcile it with `abrolia-control-plane reconcile"
+                    " <job-id>` before provisioning on top of it."
+                )
             if runtime_job is not None:
                 plan.pending_runtime_job = {
                     "job_id": runtime_job["id"],
@@ -801,6 +820,13 @@ def plan_onboarding(
                         "runtime job outcome is unknown; reconcile it before"
                         " onboarding"
                     )
+                    # `table_writes` was cleared here and the resource and
+                    # secret sections were not, so the report still described
+                    # resources as though they will be created and both secrets
+                    # as though they will be installed — when an inspection may
+                    # find the resource already exists, failed, or needs
+                    # cleanup. The same uncertainty governs all three.
+                    plan.operation_blocked = True
                     writes = None
                 else:
                     writes = RUNTIME_WRITES_BY_WORKFLOW_STATE.get(state)
