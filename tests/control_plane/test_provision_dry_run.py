@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import sqlite3
+import subprocess
+import sys
+import textwrap
+import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -802,21 +806,47 @@ def test_the_cli_leaves_the_live_database_files_byte_identical(
     any single mechanism.
     """
     config = ControlPlaneConfig.for_test(tmp_path)
-    seeded = ControlPlaneDatabase(config.database_path)
-    seeded.migrate()
-    with seeded.write() as connection:
-        connection.execute("CREATE TABLE canary (id TEXT PRIMARY KEY)")
-        connection.execute("INSERT INTO canary VALUES ('uncheckpointed')")
-    # Leave committed frames in the WAL, as a stopped or crashed writer does.
-    assert config.database_path.with_name(
-        f"{config.database_path.name}-wal"
-    ).exists()
+    # Explicitly closed. Left to garbage collection, this connection can outlive
+    # the statement, and while ANY connection is open the rehearsal is not the
+    # last one — so the checkpoint-on-close being guarded against never fires
+    # and the test passes against a read-write source.
+    seed = ControlPlaneDatabase(config.database_path)
+    seed.migrate()
+    seed.close()
+
+    # A writer that DIES, which is the only way to leave committed frames in the
+    # WAL with no live connection. Closing a connection cleanly checkpoints, and
+    # holding one open means the rehearsal is never the last connection — either
+    # way the failure being guarded against cannot occur, and an earlier version
+    # of this test made both mistakes in turn and passed against a read-write
+    # source that would have checkpointed in production.
+    writer = textwrap.dedent(
+        f"""
+        import os, sqlite3
+        c = sqlite3.connect({str(config.database_path)!r}, isolation_level=None)
+        c.execute("PRAGMA journal_mode=WAL")
+        c.execute("CREATE TABLE canary (id TEXT PRIMARY KEY)")
+        c.execute("INSERT INTO canary VALUES ('uncheckpointed')")
+        os._exit(0)
+        """
+    )
+    subprocess.run([sys.executable, "-c", writer], check=True)
+
+    wal = config.database_path.with_name(f"{config.database_path.name}-wal")
+    assert wal.exists() and wal.stat().st_size > 0, (
+        "the fixture must leave uncheckpointed frames, or this proves nothing"
+    )
 
     def fingerprint() -> dict[str, bytes]:
+        # `-shm` is deliberately excluded and that exclusion is the whole
+        # subtlety. It is the shared-memory index SQLite must map to read a WAL
+        # database at all, it holds no durable data, and it is rebuilt from the
+        # WAL — so touching it is not a mutation of the database. Every other
+        # file, including the WAL itself, must be byte-identical.
         return {
             path.name: hashlib.sha256(path.read_bytes()).digest()
             for path in sorted(tmp_path.iterdir())
-            if path.is_file()
+            if path.is_file() and not path.name.endswith("-shm")
         }
 
     before = fingerprint()
@@ -826,3 +856,132 @@ def test_the_cli_leaves_the_live_database_files_byte_identical(
         main(["--dry-run", "--household", "10000000-0000-4000-8000-000000000031"])
 
     assert fingerprint() == before
+    # And the durable pair specifically, named so a regression is unambiguous.
+    for suffix in ("", "-wal"):
+        name = f"{config.database_path.name}{suffix}"
+        assert fingerprint().get(name) == before.get(name), name
+
+
+@pytest.mark.parametrize("journal_mode", ["WAL", "DELETE"])
+def test_the_rehearsal_snapshot_survives_a_concurrent_writer(
+    tmp_path: Path, monkeypatch, journal_mode: str
+) -> None:
+    """The rehearsal snapshot holds up while another connection is committing.
+
+    WHAT THIS DOES NOT DO: it does not reproduce the race that motivated the
+    change. Restoring the old `shutil.copy2` loop still passes this test, even
+    with checkpoint churn and twelve iterations — a torn copy is real but rare
+    enough that a short test does not hit it. Saying so here because a test that
+    looks like a regression guard and is not one is worse than no test.
+
+    What it does establish: the online-backup path opens cleanly and reports a
+    committed state under sustained concurrent writes in BOTH journal modes,
+    including DELETE mode, where the old loop would not have copied a hot
+    `-journal` at all. The correctness argument for the change rests on SQLite's
+    documented guarantee — independently copied database and sidecar files are
+    not a valid snapshot — not on this reproduction.
+    """
+    config = ControlPlaneConfig.for_test(tmp_path)
+    seeded = ControlPlaneDatabase(config.database_path)
+    seeded.migrate()
+    with seeded.write() as connection:
+        connection.execute("CREATE TABLE churn (id INTEGER PRIMARY KEY, blob TEXT)")
+    seeded.connection.execute(f"PRAGMA journal_mode={journal_mode}")
+    monkeypatch.setattr(ControlPlaneConfig, "from_env", staticmethod(lambda: config))
+
+    stop = threading.Event()
+    failures: list[BaseException] = []
+
+    def churn() -> None:
+        writer = sqlite3.connect(config.database_path, isolation_level=None)
+        try:
+            row = 0
+            while not stop.is_set():
+                row += 1
+                writer.execute(
+                    "INSERT INTO churn VALUES (?, ?)", (row, "x" * 4000)
+                )
+                if row % 3 == 0:
+                    # Checkpointing is precisely when the main file and the WAL
+                    # diverge, so a non-atomic copy is most likely to catch them
+                    # in different generations here.
+                    writer.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except BaseException as error:  # surfaced below, not swallowed
+            failures.append(error)
+        finally:
+            writer.close()
+
+    thread = threading.Thread(target=churn, daemon=True)
+    thread.start()
+    try:
+        for _ in range(12):
+            # Exits on the missing household — after the snapshot, which is the
+            # step under test.
+            with pytest.raises(SystemExit) as exit_info:
+                main([
+                    "--dry-run",
+                    "--household",
+                    "10000000-0000-4000-8000-000000000031",
+                ])
+            message = str(exit_info.value)
+            assert "could not snapshot" not in message, message
+            assert "malformed" not in message and "corrupt" not in message, message
+    finally:
+        stop.set()
+        thread.join(timeout=10)
+
+    assert not failures, failures
+    seeded.close()
+
+
+def test_a_deleted_secret_binding_is_not_reported_as_installed(container) -> None:
+    """The receipt outlives the binding, by design.
+
+    `_delete_email_cleanup_secret` removes the secret from the sink and
+    deliberately RETAINS its `email_secret_installs` row as an audit record. An
+    unfiltered query then labels a deleted credential "already installed", and
+    after a provider change reports the obsolete name beside the current one —
+    a false credential plan for the operator.
+
+    The receipt is seeded directly: the synthetic provider never installs one,
+    so a fixture that onboards normally cannot exercise this at all.
+    """
+    household_id = _household_with_profile(container)
+    _verify_all_steps(container, household_id)
+    job_id = container.database.query_one(
+        "SELECT id FROM provisioning_jobs WHERE household_id = ?"
+        " AND kind = 'email_identity' ORDER BY created_at DESC LIMIT 1",
+        (household_id,),
+    )["id"]
+    with container.database.write() as connection:
+        connection.execute(
+            "INSERT INTO email_secret_installs (job_id, household_id, secret_name,"
+            " namespace_ref, installed_at, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (job_id, household_id, "ABROLIA_NERVE_EMAIL_CREDENTIALS",
+             "synthetic-namespace", 1.0, 1.0),
+        )
+
+    reported = {
+        secret["name"] for secret in plan_onboarding(container, household_id).secrets
+    }
+    assert "ABROLIA_NERVE_EMAIL_CREDENTIALS" in reported, (
+        "a live binding must still be reported"
+    )
+
+    # The cleanup path: the binding goes, the receipt stays.
+    with container.database.write() as connection:
+        connection.execute(
+            "UPDATE provisioning_jobs SET status = 'cancelled' WHERE id = ?",
+            (job_id,),
+        )
+
+    after = {
+        secret["name"] for secret in plan_onboarding(container, household_id).secrets
+    }
+    retained = container.database.query(
+        "SELECT secret_name FROM email_secret_installs WHERE household_id = ?",
+        (household_id,),
+    )
+
+    assert retained, "the receipt must not be erased to shape the report"
+    assert "ABROLIA_NERVE_EMAIL_CREDENTIALS" not in after

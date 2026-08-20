@@ -13,7 +13,6 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import shutil
 import sqlite3
 import tempfile
 import time
@@ -253,9 +252,28 @@ def _secret_names(
             "lifecycle": "installed with the bootstrap token, kept for runtime DSAR",
         },
     ]
+    # Live bindings only. The receipt is an audit record and is RETAINED when
+    # the binding is deleted — `_delete_email_cleanup_secret` removes the secret
+    # from the sink and deliberately leaves the row — so an unfiltered query
+    # reported a deleted credential as "already installed", and after a provider
+    # change reported the obsolete name alongside the current one. That is a
+    # false credential plan for the operator.
+    #
+    # Filtered by joining to the job that installed it: a receipt counts only
+    # while its job is neither cancelled nor superseded and its email identity
+    # is still one that holds credentials. The receipt itself is never erased —
+    # shaping a report is not a reason to destroy an audit trail.
     installed = container.database.query(
-        "SELECT secret_name, namespace_ref FROM email_secret_installs"
-        " WHERE household_id = ? ORDER BY secret_name",
+        "SELECT s.secret_name, s.namespace_ref FROM email_secret_installs s"
+        " JOIN provisioning_jobs j ON j.id = s.job_id"
+        " WHERE s.household_id = ?"
+        " AND j.status NOT IN ('cancelled','failed')"
+        " AND EXISTS ("
+        "   SELECT 1 FROM email_identities e"
+        "   WHERE e.household_id = s.household_id"
+        "   AND e.status IN ('verified','activating','active','needs_attention')"
+        " )"
+        " ORDER BY s.secret_name",
         (household_id,),
     )
     secrets.extend(
@@ -689,11 +707,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     # rather than a list: the rehearsal cannot touch the live files because it
     # never opens them. Anything it does is discarded with the copy.
     #
-    # A plain file copy, not SQLite's backup API, because the backup API would
-    # have to open the live database — the thing being avoided. A writer active
-    # during the copy can leave the pair mid-transaction; SQLite's recovery
-    # handles that on open, and the result describes an instant that genuinely
-    # occurred. The operator runs this before an onboarding, not during one.
+    # The copy is taken by SQLite, not by the filesystem. A `shutil.copy2` loop
+    # over the database and its sidecars is not atomic: with the API appending
+    # or checkpointing, the main file can come from one generation and the
+    # `-wal` from another, and a DELETE-mode database can have a hot `-journal`
+    # that such a loop does not copy at all. SQLite cannot promise that
+    # independently copied files form a valid snapshot, so the rehearsal could
+    # fail on corruption or — worse — report a state that never existed.
+    #
+    # An online backup from a READ-ONLY source solves both halves: the source
+    # cannot be written, so no checkpoint-on-close and no journal-mode rewrite;
+    # and the backup runs under a read transaction, so the copy is one committed
+    # state including WAL frames not yet checkpointed.
+    #
+    # What this does touch is `-shm`, the shared-memory index, which SQLite must
+    # map to read a WAL database at all. It holds no durable data and is rebuilt
+    # from the WAL, so the guarantee is precise rather than absolute: the
+    # database and its WAL are left byte-identical; the transient index may be
+    # updated.
     with tempfile.TemporaryDirectory(prefix="abrolia-dry-run-") as scratch:
         live = ControlPlaneConfig.from_env()
         rehearsal_path = Path(scratch) / live.database_path.name
@@ -702,12 +733,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"dry-run found no database at {live.database_path};"
                 " refusing rather than creating one"
             )
-        for suffix in ("", "-wal", "-shm"):
-            source = live.database_path.with_name(f"{live.database_path.name}{suffix}")
-            if source.exists():
-                shutil.copy2(source, rehearsal_path.with_name(
-                    f"{rehearsal_path.name}{suffix}"
-                ))
+        source = sqlite3.connect(f"file:{live.database_path}?mode=ro", uri=True)
+        try:
+            snapshot = sqlite3.connect(rehearsal_path)
+            try:
+                source.backup(snapshot)
+            finally:
+                snapshot.close()
+        except sqlite3.DatabaseError as error:
+            raise SystemExit(
+                f"dry-run could not snapshot {live.database_path}: {error}"
+            ) from None
+        finally:
+            source.close()
         config = replace(live, database_path=rehearsal_path)
         return _rehearse(config, args.household)
 
