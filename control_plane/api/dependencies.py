@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from typing import Any, NamedTuple
 
 from fastapi import Header, HTTPException, Request, status
 
@@ -145,3 +146,55 @@ def request_id(request: Request) -> str:
 def network_bucket(request: Request) -> str:
     # Raw address is used transiently as HMAC input and is never persisted.
     return request.client.host if request.client else "unknown"
+
+
+class BrowserSession(NamedTuple):
+    """What a rendered page needs about its caller."""
+
+    household: Any
+    account: Any
+
+
+class SeeOther(HTTPException):
+    """A 303 to a page, raised from a dependency.
+
+    Dependencies signal by raising, and a page must send the browser somewhere
+    rather than render a 401 as an error page. `create_app` turns this back into
+    the `RedirectResponse` the inline check used to return.
+    """
+
+    def __init__(self, location: str) -> None:
+        super().__init__(
+            status_code=status.HTTP_303_SEE_OTHER, headers={"Location": location}
+        )
+
+
+def browser_session(request: Request) -> BrowserSession:
+    """Authenticate a page request, or send the browser to `/start`.
+
+    A DEPENDENCY rather than a `try` inside the handler. The inline version
+    behaved correctly, and the rule it broke is a checkable one: an auth
+    dependency is visible in the route's signature and survives an early return
+    added above it later, where an inline check is one edit away from being
+    stepped over.
+
+    Module level, beside the other dependencies, for a mechanical reason as well
+    as a tidy one: `from __future__ import annotations` makes every annotation a
+    string that FastAPI resolves against MODULE globals, so a dependency defined
+    inside `create_app` cannot be named in an `Annotated[...]` at all.
+    """
+    active = container(request)
+    try:
+        # The sessions repository directly, NOT the `authenticate` dependency
+        # above: that one raises `HTTPException(401)`, and a browser renders a
+        # 401 as an error page. This route has always redirected an
+        # unauthenticated visitor to `/start`, and moving the check into a
+        # dependency must not change what the family sees.
+        principal = active.sessions.authenticate(
+            request.cookies.get(active.config.session_cookie_name, "")
+        )
+        household = active.households.current_for_account(principal.account_id)
+        account = active.accounts.get(principal.account_id)
+    except (PermissionError, HouseholdNotFound) as error:
+        raise SeeOther("/start") from error
+    return BrowserSession(household, account)

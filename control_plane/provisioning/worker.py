@@ -26,6 +26,7 @@ from control_plane.models import StepKind, StepStatus
 from control_plane.observability import StructuredLogger
 from control_plane.onboarding.state import VERIFY_RESULT, next_status
 from control_plane.privacy.consent import (
+    CONTENT_RESOURCE_TYPES,
     CONTENT_RESTRICTION_PURPOSE,
     CURRENT_RECEIPT_SQL,
     HOUSEHOLD_CONTENT_PURPOSE,
@@ -71,6 +72,14 @@ class _ProjectionCancelled(RuntimeError):
 DNS_POLL_INITIAL_SECONDS = 30.0
 DNS_POLL_MAX_SECONDS = 300.0
 DNS_POLL_MAX_JOB_ATTEMPTS = 5
+
+
+#: Step kinds whose late `ProviderWaiting` reference gets a teardown job. These
+#: are the kinds that can create a resource at a provider before recording it,
+#: and the set is derived from the withdrawal scope so the two cannot drift: a
+#: kind that withdrawal quarantines but this does not compensate is a resource
+#: created and then abandoned.
+COMPENSATED_STEP_KINDS = frozenset(CONTENT_RESOURCE_TYPES)
 
 
 class ProvisioningWorker:
@@ -610,12 +619,20 @@ class ProvisioningWorker:
                 return self._mark_step_problem(
                     job, request, "outcome_unknown", "provider_result_invalid"
                 )
-            if external_ref is not None:
-                cleanup = self._schedule_cancelled_waiting_cleanup(
-                    job, request, external_ref
-                )
-                if cleanup is not None:
-                    return cleanup
+        # Every kind that can hold a quarantined external reference, not just
+        # email. Withdrawal quarantines WhatsApp and channel jobs too now, and
+        # this compensation stayed email-only — so a late `ProviderWaiting`
+        # carrying a newly created reference fell through to
+        # `_mark_step_problem`, which sees the quarantine and returns WITHOUT
+        # recording the reference or scheduling a teardown. An identity created
+        # at the provider, with nothing in our database that would ever delete
+        # it: the same shape as the email leak this path was written to close.
+        if external_ref is not None and job.kind in COMPENSATED_STEP_KINDS:
+            cleanup = self._schedule_cancelled_waiting_cleanup(
+                job, request, external_ref
+            )
+            if cleanup is not None:
+                return cleanup
         return self._mark_step_problem(
             job,
             request,
@@ -655,7 +672,10 @@ class ProvisioningWorker:
                 desired_revision=job.desired_revision,
                 request={
                     "resource_id": resource_id,
-                    "resource_type": "email_identity",
+                    # The job's OWN kind. Hard-coding `email_identity` here
+                    # would hand the cleanup worker a WhatsApp reference
+                    # labelled as an inbox.
+                    "resource_type": job.kind,
                     "external_ref": external_ref,
                     "email_identity_id": request.get("email_identity_id"),
                     "parent_job_id": job.id,

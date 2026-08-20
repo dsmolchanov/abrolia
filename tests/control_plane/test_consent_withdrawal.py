@@ -19,6 +19,7 @@ import pytest
 from control_plane.models import StepKind
 from control_plane.privacy.consent import (
     CONSENT_TEXTS,
+    CONTENT_RESOURCE_TYPES,
     CONTENT_RESTRICTION_PURPOSE,
     HOUSEHOLD_CONTENT_PURPOSE,
     WITHDRAWAL_SCOPES,
@@ -28,11 +29,16 @@ from control_plane.privacy.withdraw import (
     ConsentNotHeld,
     ConsentWithdrawalService,
 )
-from control_plane.provisioning.contracts import ProviderRegistry
+from control_plane.provisioning.contracts import ProviderRegistry, ProviderWaiting
 from control_plane.provisioning.fakes import DeterministicFakeProvisioner
 from control_plane.provisioning.planner import DesiredSpecPlanner
+from control_plane.provisioning.worker import COMPENSATED_STEP_KINDS
 
-from .test_art9_household_consent import complete_onboarding, real_email_selection
+from .test_art9_household_consent import (
+    WHATSAPP_SELECTION,
+    complete_onboarding,
+    real_email_selection,
+)
 
 BASE_TIME = 1_800_000_000.0
 # Must satisfy control_plane.privacy.runtime.RUNTIME_REF; a ref that does
@@ -962,3 +968,92 @@ def test_the_stop_carries_the_withdrawn_receipt_ids(cp_stack) -> None:
 
     assert runtime.calls, "no stop was delivered"
     assert sorted(runtime.calls[-1]["body"]["receipt_ids"]) == sorted(revoked)
+
+
+def test_a_late_waiting_channel_reference_gets_a_teardown_too(cp_stack) -> None:
+    """Broadening the quarantine without broadening the compensation leaks.
+
+    The previous round made withdrawal quarantine WhatsApp and channel jobs as
+    well as email. `_handle_provider_waiting` still scheduled a late-waiting
+    cleanup only for `email_identity`, so a WhatsApp or channel provider
+    returning `ProviderWaiting` with a newly created reference fell through to
+    `_mark_step_problem` — which sees the quarantine and returns WITHOUT
+    recording the reference or scheduling a teardown. An identity created at the
+    provider with nothing in our database that would ever delete it: the same
+    leak the email path was written to close.
+    """
+    complete_onboarding(cp_stack)
+    drain(cp_stack)
+    set_runtime_ref(cp_stack)
+    assert {"whatsapp_identity", "channel_binding"} <= COMPENSATED_STEP_KINDS, (
+        "the compensated kinds no longer cover every quarantined channel"
+    )
+    # The property that matters, asserted structurally: every kind withdrawal
+    # quarantines is a kind whose late reference gets compensated. A kind in one
+    # set and not the other is a resource created and then abandoned.
+    assert CONTENT_RESOURCE_TYPES <= COMPENSATED_STEP_KINDS
+
+
+def test_a_late_waiting_whatsapp_reference_is_recorded_and_torn_down(
+    cp_stack,
+) -> None:
+    """Driven, not inspected: the provider really returns a late reference.
+
+    The barrier is the provider call itself — it withdraws, then raises
+    `ProviderWaiting` carrying a reference it just created — so the response
+    cannot precede the withdrawal. What must not happen is the reference being
+    dropped: recorded nowhere, with no teardown, while the identity exists at
+    the provider.
+    """
+    cp_stack.complete_profile()
+    cp_stack.service.select(
+        cp_stack.household.id,
+        StepKind.EMAIL,
+        real_email_selection(),
+        context=cp_stack.context(),
+        now=BASE_TIME + 2,
+    )
+    worker = cp_stack.make_worker(now=BASE_TIME + 3)
+    assert worker.run_once().status == "succeeded"
+    cp_stack.service.select(
+        cp_stack.household.id,
+        StepKind.WHATSAPP,
+        WHATSAPP_SELECTION,
+        context=cp_stack.context(),
+        now=BASE_TIME + 4,
+    )
+
+    created = "whatsapp-late-reference"
+
+    class WithdrawThenWait(DeterministicFakeProvisioner):
+        def ensure(self, intent, idempotency_key):
+            del intent, idempotency_key
+            withdraw_now(cp_stack, now=BASE_TIME + 5)
+            raise ProviderWaiting(
+                "synthetic owner action required", external_ref=created
+            )
+
+    registry = ProviderRegistry()
+    registry.register("fake-whatsapp", WithdrawThenWait("whatsapp"))
+    late = cp_stack.make_worker(providers=registry, now=BASE_TIME + 5).run_once()
+
+    assert late.error_code == "withdrawal_requires_reconciliation"
+    cleanup = cp_stack.database.query_one(
+        "SELECT id FROM provisioning_jobs WHERE intent_key = ?",
+        (f"{cp_stack.household.id}:late-waiting-cleanup:{late.job_id}",),
+    )
+    assert cleanup is not None, "the late WhatsApp reference got no teardown job"
+    # The teardown must be labelled with the job's OWN kind. Hard-coding
+    # `email_identity` hands the cleanup worker a WhatsApp reference dressed as
+    # an inbox, and it takes the email branch against a resource that is not
+    # one — so the identity is never actually deprovisioned.
+    teardown = cp_stack.jobs.request(cleanup["id"])
+    assert teardown["resource_type"] == "whatsapp_identity", teardown["resource_type"]
+    assert teardown["external_ref"] == created
+    recorded = cp_stack.database.query(
+        "SELECT resource_type, status FROM external_resources"
+        " WHERE household_id = ? AND resource_type = 'whatsapp_identity'",
+        (cp_stack.household.id,),
+    )
+    assert recorded, "the reference the provider created was never recorded"
+    assert all(row["status"] in {"deleting", "deleted"} for row in recorded)

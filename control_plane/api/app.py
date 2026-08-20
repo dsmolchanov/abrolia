@@ -4,14 +4,16 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Annotated
 
-from fastapi import FastAPI, Request, status
+from fastapi import Depends, FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from control_plane.api import auth, email, households, internal_bootstrap, onboarding, privacy, web
+from control_plane.api.dependencies import BrowserSession, SeeOther, browser_session
 from control_plane.config import ControlPlaneConfig
 from control_plane.container import ControlPlaneContainer
 from control_plane.db import new_id
@@ -97,6 +99,13 @@ def create_app(
             response.headers["Pragma"] = "no-cache"
         return response
 
+    @app.exception_handler(SeeOther)
+    def _see_other(request: Request, error: SeeOther):
+        del request
+        return RedirectResponse(
+            error.headers["Location"], status_code=status.HTTP_303_SEE_OTHER
+        )
+
     @app.exception_handler(WorkflowConflict)
     async def workflow_conflict(_request: Request, error: WorkflowConflict) -> JSONResponse:
         return JSONResponse(
@@ -137,15 +146,11 @@ def create_app(
         return templates.TemplateResponse(request, "verify.html", {})
 
     @app.get("/onboarding", include_in_schema=False)
-    def onboarding_page(request: Request):
-        try:
-            principal = active_container.sessions.authenticate(
-                request.cookies.get(active_container.config.session_cookie_name, "")
-            )
-            household = active_container.households.current_for_account(principal.account_id)
-            account = active_container.accounts.get(principal.account_id)
-        except (PermissionError, HouseholdNotFound):
-            return RedirectResponse("/start", status_code=status.HTTP_303_SEE_OTHER)
+    def onboarding_page(
+        request: Request,
+        session: Annotated[BrowserSession, Depends(browser_session)],
+    ):
+        household, account = session
         snapshot = active_container.onboarding_repository.snapshot(household.id)
         restriction_version, restriction_text = consent_version_and_text(
             "special_category_content_restriction"
