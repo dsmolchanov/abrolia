@@ -246,14 +246,23 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"backup refused: {error}. Stop the service first."
             ) from error
         try:
-            require_control_plane_database(database_path)
+            # The ENTRY that was proved, carried into the snapshot. Validation
+            # opens and closes its own read-only connection, `database` has not
+            # opened one yet, and the writer lock is advisory — so a rename in
+            # between would have this authenticate a file nobody checked and
+            # report a valid archive of the wrong generation, after which the
+            # runbook permits deleting the real bundle.
+            identity = require_control_plane_database(database_path)
         except BackupError as error:
             database.release_process_lock()
             database.close()
             raise SystemExit(f"backup refused: {error}") from error
         try:
             result = create_backup(
-                database, args.target, backup_key=backup_key_from_env()
+                database,
+                args.target,
+                backup_key=backup_key_from_env(),
+                identity=identity,
             )
         except BackupError as error:
             # A refusal, not a crash. `create_backup` rejects a target that

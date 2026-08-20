@@ -6,10 +6,8 @@ import errno
 import hashlib
 import hmac
 import os
-import re
 import sqlite3
 import stat
-import sys
 import tempfile
 import time
 from contextlib import contextmanager
@@ -109,6 +107,19 @@ def create_pre_migrate_backup(
 
 
 CHUNK_BYTES = 1 << 16
+
+
+def _require_identity(path: Path, expected: tuple[int, int] | None) -> None:
+    """Refuse if `path` no longer names the entry that was validated."""
+    if expected is None:
+        return
+    if _inode(path) != expected:
+        raise BackupError(
+            f"{path} is not the database that was validated; it was replaced"
+            " while this backup was running. Nothing has been archived — an"
+            " archive of an unvalidated file is exactly what licenses deleting"
+            " the real one."
+        )
 
 
 def _materialise(database: ControlPlaneDatabase, destination: Path) -> None:
@@ -401,7 +412,11 @@ def _publish(temporary: Path, destination: Path) -> None:
 
 
 def create_backup(
-    database: ControlPlaneDatabase, target: Path | str, *, backup_key: bytes
+    database: ControlPlaneDatabase,
+    target: Path | str,
+    *,
+    backup_key: bytes,
+    identity: tuple[int, int] | None = None,
 ) -> Path:
     """Encrypt an image of the database into an authenticated archive.
 
@@ -412,6 +427,15 @@ def create_backup(
     The layout is unchanged — MAGIC, nonce, ciphertext, 16-byte tag — so
     `restore_backup` reads archives written before and after this change
     identically.
+
+    `identity` is the entry `require_control_plane_database` proved, and passing
+    it closes the gap between proving and snapshotting. Validation opens and
+    closes its own read-only connection, `database.connection` is not opened
+    until `_materialise`, and the writer lock is advisory — so a rename of the
+    database path in between meant this authenticated a file nobody had
+    checked, reported a valid archive of the wrong generation, and the runbook
+    then permitted deleting the real bundle. The entry is compared immediately
+    before the image is taken and again immediately after.
     """
     destination = Path(target)
     # BEFORE the occupancy check, because the dangerous aliases are the ones
@@ -421,6 +445,7 @@ def create_backup(
     # the database as an unreconciled restore and stopped doing durable work. A
     # nominal backup silently disabled production.
     _refuse_alias(destination, database.path, what="the database being archived")
+    _require_identity(database.path, identity)
     if _present(destination):
         # `lexists`, because a DANGLING symlink is reported absent by
         # `Path.exists()` — and `_publish`'s `os.replace` would then silently
@@ -444,6 +469,10 @@ def create_backup(
         ) as handle:
             image = Path(handle.name)
         _materialise(database, image)
+        # And again AFTER. `_materialise` is where `database.connection` first
+        # opens, by path, so the check before it proves nothing about the file
+        # SQLite actually read.
+        _require_identity(database.path, identity)
 
         nonce = os.urandom(NONCE_BYTES)
         encryptor = Cipher(
@@ -1267,31 +1296,45 @@ def _is_a_copy(source: Path, destination: Path) -> bool:
                 path.unlink(missing_ok=True)
 
 
-#: `CREATE TABLE [IF NOT EXISTS] name`, in any of the quotings SQLite accepts.
-_CREATE_TABLE = re.compile(
-    r"""CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?["'`\[]?(\w+)""",
-    re.IGNORECASE,
-)
-#: A `--` comment, so a commented-out statement is not read as a real one.
-_SQL_COMMENT = re.compile(r"--[^\n]*")
+def _reference_schema(migrations: tuple[str, ...]) -> dict[str, str]:
+    """The schema those migration scripts produce, by RUNNING them.
 
+    Table names alone are not identity: a file with the exact ledger and
+    `accounts(x)` beside equally hollow look-alikes for the rest passes
+    integrity and foreign-key checks — it passes them BECAUSE it is empty — and
+    was archived as the control-plane database. A mistyped path or a
+    schema-damaged file could then authorise deleting the real one.
 
-def _tables_created_by(migrations: tuple[str, ...]) -> set[str]:
-    """Every table these migration scripts create.
-
-    Derived from the scripts rather than listed here, so it cannot fall behind
-    them, and so it answers for EVERY historical revision without a table of
-    revisions to maintain. No migration in this schema has ever dropped or
-    renamed a table, which is what makes "created by an applied migration"
-    equivalent to "present now".
+    Executed into `:memory:` rather than described in a table here, so the
+    columns, keys, constraints and indexes come from the same source of truth
+    the migrator uses and cannot drift from it, and so every historical revision
+    is answered without a catalogue of revisions to maintain.
     """
-    names: set[str] = set()
-    for migration in migrations:
-        script = _SQL_COMMENT.sub(
-            "", (MIGRATIONS_DIR / migration).read_text(encoding="utf-8")
+    reference = sqlite3.connect(":memory:")
+    try:
+        for migration in migrations:
+            reference.executescript(
+                (MIGRATIONS_DIR / migration).read_text(encoding="utf-8")
+            )
+        return _schema_objects(reference)
+    finally:
+        reference.close()
+
+
+def _schema_objects(connection: sqlite3.Connection) -> dict[str, str]:
+    """Every declared object and its definition, whitespace-normalised.
+
+    `schema_migrations` is excluded: `migrate()` creates it itself rather than
+    through a script, so it is not part of what the scripts describe. SQLite's
+    own `sqlite_%` objects are excluded for the same reason.
+    """
+    return {
+        f"{row[0]}:{row[1]}": " ".join(str(row[2]).split())
+        for row in connection.execute(
+            "SELECT type, name, sql FROM sqlite_master WHERE sql IS NOT NULL"
+            " AND name NOT LIKE 'sqlite_%' AND name != 'schema_migrations'"
         )
-        names.update(_CREATE_TABLE.findall(script))
-    return names
+    }
 
 
 def _shipped_migrations() -> tuple[str, ...]:
@@ -1304,7 +1347,7 @@ def _shipped_migrations() -> tuple[str, ...]:
     return tuple(sorted(entry.name for entry in MIGRATIONS_DIR.glob("*.sql")))
 
 
-def require_control_plane_database(path: Path) -> None:
+def require_control_plane_database(path: Path) -> tuple[int, int]:
     """Establish that `path` IS the control-plane database, not merely a file.
 
     A recovery command that archives the wrong file is worse than one that
@@ -1331,6 +1374,11 @@ def require_control_plane_database(path: Path) -> None:
     Leaves nothing behind: the read-only opens are the same one
     `_readable_sqlite` makes, with the same bundle validation and sidecar
     cleanup.
+
+    RETURNS the entry it proved, so the caller can require that the same one is
+    still there when the snapshot is taken. This function opens and closes its
+    own read-only connection and the writer lock is advisory, so without that
+    the proof and the archive could be about two different files.
     """
     if not _regular_file(path):
         raise BackupError(
@@ -1359,12 +1407,7 @@ def require_control_plane_database(path: Path) -> None:
                 if ledger is not None
                 else []
             )
-            tables = {
-                row[0]
-                for row in connection.execute(
-                    "SELECT name FROM sqlite_master WHERE type = 'table'"
-                )
-            }
+            declared = _schema_objects(connection)
     except RollbackError as error:
         raise BackupError(str(error)) from error
     if ledger is None:
@@ -1402,13 +1445,39 @@ def require_control_plane_database(path: Path) -> None:
     # precisely because it has no rows and no references — and a copied ledger
     # is the easiest thing in the world to produce by accident. What the
     # recorded migrations created has to actually be there.
-    missing = sorted(_tables_created_by(tuple(applied[:shared])) - tables)
-    if missing:
+    # The ledger NAMES a schema; this is the schema itself, compared object by
+    # object against what those exact migration scripts produce. Checking that
+    # the table NAMES exist was not enough: a file with the right ledger and
+    # `accounts(x)` beside equally hollow look-alikes passed, and passed the
+    # integrity and foreign-key checks precisely because it was empty.
+    #
+    # Only what the recorded prefix should have created is required. Objects
+    # BEYOND it are ignored, so a database from a newer image than this one is
+    # still recognised — the same asymmetry the ledger comparison makes, and for
+    # the same reason.
+    reference = _reference_schema(tuple(applied[:shared]))
+    wrong = sorted(
+        (
+            name
+            for name, definition in reference.items()
+            if declared.get(name) != definition
+        ),
+        # TABLES first among however few are shown. Sorted plainly, `index:`
+        # sorts before `table:` and an operator looking at a file whose every
+        # table is wrong was told about five indexes.
+        key=lambda name: (not name.startswith("table:"), name),
+    )
+    if wrong:
         raise BackupError(
-            f"{path} records migrations whose tables are not in it"
-            f" ({', '.join(missing)}); its ledger describes a schema the file"
-            " does not have, so it is not the control-plane database"
+            f"{path} records migrations whose schema is not the one they"
+            f" declare ({', '.join(wrong[:5])}); its ledger describes a"
+            " database this file is not, so archiving it would authorise"
+            " deleting the real one"
         )
+    entry = _inode(path)
+    if entry is None:
+        raise BackupError(f"{path} vanished while it was being validated")
+    return entry
 
 
 def install_rollback(
@@ -1514,8 +1583,71 @@ def install_rollback(
             guard.close()
 
 
-def _undo(moved: list[_Move]) -> None:
+class IncompleteReversal(RollbackError):
+    """A failed install could not be fully undone, and the volume is mixed.
+
+    Raised INSTEAD of the original failure, because it describes a worse state
+    than the one that caused it: the canonical path holds some subset of two
+    generations, and the writer locks are about to be released over it. The
+    constructor installs a fail-safe pause first — whatever database is sitting
+    there, it must not start — and carries the outstanding moves so recovery is
+    by hand rather than by guess.
+    """
+
+    def __init__(self, target: Path, unreversed: list[_Move]) -> None:
+        outstanding = "; ".join(
+            f"{move.destination} should be {move.source}" for move in unreversed
+        )
+        paused = _install_failsafe_pause(target)
+        super().__init__(
+            f"the rollback install failed and could not be fully reversed."
+            f" {target} is neither the original bundle nor a complete"
+            f" replacement. Outstanding: {outstanding}."
+            + (
+                f" A worker pause has been written to {_pause_marker(target)};"
+                " leave it there until the bundle is repaired by hand."
+                if paused
+                else f" A worker pause could NOT be written to"
+                f" {_pause_marker(target)}: do not start the service."
+            )
+        )
+        self.target = target
+        self.unreversed = unreversed
+        self.paused = paused
+
+
+def _install_failsafe_pause(target: Path) -> bool:
+    """Pause whatever ends up at `target`, and say whether it worked.
+
+    Best effort, because the filesystem that just failed may fail again — but
+    the attempt has to be made before the locks are released. Written to the
+    canonical name directly rather than through `_claim`: an existing marker is
+    the outcome this wants, so refusing to replace one would defeat it.
+    """
+    marker = _pause_marker(target)
+    try:
+        marker.write_text(
+            "an interrupted rollback install left this bundle mixed;"
+            " reconcile it by hand before starting anything\n",
+            encoding="utf-8",
+        )
+        os.chmod(marker, 0o600)
+        with open(marker, "rb") as handle:
+            os.fsync(handle.fileno())
+        _fsync_directory(marker.parent)
+    except OSError:
+        return False
+    return True
+
+
+def _undo(moved: list[_Move]) -> list[_Move]:
     """Put every completed move back, newest first, and never mask the cause.
+
+    RETURNS the moves it could not reverse, rather than printing them. Printing
+    made an incomplete reversal indistinguishable from a complete one to the
+    caller, which then released both writer locks over whatever subset had been
+    restored — a candidate database left canonical and unpaused among the
+    possibilities.
 
     Publication and source removal are reversed separately, because they can
     fail separately:
@@ -1533,7 +1665,7 @@ def _undo(moved: list[_Move]) -> None:
     prevent the rest. The original exception is what the caller sees; a failure
     in here would replace a diagnosis with a symptom.
     """
-    unreversed: list[Path] = []
+    unreversed: list[_Move] = []
     for move in reversed(moved):
         source, destination = move.source, move.destination
         try:
@@ -1543,7 +1675,7 @@ def _undo(moved: list[_Move]) -> None:
                 # Somebody else holds this name now. Removing it or moving it
                 # would destroy their file, which is the failure mode this
                 # module keeps finding in its own cleanup paths.
-                unreversed.append(destination)
+                unreversed.append(move)
                 continue
             if not move.source_removed:
                 destination.unlink()
@@ -1552,7 +1684,7 @@ def _undo(moved: list[_Move]) -> None:
                 # careful to avoid.
                 _fsync_directory(destination.parent)
             elif _present(source):
-                unreversed.append(destination)
+                unreversed.append(move)
             else:
                 if not _rename_or_exdev(destination, source):
                     # The forward direction crossed a filesystem, so the reverse
@@ -1571,18 +1703,15 @@ def _undo(moved: list[_Move]) -> None:
                     # subset of the canonical members `_undo` had just reported
                     # gone: the database without its pause marker among them.
                     _fsync_directory(destination.parent)
-        except OSError:
-            unreversed.append(destination)
+        except (OSError, BackupError):
+            # `BackupError` too, and specifically `AmbiguousPublication`, which
+            # a cross-filesystem `_copy_install` raises and which is NOT an
+            # `OSError`. It escaped this handler and abandoned every reversal
+            # still queued behind it, so one member that could not be made
+            # durable stopped the ones that could.
+            unreversed.append(move)
             continue
-    if unreversed:
-        # Reported, not swallowed. The original exception still propagates —
-        # that is the diagnosis — but an operator needs to know the volume is
-        # not back where it started, and which files to look at.
-        print(
-            "rollback could not be fully reversed; these are not where they"
-            f" started: {', '.join(str(path) for path in unreversed)}",
-            file=sys.stderr,
-        )
+    return unreversed
 
 
 def _install_rollback_locked(
@@ -1604,8 +1733,17 @@ def _install_rollback_locked(
     # candidate, and a retry that refuses because the target is missing. Either
     # the original bundle stands or the new one is complete; there is no third
     # acceptable state.
+    # ONE failure boundary, from the first superseded move to the last
+    # invariant check. The post-move assertions used to sit between two `try`
+    # blocks rather than inside either: a canonical entry appearing in that
+    # interval raised with the live database still under its aside name — an
+    # outage with no reversal attempted — and the pause-marker assertion had the
+    # same shape after publication, leaving an installed database runnable with
+    # no marker beside it. If it can fail after the first member moves, it
+    # belongs in here.
     moved: list[_Move] = []
     try:
+        # These renames stay on the volume and cost no blocks.
         for path in superseded:
             if _present(path):
                 landed = path.with_name(
@@ -1618,61 +1756,67 @@ def _install_rollback_locked(
                 # the move is recorded the instant the link succeeds, before the
                 # unlink that can fail after it.
                 _claim(path, landed, moved)
-    except BaseException:
-        _undo(moved)
-        raise
-    remaining = [str(path) for path in superseded if path.exists()]
-    if remaining:
-        raise RollbackError(
-            f"superseded files remain at the canonical path: {', '.join(remaining)}"
+        remaining = [str(path) for path in superseded if _present(path)]
+        if remaining:
+            raise RollbackError(
+                f"superseded files remain at the canonical path:"
+                f" {', '.join(remaining)}"
+            )
+        # `None` in the already-freed mode: there was nothing to move aside,
+        # because the operator archived and deleted it to make room. Naming a
+        # path that holds nothing would read as a recovery copy that does not
+        # exist.
+        report["superseded_kept_as"] = (
+            str(volume / aside) if (volume / aside).exists() else None
         )
-    # `None` in the already-freed mode: there was nothing to move aside, because
-    # the operator archived and deleted it to make room. Naming a path that
-    # holds nothing would read as a recovery copy that does not exist.
-    report["superseded_kept_as"] = (
-        str(volume / aside) if (volume / aside).exists() else None
-    )
 
-    # The PAUSE FIRST, for the same reason `restore_backup` publishes it first:
-    # a database that becomes visible before its marker is a database that can
-    # be started without one. Installing in bundle order put the database at the
-    # canonical path and then the marker, so a crash or a failed copy in between
-    # left a startable, unreconciled rollback.
-    # Marker, then sidecars, then the DATABASE LAST. The database becoming
-    # visible is what makes the rollback real, so everything belonging to that
-    # generation has to be in place first. Publishing it before its sidecars
-    # meant that a crash in between left a canonical database whose committed
-    # WAL frames — a candidate inspected by a process that was then killed still
-    # has them — were sitting at the staging path, so the next open silently
-    # read a database missing its own latest commits.
-    ordered = (
-        _pause_marker(restored_path),
-        *_sidecars(restored_path),
-        restored_path,
-    )
-    destinations = (
-        _pause_marker(target_path),
-        *_sidecars(target_path),
-        target_path,
-    )
-    try:
+        # The PAUSE FIRST, for the same reason `restore_backup` publishes it first:
+        # a database that becomes visible before its marker is a database that can
+        # be started without one. Installing in bundle order put the database at the
+        # canonical path and then the marker, so a crash or a failed copy in between
+        # left a startable, unreconciled rollback.
+        # Marker, then sidecars, then the DATABASE LAST. The database becoming
+        # visible is what makes the rollback real, so everything belonging to that
+        # generation has to be in place first. Publishing it before its sidecars
+        # meant that a crash in between left a canonical database whose committed
+        # WAL frames — a candidate inspected by a process that was then killed still
+        # has them — were sitting at the staging path, so the next open silently
+        # read a database missing its own latest commits.
+        ordered = (
+            _pause_marker(restored_path),
+            *_sidecars(restored_path),
+            restored_path,
+        )
+        destinations = (
+            _pause_marker(target_path),
+            *_sidecars(target_path),
+            target_path,
+        )
         for source, destination in zip(ordered, destinations, strict=True):
             if _present(source) and not _rename_or_exdev(
                 source, destination, moved
             ):
                 _copy_install(source, destination, moved)
-    except BaseException:
+
+        if not _present(_pause_marker(target_path)):
+            raise RollbackError(
+                "the restore is installed but its worker pause did not travel;"
+                f" write {_pause_marker(target_path)} before starting anything"
+            )
+    except BaseException as error:
         # Back to the original bundle, in reverse: the installed members return
         # to the candidate, and the superseded members return to the canonical
         # path. An operator retries against the state they started from.
-        _undo(moved)
+        unreversed = _undo(moved)
+        if unreversed:
+            # The locks are about to be released over a canonical path that is
+            # neither the original bundle nor a complete replacement. Whatever
+            # database is there must not start: pause it, durably, and say
+            # exactly which moves are outstanding so the recovery is by hand
+            # rather than by guess.
+            raise IncompleteReversal(target_path, unreversed) from error
         raise
 
-    if not _pause_marker(target_path).exists():
-        raise RollbackError(
-            "the restore is installed but its worker pause did not travel;"
-            f" write {_pause_marker(target_path)} before starting anything"
-        )
     report["workers"] = "paused"
     report["sidecars"] = sorted(
         path.name for path in _sidecars(target_path) if path.exists()

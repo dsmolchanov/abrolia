@@ -2901,39 +2901,101 @@ def test_a_ledger_without_its_schema_is_not_this_database(tmp_path, monkeypatch)
     monkeypatch.setenv("ABROLIA_CONTROL_PLANE_DB", str(impostor))
     monkeypatch.setenv("ABROLIA_CONTROL_PLANE_BACKUP_KEY", BACKUP_KEY)
 
-    with pytest.raises(SystemExit, match="tables are not in it"):
+    with pytest.raises(SystemExit, match="schema is not the one they declare"):
         cli_main(["backup", str(tmp_path / "superseded.cpb")])
 
     assert not (tmp_path / "superseded.cpb").exists()
 
 
-def test_the_schema_sentinels_come_from_the_migrations_themselves(tmp_path) -> None:
-    """A hand-kept list of tables falls behind the scripts that create them."""
+def test_the_reference_schema_is_the_one_the_migrator_produces(tmp_path) -> None:
+    """Derived by RUNNING the scripts, so it cannot drift from them.
+
+    A hand-kept catalogue of tables — or of columns, keys and indexes — falls
+    behind the migrations that create them, and every historical revision needs
+    its own entry. Executing the recorded prefix answers all of that from the
+    same source of truth the migrator uses.
+    """
     shipped = backup_module._shipped_migrations()
-    created = backup_module._tables_created_by(shipped)
+    reference = backup_module._reference_schema(shipped)
 
     seed = _database(tmp_path)
     seed.migrate()
-    present = {
-        row["name"]
-        for row in seed.connection.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'table'"
-        )
-    }
+    actual = backup_module._schema_objects(seed.connection)
     seed.close()
 
-    assert created, "no CREATE TABLE was parsed out of the shipped migrations"
-    assert created <= present, sorted(created - present)
-    # And COMPLETE. A sentinel set that names one or two tables passes the
-    # subset check while checking almost nothing, so the only tables allowed to
-    # be present without appearing in a migration script are the ones no script
-    # writes: the ledger `migrate()` creates itself, and SQLite's own.
-    assert present - created <= {"schema_migrations", "sqlite_sequence"}, sorted(
-        present - created
+    assert reference, "no schema was parsed out of the shipped migrations"
+    assert reference == actual, (
+        "the schema this check compares against is not the schema `migrate()`"
+        " builds: "
+        + str(
+            sorted(
+                name
+                for name in set(reference) | set(actual)
+                if reference.get(name) != actual.get(name)
+            )
+        )
     )
 
 
-@pytest.mark.parametrize("alias", ["", "-wal", "-shm", ".workers-paused", ".writer.lock"])
+def test_a_look_alike_schema_is_not_this_database(tmp_path, monkeypatch) -> None:
+    """Every expected table NAME, and none of the definitions.
+
+    Checking that the names exist accepted `accounts(x)` beside equally hollow
+    placeholders for the rest — and such a file passes the integrity and
+    foreign-key checks precisely BECAUSE it is empty. A mistyped path or a
+    schema-damaged database could then be archived, verified, and used to
+    authorise deleting the real one.
+    """
+    impostor = tmp_path / "control-plane.db"
+    shipped = backup_module._shipped_migrations()
+    expected = backup_module._reference_schema(shipped)
+    raw = sqlite3.connect(impostor)
+    try:
+        raw.execute("CREATE TABLE schema_migrations (name TEXT, applied_at TEXT)")
+        for migration in shipped:
+            raw.execute(
+                "INSERT INTO schema_migrations VALUES (?, '2026-01-01T00:00:00Z')",
+                (migration,),
+            )
+        # Every object the reference declares, by NAME, and none of them right.
+        # Hollow tables cannot carry the real indexes and triggers — those index
+        # columns that are not there — so they are created against the one
+        # column that is. The names all match; nothing else does.
+        for name in expected:
+            kind, object_name = name.split(":", 1)
+            if kind == "table":
+                raw.execute(f"CREATE TABLE {object_name} (x TEXT)")
+        for name in expected:
+            kind, object_name = name.split(":", 1)
+            if kind == "index":
+                raw.execute(f"CREATE INDEX {object_name} ON accounts (x)")
+            elif kind == "trigger":
+                raw.execute(
+                    f"CREATE TRIGGER {object_name} AFTER INSERT ON accounts"
+                    " BEGIN SELECT 1; END"
+                )
+        raw.commit()
+    finally:
+        raw.close()
+    monkeypatch.setenv("ABROLIA_CONTROL_PLANE_DB", str(impostor))
+    monkeypatch.setenv("ABROLIA_CONTROL_PLANE_BACKUP_KEY", BACKUP_KEY)
+
+    with pytest.raises(
+        SystemExit, match="schema is not the one they declare"
+    ) as exit_code:
+        cli_main(["backup", str(tmp_path / "superseded.cpb")])
+
+    # A TABLE is named, not merely a missing index. Every object the reference
+    # declares exists here by name, so a check that only asks "does this name
+    # exist" reports nothing at all about the hollow definitions — which is
+    # precisely the version this replaced.
+    assert "table:" in str(exit_code.value), str(exit_code.value)
+    assert not (tmp_path / "superseded.cpb").exists()
+
+
+@pytest.mark.parametrize(
+    "alias", ["", "-wal", "-shm", ".workers-paused", ".writer.lock"]
+)
 def test_backup_refuses_a_target_inside_the_live_bundle(
     tmp_path, monkeypatch, alias
 ) -> None:
@@ -3186,3 +3248,151 @@ def test_a_pause_marker_replaced_after_publication_is_left_alone(
     assert marker.read_bytes() == b"another restore's pause", (
         "the cleanup removed a pause marker this restore no longer owned"
     )
+
+
+def test_backup_refuses_a_database_replaced_after_validation(
+    tmp_path, monkeypatch
+) -> None:
+    """The proof and the archive must be about the same file.
+
+    `require_control_plane_database` opens and closes its own read-only
+    connection; `database.connection` is not opened until `_materialise`; and
+    the writer lock is ADVISORY, so nothing stops a rename in between. The
+    command then authenticated a file nobody had validated and reported a valid
+    archive of the wrong generation — after which the runbook permits deleting
+    the real bundle.
+    """
+    seed = _database(tmp_path)
+    seed.migrate()
+    seed.close()
+    database = tmp_path / "control-plane.db"
+    for sidecar in _sidecars_of(database):
+        sidecar.unlink(missing_ok=True)
+    monkeypatch.setenv("ABROLIA_CONTROL_PLANE_DB", str(database))
+    monkeypatch.setenv("ABROLIA_CONTROL_PLANE_BACKUP_KEY", BACKUP_KEY)
+
+    imposter = tmp_path / "somebody-elses.db"
+    other = ControlPlaneDatabase(imposter)
+    other.migrate()
+    with other.write() as connection:
+        connection.execute("CREATE TABLE the_wrong_generation (id TEXT PRIMARY KEY)")
+    other.close()
+    for sidecar in _sidecars_of(imposter):
+        sidecar.unlink(missing_ok=True)
+
+    real_require = backup_module.require_control_plane_database
+
+    real_materialise = backup_module._materialise
+
+    def materialise(handle, image):
+        # The swap lands INSIDE the snapshot: `_materialise` is where
+        # `database.connection` first opens, by path, so a check made before it
+        # proves nothing about the file SQLite went on to read. Only the check
+        # made afterwards can see this.
+        os.replace(imposter, database)
+        return real_materialise(handle, image)
+
+    assert real_require is not None
+    monkeypatch.setattr(backup_module, "_materialise", materialise)
+
+    with pytest.raises(SystemExit, match="not the database that was validated"):
+        cli_main(["backup", str(tmp_path / "archive.cpb")])
+
+    assert not (tmp_path / "archive.cpb").exists(), (
+        "an archive was written of a database that was never validated"
+    )
+
+
+def test_a_canonical_entry_appearing_after_the_move_is_reversed(
+    tmp_path, monkeypatch
+) -> None:
+    """The post-move assertions sat between two `try` blocks, inside neither.
+
+    An entry arriving at the canonical path after the superseded bundle had
+    moved raised from outside any failure boundary, so the live database stayed
+    under its internal aside name with no reversal attempted — an outage, from
+    a command whose entire purpose is to avoid one.
+    """
+    volume, target, restored = _rollback_fixture(tmp_path)
+    _constrain(monkeypatch, volume, capacity=target.stat().st_size * 10)
+    before = _fingerprint(volume)
+    real_claim = backup_module._claim
+    intruder = b"an entry that arrived mid-install"
+
+    def claim(source, destination, journal=None):
+        real_claim(source, destination, journal)
+        # Somebody recreates the canonical database the instant it is vacated.
+        if Path(source) == target and not target.exists():
+            target.write_bytes(intruder)
+
+    monkeypatch.setattr(backup_module, "_claim", claim)
+
+    with pytest.raises(backup_module.IncompleteReversal) as raised:
+        install_rollback(restored, target, now=1800000042)
+
+    monkeypatch.undo()
+    # Reversal was ATTEMPTED, which is the whole difference. Outside the
+    # boundary the check raised with nothing tried; inside it, the undo runs,
+    # declines to clobber the interloper — that is the conservative answer, not
+    # a failure — and the pause goes down before the locks are released.
+    assert target.read_bytes() == intruder, "the interloper was destroyed"
+    assert raised.value.paused, "no fail-safe pause was written"
+    assert backup_module._pause_marker(target).exists(), (
+        "the locks were released over a mixed bundle with no worker pause"
+    )
+    assert set(before) <= set(_fingerprint(volume))
+
+
+def test_an_unreversible_install_fails_with_the_bundle_paused(
+    tmp_path, monkeypatch
+) -> None:
+    """Releasing the locks over a mixed bundle is the outcome to prevent.
+
+    `_undo` used to print what it could not reverse and return, so the caller
+    could not tell a complete reversal from a partial one and released both
+    writer locks over whatever subset survived — a candidate database left
+    canonical and unpaused among the possibilities. The reversal now reports,
+    and a caller that cannot prove it pauses whatever is there.
+    """
+    volume, target, restored = _rollback_fixture(tmp_path)
+    _constrain(monkeypatch, volume, capacity=target.stat().st_size * 10)
+    marker = backup_module._pause_marker(target)
+    marker.unlink(missing_ok=True)
+    real_claim = backup_module._claim
+    calls: list[int] = []
+
+    def claim(source, destination, journal=None):
+        # The preflight's volume probes go through here too. Counting them made
+        # the fixture fail during preflight, before a single bundle member had
+        # moved — a test aimed at reversal that never reached an install.
+        if ".volume-probe-" in Path(source).name:
+            return real_claim(source, destination, journal)
+        calls.append(1)
+        if len(calls) > 1:
+            # The forward move fails after the first member has already gone.
+            raise OSError(errno.EIO, "the install failed mid-bundle")
+        return real_claim(source, destination, journal)
+
+    real_rename = backup_module._rename_or_exdev
+
+    def refuse_reversal(source, destination, journal=None):
+        # Not the preflight's volume probes, which go through here too and
+        # would fail the command before any move happened — a test that never
+        # reaches its own subject.
+        if ".volume-probe-" in Path(source).name:
+            return real_rename(source, destination, journal)
+        raise OSError(errno.EIO, "and the reversal fails too")
+
+    monkeypatch.setattr(backup_module, "_claim", claim)
+    monkeypatch.setattr(backup_module, "_rename_or_exdev", refuse_reversal)
+
+    with pytest.raises(backup_module.IncompleteReversal) as raised:
+        install_rollback(restored, target, now=1800000042)
+
+    monkeypatch.undo()
+    assert raised.value.unreversed, "an incomplete reversal reported nothing"
+    assert raised.value.paused, "no fail-safe pause was written"
+    assert marker.exists(), (
+        "the locks were released over a mixed bundle with no worker pause"
+    )
+    assert "by hand" in str(raised.value)
