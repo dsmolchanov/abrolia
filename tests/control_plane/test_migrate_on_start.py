@@ -2124,3 +2124,125 @@ def test_an_entry_created_during_the_backup_is_not_replaced(tmp_path, monkeypatc
         "the backup replaced a file that appeared while it was running"
     )
     assert not list(tmp_path.glob(".racing.cpb.*")), "a temporary was left behind"
+
+
+def test_a_failure_midway_leaves_the_original_bundle_standing(tmp_path, monkeypatch) -> None:
+    """Either the original bundle stands or the new one is complete.
+
+    A rename that raises after an earlier member moved — an `EIO` on the WAL, a
+    cross-filesystem copy running out of space after the marker landed — escaped
+    with the bundle half-apart: no canonical database, no complete candidate,
+    and a retry that refuses because the target is missing. There is no third
+    acceptable state.
+    """
+    volume, target, restored = _rollback_fixture(tmp_path)
+    (volume / f"{target.name}-wal").write_bytes(b"\x00" * 4096)
+    _constrain(monkeypatch, volume, capacity=target.stat().st_size * 10)
+    before = _fingerprint(volume)
+    real_rename = Path.rename
+    seen = {"count": 0}
+
+    def fail_on_the_second_move(self, landed):
+        seen["count"] += 1
+        if seen["count"] == 2:
+            raise OSError(errno.EIO, "the volume gave up mid-bundle")
+        return real_rename(self, landed)
+
+    monkeypatch.setattr(Path, "rename", fail_on_the_second_move)
+
+    with pytest.raises(OSError, match="gave up mid-bundle"):
+        install_rollback(restored, target, now=1800000042)
+
+    monkeypatch.undo()
+    assert _fingerprint(volume) == before, (
+        "a failure left the canonical bundle partly moved aside"
+    )
+    assert "migrated_only" in _tables(target), "the live database did not come back"
+
+
+def test_a_snapshot_of_a_damaged_database_does_not_open_the_gate(tmp_path) -> None:
+    """A snapshot of a corrupt database is not a restore point.
+
+    `backup()` materialises whatever state the file is in and the archive
+    authenticates perfectly, and a reusable archive is accepted on its digest
+    alone — which proves the archive matches the database, not that the database
+    can be restored. The gate this snapshot guards is "may the migration
+    proceed".
+    """
+    directory = tmp_path / "migrations"
+    directory.mkdir()
+    (directory / "9999_pilot_probe.sql").write_text(
+        "CREATE TABLE pilot_probe (id TEXT PRIMARY KEY);\n", encoding="utf-8"
+    )
+    database = _database(tmp_path)
+    database.migrate()
+    database.close()
+    # A foreign-key violation the integrity check tolerates but the restore
+    # would carry forward. Written through a raw connection: SQLite ignores
+    # `PRAGMA foreign_keys` inside a transaction, so the repository's own
+    # `write()` cannot create this state.
+    raw = sqlite3.connect(tmp_path / "control-plane.db")
+    try:
+        raw.execute("PRAGMA foreign_keys=OFF")
+        raw.execute(
+            "CREATE TABLE dangling (id TEXT PRIMARY KEY,"
+            " missing TEXT REFERENCES households (id))"
+        )
+        raw.execute("INSERT INTO dangling (id, missing) VALUES ('a', 'nobody')")
+        raw.commit()
+    finally:
+        raw.close()
+    database = _database(tmp_path)
+
+    try:
+        with pytest.raises(BackupError, match="foreign-key check"):
+            create_pre_migrate_backup(
+                database, backup_key=BACKUP_KEY_BYTES, directory=directory
+            )
+    finally:
+        database.close()
+
+    assert list(tmp_path.glob("*.bak")) == [], "a snapshot of damaged state was kept"
+
+
+def test_an_unsyncable_removal_keeps_the_worker_pause(tmp_path, monkeypatch) -> None:
+    """A database that may survive must keep its pause.
+
+    `_publish` unlinks the database when the directory sync fails — and if that
+    removal cannot itself be synced, whether the entry survives a crash is
+    unknown. Removing the marker on that path would leave a database present and
+    unpaused, reached through the CLEANUP of a different failure.
+    """
+    seed = _database(tmp_path)
+    seed.migrate()
+    archive = tmp_path / "control-plane.cpb"
+    create_backup(seed, archive, backup_key=BACKUP_KEY_BYTES)
+    seed.close()
+
+    destination = tmp_path / "restored"
+    destination.mkdir()
+    target = destination / "control-plane.db"
+    real_fsync = os.fsync
+    directories = {"seen": 0}
+
+    def refuse_the_second_directory(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            directories["seen"] += 1
+            # The FIRST directory sync publishes the pause marker and must
+            # succeed — the marker has to be durably in place for its removal to
+            # be the thing under test. The second is the database's.
+            if directories["seen"] > 1:
+                raise OSError(errno.EIO, "directory sync failed")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", refuse_the_second_directory)
+
+    with pytest.raises(BackupError, match="may or may not exist"):
+        restore_backup(
+            archive, target, backup_key=BACKUP_KEY_BYTES, apply_migrations=False
+        )
+
+    monkeypatch.undo()
+    assert _pause_marker_path(target).exists(), (
+        "the pause was removed while the database it guards may have survived"
+    )

@@ -33,6 +33,29 @@ def _key(value: bytes) -> bytes:
     return value
 
 
+def _require_sound_database(database: ControlPlaneDatabase) -> None:
+    """Refuse to call a snapshot of a damaged database a restore point.
+
+    Checked here rather than on the archive, because it covers BOTH paths at
+    once: a snapshot taken now, and an existing one reused because its content
+    matches this database. A digest proves the archive is the same as what is on
+    disk; it says nothing about whether what is on disk can be restored.
+    """
+    connection = database.connection
+    integrity = connection.execute("PRAGMA integrity_check").fetchone()
+    if integrity is None or integrity[0] != "ok":
+        raise BackupError(
+            f"{database.path} fails its SQLite integrity check, so a snapshot of"
+            " it is not a restore point; migration must not proceed"
+        )
+    connection.execute("PRAGMA foreign_keys=ON")
+    if connection.execute("PRAGMA foreign_key_check").fetchall():
+        raise BackupError(
+            f"{database.path} fails its SQLite foreign-key check, so a snapshot"
+            " of it is not a restore point; migration must not proceed"
+        )
+
+
 def create_pre_migrate_backup(
     database: ControlPlaneDatabase,
     *,
@@ -48,6 +71,13 @@ def create_pre_migrate_backup(
     """
     if not database.pending_migrations(directory):
         return None
+    # The gate this snapshot guards is "may the migration proceed", and a
+    # snapshot of a corrupt database is not a restore point. `backup()`
+    # materialises whatever state the file is in and the archive authenticates
+    # perfectly — and a reusable archive is accepted on its digest alone, which
+    # says the content matches, not that the content is sound. Prove it is
+    # restorable before letting anything cross.
+    _require_sound_database(database)
     revision = database.applied_revision()
 
     # A persistently failing migration restarts the container in a loop, and
@@ -221,6 +251,23 @@ def _reusable_pre_migrate_backup(
     return None
 
 
+class AmbiguousPublication(BackupError):
+    """The destination may or may not exist after a failed publication.
+
+    Raised when the rollback of a publication could not be made durable. The
+    caller must NOT then remove a worker pause: a database that survives without
+    its marker is one that starts unpaused, which is the failure the marker
+    exists to prevent, reached through the cleanup of a different failure.
+    """
+
+    def __init__(self, destination: Path) -> None:
+        super().__init__(
+            f"{destination} may or may not exist after a failed publication;"
+            " leaving the worker pause in place"
+        )
+        self.destination = destination
+
+
 def _publish(temporary: Path, destination: Path) -> None:
     """Rename into place, then make the DIRECTORY ENTRY itself durable.
 
@@ -253,7 +300,13 @@ def _publish(temporary: Path, destination: Path) -> None:
     try:
         _fsync_directory(destination.parent)
     except OSError:
-        # Undo the rename. Leaving the file behind is worse than not writing it:
+        # Undo the rename, and make the REMOVAL durable too. Unlinking without
+        # syncing the directory leaves the same ambiguity one level down: the
+        # entry may or may not survive a crash, so a caller that then removes
+        # the pause marker can leave a database present and unpaused. Sync, and
+        # tell the caller it is ambiguous if even that fails.
+        #
+        # Leaving the file behind is worse than not writing it:
         # `_reusable_pre_migrate_backup` would find this archive on the next
         # boot, skip the snapshot, and migrate against a restore point whose
         # name was never made durable — turning a fail-closed boot into a
@@ -261,6 +314,10 @@ def _publish(temporary: Path, destination: Path) -> None:
         # finding in itself. The caller's `finally` cannot do it: the temporary
         # path no longer exists, so its `unlink(missing_ok=True)` is a no-op.
         destination.unlink(missing_ok=True)
+        try:
+            _fsync_directory(destination.parent)
+        except OSError as error:
+            raise AmbiguousPublication(destination) from error
         raise
 
 
@@ -495,9 +552,14 @@ def _restore_locked(
 
         try:
             _publish(temporary, destination)
+        except AmbiguousPublication:
+            # The database may have survived. Its marker STAYS: a spare pause
+            # beside nothing is harmless, and a database beside nothing is a
+            # database that starts unpaused.
+            raise
         except BaseException:
-            # The database never became visible, so its marker must not stay
-            # behind claiming to guard something that is not there.
+            # The database definitely never became visible, so its marker must
+            # not stay behind claiming to guard something that is not there.
             _pause_marker(destination).unlink(missing_ok=True)
             raise
         temporary = None
@@ -1026,6 +1088,22 @@ def install_rollback(
             guard.close()
 
 
+def _undo(moved: list[tuple[Path, Path]]) -> None:
+    """Put every completed move back, newest first, and never mask the cause.
+
+    Best effort by necessity — the filesystem that just failed may fail again —
+    but each attempt is independent, so one that cannot be undone does not
+    prevent the rest. The original exception is what the caller sees; a failure
+    in here would replace a diagnosis with a symptom.
+    """
+    for source, destination in reversed(moved):
+        try:
+            if _present(destination) and not _present(source):
+                destination.rename(source)
+        except OSError:
+            continue
+
+
 def _install_rollback_locked(
     restored_path: Path, target_path: Path, *, aside: str
 ) -> dict[str, object]:
@@ -1037,9 +1115,26 @@ def _install_rollback_locked(
     # travels with them so that a restore whose own marker fails to arrive
     # cannot look paused because of a marker belonging to a database that is no
     # longer there.
-    for path in superseded:
-        if path.exists():
-            path.rename(path.with_name(path.name.replace(target_path.name, aside, 1)))
+    #
+    # Every move is recorded, and any failure undoes them in reverse. A rename
+    # that raises after an earlier member moved — an `EIO` on the WAL, a
+    # cross-filesystem copy running out of space after the marker landed — used
+    # to escape with the bundle half-apart: no canonical database, no complete
+    # candidate, and a retry that refuses because the target is missing. Either
+    # the original bundle stands or the new one is complete; there is no third
+    # acceptable state.
+    moved: list[tuple[Path, Path]] = []
+    try:
+        for path in superseded:
+            if _present(path):
+                landed = path.with_name(
+                    path.name.replace(target_path.name, aside, 1)
+                )
+                path.rename(landed)
+                moved.append((path, landed))
+    except BaseException:
+        _undo(moved)
+        raise
     remaining = [str(path) for path in superseded if path.exists()]
     if remaining:
         raise RollbackError(
@@ -1074,9 +1169,20 @@ def _install_rollback_locked(
         *_sidecars(target_path),
         target_path,
     )
-    for source, destination in zip(ordered, destinations, strict=True):
-        if source.exists() and not _rename_or_exdev(source, destination):
-            _copy_install(source, destination)
+    try:
+        for source, destination in zip(ordered, destinations, strict=True):
+            if _present(source):
+                if _rename_or_exdev(source, destination):
+                    moved.append((source, destination))
+                else:
+                    _copy_install(source, destination)
+                    moved.append((source, destination))
+    except BaseException:
+        # Back to the original bundle, in reverse: the installed members return
+        # to the candidate, and the superseded members return to the canonical
+        # path. An operator retries against the state they started from.
+        _undo(moved)
+        raise
 
     if not _pause_marker(target_path).exists():
         raise RollbackError(
