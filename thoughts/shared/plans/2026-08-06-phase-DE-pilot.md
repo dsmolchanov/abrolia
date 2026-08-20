@@ -169,6 +169,8 @@ After `codex/phase-E-pilotization` merges, the system can onboard a pilot househ
 
 **Files:** `control_plane/onboarding/state.py`, `control_plane/onboarding/provision.py`, `control_plane/onboarding/transitions.py`, `control_plane/migrations/0001_control_plane.sql` (if new columns needed), `docs/onboarding-runbook.md`, `control_plane/container.py`, `control_plane/db.py`, `control_plane/provisioning/fakes.py`, `control_plane/repositories/jobs.py`, `control_plane/privacy/consent.py`, `control_plane/provisioning/worker.py`, `tests/control_plane/test_provision_dry_run.py`, `tests/control_plane/test_plan_inventory.py`.
 
+**Branches:** `codex/phase-E-provision-dry-run`.
+
 **Report narrowed 2026-08-20.** The rehearsal grew a second job beyond the
 no-mutation guarantee: predicting which job the worker would take next, and
 summarising the household's state in derived booleans. That prediction had to

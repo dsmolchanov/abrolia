@@ -1,20 +1,22 @@
-"""Every changed implementation path must be declared by ONE plan step.
+"""Every changed implementation path must be declared by THIS BRANCH'S plan step.
 
 Three separate review rounds have been spent on the same defect: a branch
 touched a file its plan did not list, and the omission was found by reading
 rather than by running anything. `AGENTS.md` makes an undeclared change a
 merge-blocking deviation, so the cheapest place to find one is here.
 
-The rule is *one step covers everything*, not *every path appears somewhere*.
-The union of all inventories is far too generous — `control_plane/cli.py` is
-declared by Step E9, so under a union an E1 branch could change it and pass
-while E1 says nothing about it, which is precisely the class of deviation this
-file was added to catch. A branch implements one step; that step's `**Files:**`
-block has to account for every implementation path the branch touched.
+Which step that is has to be stated, not inferred. Two earlier versions tried
+to infer it and both leaked: the union of every inventory let an E1 branch
+change `control_plane/cli.py` because Step E9 declares it, and "some single step
+covers the whole diff" has the same hole the moment a diff is small — a one-file
+change to `control_plane/onboarding/state.py` is covered by an older phase's
+inventory whatever E1 says. Any rule that searches for a step that fits will
+find one.
 
-A branch that genuinely spans two steps fails this, and that is the intended
-answer rather than a limitation: the remedy is to declare the path under the
-step it belongs to, which is what `AGENTS.md` asks for anyway.
+So each step names the branches that implement it, in a `**Branches:**` line
+beside its `**Files:**` line, and this reads that. A branch no step claims is a
+hard failure with the line to add — the scope of a branch is a fact its author
+knows and nothing here can derive.
 """
 
 from __future__ import annotations
@@ -134,7 +136,57 @@ def _changed_paths() -> list[str] | None:
     return [line for line in changed.splitlines() if line]
 
 
-def test_every_changed_path_is_declared_by_one_plan_step() -> None:
+#: The branches a step is implemented by, beside that step's `**Files:**`.
+_BRANCHES = re.compile(r"^\*\*Branches:\*\*(.*)$", re.MULTILINE)
+#: Any markdown heading, which is what separates one step from the next.
+_HEADING = re.compile(r"^#{2,6} .*$", re.MULTILINE)
+
+
+def _steps(plans: Path | None = None) -> list[tuple[str, set[str], set[str]]]:
+    """Every step that declares files: its name, its paths, and its branches."""
+    steps: list[tuple[str, set[str], set[str]]] = []
+    for plan in sorted((plans or PLANS).glob("*.md")):
+        text = plan.read_text(encoding="utf-8")
+        headings = list(_HEADING.finditer(text))
+        for index, heading in enumerate(headings):
+            end = headings[index + 1].start() if index + 1 < len(headings) else len(text)
+            body = text[heading.end() : end]
+            patterns = _tokens(_INVENTORY.findall(body))
+            if not patterns:
+                continue
+            steps.append(
+                (
+                    f"{plan.name} {heading.group().lstrip('# ').strip()}",
+                    patterns,
+                    _tokens(_BRANCHES.findall(body)),
+                )
+            )
+    return steps
+
+
+def _tokens(lines: list[str]) -> set[str]:
+    return {
+        token
+        for line in lines
+        for quoted in _QUOTED.findall(line)
+        for token in _expand(quoted.strip().rstrip(",."))
+    }
+
+
+def _branch_name() -> str:
+    """What this branch is called, in CI and out of it.
+
+    `GITHUB_HEAD_REF` is the PR's source branch; a `pull_request` checkout is
+    detached, so asking git directly there answers `HEAD` and matches nothing.
+    """
+    for variable in ("GITHUB_HEAD_REF", "GITHUB_REF_NAME"):
+        value = (os.environ.get(variable) or "").strip()
+        if value:
+            return value
+    return _git("rev-parse", "--abbrev-ref", "HEAD") or ""
+
+
+def test_every_changed_path_is_declared_by_this_branch_s_plan_step() -> None:
     changed = _changed_paths()
     if changed is None:
         # FAILS in CI, where a scope gate that cannot run is worse than no gate
@@ -147,31 +199,35 @@ def test_every_changed_path_is_declared_by_one_plan_step() -> None:
             pytest.fail(message)
         pytest.skip(f"{message}; meaningful only on a branch with a base")
 
-    steps = _inventories()
+    steps = _steps()
     assert steps, "no plan inventory was parsed, so this check proves nothing"
     subject = [path for path in changed if not path.startswith(EXEMPT)]
     if not subject:
         return
 
-    def uncovered(patterns: set[str]) -> list[str]:
-        return [
-            path
-            for path in subject
-            if not any(fnmatch.fnmatch(path, pattern) for pattern in patterns)
-        ]
+    branch = _branch_name()
+    applicable = [
+        (name, patterns) for name, patterns, branches in steps if branch in branches
+    ]
+    if len(applicable) != 1:
+        pytest.fail(
+            f"{len(applicable)} plan steps claim the branch `{branch}`, and the"
+            " scope of a change is not something this can infer. Add"
+            f" `**Branches:** `{branch}`.` beside the `**Files:**` line of the"
+            " step this branch implements — exactly one of them."
+        )
 
-    shortfalls = {name: uncovered(patterns) for name, patterns in steps}
-    if any(not missing for missing in shortfalls.values()):
-        return
-
-    # The closest step, so the message names what to add rather than making the
-    # reader diff two lists themselves.
-    closest, missing = min(shortfalls.items(), key=lambda item: len(item[1]))
-    raise AssertionError(
-        "no single plan step declares every implementation path this branch"
-        " changed, which AGENTS.md makes a merge-blocking deviation. The"
-        f" closest is {closest}, which does not account for:"
-        f" {', '.join(sorted(missing))}"
+    name, patterns = applicable[0]
+    undeclared = sorted(
+        path
+        for path in subject
+        if not any(fnmatch.fnmatch(path, pattern) for pattern in patterns)
+    )
+    assert not undeclared, (
+        f"{name} is the step this branch implements, and it does not declare"
+        " these changed paths — which AGENTS.md makes a merge-blocking"
+        " deviation. Another step declaring them is not enough; add them here"
+        f" with the reason: {', '.join(undeclared)}"
     )
 
 
@@ -232,7 +288,7 @@ def test_the_check_fails_rather_than_skips_when_the_base_is_unreachable(
     # became a skipped test when the behaviour regressed, which is the same
     # green-while-enforcing-nothing this whole check is about.
     try:
-        test_every_changed_path_is_declared_by_one_plan_step()
+        test_every_changed_path_is_declared_by_this_branch_s_plan_step()
     except pytest.fail.Exception as failure:
         assert "plan-scope check cannot run" in str(failure)
     except BaseException as other:  # noqa: BLE001 - a skip lands here on purpose
@@ -246,42 +302,76 @@ def test_the_check_fails_rather_than_skips_when_the_base_is_unreachable(
         )
 
 
-def test_a_path_declared_only_by_another_step_does_not_cover_this_branch(
+def test_a_path_declared_only_by_another_step_is_still_undeclared(
     tmp_path, monkeypatch
 ) -> None:
-    """The union of every inventory is far too generous.
+    """Searching for a step that fits will always find one.
 
-    `control_plane/cli.py` is declared by Step E9, so under a union an E1 branch
-    could change it and pass while E1 says nothing about it — precisely the
-    class of deviation this file was added to catch. One step has to account for
-    everything the branch touched.
+    `control_plane/onboarding/state.py` is declared by an older phase, so a
+    one-file E1 change to it passed both earlier rules: the union obviously, and
+    "some single step covers the whole diff" too, because that older step covers
+    a one-file diff completely. Only the step this branch SAYS it implements can
+    answer the question.
     """
     plans = tmp_path / "plans"
     plans.mkdir()
     (plans / "a-plan.md").write_text(
-        "#### Step ONE\n\n"
+        "#### Step E1\n\n"
         "**Files:** `control_plane/onboarding/provision.py`.\n\n"
-        "#### Step TWO\n\n"
-        "**Files:** `control_plane/cli.py`.\n",
+        "**Branches:** `codex/phase-E-provision-dry-run`.\n\n"
+        "#### Phase B foundation\n\n"
+        "**Files:** `control_plane/onboarding/state.py`.\n\n"
+        "**Branches:** `codex/phase-B-foundation`.\n",
         encoding="utf-8",
     )
-    steps = _inventories(plans)
+    steps = _steps(plans)
     assert len(steps) == 2, steps
     monkeypatch.setattr(
-        "tests.control_plane.test_plan_inventory._inventories", lambda: steps
+        "tests.control_plane.test_plan_inventory._steps", lambda: steps
+    )
+    monkeypatch.setattr(
+        "tests.control_plane.test_plan_inventory._branch_name",
+        lambda: "codex/phase-E-provision-dry-run",
     )
     monkeypatch.setattr(
         "tests.control_plane.test_plan_inventory._changed_paths",
-        lambda: ["control_plane/onboarding/provision.py", "control_plane/cli.py"],
+        lambda: ["control_plane/onboarding/state.py"],
     )
 
-    with pytest.raises(AssertionError, match="no single plan step declares"):
-        test_every_changed_path_is_declared_by_one_plan_step()
+    with pytest.raises(AssertionError, match="does not declare"):
+        test_every_changed_path_is_declared_by_this_branch_s_plan_step()
 
-    # And a branch inside one step still passes, so the rule is not simply
+    # And a path this step does declare still passes, so the rule is not simply
     # rejecting everything.
     monkeypatch.setattr(
         "tests.control_plane.test_plan_inventory._changed_paths",
-        lambda: ["control_plane/cli.py"],
+        lambda: ["control_plane/onboarding/provision.py"],
     )
-    test_every_changed_path_is_declared_by_one_plan_step()
+    test_every_changed_path_is_declared_by_this_branch_s_plan_step()
+
+
+def test_a_branch_no_step_claims_is_a_hard_failure(tmp_path, monkeypatch) -> None:
+    """The scope of a branch is a fact its author knows and this cannot derive."""
+    plans = tmp_path / "plans"
+    plans.mkdir()
+    (plans / "a-plan.md").write_text(
+        "#### Step E1\n\n"
+        "**Files:** `control_plane/onboarding/provision.py`.\n\n"
+        "**Branches:** `codex/phase-E-provision-dry-run`.\n",
+        encoding="utf-8",
+    )
+    declared = _steps(plans)
+    monkeypatch.setattr(
+        "tests.control_plane.test_plan_inventory._steps", lambda: declared
+    )
+    monkeypatch.setattr(
+        "tests.control_plane.test_plan_inventory._branch_name",
+        lambda: "codex/something-nobody-declared",
+    )
+    monkeypatch.setattr(
+        "tests.control_plane.test_plan_inventory._changed_paths",
+        lambda: ["control_plane/onboarding/provision.py"],
+    )
+
+    with pytest.raises(pytest.fail.Exception, match="0 plan steps claim the branch"):
+        test_every_changed_path_is_declared_by_this_branch_s_plan_step()
