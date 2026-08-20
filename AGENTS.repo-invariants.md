@@ -94,3 +94,11 @@ makes a review loop unable to terminate.
   descriptor rewrites a file in place without the inode moving, so anything
   whose correctness depends on the CONTENTS compares a digest taken at
   validation time.
+
+  This applies to REVERSAL as much as to publication, which is the half that
+  was missed first: `_undo` verified the inode alone, so a landed member
+  rewritten in place was carried back into the canonical namespace as though it
+  were the validated generation, with nothing reported and no fail-safe pause.
+  A move records what it published, and anything else at that name — a
+  different entry or the same entry with different bytes — is not this
+  operation's to move.

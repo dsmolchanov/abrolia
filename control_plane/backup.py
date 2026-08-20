@@ -336,6 +336,12 @@ class _Move:
     source: Path
     destination: Path
     published_inode: tuple[int, int] | None = None
+    #: The bytes this move put at the destination. The inode is not enough: a
+    #: process holding an open descriptor rewrites a file in place without it
+    #: changing, and `_undo` then moved the MODIFIED bytes back into the
+    #: canonical namespace, reported nothing outstanding, and released the
+    #: locks with no fail-safe pause.
+    published_digest: bytes | None = None
     #: False while the destination is published and the source still stands.
     source_removed: bool = False
 
@@ -363,8 +369,10 @@ def _claim(
     # know the destination now existed, so `_undo` would not reverse it and the
     # bundle stayed half-apart. The link is the move; the unlink is tidying
     # after it, and `source_removed` is set only once that tidying succeeded.
-    published = _inode(destination)
-    record = _Move(source, destination, published_inode=published)
+    published, digest = _content_identity(destination)
+    record = _Move(
+        source, destination, published_inode=published, published_digest=digest
+    )
     if journal is not None:
         journal.append(record)
     try:
@@ -1038,7 +1046,13 @@ def _copy_install(
     # source is gone — a copy whose source removal fails leaves both names
     # holding the generation, which `_undo` has to be able to tell from a move
     # that never started. See `_Move`.
-    record = _Move(source, destination, published_inode=_inode(destination))
+    landed_inode, landed_digest = _content_identity(destination)
+    record = _Move(
+        source,
+        destination,
+        published_inode=landed_inode,
+        published_digest=landed_digest,
+    )
     if journal is not None:
         journal.append(record)
     try:
@@ -1897,10 +1911,15 @@ def _undo(moved: list[_Move]) -> list[_Move]:
                     # bundle missing a file.
                     unreversed.append(move)
                 continue
-            if _inode(destination) != move.published_inode:
-                # Somebody else holds this name now. Removing it or moving it
-                # would destroy their file, which is the failure mode this
-                # module keeps finding in its own cleanup paths.
+            if _content_identity(destination) != (
+                move.published_inode,
+                move.published_digest,
+            ):
+                # Not what this move put there. Either somebody else holds the
+                # name — removing or moving it would destroy their file — or the
+                # bytes were rewritten in place, which keeps the inode and which
+                # a reversal must not carry into the canonical namespace. Both
+                # are "this is not mine to move"; both are reported.
                 unreversed.append(move)
                 continue
             if not move.source_removed:

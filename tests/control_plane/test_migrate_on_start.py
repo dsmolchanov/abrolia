@@ -2455,11 +2455,13 @@ def test_a_failed_source_unlink_is_reversed_by_removing_the_destination(
     destination = tmp_path / "landed"
     journal: list[backup_module._Move] = []
     os.link(source, destination)
+    landed, digest = backup_module._content_identity(destination)
     journal.append(
         backup_module._Move(
             source,
             destination,
-            published_inode=(destination.lstat().st_dev, destination.lstat().st_ino),
+            published_inode=landed,
+            published_digest=digest,
         )
     )
 
@@ -2893,11 +2895,13 @@ def test_a_reversal_across_directories_syncs_the_one_it_emptied(
     source = staging / "control-plane.db"
     destination = volume / "control-plane.db"
     destination.write_bytes(b"the installed generation")
+    landed, digest = backup_module._content_identity(destination)
     journal = [
         backup_module._Move(
             source,
             destination,
-            published_inode=(destination.lstat().st_dev, destination.lstat().st_ino),
+            published_inode=landed,
+            published_digest=digest,
             source_removed=True,
         )
     ]
@@ -3994,3 +3998,55 @@ def test_a_superseded_member_removed_after_it_moves_is_not_a_success(
     assert backup_module._pause_marker(target).exists(), (
         "the locks were released over a bundle with no recovery copy and no pause"
     )
+
+
+@pytest.mark.parametrize("member", ["", "-wal", ".workers-paused"])
+def test_a_reversal_refuses_to_carry_back_modified_bytes(
+    tmp_path, monkeypatch, member
+) -> None:
+    """The digest check on the way IN does not cover the way back.
+
+    A landed member rewritten through an open descriptor keeps its inode, so a
+    reversal that verified only the inode moved the MODIFIED bytes into the
+    canonical namespace, reported nothing outstanding, and released both writer
+    locks with no fail-safe pause — the canonical database corrupted, or
+    combined with modified sidecars, while the command reported only whatever
+    error triggered the reversal.
+    """
+    volume, target, restored = _rollback_fixture(tmp_path)
+    _constrain(monkeypatch, volume, capacity=target.stat().st_size * 10)
+    source = Path(f"{restored}{member}")
+    if not source.exists():
+        source.write_bytes(b"a sidecar the candidate came with")
+    landed = Path(f"{target}{member}")
+    rewritten: list[Path] = []
+    real_copy = backup_module._copy_install
+
+    def copy_install(source, destination, journal=None):
+        # AFTER the move is journalled, not during `_publish`. `_copy_install`
+        # records the landed content when it returns, so rewriting inside the
+        # publication made it record the MODIFIED bytes as the published ones —
+        # a fixture that agreed with itself and proved nothing.
+        real_copy(source, destination, journal)
+        if Path(destination) == landed and not rewritten:
+            # In place: same inode, different bytes.
+            with open(destination, "r+b") as handle:
+                handle.seek(0)
+                handle.write(b"XXXXXXXX")
+                handle.flush()
+                os.fsync(handle.fileno())
+            rewritten.append(landed)
+
+    monkeypatch.setattr(backup_module, "_copy_install", copy_install)
+
+    with pytest.raises(RollbackError) as raised:
+        install_rollback(restored, target, now=1800000042)
+
+    monkeypatch.undo()
+    assert rewritten, "the fixture never rewrote a landed member"
+    assert isinstance(raised.value, backup_module.IncompleteReversal), str(raised.value)
+    assert any(
+        move.destination == landed for move in raised.value.unreversed
+    ), f"the altered member was not identified: {raised.value.unreversed}"
+    assert raised.value.paused, "no fail-safe pause was written"
+    assert backup_module._pause_marker(target).exists()
