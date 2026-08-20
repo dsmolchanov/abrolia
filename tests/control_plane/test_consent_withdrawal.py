@@ -1233,4 +1233,56 @@ def test_reconciling_a_quarantined_job_never_creates_a_new_resource(cp_stack) ->
     assert type(provider).created == 0, (
         "reconciling a quarantined job created a new resource"
     )
-    assert reconciled.error_code == "shutdown_requires_no_new_resource"
+    # The quarantine REASON survives — an operator still knows which command
+    # settles it. What the refusal changes is that nothing new was built.
+    assert reconciled.error_code == "withdrawal_requires_reconciliation"
+
+
+def test_reconciling_a_quarantined_email_job_creates_nothing(cp_stack) -> None:
+    """The email branch calls `reconcile`, which for Nerve IS `ensure`.
+
+    `NerveManagedEmailProvisioner.reconcile` and its BYO-domain sibling delegate
+    straight to `ensure`, so it resumes the provisioning graph — an org, a
+    domain, an inbox, a key, a webhook. Skipping the consent precondition is
+    what lets a quarantined job be examined at all; calling `reconcile` under
+    that exemption would build new upstream state for a household that withdrew.
+    The runtime branch got this guard first and the email branch, which is the
+    one that actually creates inboxes, did not.
+    """
+    complete_onboarding(cp_stack)
+    drain(cp_stack)
+    set_runtime_ref(cp_stack)
+    email_job = cp_stack.database.query_one(
+        "SELECT id FROM provisioning_jobs WHERE household_id = ?"
+        " AND kind = 'email_identity' ORDER BY created_at DESC LIMIT 1",
+        (cp_stack.household.id,),
+    )["id"]
+    with cp_stack.database.write() as connection:
+        connection.execute(
+            "UPDATE provisioning_jobs SET status = 'outcome_unknown',"
+            " error_code = 'outcome_unknown', settled_at = NULL,"
+            " provider = 'nerve-managed' WHERE id = ?",
+            (email_job,),
+        )
+    withdraw_now(cp_stack, now=BASE_TIME)
+
+    class CountingNerve(DeterministicFakeProvisioner):
+        reconciled = 0
+
+        def reconcile(self, intent, idempotency_key=None):
+            type(self).reconciled += 1
+            return super().ensure(intent, idempotency_key)
+
+    provider = CountingNerve("email")
+    registry = ProviderRegistry()
+    registry.register("nerve-managed", provider)
+    result = cp_stack.make_worker(providers=registry, now=BASE_TIME + 50).reconcile(
+        email_job
+    )
+
+    assert type(provider).reconciled == 0, (
+        "a withdrawn household's email job resumed provisioning"
+    )
+    # And the quarantine reason survives, so an operator still knows what
+    # settles it.
+    assert result.error_code == "withdrawal_requires_reconciliation"

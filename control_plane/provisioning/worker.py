@@ -1265,6 +1265,26 @@ class ProvisioningWorker:
             inspected.error_code or "provider_absent",
         )
 
+    def _shutdown_refusal(self, job: JobRecord, request: dict[str, Any]) -> WorkResult:
+        """Refuse to create, and keep the reason the job already carries.
+
+        A quarantined job stays quarantined; what it must not do is build new
+        upstream state. Overwriting `reset_requires_reconciliation` with a
+        generic code would erase which command an operator was told to run, for
+        no gain — the same argument that stopped the withdrawal sweep
+        overwriting an existing quarantine reason.
+        """
+        current = self.jobs.db.query_one(
+            "SELECT error_code FROM provisioning_jobs WHERE id = ?", (job.id,)
+        )
+        code = current["error_code"] if current is not None else None
+        return self._mark_step_problem(
+            job,
+            request,
+            "outcome_unknown",
+            code if requires_reconciliation(code) else "shutdown_requires_no_new_resource",
+        )
+
     def _is_shutdown_action(self, job: JobRecord) -> bool:
         """Work that exists BECAUSE a consent went away.
 
@@ -1663,12 +1683,7 @@ class ProvisioningWorker:
                         # happen; re-running `prepare` under that exemption
                         # would hand a withdrawn household a brand-new resource,
                         # which is the opposite of what the quarantine is for.
-                        return self._mark_step_problem(
-                            job,
-                            request,
-                            "outcome_unknown",
-                            "shutdown_requires_no_new_resource",
-                        )
+                        return self._shutdown_refusal(job, request)
                     prepared = (
                         provider.prepare(request, job.intent_key)
                         if split_runtime
@@ -1701,6 +1716,17 @@ class ProvisioningWorker:
                 "selection": request["selection"],
                 "secret_namespace_ref": namespace_ref,
             }
+            if self._is_shutdown_action(job):
+                # `NerveManagedEmailProvisioner.reconcile` and its BYO-domain
+                # sibling delegate straight to `ensure`, which resumes the
+                # provisioning graph and can create an org, a domain, an inbox,
+                # a key or a webhook. Skipping the consent precondition is what
+                # lets a quarantined job be examined at all; letting it call
+                # `reconcile` under that exemption would build new upstream
+                # state for a household that withdrew. The runtime branch got
+                # this guard and the email branch — the one the finding is
+                # actually about — did not.
+                return self._shutdown_refusal(job, request)
             try:
                 result = reconcile_email(
                     provider_request,

@@ -635,7 +635,18 @@ class RuntimeService:
         start = _t.time()
         path = str(environ.get("PATH_INFO") or "")
         method = str(environ.get("REQUEST_METHOD") or "GET").upper()
-        if path == "/v1/email/nerve/webhook" and method == "POST":
+        # Authenticated BEFORE any handler runs, for every internal route at
+        # once, so a handler is reached only by an authenticated caller.
+        refusal = (
+            self._authenticate_internal(
+                method, str(environ.get("HTTP_AUTHORIZATION") or "")
+            )
+            if path in self.INTERNAL_ROUTES
+            else None
+        )
+        if refusal is not None:
+            probe = refusal
+        elif path == "/v1/email/nerve/webhook" and method == "POST":
             probe = self._nerve_webhook(environ)
         elif path in {"/v1/whatsapp/webhook", "/webhooks/whatsapp"} and method == "POST":
             probe = self._whatsapp_webhook(environ)
@@ -757,6 +768,42 @@ class RuntimeService:
                 "event_id": accepted.event.id,
             },
         )
+
+    #: Internal routes that require the runtime DSAR credential. Named here, so
+    #: adding a route without adding it to this table is a route with no
+    #: authentication — visible in one place rather than buried in a handler.
+    INTERNAL_ROUTES = frozenset({
+        "/internal/v1/consent/revoke",
+        "/internal/v1/dsar/export",
+        "/internal/v1/dsar/delete",
+        "/internal/v1/email/google/revoke",
+    })
+
+    def _authenticate_internal(self, method: str, authorization: str) -> Probe | None:
+        """The gate, OUTSIDE the handlers, or None when the caller may proceed.
+
+        Each handler used to do this itself. The comparisons were correct, and
+        the rule they broke is a checkable one: authentication performed inside
+        a handler is authentication a future early return, or a second dispatch
+        path, can step over — and there is no signature to inspect that would
+        show it missing. Hoisted here, a route either appears in
+        `INTERNAL_ROUTES` and is authenticated, or it does not exist.
+
+        The handlers keep their own checks as defence in depth; this is what
+        makes the property structural.
+        """
+        expected = self.env.get(ENV_RUNTIME_DSAR_TOKEN, "")
+        if method != "POST" or not expected:
+            # 404 rather than 401: an unconfigured runtime does not admit that
+            # these routes exist.
+            return Probe(404, {"status": "not_found"})
+        prefix = "Bearer "
+        supplied = (
+            authorization[len(prefix) :] if authorization.startswith(prefix) else ""
+        )
+        if not supplied or not hmac.compare_digest(supplied, expected):
+            return Probe(401, {"status": "unauthorized"})
+        return None
 
     @staticmethod
     def _request_body(environ: dict) -> bytes:

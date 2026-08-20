@@ -576,3 +576,74 @@ def test_a_stop_naming_no_generation_still_stops_an_unreadable_runtime(
 
     assert probe.status_code == 200
     assert service.consent_marker.exists()
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/internal/v1/consent/revoke",
+        "/internal/v1/dsar/export",
+        "/internal/v1/dsar/delete",
+        "/internal/v1/email/google/revoke",
+    ],
+)
+def test_every_internal_route_is_authenticated_before_its_handler(
+    tmp_path: Path, path
+) -> None:
+    """The gate is outside the handler, so a handler is only ever reached
+    authenticated.
+
+    Each handler used to check its own credential. The comparisons were correct,
+    and the rule they broke is checkable: authentication inside a handler is
+    authentication a future early return, or a second dispatch path, can step
+    over — with no signature to inspect that would show it missing. A route
+    either appears in `INTERNAL_ROUTES` and is authenticated, or it does not
+    exist.
+    """
+    service = active_service(tmp_path)
+    assert path in service.INTERNAL_ROUTES, "a route with no declared gate"
+
+    body: list[bytes] = []
+    status: list[str] = []
+
+    def start_response(code, headers):
+        status.append(code)
+        return body.append
+
+    # The property is that the HANDLER IS NOT REACHED — not merely that a 401
+    # comes back, which the handlers' own checks would also produce. Observing
+    # the outcome cannot tell a gate from defence in depth.
+    reached: list[str] = []
+    for name in ("_consent_revoke", "_dsar", "_google_revoke"):
+        original = getattr(type(service), name)
+
+        def trap(*args, _name=name, _original=original, **kwargs):
+            reached.append(_name)
+            return _original(*args, **kwargs)
+
+        setattr(service, name, trap.__get__(service, type(service)))
+
+    service(
+        {
+            "PATH_INFO": path,
+            "REQUEST_METHOD": "POST",
+            "HTTP_AUTHORIZATION": "Bearer wrong-token",
+        },
+        start_response,
+    )
+
+    assert status and status[0].startswith("401"), status
+    assert reached == [], f"an unauthenticated request reached {reached}"
+
+
+def test_the_declared_internal_routes_are_the_dispatched_ones(tmp_path: Path) -> None:
+    """A route added to dispatch but not to the table is an open route."""
+    import inspect
+
+    service = active_service(tmp_path)
+    dispatched = {
+        literal
+        for literal in inspect.getsource(type(service).__call__).split('"')
+        if literal.startswith("/internal/")
+    }
+    assert dispatched <= service.INTERNAL_ROUTES, dispatched - service.INTERNAL_ROUTES
