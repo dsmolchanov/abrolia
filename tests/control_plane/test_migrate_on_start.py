@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import errno
 import json
 import os
@@ -3636,7 +3637,7 @@ def test_a_candidate_member_removed_after_preflight_stops_the_install(
 
     monkeypatch.setattr(backup_module, "_preflight", preflight)
 
-    with pytest.raises(RollbackError, match="not the entry that passed"):
+    with pytest.raises(RollbackError, match="not what passed validation"):
         install_rollback(restored, target, now=1800000042)
 
     monkeypatch.undo()
@@ -3668,7 +3669,7 @@ def test_a_candidate_replaced_after_preflight_is_not_installed(
 
     monkeypatch.setattr(backup_module, "_preflight", preflight)
 
-    with pytest.raises(RollbackError, match="not the entry that passed"):
+    with pytest.raises(RollbackError, match="not what passed validation"):
         install_rollback(restored, target, now=1800000042)
 
     monkeypatch.undo()
@@ -3770,3 +3771,226 @@ def test_a_canonical_member_removed_after_it_lands_is_not_a_success(
     assert raised.value.paused, "no fail-safe pause was written"
     assert backup_module._pause_marker(target).exists()
     assert before, "the fixture volume was empty"
+
+
+# --------------------------------------------------------------------------
+# The class-level check for the ownership invariant recorded in
+# `AGENTS.repo-invariants.md`. This enforces the RULE, not the instances.
+# --------------------------------------------------------------------------
+
+#: The two windows in which a published move still holds its source name: after
+#: `os.link` and before `_claim` removes it, and after `_publish` and before
+#: `_copy_install` removes it. Interposing on the primitives THEMSELVES proves
+#: nothing — by the time they return, the removal has already happened — which
+#: is how the first version of this check passed against the very code it was
+#: written to reject.
+OWNERSHIP_WINDOWS = ["link", "copy"]
+
+
+@pytest.mark.parametrize("window", OWNERSHIP_WINDOWS)
+@pytest.mark.parametrize("sentinel", ["regular", "hard-link", "symlink"])
+def test_no_move_primitive_deletes_an_entry_it_stopped_owning(
+    tmp_path, monkeypatch, window, sentinel
+) -> None:
+    """A name is not a claim on the entry behind it.
+
+    Both primitives ended a publication by unlinking a PATHNAME. Between the
+    link or copy and that unlink, another actor can put something else at the
+    name — and the operation then reported success having destroyed an
+    unrelated file. The rule is that a removal is authorised only while the
+    entry is still the one this call published or copied.
+    """
+    volume, target, restored = _rollback_fixture(tmp_path)
+    _constrain(monkeypatch, volume, capacity=target.stat().st_size * 10)
+    # Beside the entry it will be aliased from: `_constrain` makes a link that
+    # crosses into the volume answer `EXDEV`, exactly as the kernel would, so a
+    # hard-link sentinel has to live on the same side as its source.
+    bystander = (volume if window == "link" else restored.parent) / "not-yours.txt"
+    bystander.write_bytes(b"not yours to delete")
+    swapped: list[Path] = []
+    # Captured BEFORE this test patches anything, so creating the sentinel does
+    # not re-enter the interposition and usurp the sentinel itself.
+    raw_link = os.link
+
+    def usurp(source: Path) -> None:
+        if swapped or ".volume-probe-" in source.name or source == bystander:
+            return
+        source.unlink(missing_ok=True)
+        if sentinel == "regular":
+            source.write_bytes(b"somebody else's file")
+        elif sentinel == "hard-link":
+            raw_link(bystander, source)
+        else:
+            source.symlink_to(bystander)
+        swapped.append(source)
+
+    if window == "link":
+        def link(source, destination, **keywords):
+            raw_link(source, destination, **keywords)
+            usurp(Path(source))
+
+        monkeypatch.setattr(backup_module.os, "link", link)
+    else:
+        # The copy's source, recorded by wrapping `_copy_install` itself. The
+        # first version derived it from the destination by string substitution,
+        # which is wrong the moment the two bundles have different basenames —
+        # they do — so it usurped a path nothing was using and the check it was
+        # written to exercise never ran.
+        copying: list[Path] = []
+        real_copy = backup_module._copy_install
+        real_publish = backup_module._publish
+
+        def copy_install(source, destination, journal=None):
+            copying.append(Path(source))
+            try:
+                return real_copy(source, destination, journal)
+            finally:
+                copying.pop()
+
+        def publish(temporary, destination):
+            real_publish(temporary, destination)
+            # `_copy_install` removes its source after this returns.
+            if copying:
+                usurp(copying[-1])
+
+        monkeypatch.setattr(backup_module, "_copy_install", copy_install)
+        monkeypatch.setattr(backup_module, "_publish", publish)
+
+    with contextlib.suppress(RollbackError, OSError):
+        install_rollback(restored, target, now=1800000042)
+
+    monkeypatch.undo()
+    assert swapped, f"the {window} window was never reached"
+    assert bystander.read_bytes() == b"not yours to delete", (
+        "a move primitive deleted an entry it did not own"
+    )
+    if sentinel == "regular":
+        assert swapped[0].read_bytes() == b"somebody else's file", (
+            "a move primitive removed an entry that took the name it vacated"
+        )
+    else:
+        assert os.path.lexists(swapped[0]), (
+            "a move primitive removed a link it did not create"
+        )
+
+
+def _present_entry(path: Path) -> bool:
+    return os.path.lexists(path)
+
+
+@pytest.mark.parametrize("member", ["", "-wal", ".workers-paused"])
+def test_no_validated_member_is_installed_after_it_changes(
+    tmp_path, monkeypatch, member
+) -> None:
+    """Validation and use are two moments, and a file can change in between.
+
+    Inode equality is not content equality: a process holding an open
+    descriptor rewrites a member in place without the inode moving. Every
+    candidate member is therefore validated by CONTENT, and a rewrite between
+    preflight and publication has to stop the install rather than reach the
+    canonical path.
+    """
+    volume, target, restored = _rollback_fixture(tmp_path)
+    _constrain(monkeypatch, volume, capacity=target.stat().st_size * 10)
+    victim = Path(f"{restored}{member}")
+    if not victim.exists():
+        victim.write_bytes(b"a sidecar the candidate came with")
+    before = _fingerprint(volume)
+    real_preflight = backup_module._preflight
+
+    def preflight(*arguments, **keywords):
+        result = real_preflight(*arguments, **keywords)
+        # In place, through a descriptor: same inode, different bytes.
+        with open(victim, "r+b") as handle:
+            handle.seek(0)
+            handle.write(b"XXXXXXXX")
+            handle.flush()
+            os.fsync(handle.fileno())
+        return result
+
+    monkeypatch.setattr(backup_module, "_preflight", preflight)
+
+    with pytest.raises(RollbackError, match="not what passed validation"):
+        install_rollback(restored, target, now=1800000042)
+
+    monkeypatch.undo()
+    assert _fingerprint(volume) == before, "the live bundle did not come back"
+
+
+@pytest.mark.parametrize("victim", ["", "-wal", ".workers-paused"])
+def test_a_landed_member_removed_before_success_is_not_a_success(
+    tmp_path, monkeypatch, victim
+) -> None:
+    """The report says `workers: paused`; every member has to be there.
+
+    Checking the canonical database and marker NAMES let a landed WAL be
+    removed — losing committed frames the candidate carried — or any member be
+    replaced after publication, and the command still declared the rollback
+    installed.
+    """
+    volume, target, restored = _rollback_fixture(tmp_path)
+    _constrain(monkeypatch, volume, capacity=target.stat().st_size * 10)
+    source = Path(f"{restored}{victim}")
+    if not source.exists():
+        source.write_bytes(b"a sidecar the candidate came with")
+    landed = Path(f"{target}{victim}")
+    real_publish = backup_module._publish
+
+    def publish(temporary, destination):
+        real_publish(temporary, destination)
+        if Path(destination) == landed:
+            Path(destination).unlink()
+
+    monkeypatch.setattr(backup_module, "_publish", publish)
+
+    with pytest.raises(RollbackError) as raised:
+        install_rollback(restored, target, now=1800000042)
+
+    monkeypatch.undo()
+    # Either refusal is correct and both are fail-closed: the missing member is
+    # noticed, and if the reversal cannot put the volume back the bundle is
+    # left paused with the outstanding moves named. What must not happen is a
+    # report of `workers: paused` over a bundle missing a file.
+    assert "incomplete" in str(raised.value) or isinstance(
+        raised.value, backup_module.IncompleteReversal
+    ), str(raised.value)
+    if isinstance(raised.value, backup_module.IncompleteReversal):
+        assert raised.value.paused
+    assert backup_module._pause_marker(target).exists()
+
+
+def test_a_superseded_member_removed_after_it_moves_is_not_a_success(
+    tmp_path, monkeypatch
+) -> None:
+    """The report names where the superseded bundle was kept.
+
+    `superseded_kept_as` is a promise about a recovery copy. Verifying only the
+    canonical side let that copy be removed or replaced after it moved aside
+    while the command still reported it kept — an operator who then needs it
+    finds nothing there.
+    """
+    volume, target, restored = _rollback_fixture(tmp_path)
+    _constrain(monkeypatch, volume, capacity=target.stat().st_size * 10)
+    real_claim = backup_module._claim
+    removed: list[Path] = []
+
+    def claim(source, destination, journal=None):
+        real_claim(source, destination, journal)
+        landed = Path(destination)
+        if ".superseded-" in landed.name and not removed:
+            landed.unlink()
+            removed.append(landed)
+
+    monkeypatch.setattr(backup_module, "_claim", claim)
+
+    with pytest.raises(RollbackError) as raised:
+        install_rollback(restored, target, now=1800000042)
+
+    monkeypatch.undo()
+    assert removed, "the fixture never moved a superseded member aside"
+    assert "incomplete" in str(raised.value) or isinstance(
+        raised.value, backup_module.IncompleteReversal
+    ), str(raised.value)
+    assert backup_module._pause_marker(target).exists(), (
+        "the locks were released over a bundle with no recovery copy and no pause"
+    )

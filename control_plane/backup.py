@@ -137,6 +137,54 @@ def _materialise(database: ControlPlaneDatabase, destination: Path) -> None:
         output.close()
 
 
+def _open_pinned(path: Path):
+    """Open once, and answer every later question from the DESCRIPTOR.
+
+    `stat` by pathname followed by `open` by pathname is two questions about two
+    possibly different files. The archive's size was read one way and its bytes
+    another, so replacing it in between with a same-sized archive valid under
+    the same key restored a different generation — authenticated, and not the
+    one the operator selected. `O_NOFOLLOW` refuses a symlink outright rather
+    than following it somewhere ephemeral.
+    """
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        return os.fdopen(descriptor, "rb")
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _digest_of(handle) -> bytes:
+    """The digest of an OPEN file, read from where it is and left there."""
+    start = handle.tell()
+    try:
+        handle.seek(0)
+        digest = hashlib.sha256()
+        for chunk in iter(lambda: handle.read(CHUNK_BYTES), b""):
+            digest.update(chunk)
+        return digest.digest()
+    finally:
+        handle.seek(start)
+
+
+def _content_identity(path: Path) -> tuple[tuple[int, int] | None, bytes | None]:
+    """What this entry IS: which inode, and which bytes.
+
+    The inode alone is not identity. A process holding an open descriptor can
+    truncate or rewrite a file in place without changing it, so a check that
+    compared only `(st_dev, st_ino)` passed and the modified member was
+    installed as though it were the validated one.
+    """
+    if not _present(path):
+        return (None, None)
+    try:
+        with _open_pinned(path) as handle:
+            return (_inode(path), _digest_of(handle))
+    except OSError:
+        return (_inode(path), None)
+
+
 def _digest_file(path: Path) -> bytes:
     digest = hashlib.sha256()
     with open(path, "rb") as handle:
@@ -315,10 +363,18 @@ def _claim(
     # know the destination now existed, so `_undo` would not reverse it and the
     # bundle stayed half-apart. The link is the move; the unlink is tidying
     # after it, and `source_removed` is set only once that tidying succeeded.
-    record = _Move(source, destination, published_inode=_inode(destination))
+    published = _inode(destination)
+    record = _Move(source, destination, published_inode=published)
     if journal is not None:
         journal.append(record)
     try:
+        # The source and the destination are two names for ONE inode after
+        # `os.link`. If they no longer are, something replaced the source in
+        # between, and unlinking by name would delete that replacement while
+        # keeping the original at the destination — a move reported as
+        # successful after destroying an unrelated entry.
+        if _inode(source) != published:
+            raise RaceLostSource(source)
         source.unlink(missing_ok=True)
     except OSError:
         # Somebody has to reverse this. A journalled caller does it in `_undo`,
@@ -330,9 +386,25 @@ def _claim(
         # then withdrew its pause marker over a database that was standing.
         if journal is not None:
             raise
-        _withdraw(destination)
+        _withdraw(destination, published)
         raise
     record.source_removed = True
+
+
+class RaceLostSource(BackupError, OSError):
+    """The source name stopped referring to the entry that was just published.
+
+    Both bases on purpose: callers of these primitives already handle `OSError`
+    from a move, and the recovery is the same one — undo, or withdraw. What must
+    NOT happen is unlinking the name anyway.
+    """
+
+    def __init__(self, source: Path) -> None:
+        super().__init__(
+            f"{source} was replaced while it was being moved; it has not been"
+            " removed, and nothing further will be published from it"
+        )
+        self.source = source
 
 
 class AmbiguousPublication(BackupError):
@@ -352,14 +424,20 @@ class AmbiguousPublication(BackupError):
         self.destination = destination
 
 
-def _withdraw(destination: Path) -> None:
+def _withdraw(destination: Path, published: tuple[int, int] | None = None) -> None:
     """Take a published name away, and make the ABSENCE durable too.
+
+    Only while the name still holds what was published. A cleanup that unlinks
+    by name after another operation has taken that name destroys their file
+    while reporting this operation's error.
 
     Unlinking without syncing the directory leaves the same ambiguity the
     publication was careful to avoid: the entry may or may not survive a crash,
     so a caller that then removes a pause marker can leave a database present
     and unpaused. Sync, and say the state is ambiguous if even that fails.
     """
+    if published is not None and _inode(destination) != published:
+        return
     destination.unlink(missing_ok=True)
     try:
         _fsync_directory(destination.parent)
@@ -615,13 +693,18 @@ def _restore_locked(
     # 512 MiB Machine — taking down the rollback procedure precisely for the
     # larger databases whose migrations are most likely to need it.
     prologue = len(MAGIC) + NONCE_BYTES
-    size = source.stat().st_size
-    if size <= prologue + TAG_BYTES:
-        raise BackupError("unsupported or truncated control-plane backup")
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary: Path | None = None
     try:
-        with open(source, "rb") as archive_file:
+        # ONE descriptor, and the size read from IT. Stat-by-name then
+        # open-by-name is two questions about two possibly different files:
+        # swapping the archive in between for another of the same size, valid
+        # under the same key, restored a different generation — authenticated,
+        # and not the one the operator asked for.
+        with _open_pinned(source) as archive_file:
+            size = os.fstat(archive_file.fileno()).st_size
+            if size <= prologue + TAG_BYTES:
+                raise BackupError("unsupported or truncated control-plane backup")
             header = archive_file.read(prologue)
             if not header.startswith(MAGIC):
                 raise BackupError("unsupported or truncated control-plane backup")
@@ -935,6 +1018,7 @@ def _copy_install(
     database or the destruction of an unrelated file. `mkstemp` creates it with
     `O_EXCL`, so this call owns the name it is about to publish from.
     """
+    origin = _inode(source)
     handle, name = tempfile.mkstemp(
         prefix=f".{destination.name}.installing.", dir=destination.parent
     )
@@ -958,6 +1042,11 @@ def _copy_install(
     if journal is not None:
         journal.append(record)
     try:
+        # A copy has two different inodes by construction, so the ownership
+        # question is asked of the SOURCE: is this still the entry whose bytes
+        # were just copied? If not, removing it destroys somebody else's file.
+        if _inode(source) != origin:
+            raise RaceLostSource(source)
         source.unlink(missing_ok=True)
     except OSError:
         # Somebody has to reverse this. A journalled caller does it in `_undo`,
@@ -1145,7 +1234,7 @@ def _refuse_overlap(restored: Path, target: Path) -> None:
 
 def _preflight(
     restored: Path, target: Path, stamp: int, *, target_already_freed: bool
-) -> tuple[str, dict[Path, tuple[int, int] | None]]:
+) -> tuple[str, dict[Path, tuple[tuple[int, int] | None, bytes | None]]]:
     """Everything that can be known before the live database is touched.
 
     The first version checked `restored.is_file()` and `target.exists()` and
@@ -1217,8 +1306,12 @@ def _preflight(
     # check that only ever asked whether the file opened.
     require_control_plane_image(restored)
 
-    # Read AFTER every validation above, so these are the entries that passed.
-    candidate = {member: _inode(member) for member in _bundle(restored)}
+    # Read AFTER every validation above, so this is what passed — and BY
+    # CONTENT, not only by inode. A process holding an open descriptor can
+    # truncate or rewrite a member in place without the inode changing, so an
+    # inode-only comparison passed and the modified file was installed as
+    # though it were the validated one.
+    candidate = {member: _content_identity(member) for member in _bundle(restored)}
 
     aside = _reserve_aside(target, stamp)
     required = _occupied_bytes(restored, block_size=_block_size(target.parent))
@@ -1852,7 +1945,7 @@ def _install_rollback_locked(
     target_path: Path,
     *,
     aside: str,
-    candidate: dict[Path, tuple[int, int] | None],
+    candidate: dict[Path, tuple[tuple[int, int] | None, bytes | None]],
 ) -> dict[str, object]:
     volume = target_path.parent
     superseded = _bundle(target_path)
@@ -1879,13 +1972,18 @@ def _install_rollback_locked(
     # no marker beside it. If it can fail after the first member moves, it
     # belongs in here.
     moved: list[_Move] = []
+    # What the superseded bundle IS before anything moves, so the final check
+    # can say whether the recovery copy this command promises to keep is
+    # actually there and unmodified.
+    superseded_before = {member: _content_identity(member) for member in superseded}
+    aside_names = tuple(
+        member.with_name(member.name.replace(target_path.name, aside, 1))
+        for member in superseded
+    )
     try:
         # These renames stay on the volume and cost no blocks.
-        for path in superseded:
+        for path, landed in zip(superseded, aside_names, strict=True):
             if _present(path):
-                landed = path.with_name(
-                    path.name.replace(target_path.name, aside, 1)
-                )
                 # Claimed, not renamed: `_reserve_aside` checks the whole bundle
                 # is free and another process can still take one of those names
                 # before this loop reaches it. The reservation narrows the
@@ -1936,26 +2034,42 @@ def _install_rollback_locked(
             # could simply not be installed and the command still reported
             # success — or replace it, in which case an unvalidated file went to
             # the canonical path beside the validated generation's sidecars.
-            validated = candidate.get(source)
-            if _inode(source) != validated:
+            validated = candidate.get(source, (None, None))
+            if _content_identity(source) != validated:
                 raise RollbackError(
-                    f"{source} is not the entry that passed validation; the"
-                    " rollback candidate changed under this command and"
-                    " nothing further will be installed"
+                    f"{source} is not what passed validation; the rollback"
+                    " candidate changed under this command and nothing"
+                    " further will be installed"
                 )
-            if validated is None:
+            if validated[0] is None:
                 continue
             if not _rename_or_exdev(source, destination, moved):
                 _copy_install(source, destination, moved)
 
-        # Both REQUIRED members, inside the boundary. A missing marker is a
-        # startable unreconciled rollback; a missing database is an outage
-        # reported as a success.
-        for required in (_pause_marker(target_path), target_path):
-            if not _present(required):
+        # EVERY landed member, by content, plus the superseded bundle this
+        # command promised to keep. Checking only that the canonical database
+        # and marker NAMES exist let a landed WAL be removed — losing committed
+        # frames — or any member be replaced after publication, and still
+        # reported `workers: paused`. A missing aside member was likewise
+        # invisible while the report claimed the superseded bundle was kept.
+        for source, destination in zip(ordered, destinations, strict=True):
+            expected = candidate.get(source, (None, None))
+            if expected[0] is None:
+                continue
+            if _content_identity(destination)[1] != expected[1]:
                 raise RollbackError(
-                    f"the rollback install is incomplete: {required} is not"
-                    " there. Nothing at that path may be started."
+                    f"the rollback install is incomplete: {destination} is not"
+                    " the validated content. Nothing at that path may be"
+                    " started."
+                )
+        for member, landed in zip(superseded, aside_names, strict=True):
+            if superseded_before[member][0] is None:
+                continue
+            if _content_identity(landed)[1] != superseded_before[member][1]:
+                raise RollbackError(
+                    "the rollback install is incomplete: the superseded"
+                    f" {landed} is not what was moved aside. Nothing at"
+                    f" {target_path} may be started."
                 )
     except BaseException as error:
         # Back to the original bundle, in reverse: the installed members return
