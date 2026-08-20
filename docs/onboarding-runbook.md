@@ -190,11 +190,30 @@ restatement of its rules, so the report and the worker cannot disagree: a
 `waiting_user`/`inspect` DNS recheck is, an `outcome_unknown` job never is, and
 nothing is while the workers are paused.
 
+`executable` means the worker can run it **in this deployment**, which is three
+things: the row is selectable by `lease`, the workers are not paused, and the
+job's durable provider is one this deployment still registers. A `nerve-managed`
+job queued with real email on and reached after a restart with it off is a
+perfectly leasable row that cannot be dispatched. The same three questions are
+asked of the runtime job.
+
 A report is never "nothing is pending" while any unsettled intent exists — step
 job or runtime — even when the planner refuses because those very steps have not
 verified yet. That refusal is **not** a blockage: it is the normal state while
 the steps' own jobs are still queued, so `operation_blocked` stays false as long
 as something is leasable.
+
+The top-level story — `operation_pending`, `operation_blocked`, `blocked_by`,
+`rehearsal`, `table_writes` — is decided **together**, in one place, so those
+fields cannot describe different operations. In order of precedence: an
+unresolved runtime intent needing reconciliation outranks everything, because
+its provider may already have created state and settling that is the next
+action; otherwise the next leasable job is named, with its write set where the
+work is internal and deterministic, and an explicit statement of uncertainty
+where it depends on a provider result this command does not obtain. A terminal
+classifier's explanation survives all of this: a cancelled onboarding with a
+queued teardown reports both — the onboarding is over, *and* this cleanup is
+what runs next.
 
 `unresolved_runtime_jobs` lists **every** unsettled `ensure_runtime` intent, not
 just the next one. A reset preserves a started job as `outcome_unknown` with

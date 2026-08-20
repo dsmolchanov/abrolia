@@ -26,6 +26,7 @@ from control_plane.onboarding.provision import (
     RUNTIME_BOOTSTRAP_SECRET,
     RUNTIME_DSAR_SECRET,
     RUNTIME_WRITES_BY_WORKFLOW_STATE,
+    STEP_WRITES_BY_KIND,
     TableWrite,
     _now_seconds,
     _parser,
@@ -1985,3 +1986,173 @@ def test_the_report_names_the_job_the_worker_will_actually_lease(container) -> N
     assert plan.blocked_by is None, plan.blocked_by
     assert runnable["job_id"] in plan.rehearsal, plan.rehearsal
     assert "planning pass" not in plan.rehearsal.split("The planning pass")[0]
+
+
+def test_a_rate_limited_runtime_job_is_not_reported_as_executable(container) -> None:
+    """The runtime query never asked `lease`'s question.
+
+    It selected neither `operation` nor `not_before` and the classifier never
+    consulted the pause, so a Fly attempt rate-limited back to `pending` with a
+    future `not_before` was presented as the ordinary executable success path
+    while `lease` returns nothing at all.
+    """
+    household_id = _household_with_profile(container)
+    _verify_all_steps(container, household_id)
+    with container.database.write() as connection:
+        connection.execute(
+            "UPDATE provisioning_jobs SET status = 'pending', not_before = ?"
+            " WHERE household_id = ? AND kind = 'runtime'"
+            " AND operation = 'ensure_runtime'",
+            (_now_seconds() + 3600, household_id),
+        )
+
+    plan = plan_onboarding(container, household_id)
+
+    assert plan.unresolved_runtime_jobs, "the fixture settled the runtime job"
+    assert not any(job["executable"] for job in plan.unresolved_runtime_jobs), (
+        "a job the worker cannot lease for another hour was reported executable"
+    )
+    assert container.jobs.lease("probe", now=_now_seconds()) is None
+
+
+def test_a_job_whose_provider_is_gone_is_not_executable(container) -> None:
+    """A leasable row is not an executable operation.
+
+    Queue a `nerve-managed` email job with real email enabled and restart with
+    it disabled, or a Fly namespace job under `dry-run-runtime`: the row stays
+    perfectly selectable while the dispatch that follows cannot happen.
+    """
+    household_id = _household_with_profile(container)
+    account_id, session_id = _PRINCIPALS[household_id]
+    container.onboarding.select(
+        household_id,
+        StepKind.EMAIL,
+        EMAIL_SELECTION,
+        context=_context(
+            container, household_id, "select-0",
+            account_id=account_id, session_id=session_id,
+        ),
+    )
+    runnable_before = plan_onboarding(container, household_id)
+    assert any(job["executable"] for job in runnable_before.pending_step_jobs)
+
+    with container.database.write() as connection:
+        connection.execute(
+            "UPDATE provisioning_jobs SET provider = 'a-provider-nobody-registers'"
+            " WHERE household_id = ? AND kind = 'email_identity'",
+            (household_id,),
+        )
+
+    plan = plan_onboarding(container, household_id)
+
+    email = [job for job in plan.pending_step_jobs if job["kind"] == "email_identity"]
+    assert email, "the job left the inventory"
+    assert not any(job["executable"] for job in email), (
+        "a job whose provider this deployment cannot dispatch was called executable"
+    )
+
+
+def test_a_quarantined_intent_outranks_the_planner_prerequisite(container) -> None:
+    """An unresolved provider effect is what an operator must act on.
+
+    Reset a leased `ensure_runtime` so it stays
+    `outcome_unknown/reset_requires_reconciliation`, drain the cleanup, and
+    rehearse before re-verifying: the revoked revision sends execution through
+    `planner.issue`, which raises for the unverified steps, and that generic
+    message overwrote the reconciliation instruction — sending the operator to
+    the wrong place entirely.
+    """
+    household_id = _household_with_profile(container)
+    _verify_all_steps(container, household_id)
+    account_id, session_id = _PRINCIPALS[household_id]
+    quarantined = container.database.query_one(
+        "SELECT id FROM provisioning_jobs WHERE household_id = ?"
+        " AND kind = 'runtime' AND operation = 'ensure_runtime'"
+        " ORDER BY created_at DESC LIMIT 1",
+        (household_id,),
+    )["id"]
+    with container.database.write() as connection:
+        connection.execute(
+            "UPDATE provisioning_jobs SET status = 'outcome_unknown',"
+            " error_code = 'reset_requires_reconciliation' WHERE id = ?",
+            (quarantined,),
+        )
+    container.onboarding.reset_from(
+        household_id,
+        StepKind.EMAIL,
+        context=_context(
+            container, household_id, "reset", account_id=account_id,
+            session_id=session_id,
+        ),
+    )
+    for _ in range(10):
+        if container.worker.run_once() is None:
+            break
+
+    plan = plan_onboarding(container, household_id)
+
+    assert plan.blocked_by is not None
+    assert quarantined in plan.blocked_by, plan.blocked_by
+    assert "reconcile" in plan.blocked_by
+    assert "verified results" not in plan.blocked_by, (
+        "the planner's prerequisite overwrote the reconciliation instruction"
+    )
+
+
+def test_a_terminal_workflow_still_names_its_cleanup_job(container) -> None:
+    """`operation_pending` alone was not enough.
+
+    The late override flipped the flag to true and left `rehearsal` insisting
+    there was no pending operation, naming neither the cleanup job nor what it
+    writes. Every top-level field has to describe the same next operation.
+    """
+    household_id = _household_with_profile(container)
+    _verify_all_steps(container, household_id)
+    while container.worker.run_once() is not None:
+        pass
+    workflow = container.database.query_one(
+        "SELECT id FROM onboarding_workflows WHERE household_id = ?", (household_id,)
+    )
+    with container.database.write() as connection:
+        connection.execute(
+            "UPDATE onboarding_workflows SET state = 'complete' WHERE id = ?",
+            (workflow["id"],),
+        )
+        cleanup_id, _created = container.jobs.create(
+            connection,
+            household_id=household_id,
+            workflow_id=workflow["id"],
+            kind="bootstrap_cleanup",
+            operation="delete_bootstrap_secret",
+            intent_key=f"{household_id}:late-bootstrap-cleanup:probe",
+            request={"name": "HERMES_BOOTSTRAP_TOKEN"},
+            provider="internal-secret-sink",
+            now=BASE_TIME,
+        )
+
+    plan = plan_onboarding(container, household_id)
+
+    assert plan.operation_pending is True
+    assert cleanup_id in plan.rehearsal, plan.rehearsal
+    # Deterministic internal work, so its write set IS knowable and is reported.
+    assert plan.table_writes == list(STEP_WRITES_BY_KIND["bootstrap_cleanup"])
+
+
+def test_a_provider_backed_step_job_states_its_uncertainty(container) -> None:
+    """Knowable where durable state determines it; said so where it does not."""
+    household_id = _household_with_profile(container)
+    account_id, session_id = _PRINCIPALS[household_id]
+    container.onboarding.select(
+        household_id,
+        StepKind.EMAIL,
+        EMAIL_SELECTION,
+        context=_context(
+            container, household_id, "select-0",
+            account_id=account_id, session_id=session_id,
+        ),
+    )
+
+    plan = plan_onboarding(container, household_id)
+
+    assert "depends on a provider result" in plan.rehearsal, plan.rehearsal
+    assert plan.table_writes == []
