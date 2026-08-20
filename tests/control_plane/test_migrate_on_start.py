@@ -773,7 +773,12 @@ def test_a_restore_that_cannot_pause_publishes_nothing(tmp_path, monkeypatch) ->
 
     assert not target.exists(), "an unpausable restore was published anyway"
     assert not _pause_marker_path(target).exists()
-    assert sorted(path.name for path in destination.iterdir()) == []
+    # The writer lock is the restore TAKING the lock, not a published artifact.
+    assert [
+        path.name
+        for path in destination.iterdir()
+        if not path.name.endswith(".writer.lock")
+    ] == []
 
 
 def _constrain(monkeypatch, volume: Path, capacity: int) -> None:
@@ -1467,3 +1472,76 @@ def test_a_name_too_long_for_the_filesystem_is_refused_before_the_move(
 
     assert _fingerprint(volume) == before
     assert target.exists(), "the canonical database is gone"
+
+
+def test_a_running_writer_stops_a_restore(tmp_path) -> None:
+    """Publishing under a live writer is the same hazard as installing under one.
+
+    `install-rollback` took the writer lock; `restore` published a database and
+    its pause marker at a path another process could be writing at the same
+    time. Same lock, taken the same way, for the same reason.
+    """
+    seed = _database(tmp_path)
+    seed.migrate()
+    archive = tmp_path / "control-plane.cpb"
+    create_backup(seed, archive, backup_key=BACKUP_KEY_BYTES)
+    seed.close()
+
+    destination = tmp_path / "restored"
+    destination.mkdir()
+    target = destination / "control-plane.db"
+    writer = ControlPlaneDatabase(target)
+    writer.acquire_process_lock()
+    try:
+        with pytest.raises(BackupError, match="already owns"):
+            restore_backup(
+                archive, target, backup_key=BACKUP_KEY_BYTES, apply_migrations=False
+            )
+    finally:
+        writer.release_process_lock()
+        writer.close()
+
+    assert not target.exists()
+
+    # And it succeeds once the writer lets go, so the guard is a gate not a wall.
+    restored = restore_backup(
+        archive, target, backup_key=BACKUP_KEY_BYTES, apply_migrations=False
+    )
+    try:
+        assert restored.workers_paused
+    finally:
+        restored.close()
+
+
+def test_the_volume_probe_cannot_collide_with_a_concurrent_one(tmp_path) -> None:
+    """A PID is reused, and two containers on one volume share the namespace.
+
+    The probe was named from `os.getpid()`, so two rollbacks racing on the same
+    volume could write, rename and unlink each other's file — and the loser
+    reads the wrong answer to "is this a copy", which decides whether the
+    install is refused for space.
+    """
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.mkdir()
+    destination.mkdir()
+    seen: set[str] = set()
+    real_rename = backup_module._rename_or_exdev
+
+    def record(probe, landed):
+        seen.add(probe.name)
+        return real_rename(probe, landed)
+
+    original = backup_module._rename_or_exdev
+    backup_module._rename_or_exdev = record
+    try:
+        for _ in range(5):
+            backup_module._is_a_copy(source, destination)
+    finally:
+        backup_module._rename_or_exdev = original
+
+    assert len(seen) == 5, f"probe names repeat across calls: {seen}"
+    assert all(name.startswith(".volume-probe-") for name in seen)
+    # And nothing is left behind on either side.
+    assert list(source.iterdir()) == []
+    assert list(destination.iterdir()) == []

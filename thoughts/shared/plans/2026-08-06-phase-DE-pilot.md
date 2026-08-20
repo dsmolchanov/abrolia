@@ -342,19 +342,30 @@ with `AGENTS.repo-invariants.md`.
 
 - Container entrypoint runs `python -m control_plane.db migrate --backup-first` — creates a timestamped `/data/control-plane.db.pre-migrate-<rev>.bak` before applying any new `control_plane/migrations/*.sql`; migration failure → container exits non-zero, no partial schema.
 
-**Rollback install.** Added 2026-08-20. The drill's rollback was a column of
-`mv` commands in `docs/control-plane-restore.md`, and three of its steps have a
-failure that does not announce itself: the install is a cross-filesystem COPY
-when the restore was staged off the volume (and renaming the superseded database
-aside frees no blocks, so it still ends in `ENOSPC`); a superseded `-wal` left at
-the canonical path is replayed into the restore; and the worker pause is a
-sibling file that does not travel with the database. `abrolia-control-plane
-install-rollback` performs the sequence with those checks attached — archiving
-the superseded database off-volume and reading that archive back before
-releasing its blocks, never deleting a copy that has not been shown to open.
-Prose cannot be executed by a test, which is why the previous check could only
-assert that `/tmp` appeared on the page while the documented procedure still
-failed.
+**Rollback install.** Added 2026-08-20, **revised the same day.** The drill's
+rollback was a column of `mv` commands in `docs/control-plane-restore.md`, and
+three of its steps have a failure that does not announce itself: the install is
+a cross-filesystem COPY when the restore was staged off the volume (and renaming
+the superseded database aside frees no blocks, so it still ends in `ENOSPC`); a
+superseded `-wal` left at the canonical path is replayed into the restore; and
+the worker pause is a sibling file that does not travel with the database. Prose
+cannot be executed by a test, which is why the previous check could only assert
+that `/tmp` appeared on the page while the documented procedure still failed.
+`abrolia-control-plane install-rollback` performs the sequence with those checks
+attached.
+
+It **refuses** the low-space case rather than resolving it. The first version
+archived the superseded database off-volume and deleted it to make room, which
+made a command an operator runs to move a file capable of destroying the only
+copy of every write taken after the migration — and it needed the backup key, a
+staging directory, capacity arithmetic and collision-free archive naming to do
+it. That surface produced nine review blockers over three rounds. Freeing space
+is a decision with data-loss consequences and belongs to whoever knows what else
+is on the machine, so the command checks before anything moves, reports the
+bytes needed and the bytes free, and leaves `/data` untouched. The runbook
+carries the manual procedure — archive off-volume, verify it restores, only then
+delete — and a test asserts that order, because a page documenting deletion
+before verification is worse than one documenting nothing.
 
 **Restore drill (reuse Phase B procedure):**
 

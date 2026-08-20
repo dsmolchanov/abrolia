@@ -328,6 +328,39 @@ def restore_backup(
     destination = Path(target)
     if destination.exists():
         raise FileExistsError(destination)
+    # Exclusive ownership of the path being written, for the same reason
+    # `install-rollback` takes it: publishing a database and its pause marker
+    # under a live writer means the two can interleave with whatever that writer
+    # is doing at the same path. Taken through `ControlPlaneDatabase`, which
+    # opens no connection until one is asked for, so this locks without touching
+    # SQLite — and held until the restore is complete and paused.
+    guard = ControlPlaneDatabase(destination)
+    try:
+        guard.acquire_process_lock()
+    except ProcessAlreadyRunning as error:
+        raise BackupError(
+            f"a control-plane writer already owns {destination};"
+            " stop it before restoring over that path"
+        ) from error
+    try:
+        return _restore_locked(
+            source,
+            destination,
+            backup_key=backup_key,
+            apply_migrations=apply_migrations,
+        )
+    finally:
+        guard.release_process_lock()
+        guard.close()
+
+
+def _restore_locked(
+    source: Path,
+    destination: Path,
+    *,
+    backup_key: bytes,
+    apply_migrations: bool,
+) -> ControlPlaneDatabase:
     # Streamed, not buffered. Holding the payload, a ciphertext slice, the
     # decrypted bytes and a copy of them meant a ~125 MiB archive could OOM the
     # 512 MiB Machine — taking down the rollback procedure precisely for the
@@ -733,12 +766,17 @@ def _is_a_copy(source: Path, destination: Path) -> bool:
     to matter: bind mounts and overlays can share a device number across what
     are, for renaming purposes, different filesystems.
     """
-    probe = source / f".volume-probe-{os.getpid()}"
-    landed = destination / probe.name
+    # A PID is not unique enough to name a temporary file with: it is reused,
+    # and two containers on one volume share the namespace. `mkstemp` gets the
+    # name from the kernel with O_EXCL, so the probe cannot collide with — or be
+    # clobbered by — a concurrent one.
     try:
-        probe.write_bytes(b"")
+        handle, name = tempfile.mkstemp(prefix=".volume-probe-", dir=source)
     except OSError:
         return True
+    os.close(handle)
+    probe = Path(name)
+    landed = destination / probe.name
     try:
         return not _rename_or_exdev(probe, landed)
     finally:
