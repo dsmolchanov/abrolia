@@ -25,6 +25,8 @@ from control_plane.backup import (
     install_rollback,
     restore_backup,
 )
+from control_plane.cli import main as cli_main
+from control_plane.config import ConfigurationError
 from control_plane.db import ControlPlaneDatabase, main
 
 BACKUP_KEY_BYTES = b"pre-migrate-backup-key-32-bytes!"
@@ -887,15 +889,27 @@ def test_the_worker_pause_travels_with_the_restore(tmp_path, monkeypatch) -> Non
         installed.close()
 
 
-def test_a_restore_with_no_pause_marker_is_reported_not_silently_installed(
+def test_a_restore_with_no_pause_marker_is_refused_before_anything_moves(
     tmp_path, monkeypatch
 ) -> None:
+    """Refused in the preflight, not discovered halfway through.
+
+    This check used to run after the install, so the live database had already
+    been renamed aside and the invalid candidate was already at the canonical
+    path by the time it fired — leaving an operator mid-rollback with neither a
+    working database nor an obvious way back. The marker is written by
+    `restore`, so its absence means the candidate did not come from one, which
+    is knowable before anything is touched.
+    """
     volume, target, restored = _rollback_fixture(tmp_path)
     restored.with_name(f"{restored.name}.workers-paused").unlink()
     _constrain(monkeypatch, volume, capacity=target.stat().st_size * 10)
+    before = _fingerprint(volume)
 
-    with pytest.raises(RollbackError, match="worker pause did not travel"):
+    with pytest.raises(RollbackError, match="has no worker pause"):
         install_rollback(restored, target, backup_key=BACKUP_KEY_BYTES, now=1800000042)
+
+    assert _fingerprint(volume) == before, "the volume was modified by a refused install"
 
 
 def test_nothing_is_deleted_when_the_superseded_archive_will_not_open(
@@ -940,3 +954,244 @@ def test_archiving_onto_the_volume_being_freed_is_refused(tmp_path, monkeypatch)
             superseded_to=volume,
             now=1800000042,
         )
+
+
+def _fingerprint(directory: Path) -> dict[str, bytes]:
+    """Every file under `directory`, by name and content."""
+    return {
+        path.name: path.read_bytes()
+        for path in sorted(directory.iterdir())
+        if path.is_file()
+    }
+
+
+@pytest.mark.parametrize(
+    ("damage", "message"),
+    [
+        pytest.param(
+            lambda volume, target, restored: restored.write_bytes(b"not a database"),
+            "not a valid SQLite|does not open as SQLite|integrity check",
+            id="not-sqlite",
+        ),
+        pytest.param(
+            lambda volume, target, restored: restored.write_bytes(
+                restored.read_bytes()[: len(restored.read_bytes()) // 2]
+            ),
+            "not a valid SQLite|does not open as SQLite|integrity check",
+            id="truncated",
+        ),
+        pytest.param(
+            lambda volume, target, restored: (
+                target.unlink(),
+                target.mkdir(),
+            ),
+            "not a regular file",
+            id="directory-target",
+        ),
+    ],
+)
+def test_an_invalid_rollback_bundle_leaves_the_volume_untouched(
+    tmp_path, monkeypatch, damage, message
+) -> None:
+    """Everything decidable in advance is decided before the live data moves.
+
+    The first version checked that `--restored` was a regular file and that the
+    target existed, then started renaming. A truncated file, a non-database, or
+    a directory target therefore reached the rename loop, and the operator found
+    out only once the live database was already aside.
+    """
+    volume, target, restored = _rollback_fixture(tmp_path)
+    _constrain(monkeypatch, volume, capacity=target.stat().st_size * 10)
+    damage(volume, target, restored)
+    before = _fingerprint(volume)
+
+    with pytest.raises(RollbackError, match=message):
+        install_rollback(restored, target, backup_key=BACKUP_KEY_BYTES, now=1800000042)
+
+    assert _fingerprint(volume) == before, "a refused install modified the volume"
+
+
+def test_installing_a_database_over_itself_is_refused(tmp_path, monkeypatch) -> None:
+    """`--restored` equal to `--target` would supersede the file being installed."""
+    volume, target, _restored = _rollback_fixture(tmp_path)
+    _constrain(monkeypatch, volume, capacity=target.stat().st_size * 10)
+    before = _fingerprint(volume)
+
+    with pytest.raises(RollbackError, match="same file"):
+        install_rollback(target, target, backup_key=BACKUP_KEY_BYTES, now=1800000042)
+
+    assert _fingerprint(volume) == before
+
+
+def test_the_preflight_leaves_no_sidecars_beside_the_restore(
+    tmp_path, monkeypatch
+) -> None:
+    """Read-only is not side-effect free, and the check must not forge evidence.
+
+    Opening a WAL database with `mode=ro` creates BOTH `-wal` and `-shm` and
+    leaves them after close. The integrity check therefore manufactured sidecars
+    beside the restored database, which the install loop then copied to the
+    canonical path — a validation step fabricating the exact artifact the
+    install exists to keep straight.
+    """
+    volume, target, restored = _rollback_fixture(tmp_path)
+    staging = restored.parent
+    assert not list(staging.glob("*-wal")), "the fixture already has a WAL"
+    _constrain(monkeypatch, volume, capacity=target.stat().st_size * 10)
+
+    install_rollback(restored, target, backup_key=BACKUP_KEY_BYTES, now=1800000042)
+
+    assert not (volume / "control-plane.db-wal").exists()
+    assert not (volume / "control-plane.db-shm").exists()
+
+
+def test_a_superseded_name_collision_never_overwrites_the_earlier_copy(
+    tmp_path, monkeypatch
+) -> None:
+    """`Path.rename` replaces an existing file on POSIX, silently.
+
+    The superseded name is second-resolution, so a retried install inside the
+    same second — or a caller passing a fixed `now`, or a clock that steps back —
+    renamed the live database straight over the previous attempt's recovery
+    copy. The whole bundle moves as one generation, so a name is only taken when
+    every member of it is free.
+    """
+    volume, target, restored = _rollback_fixture(tmp_path)
+    _constrain(monkeypatch, volume, capacity=target.stat().st_size * 10)
+    earlier = {
+        volume / "control-plane.db.superseded-1800000042": b"the-earlier-database",
+        volume / "control-plane.db.superseded-1800000042-wal": b"the-earlier-wal",
+        volume / "control-plane.db.superseded-1800000042.workers-paused": b"paused\n",
+    }
+    for path, sentinel in earlier.items():
+        path.write_bytes(sentinel)
+
+    report = install_rollback(
+        restored, target, backup_key=BACKUP_KEY_BYTES, now=1800000042
+    )
+
+    for path, sentinel in earlier.items():
+        assert path.read_bytes() == sentinel, f"{path.name} was overwritten"
+    kept = Path(str(report["superseded_kept_as"]))
+    assert kept not in earlier
+    assert "migrated_only" in _tables(kept), "this generation was not preserved either"
+
+
+def test_a_running_writer_stops_the_install(tmp_path, monkeypatch) -> None:
+    """Renaming a database out from under a live connection fails silently.
+
+    The process keeps its descriptors on the superseded inode, so its writes
+    land in a file nothing will read again, and it can recreate stale sidecars
+    at the canonical path beside the installed rollback. The command documented
+    "with the service stopped" and then trusted it.
+
+    The lock is taken through `ControlPlaneDatabase.acquire_process_lock`, the
+    same call `serve` uses, so the two cannot disagree about which file it is.
+    """
+    volume, target, restored = _rollback_fixture(tmp_path)
+    _constrain(monkeypatch, volume, capacity=target.stat().st_size * 10)
+    before = _fingerprint(volume)
+
+    writer = ControlPlaneDatabase(target)
+    writer.acquire_process_lock()
+    try:
+        with pytest.raises(RollbackError, match="writer still owns"):
+            install_rollback(
+                restored, target, backup_key=BACKUP_KEY_BYTES, now=1800000042
+            )
+    finally:
+        writer.release_process_lock()
+        writer.close()
+
+    installed = {name: body for name, body in _fingerprint(volume).items()
+                 if not name.endswith(".writer.lock")}
+    assert installed == {name: body for name, body in before.items()
+                         if not name.endswith(".writer.lock")}
+
+    # And it succeeds once the writer lets go, so the guard is a gate rather
+    # than a wall.
+    install_rollback(restored, target, backup_key=BACKUP_KEY_BYTES, now=1800000042)
+    assert "migrated_only" not in _tables(target)
+
+
+def test_restoring_leaves_no_orphaned_sidecars_behind(tmp_path) -> None:
+    """`with sqlite3.connect(...)` commits; it does not close.
+
+    The integrity check's connection stayed open, so its `-wal` and `-shm`
+    remained under the TEMPORARY name that publication then renamed away from.
+    Every restore left two orphans on the volume — on the 1 GiB volume whose
+    exhaustion is the reason this rollback path exists at all.
+    """
+    database = _database(tmp_path)
+    database.migrate()
+    archive = tmp_path / "control-plane.cpb"
+    create_backup(database, archive, backup_key=BACKUP_KEY_BYTES)
+    database.close()
+
+    destination = tmp_path / "restored"
+    destination.mkdir()
+    restored = restore_backup(
+        archive,
+        destination / "control-plane.db",
+        backup_key=BACKUP_KEY_BYTES,
+        apply_migrations=False,
+    )
+    restored.close()
+
+    leftovers = sorted(
+        path.name
+        for path in destination.iterdir()
+        if path.name.startswith(".") or path.name.endswith(("-wal", "-shm"))
+    )
+    assert leftovers == [], f"restore left {leftovers} on the volume"
+
+
+def test_recovery_needs_only_the_backup_key(tmp_path, monkeypatch, capsys) -> None:
+    """Rollback must not require the deployment it is rolling back to be intact.
+
+    Both commands read the key through `ControlPlaneConfig.from_env`, which
+    validates the WHOLE application — field encryption, both HMAC keys, and
+    under the checked-in `fly-runtime` configuration the Fly token,
+    organization, image digest and bootstrap host. A single missing or invalid
+    unrelated secret therefore withdrew the documented two-command rollback,
+    with a perfectly good archive and a perfectly good key in hand, in exactly
+    the broken state the procedure exists for.
+
+    So: nothing in the environment but the backup key and the file arguments.
+    """
+    for name in list(os.environ):
+        if name.startswith("ABROLIA_") or name.startswith("FLY_"):
+            monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("ABROLIA_CONTROL_PLANE_BACKUP_KEY", BACKUP_KEY)
+
+    volume = tmp_path / "data"
+    volume.mkdir()
+    target = volume / "control-plane.db"
+    database = ControlPlaneDatabase(target)
+    database.migrate()
+    archive = tmp_path / "control-plane.db.pre-migrate-0008-1800000000.bak"
+    create_backup(database, archive, backup_key=BACKUP_KEY_BYTES)
+    database.close()
+
+    staged = tmp_path / "control-plane-rollback.db"
+    assert cli_main(["restore", str(archive), "--target", str(staged), "--no-migrate"]) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "restored"
+
+    assert cli_main([
+        "install-rollback",
+        "--restored", str(staged),
+        "--target", str(target),
+    ]) == 0
+    assert json.loads(capsys.readouterr().out)["workers"] == "paused"
+    assert target.exists()
+
+
+def test_a_recovery_command_still_refuses_a_missing_backup_key(
+    tmp_path, monkeypatch
+) -> None:
+    """Fewer requirements, not none: the key itself is still mandatory."""
+    monkeypatch.delenv("ABROLIA_CONTROL_PLANE_BACKUP_KEY", raising=False)
+    with pytest.raises(ConfigurationError, match="BACKUP_KEY is required"):
+        cli_main([
+            "restore", str(tmp_path / "nothing.cpb"), "--target", str(tmp_path / "t.db")
+        ])

@@ -144,6 +144,22 @@ steps have a failure that does not announce itself:
   resumes the workers against data nobody has reconciled. The command installs
   the marker and fails if it did not arrive.
 
+It refuses before touching anything if a control-plane writer still holds
+`/data/control-plane.db.writer.lock` — the same lock `serve` takes. Renaming a
+database and its sidecars out from under a live SQLite connection does not fail
+loudly; the process keeps its descriptors on the superseded inode and its writes
+land in a file nothing will read again. **Stop the service first.**
+
+It also validates the candidate before the live database moves: distinct paths,
+a regular-file target, a restore that opens as SQLite and passes
+`integrity_check` and `foreign_key_check`, and a worker pause marker beside it.
+A bundle that cannot be installed is refused with `/data` exactly as it was.
+
+Both `restore` and `install-rollback` read `ABROLIA_CONTROL_PLANE_BACKUP_KEY`
+and nothing else. They do not need the field-encryption keys, the HMAC keys, or
+any Fly setting — recovery must not require the deployment it is recovering to
+be intact.
+
 It prints what it did, including where the superseded database ended up:
 
 ```json

@@ -14,7 +14,7 @@ import uvicorn
 from control_plane.api.app import create_app
 from control_plane.auth.mailer import ConsoleMailer, Mailer
 from control_plane.backup import create_backup, install_rollback, restore_backup
-from control_plane.config import ControlPlaneConfig
+from control_plane.config import ControlPlaneConfig, backup_key_from_env
 from control_plane.container import ControlPlaneContainer
 from control_plane.observability import StructuredLogger
 
@@ -168,11 +168,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "serve":
         return _serve(args)
     if args.command == "restore":
-        config = ControlPlaneConfig.from_env()
+        # `backup_key_from_env`, NOT `ControlPlaneConfig.from_env`. Recovery
+        # must not require the rest of the deployment to be intact: reading the
+        # key through the full config made this refuse to run when any unrelated
+        # secret was missing, which withdrew the rollback path in precisely the
+        # state it exists for.
         restored = restore_backup(
             args.archive,
             args.target,
-            backup_key=config.backup_key,
+            backup_key=backup_key_from_env(),
             apply_migrations=not args.no_migrate,
         )
         restored.close()
@@ -183,15 +187,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         }, sort_keys=True))
         return 0
     if args.command == "install-rollback":
-        config = ControlPlaneConfig.from_env()
-        # No container and no database handle: this command runs with the
-        # service stopped, and opening the target would create WAL sidecars on
-        # the very volume it is trying to free.
+        # No container: this command runs with the service stopped, and building
+        # one would open the target and create WAL sidecars on the very volume
+        # it is trying to free. Same recovery-only key as `restore`, for the
+        # same reason — the two are one documented procedure and must have the
+        # same preconditions.
         print(json.dumps(
             install_rollback(
                 args.restored,
                 args.target,
-                backup_key=config.backup_key,
+                backup_key=backup_key_from_env(),
                 superseded_to=args.superseded_to,
             ),
             sort_keys=True,

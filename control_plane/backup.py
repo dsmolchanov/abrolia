@@ -14,7 +14,7 @@ from pathlib import Path
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
-from control_plane.db import ControlPlaneDatabase
+from control_plane.db import ControlPlaneDatabase, ProcessAlreadyRunning
 
 TAG_BYTES = 16
 SCRATCH_DIR_ENV = "ABROLIA_BACKUP_SCRATCH_DIR"
@@ -355,17 +355,26 @@ def restore_backup(
                 output.flush()
                 os.fsync(output.fileno())
         os.chmod(temporary, 0o600)
+        # `with sqlite3.connect(...)` commits; it does NOT close. The connection
+        # stayed open and its `-wal`/`-shm` stayed on disk under the TEMPORARY
+        # name, which the publication below then renamed away from — leaving two
+        # orphaned sidecars per restore on the volume whose exhaustion this
+        # module exists to survive. Close it, and take its sidecars with it.
+        connection = sqlite3.connect(temporary)
         try:
-            with sqlite3.connect(temporary) as connection:
-                integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
-                if integrity != "ok":
-                    raise BackupError("restored SQLite integrity check failed")
-                connection.execute("PRAGMA foreign_keys=ON")
-                violations = connection.execute("PRAGMA foreign_key_check").fetchall()
-                if violations:
-                    raise BackupError("restored SQLite foreign-key check failed")
+            integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
+            if integrity != "ok":
+                raise BackupError("restored SQLite integrity check failed")
+            connection.execute("PRAGMA foreign_keys=ON")
+            violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+            if violations:
+                raise BackupError("restored SQLite foreign-key check failed")
         except sqlite3.DatabaseError as error:
             raise BackupError("restored payload is not a valid SQLite database") from error
+        finally:
+            connection.close()
+            for sidecar in _sidecars(temporary):
+                sidecar.unlink(missing_ok=True)
         _publish(temporary, destination)
         temporary = None
         restored = ControlPlaneDatabase(destination)
@@ -476,6 +485,104 @@ def _is_off_volume(staging: Path, volume: Path) -> bool:
         landed.unlink(missing_ok=True)
 
 
+def _readable_sqlite(path: Path) -> None:
+    """Refuse a candidate that is not a database, and leave it exactly as found.
+
+    Read-only is not side-effect free. Opening a WAL database with `mode=ro`
+    creates BOTH `-wal` and `-shm` and leaves them after close — measured, not
+    assumed. The first version of this check therefore fabricated sidecars
+    beside the restored database, which the install loop then dutifully copied
+    to the canonical path: a check that manufactured the very artifact the
+    install exists to keep straight. Anything this opens that was not here
+    before goes away again.
+
+    The URI is built from `as_uri()` rather than interpolated, so a database
+    path containing `?` or `#` cannot have its remainder parsed as URI syntax —
+    which would drop `mode=ro` and reopen the file read-WRITE.
+    """
+    absolute = path.resolve()
+    before = {sidecar for sidecar in _sidecars(path) if sidecar.exists()}
+    try:
+        connection = sqlite3.connect(f"{absolute.as_uri()}?mode=ro", uri=True)
+    except sqlite3.Error as error:
+        raise RollbackError(f"{path} does not open as SQLite: {error}") from error
+    try:
+        integrity = connection.execute("PRAGMA integrity_check").fetchone()
+        if integrity is None or integrity[0] != "ok":
+            raise RollbackError(f"{path} fails its SQLite integrity check")
+        connection.execute("PRAGMA foreign_keys=ON")
+        if connection.execute("PRAGMA foreign_key_check").fetchall():
+            raise RollbackError(f"{path} fails its SQLite foreign-key check")
+    except sqlite3.DatabaseError as error:
+        raise RollbackError(f"{path} is not a valid SQLite database") from error
+    finally:
+        connection.close()
+        for sidecar in _sidecars(path):
+            if sidecar not in before:
+                sidecar.unlink(missing_ok=True)
+
+
+def _reserve_aside(target: Path, stamp: int) -> str:
+    """A superseded-bundle name that no existing file answers to.
+
+    `Path.rename` REPLACES an existing regular file on POSIX, silently. The name
+    is second-resolution, so a retried install within the same second — or a
+    caller passing a fixed `now`, or a clock that steps back — would rename the
+    live database over the previous attempt's superseded copy and destroy the
+    recovery point it was keeping. The whole bundle has to move as one
+    generation, so the name is reserved only when EVERY member of it is free.
+    """
+    base = f"{target.name}.superseded-{stamp}"
+    for suffix in ("", *(f"-{index}" for index in range(1, 100))):
+        candidate = f"{base}{suffix}"
+        bundle = (
+            target.with_name(candidate),
+            *(target.with_name(f"{candidate}{s}") for s in SIDECAR_SUFFIXES),
+            target.with_name(f"{candidate}.workers-paused"),
+        )
+        if not any(path.exists() for path in bundle):
+            return candidate
+    raise RollbackError(
+        f"every superseded name for {target.name} at {stamp} is taken;"
+        " move the earlier copies aside before retrying"
+    )
+
+
+def _preflight(restored: Path, target: Path) -> None:
+    """Everything that can be known before the live database is touched.
+
+    The first version checked `restored.is_file()` and `target.exists()` and
+    then started renaming, so a bundle that could never be installed — a
+    truncated file, a directory, a restore with no worker pause — was discovered
+    only after the live database had been moved aside and, in the pause-marker
+    case, after the invalid candidate was already at the canonical path. An
+    operator mid-rollback then had neither a working database nor an obvious way
+    back. Everything decidable in advance is decided in advance; the checks
+    after the install stay as defence in depth.
+    """
+    if not restored.is_file():
+        raise RollbackError(f"no restored database at {restored}")
+    if not target.exists():
+        raise RollbackError(f"nothing to supersede at {target}")
+    if not target.is_file():
+        raise RollbackError(f"{target} is not a regular file")
+    if restored.resolve() == target.resolve():
+        raise RollbackError(
+            f"{restored} and {target} are the same file; there is nothing to install"
+        )
+    marker = _pause_marker(restored)
+    if not marker.exists():
+        # Checked HERE rather than after the install. `restore` writes this
+        # marker, so its absence means the candidate did not come from a
+        # restore — and installing it would resume workers on a database nobody
+        # reconciled, which is the failure the marker exists to prevent.
+        raise RollbackError(
+            f"{restored} has no worker pause at {marker};"
+            " restore it with `abrolia-control-plane restore` rather than by hand"
+        )
+    _readable_sqlite(restored)
+
+
 def install_rollback(
     restored: Path | str,
     target: Path | str,
@@ -518,14 +625,52 @@ def install_rollback(
     data-loss problem.
     """
     restored_path, target_path = Path(restored), Path(target)
-    if not restored_path.is_file():
-        raise RollbackError(f"no restored database at {restored_path}")
-    if not target_path.exists():
-        raise RollbackError(f"nothing to supersede at {target_path}")
+    _preflight(restored_path, target_path)
 
+    # Take the writer lock for the whole install, and take it the same way
+    # `serve` does so the two cannot disagree about which file is the lock.
+    #
+    # The command is documented as running with the service stopped, and it
+    # asserted that rather than checking it. Renaming the database, `-wal` and
+    # `-shm` out from under a live SQLite connection does not fail loudly: the
+    # process keeps its file descriptors on the superseded inode, so subsequent
+    # writes land in a file nothing will read again, and it can recreate stale
+    # sidecars at the canonical path beside the installed rollback.
+    #
+    # `ControlPlaneDatabase` opens no connection until one is asked for, so this
+    # takes the lock without touching SQLite.
+    guard = ControlPlaneDatabase(target_path)
+    try:
+        guard.acquire_process_lock()
+    except ProcessAlreadyRunning as error:
+        raise RollbackError(
+            f"a control-plane writer still owns {target_path};"
+            " stop the service before installing a rollback"
+        ) from error
+    try:
+        return _install_rollback_locked(
+            restored_path,
+            target_path,
+            backup_key=backup_key,
+            superseded_to=superseded_to,
+            now=now,
+        )
+    finally:
+        guard.release_process_lock()
+        guard.close()
+
+
+def _install_rollback_locked(
+    restored_path: Path,
+    target_path: Path,
+    *,
+    backup_key: bytes,
+    superseded_to: Path | str | None,
+    now: float | None,
+) -> dict[str, object]:
     stamp = int(time.time() if now is None else now)
     volume = target_path.parent
-    aside = f"{target_path.name}.superseded-{stamp}"
+    aside = _reserve_aside(target_path, stamp)
     superseded = (target_path, *_sidecars(target_path), _pause_marker(target_path))
     report: dict[str, object] = {"target": str(target_path)}
 
