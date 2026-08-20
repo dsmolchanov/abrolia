@@ -271,6 +271,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     except (binascii.Error, ValueError, TypeError):
         backup_key = b""
+    # Exclusive ownership for the whole step, taken BEFORE the pending check so
+    # nothing is decided — let alone archived — while another writer is live.
+    #
+    # Overlapping a running `serve` breaks the snapshot's only promise: an
+    # application write can commit AFTER the archive is taken and BEFORE the
+    # migration, so the restore point silently omits committed data, and the old
+    # process then carries on against the upgraded schema. The legacy CLI has
+    # always taken this lock; the entrypoint that actually runs in the container
+    # did not.
+    try:
+        database.acquire_process_lock()
+    except ProcessAlreadyRunning as error:
+        print(f"pre-migrate backup refused: {error}", file=sys.stderr)
+        database.close()
+        return 1
     try:
         backup: Path | None = None
         if args.backup_first:
@@ -293,6 +308,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ))
         return 0
     finally:
+        database.release_process_lock()
         database.close()
 
 

@@ -28,6 +28,11 @@ SQLite, and logs.
 
 ## Backup before migrate (migrate-on-start)
 
+The container entrypoint runs the migration step before `serve`. It takes the
+same writer lock `serve` takes and refuses if another process holds it: a
+snapshot that overlaps a live writer can miss a commit that lands between the
+archive and the migration, leaving a restore point that silently omits data.
+
 The container entrypoint runs the migration step before `serve`:
 
 ```bash
@@ -150,10 +155,19 @@ database and its sidecars out from under a live SQLite connection does not fail
 loudly; the process keeps its descriptors on the superseded inode and its writes
 land in a file nothing will read again. **Stop the service first.**
 
-It also validates the candidate before the live database moves: distinct paths,
-a regular-file target, a restore that opens as SQLite and passes
-`integrity_check` and `foreign_key_check`, and a worker pause marker beside it.
-A bundle that cannot be installed is refused with `/data` exactly as it was.
+It also validates everything before the live database moves: that the candidate
+and the target are genuinely different files (by inode, so a hard link cannot
+pass as a rollback), that the target is a regular file, that the restore opens
+as SQLite and passes `integrity_check` and `foreign_key_check`, that a worker
+pause marker sits beside it — and, when the install will need to free space,
+that `--superseded-to` exists, is writable, is off the volume, and has no
+archive already under the name this run would take. A bundle that cannot be
+installed is refused with `/data` exactly as it was, so the obvious retry works.
+
+The space it reserves covers the whole bundle — database, sidecars **and** the
+pause marker — in allocated blocks. A gate that only covered the database could
+pass, copy the database, and then fail on the marker, leaving a restored
+database at the canonical path with nothing pausing the workers.
 
 Both `restore` and `install-rollback` read `ABROLIA_CONTROL_PLANE_BACKUP_KEY`
 and nothing else. They do not need the field-encryption keys, the HMAC keys, or
