@@ -146,27 +146,52 @@ logs. Start the service again, open the link, and verify that a replay fails.
 
 ### Pre-onboarding rehearsal (`--dry-run`)
 
-Before every pilot onboarding, rehearse it. The command reports the config
-revision and runtime job the onboarding will actually provision — both read from
-durable state, because the worker issues them when the primary step verifies —
-then rehearses one planning pass inside a write transaction to enumerate the
-tables such a transaction touches, and rolls that rehearsal back. No provider is
-called and no row is committed; if a commit is ever observed the command exits
-non-zero instead of printing a report.
+Before every pilot onboarding, rehearse it. **What the command reports depends
+on the state the household is in**, and that is deliberate — the earlier
+promise of "the exact writes" was false for several ordinary states, and a
+report that claims precision it does not have is worse than one that says so.
 
 ```bash
 python -m control_plane.onboarding.provision --dry-run --household <household-uuid>
 ```
 
-It reports the workflow state and per-step statuses, the issued
-`config_revision` with its status and manifest SHA-256, the pending
-`ensure_runtime` job and its `desired_revision`, the deterministic Fly
-app/volume/Machine names, and the secret **names** involved —
-`HERMES_BOOTSTRAP_TOKEN` and `HERMES_RUNTIME_DSAR_TOKEN` plus any recorded email
-secret installs (values never leave the sink). When a step is not yet verified,
-`blocked_by` and `unverified_steps` say exactly what is missing instead of a
-plan. The command refuses to run without `--dry-run`; it takes no process lock,
-so it is safe while the API serves.
+It never calls a provider and never commits a row; if a commit is ever observed
+it exits non-zero instead of printing a report. It refuses to run without
+`--dry-run`, and takes no process lock, so it is safe while the API serves. It
+rehearses against a read-only snapshot of the database rather than the live
+file, which is what makes "mutates nothing" structural rather than a list of
+closed holes.
+
+Always reported: the workflow state and per-step statuses, and — when a step is
+not yet verified — `blocked_by` and `unverified_steps` naming exactly what is
+missing.
+
+`operation_pending` says whether an operation is pending at all. **When it is
+false, `table_writes`, `runtime_resources` and `secrets` are empty**, because
+they describe the pending operation and there is not one. Read `rehearsal` for
+which case you are in:
+
+| State | What is reported |
+|---|---|
+| Before a revision is issued | A planning pass is rehearsed inside a write transaction and rolled back; `table_writes` is the set of tables it touched. |
+| A revision is issued with a pending runtime job | No planning pass happens — it already did. `table_writes` is the **success path** of the pending runtime operation: an upper bound, not a prediction. A provider that rate-limits, rejects or times out writes a subset. |
+| The runtime job is `outcome_unknown`, or `running` with an expired lease | The next operation is a reconcile whose write set depends on a provider inspection this command does not perform. No write set is claimed. Use `abrolia-control-plane reconcile <job-id>`. |
+| The runtime job settled and the household is `activating` | Nothing is pending here; the next writes belong to bootstrap activation, which this command does not model. |
+| The runtime job `failed` or was `cancelled` | A terminal state needing intervention. `blocked_by` says so; no write set is claimed. |
+| The workflow is `complete` | Onboarding is done. There is no pending operation. |
+| The workflow is `cancelled` | Verified step results survive a cancellation, so the steps describe what *was* done. Nothing will resume; start a new workflow. |
+
+`runtime_resources` comes from the **configured** runtime provider, not from Fly
+unconditionally. Under `ABROLIA_RUNTIME_PROVIDER=fly-runtime` it is the
+deterministic Fly app, volume and Machine names; under the default
+`dry-run-runtime` it is the single `synthetic-runtime:<household-id>` reference
+that provider actually creates. A provider that cannot say is reported as
+unable to say rather than guessed at.
+
+`secrets` gives **names** only, never values: `HERMES_BOOTSTRAP_TOKEN` and
+`HERMES_RUNTIME_DSAR_TOKEN`, plus any email secret binding that is currently
+live. A retained install receipt whose identity has since been reset is audit
+history, not a live binding, and is not listed.
 
 Complete profile preflight with an IANA timezone, then the three choices in
 order. The default synthetic path is managed `@abrolia.com`, shared WhatsApp

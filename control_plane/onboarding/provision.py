@@ -24,7 +24,7 @@ from typing import Any
 from control_plane.config import ControlPlaneConfig
 from control_plane.container import ControlPlaneContainer
 from control_plane.db import MIGRATIONS_DIR
-from control_plane.models import USER_STEPS
+from control_plane.models import USER_STEPS, WorkflowState
 from control_plane.provisioning.fly import FlyRuntimeProvisioner
 
 # Both are installed into the runtime sink by ProvisioningWorker._finish_runtime;
@@ -138,6 +138,12 @@ class ProvisionPlan:
     #: What, if anything, this run rehearsed — so `table_writes` is never
     #: read as the write set of an operation that was not rehearsed.
     rehearsal: str = ""
+    #: True only while some operation is actually pending. Every future-tense
+    #: field — `table_writes`, `runtime_resources`, `secrets` — belongs to THAT
+    #: operation, so when there is none they are empty rather than describing
+    #: work nobody is going to do. Reported so a consumer can tell the two
+    #: apart without parsing the `rehearsal` prose.
+    operation_pending: bool = True
     uncommitted_revision_delta: int = 0
     committed: bool = False
 
@@ -252,30 +258,58 @@ def _secret_names(
             "lifecycle": "installed with the bootstrap token, kept for runtime DSAR",
         },
     ]
-    # Live bindings only. The receipt is an audit record and is RETAINED when
-    # the binding is deleted — `_delete_email_cleanup_secret` removes the secret
-    # from the sink and deliberately leaves the row — so an unfiltered query
-    # reported a deleted credential as "already installed", and after a provider
-    # change reported the obsolete name alongside the current one. That is a
-    # false credential plan for the operator.
+    # Live bindings only, correlated to the identity that holds them.
     #
-    # Filtered by joining to the job that installed it: a receipt counts only
-    # while its job is neither cancelled nor superseded and its email identity
-    # is still one that holds credentials. The receipt itself is never erased —
-    # shaping a report is not a reason to destroy an audit trail.
-    installed = container.database.query(
-        "SELECT s.secret_name, s.namespace_ref FROM email_secret_installs s"
+    # The receipt is an audit record and is RETAINED when the binding is
+    # deleted: `_delete_email_cleanup_secret` removes the secret from the sink
+    # and deliberately leaves the row. An unfiltered query therefore reported a
+    # deleted credential as "already installed".
+    #
+    # The first fix correlated by HOUSEHOLD — "does this household still have an
+    # identity in a credential-holding state" — which is not the same question.
+    # After a real provider job installs a secret, `reset_from(email)` deletes
+    # that identity and its binding but leaves the succeeded job and its receipt
+    # alone; once a replacement identity reaches `verified`, the old job still
+    # passes `status NOT IN ('cancelled','failed')` and the UNRELATED new
+    # identity satisfies the `EXISTS`. Both names came back as installed. The
+    # test missed it because it made the old job `cancelled` by hand, which
+    # reset never does.
+    #
+    # So ask the question that was meant: does the identity this receipt was
+    # installed FOR still exist? The installing job's request carries
+    # `email_identity_id`, and reading it is a decrypt of a handful of rows on a
+    # report path — no schema change, and nothing written, which the no-mutation
+    # guarantee requires. The receipt is never erased; shaping a report is not a
+    # reason to destroy an audit trail.
+    live_identities = {
+        str(row["id"])
+        for row in container.database.query(
+            "SELECT id FROM email_identities WHERE household_id = ?"
+            " AND status IN ('verified','activating','active','needs_attention')",
+            (household_id,),
+        )
+    }
+    candidates = container.database.query(
+        "SELECT s.secret_name, s.namespace_ref, s.job_id FROM email_secret_installs s"
         " JOIN provisioning_jobs j ON j.id = s.job_id"
         " WHERE s.household_id = ?"
         " AND j.status NOT IN ('cancelled','failed')"
-        " AND EXISTS ("
-        "   SELECT 1 FROM email_identities e"
-        "   WHERE e.household_id = s.household_id"
-        "   AND e.status IN ('verified','activating','active','needs_attention')"
-        " )"
         " ORDER BY s.secret_name",
         (household_id,),
     )
+    installed = []
+    for row in candidates:
+        try:
+            request = container.jobs.request(row["job_id"])
+        except Exception:
+            # An unreadable request is not evidence of a live binding. Leaving
+            # it out under-reports; leaving it in tells an operator a credential
+            # is installed that may have been deleted, which is the failure this
+            # filter exists to prevent.
+            continue
+        identity_id = request.get("email_identity_id")
+        if isinstance(identity_id, str) and identity_id in live_identities:
+            installed.append(row)
     secrets.extend(
         {
             "name": row["secret_name"],
@@ -509,7 +543,28 @@ def plan_onboarding(
                 and settled_status == "succeeded"
                 and str(workflow["state"]) == "complete"
             )
+            # A terminal workflow has no next operation, and the planner does
+            # not know that. `cancel()` revokes the issued revision and cancels
+            # the queued job but leaves the verified step results intact, so a
+            # household cancelled after every step verified fell through to the
+            # planning branch below, successfully rehearsed a revision N+1 and
+            # reported no blocker at all — a ready-to-provision report for an
+            # onboarding that can never resume.
+            cancelled_workflow = str(workflow["state"]) == WorkflowState.CANCELLED.value
+            if cancelled_workflow:
+                plan.operation_pending = False
+                plan.rehearsal = (
+                    "the onboarding workflow is `cancelled`; there is no pending"
+                    " operation to rehearse. Verified step results survive a"
+                    " cancellation, so the steps above describe what WAS done,"
+                    " not work that will resume."
+                )
+                plan.blocked_by = (
+                    "the onboarding workflow is cancelled; start a new one"
+                    " rather than provisioning from this"
+                )
             if already_onboarded:
+                plan.operation_pending = False
                 plan.rehearsal = (
                     f"revision {issued['revision']} is active and onboarding is"
                     " complete; there is no pending operation to rehearse"
@@ -520,6 +575,7 @@ def plan_onboarding(
                 and settled_status in {"failed", "cancelled"}
             )
             if failed_runtime:
+                plan.operation_pending = False
                 plan.blocked_by = (
                     f"the runtime operation for revision {issued['revision']} is"
                     f" `{settled_status}`; onboarding cannot proceed until it is"
@@ -532,13 +588,23 @@ def plan_onboarding(
                     " No write set is claimed."
                 )
             if awaiting_activation:
+                plan.operation_pending = False
                 plan.rehearsal = (
                     f"revision {issued['revision']} is issued and its runtime"
                     " operation has settled; the household is waiting on"
                     " bootstrap activation, whose writes this command does not"
                     " model. Nothing is rehearsed and no write set is claimed."
                 )
-            if failed_runtime or awaiting_activation or already_onboarded:
+            # Every state that rehearses nothing skips the planning pass and
+            # reaches the same gate below. One decision, one place: the previous
+            # shape had the cancelled case return through a second mechanism, so
+            # "does this state advertise future work" was answered twice.
+            if (
+                cancelled_workflow
+                or failed_runtime
+                or awaiting_activation
+                or already_onboarded
+            ):
                 pass
             elif already_planned:
                 state = str(workflow["state"])
@@ -651,10 +717,25 @@ def plan_onboarding(
                     )
                 except KeyError:
                     spec = None
-            plan.runtime_resources = _runtime_resources(container, household_id, spec)
-            plan.secrets = _secret_names(
-                container, household_id, plan.runtime_resources
-            )
+            if plan.operation_pending:
+                plan.runtime_resources = _runtime_resources(
+                    container, household_id, spec
+                )
+                plan.secrets = _secret_names(
+                    container, household_id, plan.runtime_resources
+                )
+            else:
+                # These were assigned unconditionally, so a household that had
+                # just been told "there is no pending operation to rehearse"
+                # was handed, in the same report, a runtime reference to create
+                # and a bootstrap token to install — for a complete household
+                # whose token had already been cleaned up, or a fresh workflow
+                # blocked on email with an empty secret target. An operator
+                # acting on that prepares or rotates credentials for work that
+                # does not exist. One flag decides it for every state, so the
+                # `rehearsal` sentence and the fields beneath it cannot
+                # contradict each other again.
+                plan.table_writes = []
             raise _DryRunRollback
     except _DryRunRollback:
         pass
@@ -733,7 +814,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"dry-run found no database at {live.database_path};"
                 " refusing rather than creating one"
             )
-        source = sqlite3.connect(f"file:{live.database_path}?mode=ro", uri=True)
+        # `as_uri()`, not interpolation. `ABROLIA_CONTROL_PLANE_DB` is a
+        # pathname, and `?` and `#` are legal in one: `/data/control?plane.db`
+        # interpolated here parses as the filename `/data/control` with
+        # `plane.db?mode=ro` as URI syntax. `mode=ro` is then not the parameter
+        # it looks like, so SQLite opens read-write-CREATE, creates
+        # `/data/control`, and the rehearsal backs up an empty database while
+        # the real one is never read. Percent-encoding closes both halves at
+        # once — the no-mutation guarantee and the "rehearse the right file"
+        # one. `resolve()` because `as_uri()` requires an absolute path.
+        source = sqlite3.connect(
+            f"{live.database_path.resolve().as_uri()}?mode=ro", uri=True
+        )
         try:
             snapshot = sqlite3.connect(rehearsal_path)
             try:

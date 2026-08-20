@@ -167,7 +167,21 @@ After `codex/phase-E-pilotization` merges, the system can onboard a pilot househ
 
 #### Step E1 — Durable 3-step onboarding machine
 
-**Files:** `control_plane/onboarding/state.py`, `control_plane/onboarding/provision.py`, `control_plane/onboarding/transitions.py`, `control_plane/migrations/0001_control_plane.sql` (if new columns needed), `docs/onboarding-runbook.md`.
+**Files:** `control_plane/onboarding/state.py`, `control_plane/onboarding/provision.py`, `control_plane/onboarding/transitions.py`, `control_plane/migrations/0001_control_plane.sql` (if new columns needed), `docs/onboarding-runbook.md`, `control_plane/container.py`, `control_plane/db.py`, `control_plane/provisioning/fakes.py`, `tests/control_plane/test_provision_dry_run.py`.
+
+**Scope corrected 2026-08-20**, on the same reading that corrected Step E9: an
+inventory listing only the modules a step was expected to touch cannot detect
+the ones it turned out to need, and a changed file outside the plan is a
+blocker under the repository rules. Four were missing rather than unnecessary:
+
+- `control_plane/container.py` and `control_plane/db.py` — `apply_migrations`
+  and `preserve_journal_mode`, the two flags that let the rehearsal open a
+  database without migrating it or rewriting its journal mode. The dry-run's
+  no-mutation guarantee is enforced there, not in `provision.py`.
+- `control_plane/provisioning/fakes.py` — the `plan` method by which a provider
+  states what it will create, so the report describes the CONFIGURED provider
+  rather than assuming Fly.
+- `tests/control_plane/test_provision_dry_run.py` — the step's own suite.
 
 **Durable 3-step machine:** `email → WhatsApp → primary`.
 
@@ -323,8 +337,24 @@ CREATE TABLE channel_bindings (
 
 ```bash
 python -m control_plane.onboarding.provision --dry-run --household <test-uuid> 2>&1 | head -n 80
-# expect: tables, config_revision diff, Fly resource names, secret names — no DB write
+# expect: no DB write, and a report matching the household's STATE.
+# `operation_pending` false => table_writes, runtime_resources and secrets are
+# empty, because they describe the pending operation and there is not one.
+# Otherwise: tables (the planning pass before a revision is issued; the SUCCESS
+# PATH of the pending runtime operation after; nothing at all when the next step
+# is a provider-dependent reconcile), resources from the CONFIGURED provider
+# (Fly names only under fly-runtime), and the names of currently live secrets.
 ```
+
+**Criterion amended 2026-08-20.** It originally read "listing exact writes" and
+"Fly resource names" unconditionally, and the runbook promised the same. Neither
+was true: a revision that is already issued means no planning pass runs, a
+provider-dependent reconcile has no knowable write set, the default
+`dry-run-runtime` provider creates no Fly resources, and a terminal or complete
+workflow has no pending operation to describe. An operator following the
+documented verification could reject correct output, or rely on precision the
+implementation deliberately does not claim. `docs/onboarding-runbook.md` now
+carries the state-by-state contract.
 
 - [ ] `channel_preferences` table exists; household-row primary/fallback; fallback is verified owner email not agent inbox; source-channel reply + permanent-failure fallback + `outcome_unknown` no-duplicate:
 

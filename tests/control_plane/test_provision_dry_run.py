@@ -8,6 +8,7 @@ import textwrap
 import threading
 import time
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -85,8 +86,11 @@ def _context(
     )
 
 
-def _household_with_profile(active: ControlPlaneContainer) -> str:
-    account = active.accounts.create_verified("dry-run@family.test", now=BASE_TIME)
+def _household_with_profile(
+    active: ControlPlaneContainer, *, email: str = "dry-run@family.test"
+) -> str:
+    """`email` is the account's unique key, so a second household needs its own."""
+    account = active.accounts.create_verified(email, now=BASE_TIME)
     household = active.households.create_for_owner(account.id, now=BASE_TIME)
     session = active.sessions.issue(account.id, now=BASE_TIME)
     _PRINCIPALS[household.id] = (account.id, session.id)
@@ -113,7 +117,15 @@ def _household_with_profile(active: ControlPlaneContainer) -> str:
     return household.id
 
 
-def _verify_all_steps(active: ControlPlaneContainer, household_id: str) -> None:
+def _verify_all_steps(
+    active: ControlPlaneContainer, household_id: str, *, label: str = "select"
+) -> None:
+    """`label` distinguishes a RECONNECT from a replay of the first attempt.
+
+    The request id is the idempotency key, so selecting the same step again with
+    the same id returns the earlier result and enqueues nothing — correct
+    behaviour, and it silently turns a reconnect into a no-op in a test.
+    """
     account_id, session_id = _PRINCIPALS[household_id]
     for index, (kind, selection) in enumerate((
         (StepKind.EMAIL, EMAIL_SELECTION),
@@ -127,7 +139,7 @@ def _verify_all_steps(active: ControlPlaneContainer, household_id: str) -> None:
             context=_context(
                 active,
                 household_id,
-                f"select-{index}",
+                f"{label}-{index}",
                 account_id=account_id,
                 session_id=session_id,
             ),
@@ -934,20 +946,13 @@ def test_the_rehearsal_snapshot_survives_a_concurrent_writer(
     seeded.close()
 
 
-def test_a_deleted_secret_binding_is_not_reported_as_installed(container) -> None:
-    """The receipt outlives the binding, by design.
+def _seed_receipt(container, household_id: str, name: str) -> str:
+    """Attach a receipt to the household's newest email job.
 
-    `_delete_email_cleanup_secret` removes the secret from the sink and
-    deliberately RETAINS its `email_secret_installs` row as an audit record. An
-    unfiltered query then labels a deleted credential "already installed", and
-    after a provider change reports the obsolete name beside the current one —
-    a false credential plan for the operator.
-
-    The receipt is seeded directly: the synthetic provider never installs one,
-    so a fixture that onboards normally cannot exercise this at all.
+    Seeded rather than provisioned: the synthetic provider never installs a
+    secret, so a fixture that onboards normally cannot exercise this path at
+    all. The JOB and its request are real, which is what the correlation reads.
     """
-    household_id = _household_with_profile(container)
-    _verify_all_steps(container, household_id)
     job_id = container.database.query_one(
         "SELECT id FROM provisioning_jobs WHERE household_id = ?"
         " AND kind = 'email_identity' ORDER BY created_at DESC LIMIT 1",
@@ -957,31 +962,208 @@ def test_a_deleted_secret_binding_is_not_reported_as_installed(container) -> Non
         connection.execute(
             "INSERT INTO email_secret_installs (job_id, household_id, secret_name,"
             " namespace_ref, installed_at, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (job_id, household_id, "ABROLIA_NERVE_EMAIL_CREDENTIALS",
-             "synthetic-namespace", 1.0, 1.0),
+            (job_id, household_id, name, "synthetic-namespace", 1.0, 1.0),
         )
+    return job_id
 
-    reported = {
-        secret["name"] for secret in plan_onboarding(container, household_id).secrets
+
+def _reported_secrets(container, household_id: str) -> set[str]:
+    return {secret["name"] for secret in plan_onboarding(container, household_id).secrets}
+
+
+def test_only_the_current_identitys_binding_is_reported_as_installed(container) -> None:
+    """A retained receipt must not be attributed to a replacement identity.
+
+    The receipt outlives its binding by design: `_delete_email_cleanup_secret`
+    removes the secret from the sink and deliberately keeps the
+    `email_secret_installs` row as an audit record.
+
+    The previous filter correlated by HOUSEHOLD — "is there still an identity in
+    a credential-holding state" — which is a different question. Reset deletes
+    the identity and its binding but leaves the succeeded job and receipt alone,
+    so once a REPLACEMENT identity reaches verified, the old receipt's job is
+    still not cancelled and the unrelated new identity satisfies the check.
+    Both names came back as installed.
+
+    This drives the real path. Nothing is edited by hand — in particular the
+    succeeded job is left succeeded, which is what the previous test got wrong
+    by marking it `cancelled`, something reset never does.
+    """
+    household_id = _household_with_profile(container)
+    _verify_all_steps(container, household_id)
+    account_id, session_id = _PRINCIPALS[household_id]
+    first_job = _seed_receipt(container, household_id, "ABROLIA_NERVE_EMAIL_CREDENTIALS")
+    assert "ABROLIA_NERVE_EMAIL_CREDENTIALS" in _reported_secrets(container, household_id)
+
+    container.onboarding.reset_from(
+        household_id,
+        StepKind.EMAIL,
+        context=_context(
+            container, household_id, "reset", account_id=account_id,
+            session_id=session_id,
+        ),
+    )
+    for _ in range(10):
+        if container.worker.run_once() is None:
+            break
+    # The reset leaves the job that installed the secret alone. If a later
+    # change starts cancelling it, this test would pass for the wrong reason.
+    assert container.database.query_one(
+        "SELECT status FROM provisioning_jobs WHERE id = ?", (first_job,)
+    )["status"] == "succeeded"
+
+    # Reconnect: a replacement identity reaches verified with its own binding.
+    _verify_all_steps(container, household_id, label="reconnect")
+    second_job = _seed_receipt(container, household_id, "ABROLIA_NERVE_EMAIL_REPLACEMENT")
+    assert second_job != first_job
+
+    reported = _reported_secrets(container, household_id)
+
+    assert "ABROLIA_NERVE_EMAIL_REPLACEMENT" in reported, "the live binding is missing"
+    assert "ABROLIA_NERVE_EMAIL_CREDENTIALS" not in reported, (
+        "the superseded identity's binding is still reported as installed"
+    )
+    # And the audit trail is intact: the report is shaped by filtering, never by
+    # deleting a receipt.
+    retained = {
+        row["secret_name"]
+        for row in container.database.query(
+            "SELECT secret_name FROM email_secret_installs WHERE household_id = ?",
+            (household_id,),
+        )
     }
-    assert "ABROLIA_NERVE_EMAIL_CREDENTIALS" in reported, (
-        "a live binding must still be reported"
+    assert retained == {
+        "ABROLIA_NERVE_EMAIL_CREDENTIALS",
+        "ABROLIA_NERVE_EMAIL_REPLACEMENT",
+    }
+
+
+def test_a_cancelled_workflow_advertises_no_future_work(container) -> None:
+    """`cancel` leaves verified steps behind; the planner cannot tell.
+
+    Cancelling after every step verified revokes the issued revision and cancels
+    the queued job but keeps the step results, so the rehearsal fell through to
+    the planning branch, successfully rehearsed a revision N+1 and reported no
+    blocker — a ready-to-provision report for an onboarding that can never
+    resume.
+    """
+    household_id = _household_with_profile(container)
+    _verify_all_steps(container, household_id)
+    account_id, session_id = _PRINCIPALS[household_id]
+    container.onboarding.cancel(
+        household_id,
+        context=_context(
+            container, household_id, "cancel", account_id=account_id,
+            session_id=session_id,
+        ),
     )
 
-    # The cleanup path: the binding goes, the receipt stays.
-    with container.database.write() as connection:
-        connection.execute(
-            "UPDATE provisioning_jobs SET status = 'cancelled' WHERE id = ?",
-            (job_id,),
-        )
+    plan = plan_onboarding(container, household_id)
 
-    after = {
-        secret["name"] for secret in plan_onboarding(container, household_id).secrets
-    }
-    retained = container.database.query(
-        "SELECT secret_name FROM email_secret_installs WHERE household_id = ?",
-        (household_id,),
+    assert plan.operation_pending is False
+    assert plan.blocked_by is not None and "cancelled" in plan.blocked_by
+    assert plan.table_writes == []
+    assert plan.runtime_resources == []
+    assert plan.secrets == []
+    assert plan.uncommitted_revision_delta == 0, "a revision N+1 was rehearsed"
+    assert plan.committed is False
+
+
+def test_no_state_advertises_resources_it_is_not_rehearsing(container) -> None:
+    """`runtime_resources` and `secrets` were assigned unconditionally.
+
+    So a household told "there is no pending operation to rehearse" was handed,
+    in the same report, a runtime reference to create and a bootstrap token to
+    install — for a complete household whose token had already been cleaned up.
+    An operator acting on that prepares or rotates credentials for work that
+    does not exist.
+
+    One flag now decides it for every state, which is why this asserts the
+    property across states rather than patching the one that was reported.
+    """
+    # `awaiting_activation`: the runtime job has settled and the next writes
+    # belong to bootstrap activation, which this command does not model. It is
+    # the state Codex named — a household told nothing is pending while being
+    # handed a runtime reference to create and a bootstrap token to install,
+    # the latter already cleaned up.
+    household_id = _household_with_profile(container)
+    _verify_all_steps(container, household_id)
+    while container.worker.run_once() is not None:
+        pass
+    settled = plan_onboarding(container, household_id)
+
+    # ...and then `cancelled`, where the verified step results survive so
+    # nothing else marks the workflow terminal. One household reaches both, in
+    # order, because the consent receipt ids in the fixture selection are unique
+    # per household.
+    account_id, session_id = _PRINCIPALS[household_id]
+    container.onboarding.cancel(
+        household_id,
+        context=_context(
+            container, household_id, "cancel", account_id=account_id,
+            session_id=session_id,
+        ),
     )
+    cancelled = plan_onboarding(container, household_id)
 
-    assert retained, "the receipt must not be erased to shape the report"
-    assert "ABROLIA_NERVE_EMAIL_CREDENTIALS" not in after
+    assert settled.operation_pending is False, settled.rehearsal
+    assert cancelled.operation_pending is False, cancelled.rehearsal
+    for plan in (settled, cancelled):
+        assert plan.runtime_resources == [], plan.rehearsal
+        assert plan.secrets == [], plan.rehearsal
+        assert plan.table_writes == [], plan.rehearsal
+
+
+def test_a_database_path_with_uri_syntax_is_rehearsed_not_created(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """`?` and `#` are legal in a pathname and meaningful in a SQLite URI.
+
+    Interpolating the path into `file:{path}?mode=ro` made
+    `/data/control?plane.db` parse as the filename `/data/control` with the rest
+    read as URI syntax. `mode=ro` was then not the parameter it looked like, so
+    SQLite opened read-write-CREATE: it created `/data/control`, and the
+    rehearsal snapshotted an EMPTY database while the real one was never read.
+    Two guarantees broken by one missing encode — "mutates nothing" and
+    "rehearses the database you named".
+    """
+    volume = tmp_path / "data"
+    volume.mkdir()
+    for name in ("control?plane.db", "control#plane.db"):
+        database_path = volume / name
+        seed = ControlPlaneDatabase(database_path)
+        seed.migrate()
+        seed.close()
+        before = {
+            path.name: path.read_bytes() for path in volume.iterdir() if path.is_file()
+        }
+
+        config = replace(
+            ControlPlaneConfig.for_test(tmp_path), database_path=database_path
+        )
+        monkeypatch.setattr(
+            ControlPlaneConfig, "from_env", staticmethod(lambda config=config: config)
+        )
+        # The household does not exist, so the rehearsal refuses AFTER taking
+        # its snapshot — which is the part under test. What must not happen is a
+        # file appearing, or the real database going unread.
+        with pytest.raises(SystemExit):
+            main(["--dry-run", "--household", "10000000-0000-4000-8000-000000000031"])
+
+        # The direct evidence: with the bug SQLite parsed `/data/control` as
+        # the filename and opened it read-write-CREATE, so this file appeared
+        # and the named database was never read at all.
+        assert not (volume / "control").exists(), f"{name}: a prefix file was created"
+        assert database_path.read_bytes() == before[name], f"{name}: the database moved"
+        # Sidecars are the documented exception, as they are for the
+        # byte-identical test above: a read-only open of a WAL database creates
+        # `-shm`, and `-wal` with it. Neither holds durable data. What must not
+        # appear is another DATABASE.
+        created = {
+            path.name
+            for path in volume.iterdir()
+            if path.is_file()
+            and path.name not in before
+            and not path.name.endswith(("-wal", "-shm"))
+        }
+        assert created == set(), f"{name}: the dry-run created {created}"
