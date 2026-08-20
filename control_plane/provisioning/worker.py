@@ -25,7 +25,10 @@ from control_plane.email.repository import EmailIdentityRepository
 from control_plane.models import StepKind, StepStatus
 from control_plane.observability import StructuredLogger
 from control_plane.onboarding.state import VERIFY_RESULT, next_status
-from control_plane.privacy.consent import consent_version_and_sha
+from control_plane.privacy.consent import (
+    CURRENT_RESTRICTION_RECEIPT_SQL,
+    consent_version_and_sha,
+)
 from control_plane.providers.email.nerve_client import email_org_external_ref
 from control_plane.provisioning.contracts import (
     InspectState,
@@ -58,6 +61,22 @@ class _ProjectionCancelled(RuntimeError):
 DNS_POLL_INITIAL_SECONDS = 30.0
 DNS_POLL_MAX_SECONDS = 300.0
 DNS_POLL_MAX_JOB_ATTEMPTS = 5
+
+
+def requires_current_content_restriction(
+    kind: str, operation: str, provider: str
+) -> bool:
+    """Whether `_run_once` gates this job on the special-category receipt.
+
+    Shared with `onboarding.provision`, which reports what the worker will do
+    and therefore has to ask the worker's own question rather than restate it —
+    the same remedy `CURRENT_RESTRICTION_RECEIPT_SQL` gave the receipt lookup.
+    Restating it meant the report checked only an already-planned runtime job
+    while the gate also covers every non-fake email-identity job.
+    """
+    return (kind == "email_identity" and provider != "fake-email") or (
+        kind == "runtime" and operation != "ensure_secret_namespace"
+    )
 
 
 class ProvisioningWorker:
@@ -337,8 +356,7 @@ class ProvisioningWorker:
             "special_category_content_restriction"
         )
         return self.jobs.db.query_one(
-            "SELECT 1 FROM consent_receipts WHERE household_id = ? AND purpose = ?"
-            " AND text_version = ? AND text_sha256 = ? AND revoked_at IS NULL LIMIT 1",
+            CURRENT_RESTRICTION_RECEIPT_SQL,
             (
                 household_id,
                 "special_category_content_restriction",
@@ -349,10 +367,8 @@ class ProvisioningWorker:
 
     @staticmethod
     def _requires_current_email_content_restriction(job: JobRecord) -> bool:
-        return (
-            job.kind == "email_identity" and job.provider != "fake-email"
-        ) or (
-            job.kind == "runtime" and job.operation != "ensure_secret_namespace"
+        return requires_current_content_restriction(
+            job.kind, job.operation, job.provider
         )
 
     def _block_for_missing_content_restriction(
