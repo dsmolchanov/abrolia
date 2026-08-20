@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 import subprocess
 import sys
@@ -24,6 +25,7 @@ from control_plane.onboarding.provision import (
     RUNTIME_DSAR_SECRET,
     RUNTIME_WRITES_BY_WORKFLOW_STATE,
     TableWrite,
+    _parser,
     _record_writes,
     _runtime_resources,
     main,
@@ -252,13 +254,26 @@ def test_dry_run_traces_the_planning_pass_that_has_not_happened_yet(container) -
 
     plan = plan_onboarding(container, household_id)
 
-    assert plan.config_revision == {}
     assert "planning pass" in plan.rehearsal
     assert TableWrite("config_revisions", "insert") in plan.table_writes
     assert plan.committed is False
     assert container.database.query(
         "SELECT id FROM config_revisions WHERE household_id = ?", (household_id,)
     ) == []
+
+    # The diff the Step E1 contract asks for. This branch is the one where the
+    # planning pass actually runs, so it is the one place the revision exists to
+    # be described — and taking only `.spec` from the planner threw it away,
+    # leaving the field empty exactly where it was owed. This test previously
+    # asserted the empty object, which pinned the gap rather than the contract.
+    assert plan.config_revision, "the rehearsed revision was discarded"
+    assert plan.config_revision["revision"]
+    assert plan.config_revision["manifest_sha256"]
+    assert "rolled back" in plan.config_revision["source"]
+    assert "diff" in plan.config_revision
+    # Key paths, never values: this prints to an operator's scrollback.
+    rendered = json.dumps(plan.config_revision["diff"])
+    assert "@abrolia" not in rendered and "dry-run@family.test" not in rendered
 
 
 def test_dry_run_reads_one_consistent_snapshot(container) -> None:
@@ -1334,3 +1349,59 @@ def test_the_snapshot_touches_only_the_shared_memory_index(
         "the rehearsal did not create the index it needs; if SQLite stops"
         " requiring one, the documented exclusion can be removed"
     )
+
+
+def test_a_blocked_planning_pass_advertises_no_future_work(container) -> None:
+    """Blocked means there is no operation to describe.
+
+    `planner.issue` raises `ValueError` for any unverified step or missing
+    prerequisite, and that handler set `blocked_by` while leaving
+    `operation_pending` true — so the gate below still emitted runtime resources
+    and both runtime secrets for an operation the same report said cannot run.
+    The one branch that reaches the gate by raising kept the contradiction the
+    flag exists to prevent.
+    """
+    household_id = _household_with_profile(container)
+
+    plan = plan_onboarding(container, household_id)
+
+    assert plan.blocked_by is not None
+    assert plan.unverified_steps
+    assert plan.operation_pending is False
+    assert plan.runtime_resources == []
+    assert plan.secrets == []
+    assert plan.table_writes == []
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "../x",
+        "not-a-uuid",
+        "10000000-0000-4000-8000-000000000031 ",
+        # Real hex letters, so uppercasing is not a no-op the way it is for an
+        # all-digit UUID — which is what made an earlier version of this case
+        # pass while proving nothing.
+        "abcdef00-0000-4000-8000-0000000000ab".upper(),
+        "{10000000-0000-4000-8000-000000000031}",
+        "urn:uuid:10000000-0000-4000-8000-000000000031",
+    ],
+)
+def test_a_malformed_household_argument_is_rejected_at_the_boundary(value) -> None:
+    """A typo must not come back as "household has no onboarding workflow".
+
+    Unvalidated, every one of these reached the database and produced the same
+    message a genuinely missing workflow produces — which is the diagnosis an
+    operator acts on. Canonical form specifically: `UUID()` accepts braces, urn
+    prefixes and mixed case, and all of them compare unequal to the stored
+    identifier, so accepting them would reintroduce the same confusion by
+    another route.
+    """
+    with pytest.raises(SystemExit):
+        _parser().parse_args(["--dry-run", "--household", value])
+
+
+def test_a_canonical_household_argument_is_accepted() -> None:
+    household_id = "10000000-0000-4000-8000-000000000031"
+    args = _parser().parse_args(["--dry-run", "--household", household_id])
+    assert args.household == household_id

@@ -16,6 +16,7 @@ import re
 import sqlite3
 import tempfile
 import time
+import uuid
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
@@ -759,10 +760,38 @@ def plan_onboarding(
                     lambda sql: _record_writes(sql, observed)
                 )
                 try:
-                    spec = container.planner.issue(
+                    planned = container.planner.issue(
                         connection, household_id=household_id
-                    ).spec
+                    )
+                    spec = planned.spec
+                    # The rehearsal just built the revision inside the
+                    # transaction it is about to roll back, so the diff it was
+                    # created to report is right here — and `.spec` alone threw
+                    # the rest away, leaving `config_revision` empty for the one
+                    # branch where the planning pass actually runs. The Step E1
+                    # contract asks for the household `config_revision` diff;
+                    # this is where it exists.
+                    plan.config_revision = {
+                        "revision": planned.revision.revision,
+                        "status": planned.revision.status,
+                        "manifest_sha256": planned.revision.manifest_sha256,
+                        "source": (
+                            "rehearsed by this planning pass and rolled back;"
+                            " the real onboarding issues it when the primary"
+                            " step verifies"
+                        ),
+                        "diff": _revision_diff(
+                            container, household_id, planned.revision.revision
+                        ),
+                    }
                 except ValueError as error:
+                    # Blocked means there is no operation to describe. Leaving
+                    # `operation_pending` true here let the gate below emit
+                    # runtime resources and both runtime secrets for an
+                    # operation the same report says cannot run — the exact
+                    # contradiction the flag exists to prevent, surviving in the
+                    # one branch that reaches it by raising.
+                    plan.operation_pending = False
                     plan.blocked_by = str(error)
                 finally:
                     connection.set_trace_callback(None)
@@ -831,13 +860,36 @@ def plan_onboarding(
     return plan
 
 
+def _household_argument(value: str) -> str:
+    """A canonical household UUID, rejected at the boundary if it is not one.
+
+    Unvalidated, `--household ../x` or an uppercase UUID reached the database
+    and came back as "household has no onboarding workflow" — conflating a typo
+    with a real missing workflow, which is the diagnosis an operator acts on.
+    Canonical form specifically: `UUID()` accepts braces, urn prefixes and mixed
+    case, all of which compare unequal to the stored identifier and would
+    produce the same misleading answer.
+    """
+    try:
+        canonical = str(uuid.UUID(value))
+    except (ValueError, AttributeError, TypeError):
+        raise argparse.ArgumentTypeError(
+            f"{value!r} is not a household UUID"
+        ) from None
+    if canonical != value:
+        raise argparse.ArgumentTypeError(
+            f"{value!r} is not canonical; use {canonical}"
+        )
+    return canonical
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="abrolia-provision",
         description="rehearse a pilot onboarding without writing anything",
     )
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--household", required=True)
+    parser.add_argument("--household", required=True, type=_household_argument)
     return parser
 
 

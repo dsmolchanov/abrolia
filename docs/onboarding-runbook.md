@@ -189,12 +189,19 @@ which case you are in:
 | The workflow is `complete` | Onboarding is done. There is no pending operation. |
 | The workflow is `cancelled` | Verified step results survive a cancellation, so the steps describe what *was* done. Nothing will resume; start a new workflow. |
 
-`runtime_resources` comes from the **configured** runtime provider, not from Fly
-unconditionally. Under `ABROLIA_RUNTIME_PROVIDER=fly-runtime` it is the
-deterministic Fly app, volume and Machine names; under the default
-`dry-run-runtime` it is the single `synthetic-runtime:<household-id>` reference
-that provider actually creates. A provider that cannot say is reported as
-unable to say rather than guessed at.
+`runtime_resources` comes from the provider of the **pending job**, which is not
+always the configured one. A job carries its provider durably and the worker
+dispatches through it, so a job queued under `dry-run-runtime` still runs
+synthetically after a restart with `ABROLIA_RUNTIME_PROVIDER=fly-runtime` — and
+the report follows the job, not the environment. `pending_runtime_job.provider`
+names it. Only before a revision is issued, when there is no job to disagree
+with, does the configured provider apply.
+
+Under a Fly job it is the deterministic app, volume and Machine names; under
+`dry-run-runtime` the single `synthetic-runtime:<household-id>` reference that
+provider actually creates. A provider that cannot describe its resources, or one
+the deployment no longer registers, is reported as unable to say rather than
+guessed at.
 
 `secrets` gives **names** only, never values: `HERMES_BOOTSTRAP_TOKEN` and
 `HERMES_RUNTIME_DSAR_TOKEN`, plus any email secret binding that is currently

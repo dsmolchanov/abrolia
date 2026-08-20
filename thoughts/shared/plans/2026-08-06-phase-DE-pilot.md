@@ -186,7 +186,7 @@ blocker under the repository rules. Four were missing rather than unnecessary:
 **Durable 3-step machine:** `email → WhatsApp → primary`.
 
 - Each step has `step_id ∈ {email, whatsapp, primary}`, `status ∈ {pending, provisioning, waiting_user, verified, failed, skipped}`, and `version` for idempotency.
-- `provision.py --dry-run` reports what the next real onboarding will do, mutating nothing and calling no provider — used by the operator before every real pilot onboarding. It reports the household `config_revision` diff (key paths, never values), the Fly resource names, the secret names, and the tables the pending operation writes **where durable state determines them**; where it does not, it says so and points at the command that would settle it.
+- `provision.py --dry-run` reports what the next real onboarding will do, mutating nothing and calling no provider — used by the operator before every real pilot onboarding. It reports the household `config_revision` diff (key paths, never values), the resource names **of the pending job's own provider** (Fly names only where that job is a Fly one), the secret names, and the tables the pending operation writes **where durable state determines them**; where it does not, it says so and points at the command that would settle it.
 
   **Amended 2026-08-19.** The criterion previously read "lists the exact writes it would make". Six review rounds established that exactness is not achievable for every state without executing the operation, which is the one thing the command must never do:
 
@@ -347,7 +347,7 @@ CREATE TABLE channel_bindings (
 
 ### Phase E Acceptance Criteria
 
-- [x] Durable 3-step machine with `provision.py --dry-run` listing exact writes without mutation; fix-before-effect; idempotency; downstream invalidation. The machine, its version checks, idempotent replay and `reset_from` downstream invalidation were already durable in `control_plane/onboarding/{state,service}.py`; `control_plane/onboarding/provision.py` adds the rehearsal and `tests/control_plane/test_provision_dry_run.py` proves it commits nothing (4 tests).
+- [x] Durable 3-step machine with `provision.py --dry-run` listing the pending operation's writes **where durable state determines them** and saying so where it does not, without mutation; fix-before-effect; idempotency; downstream invalidation. ("Exact writes" was the original wording and it was false — see the amendment below.) The machine, its version checks, idempotent replay and `reset_from` downstream invalidation were already durable in `control_plane/onboarding/{state,service}.py`; `control_plane/onboarding/provision.py` adds the rehearsal and `tests/control_plane/test_provision_dry_run.py` proves it commits nothing (4 tests).
 
 ```bash
 python -m control_plane.onboarding.provision --dry-run --household <test-uuid> 2>&1 | head -n 80
