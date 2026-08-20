@@ -129,13 +129,35 @@ def test_synthetic_rollout_does_not_demand_the_consent(cp_stack) -> None:
 
 
 def test_consent_contract_endpoint_serves_the_exact_hashed_copy(api_harness) -> None:
+    api_harness.authenticate(api_harness.create_principal())
     response = api_harness.client.get(
         "/api/v1/onboarding/consent/special-category-household-content"
     )
 
+    assert response.status_code == 200
     body = response.json()
     assert body["purpose"] == "special_category_household_content"
     assert body["text_version"] == CONSENT_VERSION
     assert body["text_sha256"] == CONSENT_SHA
     assert "Art. 9(2)(a)" in body["text"]
     assert "parental responsibility" in body["text"]
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/v1/onboarding/consent/special-category-household-content",
+        "/api/v1/onboarding/consent/special-category-content-restriction",
+    ],
+)
+def test_a_consent_contract_route_requires_authentication(api_harness, path) -> None:
+    """Every route on the onboarding API carries an auth dependency.
+
+    The copy is not a secret — it is shown to the family before they accept it —
+    but the rule is about the surface, not today's response body. An
+    unauthenticated handler on this router is one an unauthenticated caller can
+    reach, and what it returns is a decision that can change later.
+    """
+    response = api_harness.client.get(path)
+
+    assert response.status_code in (401, 403), response.status_code

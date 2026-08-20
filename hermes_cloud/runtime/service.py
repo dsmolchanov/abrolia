@@ -774,27 +774,46 @@ class RuntimeService:
         except Exception:
             return b""
 
-    def _is_superseded_revocation(self, body: bytes) -> bool:
-        """True only when this runtime demonstrably serves another generation."""
+    def _generation_verdict(self, body: bytes) -> str:
+        """`match`, `superseded`, or `undecidable` — never a guess.
+
+        The first version answered a boolean and folded "cannot tell" into
+        "match", which marks. That is wrong in the one window where it matters:
+        deliver revision A's stop after `serve_runtime` has opened its socket but
+        BEFORE the background bootstrap has installed revision B's manifest, and
+        the `ManifestError` branch classified the stale generation as current,
+        wrote the permanent marker, and bootstrap never clears or re-checks it.
+        A fully consented runtime is then suspended for good by a withdrawal
+        nobody made against it.
+
+        "Cannot tell" is now its own answer, and the caller defers. A runtime
+        whose manifest is missing or unreadable is not serving anything —
+        `readyz`, `require_ready` and `can_start_workers` all go through
+        `_ready_manifest` and fail — so deferring the marker stops no processing
+        that is happening, while marking the wrong generation stops processing
+        that is lawful.
+        """
         if not body:
-            return False
+            # No generation named: a control plane that predates this field.
+            # Nothing to compare, and nothing to defer for.
+            return "match"
         try:
             named = json.loads(body.decode("utf-8")).get("receipt_ids")
         except (ValueError, UnicodeDecodeError, AttributeError):
-            return False
+            return "match"
         named = {
             receipt for receipt in (named or []) if isinstance(receipt, str) and receipt
         }
         if not named:
-            return False
+            return "match"
         try:
             manifest = load_runtime_manifest(self.manifest_path, env=self.env)
         except ManifestError:
-            return False
+            return "undecidable"
         if manifest.consent is None or not manifest.consent.receipts:
-            return False
+            return "undecidable"
         held = {receipt.receipt_id for receipt in manifest.consent.receipts}
-        return held.isdisjoint(named)
+        return "superseded" if held.isdisjoint(named) else "match"
 
     def _consent_revoke(
         self, method: str, authorization: str, body: bytes = b""
@@ -832,10 +851,19 @@ class RuntimeService:
         )
         if not supplied or not hmac.compare_digest(supplied, expected):
             return Probe(401, {"status": "unauthorized"})
-        if self._is_superseded_revocation(body):
+        verdict = self._generation_verdict(body)
+        if verdict == "superseded":
             # Acknowledged, not obeyed: the job is satisfied and stops retrying,
             # and this runtime keeps serving the consent it actually holds.
             return Probe(200, {"state": "superseded_generation"})
+        if verdict == "undecidable":
+            # RETRYABLE, not marked. The manifest is not readable yet — most
+            # likely mid-bootstrap — so which generation this runtime serves is
+            # not yet a fact. The control plane treats a non-200/410 as
+            # `outcome_unknown` and comes back; by then the manifest exists and
+            # the question has an answer. Marking now is how a stale stop
+            # suspends a runtime that was about to be lawfully consented.
+            return Probe(503, {"status": "generation_undecidable"})
         try:
             atomic_write(self.consent_marker, b'{"status":"consent_withdrawn"}')
         except OSError:

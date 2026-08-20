@@ -502,17 +502,77 @@ def test_a_stop_that_names_no_generation_still_suspends(
     assert service.consent_marker.exists(), why
 
 
-def test_a_runtime_with_no_readable_manifest_still_stops(tmp_path: Path) -> None:
-    """Withdrawal must succeed on a runtime in an awkward state.
+def test_a_generation_that_cannot_be_decided_is_deferred_not_marked(
+    tmp_path: Path,
+) -> None:
+    """The bootstrap window, which fail-closed-toward-stopping got wrong.
 
-    An unparseable manifest cannot prove the generation is superseded, and
-    Art. 7(3) gives the family a right to withdrawal rather than an attempt at
-    it — so an unreadable manifest marks.
+    Deliver revision A's stop after `serve_runtime` has opened its socket but
+    BEFORE the background bootstrap has installed revision B's manifest. Folding
+    "cannot tell" into "match" wrote the permanent marker, and bootstrap never
+    clears or re-checks it — so a fully consented runtime is suspended for good
+    by a withdrawal nobody made against it.
+
+    Deferring costs no processing: a runtime whose manifest is unreadable is not
+    serving anything, because `readyz`, `require_ready` and `can_start_workers`
+    all go through `_ready_manifest` and fail. Marking the wrong generation
+    stops processing that is lawful. The control plane treats a non-200/410 as
+    `outcome_unknown` and comes back when the answer exists.
+    """
+    service = active_service(tmp_path)
+    service.manifest_path.write_text("this is not a manifest yet", encoding="utf-8")
+
+    probe = _revoke_body(service, ["99999999-9999-4999-8999-999999999999"])
+
+    assert probe.status_code == 503
+    assert probe.payload["status"] == "generation_undecidable"
+    assert not service.consent_marker.exists(), (
+        "a stop was obeyed before it could be attributed to a generation"
+    )
+
+
+def test_the_deferred_stop_lands_once_the_manifest_is_installed(tmp_path: Path) -> None:
+    """Deferral must be a wait, not a refusal.
+
+    The retry has to succeed once the manifest exists — otherwise "come back
+    later" is just a withdrawal that never happens, which Art. 7(3) does not
+    allow.
+    """
+    service = active_service(tmp_path)
+    held = sorted(
+        receipt.receipt_id
+        for receipt in load_runtime_manifest(
+            service.manifest_path, env=service.env
+        ).consent.receipts
+    )
+    installed = service.manifest_path.read_text(encoding="utf-8")
+    service.manifest_path.write_text("mid-bootstrap", encoding="utf-8")
+    assert _revoke_body(service, held).status_code == 503
+
+    # Bootstrap finishes.
+    service.manifest_path.write_text(installed, encoding="utf-8")
+
+    probe = _revoke_body(service, held)
+
+    assert probe.status_code == 200
+    assert probe.payload["state"] == "consent_withdrawn"
+    assert service.consent_marker.exists()
+
+
+def test_a_stop_naming_no_generation_still_stops_an_unreadable_runtime(
+    tmp_path: Path,
+) -> None:
+    """The legacy path keeps the unconditional guarantee.
+
+    A control plane that predates the generation field names nothing, so there
+    is no question to defer for — and withdrawal must still succeed on a runtime
+    in an awkward state, because Art. 7(3) gives the family a right to it rather
+    than an attempt at it.
     """
     service = active_service(tmp_path)
     service.manifest_path.write_text("this is not a manifest", encoding="utf-8")
 
-    probe = _revoke_body(service, ["99999999-9999-4999-8999-999999999999"])
+    probe = _revoke_body(service, None)
 
     assert probe.status_code == 200
     assert service.consent_marker.exists()
