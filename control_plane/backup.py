@@ -6,18 +6,19 @@ import errno
 import hashlib
 import hmac
 import os
-import re
 import sqlite3
 import stat
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
-from control_plane.db import ControlPlaneDatabase, ProcessAlreadyRunning
+from control_plane.db import MIGRATIONS_DIR, ControlPlaneDatabase, ProcessAlreadyRunning
 
 TAG_BYTES = 16
 SCRATCH_DIR_ENV = "ABROLIA_BACKUP_SCRATCH_DIR"
@@ -253,10 +254,36 @@ def _reusable_pre_migrate_backup(
     return None
 
 
+@dataclass
+class _Move:
+    """One member's journey, recorded as TWO facts rather than one.
+
+    A move is a publication followed by a removal, and the removal can fail on
+    its own — `EIO`, `EPERM`, a read-only remount — leaving both names present
+    and the destination already published. A journal that recorded only "this
+    move happened" could not describe that state, so `_undo` inferred it from
+    whether the source was back: finding the source still there, it concluded
+    the move had not happened and left the destination in place. Reversal then
+    removed nothing, and the states that outlives are the ones this module
+    exists to prevent — an installed database standing beside superseded
+    sidecars, or a restore whose pause was withdrawn while its database stayed.
+
+    `published_inode` is what makes the reversal safe to perform by name: the
+    destination is removed only while that name still refers to the entry this
+    move put there, the same discipline `_is_a_copy` uses for its probes.
+    """
+
+    source: Path
+    destination: Path
+    published_inode: tuple[int, int] | None = None
+    #: False while the destination is published and the source still stands.
+    source_removed: bool = False
+
+
 def _claim(
     source: Path,
     destination: Path,
-    journal: list[tuple[Path, Path]] | None = None,
+    journal: list[_Move] | None = None,
 ) -> None:
     """Move `source` onto `destination`, refusing to replace anything.
 
@@ -275,10 +302,12 @@ def _claim(
     # `EPERM`, a read-only remount. Unlinking first meant a caller could not
     # know the destination now existed, so `_undo` would not reverse it and the
     # bundle stayed half-apart. The link is the move; the unlink is tidying
-    # after it.
+    # after it, and `source_removed` is set only once that tidying succeeded.
+    record = _Move(source, destination, published_inode=_inode(destination))
     if journal is not None:
-        journal.append((source, destination))
+        journal.append(record)
     source.unlink(missing_ok=True)
+    record.source_removed = True
 
 
 class AmbiguousPublication(BackupError):
@@ -432,22 +461,7 @@ def restore_backup(
     """
     source = Path(archive)
     destination = Path(target)
-    if _present(destination):
-        raise FileExistsError(destination)
-    # The whole BUNDLE, not just the database. A `-wal` or `-shm` left by an
-    # earlier database at that path — an interrupted cleanup, a killed
-    # process — survives publication, and opening the result replays those
-    # committed frames into the authenticated restore. Rows are silently
-    # replaced and `integrity_check` still reports `ok`, so nothing downstream
-    # notices. The pause marker too: one left behind would make a restore that
-    # failed to write its own marker look paused.
-    stale = [path for path in _bundle(destination)[1:] if _present(path)]
-    if stale:
-        raise BackupError(
-            "restore refuses a destination with leftover SQLite state:"
-            f" {', '.join(str(path) for path in stale)}."
-            " Move them aside; they belong to a different database."
-        )
+    _require_free_bundle(destination)
     # Exclusive ownership of the path being written, for the same reason
     # `install-rollback` takes it: publishing a database and its pause marker
     # under a live writer means the two can interleave with whatever that writer
@@ -463,12 +477,16 @@ def restore_backup(
             " stop it before restoring over that path"
         ) from error
     try:
-        # Re-checked INSIDE the lock. The check above runs before the lock is
-        # held, so another process could create that path in between and this
-        # would overwrite it — the refusal to clobber an existing target is the
-        # point, and a check made outside the lock is one the lock cannot back.
-        if destination.exists():
-            raise FileExistsError(destination)
+        # Re-checked INSIDE the lock, and over the WHOLE BUNDLE. The check
+        # above runs before the lock is held, so another process could occupy
+        # that path in between — the refusal to publish beside somebody else's
+        # state is the point, and a check made outside the lock is one the lock
+        # cannot back. Rechecking only `destination` left the sidecars
+        # unguarded: publication claims the database and marker names
+        # atomically but claims nothing for `-wal`/`-shm`, so a generation that
+        # released its lock between the two checks could leave frames behind
+        # for the restored database to replay.
+        _require_free_bundle(destination)
         return _restore_locked(
             source,
             destination,
@@ -478,6 +496,28 @@ def restore_backup(
     finally:
         guard.release_process_lock()
         guard.close()
+
+
+def _require_free_bundle(destination: Path) -> None:
+    """No member of the destination bundle may exist.
+
+    The whole BUNDLE, not just the database. A `-wal` or `-shm` left by an
+    earlier database at that path — an interrupted cleanup, a killed process —
+    survives publication, and opening the result replays those committed frames
+    into the authenticated restore. Rows are silently replaced and
+    `integrity_check` still reports `ok`, so nothing downstream notices. The
+    pause marker too: one left behind would make a restore that failed to write
+    its own marker look paused.
+    """
+    if _present(destination):
+        raise FileExistsError(destination)
+    stale = [path for path in _bundle(destination)[1:] if _present(path)]
+    if stale:
+        raise BackupError(
+            "restore refuses a destination with leftover SQLite state:"
+            f" {', '.join(str(path) for path in stale)}."
+            " Move them aside; they belong to a different database."
+        )
 
 
 def _restore_locked(
@@ -563,6 +603,12 @@ def _restore_locked(
         # Written against the TEMPORARY name and renamed with it, so the two
         # become visible together: a marker for a database that is not there yet
         # is harmless, and a database without its marker is not.
+        # Last look before anything becomes visible. Everything between the
+        # locked check and here — decryption, an fsync of a database-sized
+        # image, an integrity check — is time in which a member can appear, and
+        # the publication below is the point of no return for the ones it does
+        # not claim.
+        _require_free_bundle(destination)
         marker = Path(f"{temporary}.workers-paused")
         try:
             marker.write_text(
@@ -606,9 +652,6 @@ def _restore_locked(
 
 
 SIDECAR_SUFFIXES = ("-wal", "-shm")
-
-#: A control-plane migration filename, as `db.migrate` records it.
-_MIGRATION_NAME = re.compile(r"\d{4}_[a-z0-9_]+\.sql")
 
 
 def _sidecars(database: Path) -> tuple[Path, ...]:
@@ -685,7 +728,7 @@ def _fsync_directory(directory: Path) -> None:
 def _rename_or_exdev(
     source: Path,
     destination: Path,
-    journal: list[tuple[Path, Path]] | None = None,
+    journal: list[_Move] | None = None,
 ) -> bool:
     """Rename if the filesystems allow it; report rather than raise if not.
 
@@ -708,7 +751,7 @@ def _rename_or_exdev(
 def _copy_install(
     source: Path,
     destination: Path,
-    journal: list[tuple[Path, Path]] | None = None,
+    journal: list[_Move] | None = None,
 ) -> None:
     """Chunked, because the Machine has 512 MiB against a 1 GiB volume.
 
@@ -735,13 +778,20 @@ def _copy_install(
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise
+    # Recorded the instant the copy is published, and separately once the
+    # source is gone — a copy whose source removal fails leaves both names
+    # holding the generation, which `_undo` has to be able to tell from a move
+    # that never started. See `_Move`.
+    record = _Move(source, destination, published_inode=_inode(destination))
     if journal is not None:
-        journal.append((source, destination))
+        journal.append(record)
     source.unlink(missing_ok=True)
+    record.source_removed = True
 
 
-def _readable_sqlite(path: Path) -> None:
-    """Refuse a candidate that is not a database, and leave it exactly as found.
+@contextmanager
+def _read_only_sqlite(path: Path):
+    """Open read-only, and leave the bundle exactly as it was found.
 
     Read-only is not side-effect free. Opening a WAL database with `mode=ro`
     creates BOTH `-wal` and `-shm` and leaves them after close — measured, not
@@ -751,30 +801,59 @@ def _readable_sqlite(path: Path) -> None:
     install exists to keep straight. Anything this opens that was not here
     before goes away again.
 
+    "Was not here before" is asked with `lexists`, not `exists`. A DANGLING
+    sidecar symlink answers False to `exists()`, so it was absent from the
+    snapshot, present afterwards, and the cleanup below unlinked it as though
+    SQLite had just created it — a nominally read-only validation deleting an
+    entry the operator put there. Non-regular members are refused outright
+    before anything is opened: SQLite would follow a live symlink out of the
+    volume, and neither a FIFO nor a directory is a sidecar.
+
+    Deletion is by INODE, not by name. The entries are read while the
+    connection still holds them and rechecked immediately before the unlink, so
+    a name reused between close and cleanup takes somebody else's file with it.
+
     The URI is built from `as_uri()` rather than interpolated, so a database
     path containing `?` or `#` cannot have its remainder parsed as URI syntax —
     which would drop `mode=ro` and reopen the file read-WRITE.
     """
-    absolute = path.resolve()
-    before = {sidecar for sidecar in _sidecars(path) if sidecar.exists()}
+    for sidecar in _sidecars(path):
+        if _present(sidecar) and not _regular_file(sidecar):
+            raise RollbackError(
+                f"{sidecar} is not a regular file, so {path} is not a bundle"
+                " this command can safely read; move it aside"
+            )
+    inherited = {sidecar for sidecar in _sidecars(path) if _present(sidecar)}
     try:
-        connection = sqlite3.connect(f"{absolute.as_uri()}?mode=ro", uri=True)
+        connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
     except sqlite3.Error as error:
         raise RollbackError(f"{path} does not open as SQLite: {error}") from error
     try:
-        integrity = connection.execute("PRAGMA integrity_check").fetchone()
-        if integrity is None or integrity[0] != "ok":
-            raise RollbackError(f"{path} fails its SQLite integrity check")
-        connection.execute("PRAGMA foreign_keys=ON")
-        if connection.execute("PRAGMA foreign_key_check").fetchall():
-            raise RollbackError(f"{path} fails its SQLite foreign-key check")
-    except sqlite3.DatabaseError as error:
-        raise RollbackError(f"{path} is not a valid SQLite database") from error
+        yield connection
     finally:
+        created = {
+            sidecar: _inode(sidecar)
+            for sidecar in _sidecars(path)
+            if sidecar not in inherited and _present(sidecar)
+        }
         connection.close()
-        for sidecar in _sidecars(path):
-            if sidecar not in before:
+        for sidecar, inode in created.items():
+            if inode is not None and _inode(sidecar) == inode:
                 sidecar.unlink(missing_ok=True)
+
+
+def _readable_sqlite(path: Path) -> None:
+    """Refuse a candidate that is not a sound database."""
+    with _read_only_sqlite(path) as connection:
+        try:
+            integrity = connection.execute("PRAGMA integrity_check").fetchone()
+            if integrity is None or integrity[0] != "ok":
+                raise RollbackError(f"{path} fails its SQLite integrity check")
+            connection.execute("PRAGMA foreign_keys=ON")
+            if connection.execute("PRAGMA foreign_key_check").fetchall():
+                raise RollbackError(f"{path} fails its SQLite foreign-key check")
+        except sqlite3.DatabaseError as error:
+            raise RollbackError(f"{path} is not a valid SQLite database") from error
 
 
 def _present(path: Path) -> bool:
@@ -1022,18 +1101,43 @@ def _is_a_copy(source: Path, destination: Path) -> bool:
                 path.unlink(missing_ok=True)
 
 
+def _shipped_migrations() -> tuple[str, ...]:
+    """Every migration in this image, in the order `db.migrate` applies them.
+
+    Read from the same directory `ControlPlaneDatabase.migrate` reads, so the
+    identity check and the migrator can never disagree about what this schema
+    is called.
+    """
+    return tuple(sorted(entry.name for entry in MIGRATIONS_DIR.glob("*.sql")))
+
+
 def require_control_plane_database(path: Path) -> None:
     """Establish that `path` IS the control-plane database, not merely a file.
 
     A recovery command that archives the wrong file is worse than one that
     refuses: the operator verifies the archive, it passes, and they delete the
     real bundle. `is_file()` does not establish this — a zero-byte file, an
-    unrelated SQLite database and a symlink to either all satisfy it — so this
-    checks the entry's shape, that it opens as SQLite, and that it carries the
-    migration ledger every control-plane database has.
+    unrelated SQLite database and a symlink to either all satisfy it — and
+    neither does the mere presence of a `schema_migrations` table with `name`
+    and `applied_at` columns, which is one of the most widely copied
+    conventions there is. Any unrelated application using it, with any
+    `NNNN_something.sql` in it, passed.
 
-    Leaves nothing behind: the read-only open is the same one `_readable_sqlite`
-    makes, with the same sidecar cleanup.
+    So the ledger is checked against THIS IMAGE'S migration filenames. An
+    unrelated application shares the table but not the names in it, while every
+    valid revision of the real database — including one stopped at a failed
+    pending migration — holds a prefix of them.
+
+    A database whose ledger runs PAST this image is accepted, and deliberately.
+    An image rolled back to recover from a bad deploy sees migrations it does
+    not ship, and refusing there would deny an operator the backup command at
+    exactly the moment they most need one. The shared prefix is what
+    establishes identity; the tail beyond it only establishes which side is
+    newer.
+
+    Leaves nothing behind: the read-only opens are the same one
+    `_readable_sqlite` makes, with the same bundle validation and sidecar
+    cleanup.
     """
     if not _regular_file(path):
         raise BackupError(
@@ -1042,32 +1146,28 @@ def require_control_plane_database(path: Path) -> None:
         )
     try:
         _readable_sqlite(path)
+        with _read_only_sqlite(path) as connection:
+            ledger = connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+                " AND name = 'schema_migrations'"
+            ).fetchone()
+            ledger_columns = (
+                connection.execute("PRAGMA table_info(schema_migrations)").fetchall()
+                if ledger is not None
+                else []
+            )
+            applied = (
+                [
+                    row[0]
+                    for row in connection.execute(
+                        "SELECT name FROM schema_migrations ORDER BY name"
+                    )
+                ]
+                if ledger is not None
+                else []
+            )
     except RollbackError as error:
         raise BackupError(str(error)) from error
-    before = {sidecar for sidecar in _sidecars(path) if _present(sidecar)}
-    connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
-    try:
-        ledger = connection.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'table'"
-            " AND name = 'schema_migrations'"
-        ).fetchone()
-        ledger_columns = (
-            connection.execute("PRAGMA table_info(schema_migrations)").fetchall()
-            if ledger is not None
-            else []
-        )
-        applied = (
-            connection.execute(
-                "SELECT name FROM schema_migrations ORDER BY name LIMIT 5"
-            ).fetchall()
-            if ledger is not None
-            else []
-        )
-    finally:
-        connection.close()
-        for sidecar in _sidecars(path):
-            if sidecar not in before:
-                sidecar.unlink(missing_ok=True)
     if ledger is None:
         raise BackupError(
             f"{path} opens as SQLite but carries no migration ledger, so it is"
@@ -1084,13 +1184,18 @@ def require_control_plane_database(path: Path) -> None:
             f"{path} has a `schema_migrations` table with columns {sorted(columns)},"
             " which is not the control-plane ledger"
         )
-    if not applied or not all(
-        isinstance(row[0], str) and _MIGRATION_NAME.fullmatch(row[0])
-        for row in applied
-    ):
+    if not applied:
         raise BackupError(
-            f"{path} has a control-plane-shaped ledger with no recognisable"
-            " migration in it, so it is not the control-plane database"
+            f"{path} has a control-plane-shaped ledger with no migration"
+            " recorded in it, so it is not the control-plane database"
+        )
+    shipped = _shipped_migrations()
+    shared = min(len(applied), len(shipped))
+    if applied[:shared] != list(shipped[:shared]):
+        recorded = ", ".join(applied[:5]) or "nothing"
+        raise BackupError(
+            f"{path} records migrations this schema does not have ({recorded});"
+            " it is some other application's database, not the control plane's"
         )
 
 
@@ -1197,8 +1302,19 @@ def install_rollback(
             guard.close()
 
 
-def _undo(moved: list[tuple[Path, Path]]) -> None:
+def _undo(moved: list[_Move]) -> None:
     """Put every completed move back, newest first, and never mask the cause.
+
+    Publication and source removal are reversed separately, because they can
+    fail separately:
+
+    * destination gone — nothing was published, or somebody has already
+      cleaned it up. Leave it.
+    * published, source removed — the ordinary completed move. Put the
+      generation back under its original name.
+    * published, source still standing — the removal failed after the link or
+      copy. The generation is already back where it started, so the reversal is
+      to take the destination away, durably.
 
     Best effort by necessity — the filesystem that just failed may fail again —
     but each attempt is independent, so one that cannot be undone does not
@@ -1206,14 +1322,30 @@ def _undo(moved: list[tuple[Path, Path]]) -> None:
     in here would replace a diagnosis with a symptom.
     """
     unreversed: list[Path] = []
-    for source, destination in reversed(moved):
+    for move in reversed(moved):
+        source, destination = move.source, move.destination
         try:
-            if _present(destination) and not _present(source):
-                _claim(destination, source)
-                # Durable, like every other move this module makes. An
-                # unsynced reversal leaves the same ambiguity the forward
-                # publication was careful to avoid.
-                _fsync_directory(source.parent)
+            if not _present(destination):
+                continue
+            if _inode(destination) != move.published_inode:
+                # Somebody else holds this name now. Removing it or moving it
+                # would destroy their file, which is the failure mode this
+                # module keeps finding in its own cleanup paths.
+                unreversed.append(destination)
+                continue
+            if not move.source_removed:
+                destination.unlink()
+                # Durable, like every other move this module makes. An unsynced
+                # removal leaves the same ambiguity the forward publication was
+                # careful to avoid.
+                _fsync_directory(destination.parent)
+            elif _present(source):
+                unreversed.append(destination)
+            elif not _rename_or_exdev(destination, source):
+                # The forward direction crossed a filesystem, so the reverse
+                # does too: `os.link` answers `EXDEV` and a copy is the only
+                # way back. Both paths fsync the directory they publish into.
+                _copy_install(destination, source)
         except OSError:
             unreversed.append(destination)
             continue
@@ -1247,7 +1379,7 @@ def _install_rollback_locked(
     # candidate, and a retry that refuses because the target is missing. Either
     # the original bundle stands or the new one is complete; there is no third
     # acceptable state.
-    moved: list[tuple[Path, Path]] = []
+    moved: list[_Move] = []
     try:
         for path in superseded:
             if _present(path):

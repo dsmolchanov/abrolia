@@ -2399,7 +2399,7 @@ def test_a_move_is_journalled_before_its_source_unlink(tmp_path, monkeypatch) ->
     source = tmp_path / "moving"
     source.write_bytes(b"the bundle member")
     destination = tmp_path / "landed"
-    journal: list[tuple[Path, Path]] = []
+    journal: list[backup_module._Move] = []
     real_unlink = Path.unlink
 
     def refuse(self, **kwargs):
@@ -2413,8 +2413,318 @@ def test_a_move_is_journalled_before_its_source_unlink(tmp_path, monkeypatch) ->
         backup_module._claim(source, destination, journal)
 
     monkeypatch.undo()
-    assert journal == [(source, destination)], (
+    assert len(journal) == 1, (
         "a move that had already happened went unrecorded, so a reversal would"
         " not know to undo it"
     )
+    recorded = journal[0]
+    assert (recorded.source, recorded.destination) == (source, destination)
     assert destination.exists(), "the link that succeeded is not there"
+    # The half that did NOT happen. A journal saying only "this move happened"
+    # cannot describe both names holding the generation, and `_undo` reading it
+    # that way put the source back — over a source that was still there.
+    assert not recorded.source_removed, (
+        "the unlink failed, so the source has not left; recording the move as"
+        " complete makes the reversal try to restore a name already occupied"
+    )
+    assert recorded.published_inode == (
+        destination.lstat().st_dev,
+        destination.lstat().st_ino,
+    )
+
+
+def test_a_failed_source_unlink_is_reversed_by_removing_the_destination(
+    tmp_path,
+) -> None:
+    """Published, source still standing: the reversal is a removal.
+
+    `_undo` asked one question — is the destination there and the source
+    gone? — and a move whose unlink failed answers no, because the source IS
+    still there. It therefore skipped the reversal entirely and left the
+    destination published: for an install, a rollback database standing beside
+    the superseded generation's sidecars; for a restore, the pause withdrawn
+    while the database it guards remains.
+    """
+    source = tmp_path / "moving"
+    source.write_bytes(b"the bundle member")
+    destination = tmp_path / "landed"
+    journal: list[backup_module._Move] = []
+    os.link(source, destination)
+    journal.append(
+        backup_module._Move(
+            source,
+            destination,
+            published_inode=(destination.lstat().st_dev, destination.lstat().st_ino),
+        )
+    )
+
+    backup_module._undo(journal)
+
+    assert not destination.exists(), (
+        "the destination was published and never withdrawn, so the bundle is"
+        " left half-apart"
+    )
+    assert source.read_bytes() == b"the bundle member", "the source was disturbed"
+
+
+def test_undo_leaves_a_destination_another_process_has_replaced(tmp_path) -> None:
+    """Reversal by name destroys whoever holds the name now."""
+    source = tmp_path / "moving"
+    destination = tmp_path / "landed"
+    journal = [backup_module._Move(source, destination, published_inode=(1, 2))]
+    destination.write_bytes(b"somebody else's file")
+
+    backup_module._undo(journal)
+
+    assert destination.read_bytes() == b"somebody else's file"
+
+
+def test_an_unrelated_application_ledger_is_not_this_database(
+    tmp_path, monkeypatch
+) -> None:
+    """`schema_migrations(name, applied_at)` is a shared convention, not an identity.
+
+    The previous check accepted any SQLite database whose ledger had those two
+    columns and whose rows looked like `NNNN_something.sql` — a shape most
+    migration frameworks produce. A mistyped `ABROLIA_CONTROL_PLANE_DB` could
+    therefore point at a completely unrelated service's database, archive it,
+    verify the archive, and license the operator to delete the real bundle.
+    """
+    impostor = tmp_path / "control-plane.db"
+    raw = sqlite3.connect(impostor)
+    try:
+        raw.execute("CREATE TABLE schema_migrations (name TEXT, applied_at TEXT)")
+        for name in ("0001_create_users.sql", "0002_add_billing.sql"):
+            raw.execute(
+                "INSERT INTO schema_migrations VALUES (?, '2026-01-01T00:00:00Z')",
+                (name,),
+            )
+        raw.commit()
+    finally:
+        raw.close()
+    monkeypatch.setenv("ABROLIA_CONTROL_PLANE_DB", str(impostor))
+    monkeypatch.setenv("ABROLIA_CONTROL_PLANE_BACKUP_KEY", BACKUP_KEY)
+
+    with pytest.raises(SystemExit, match="some other application's database"):
+        cli_main(["backup", str(tmp_path / "superseded.cpb")])
+
+    assert not (tmp_path / "superseded.cpb").exists()
+    assert impostor.exists(), "the refusal mutated the source it refused"
+
+
+def test_a_database_stopped_at_a_failed_migration_is_still_this_database(
+    tmp_path,
+) -> None:
+    """Identity has to hold at every revision, including a partial one.
+
+    The low-space recovery procedure runs `backup` against a database whose
+    pending migration failed — that is precisely why an operator is there — so
+    a check demanding the complete ledger would refuse exactly the bundle worth
+    archiving. Every prefix of the shipped sequence is this database.
+    """
+    seed = _database(tmp_path)
+    seed.migrate()
+    seed.close()
+    shipped = backup_module._shipped_migrations()
+    assert len(shipped) > 1, "the fixture cannot truncate a one-migration ledger"
+
+    for keep in range(1, len(shipped) + 1):
+        raw = sqlite3.connect(tmp_path / "control-plane.db")
+        try:
+            raw.execute(
+                "DELETE FROM schema_migrations WHERE name NOT IN"
+                f" ({','.join('?' * keep)})",
+                shipped[:keep],
+            )
+            raw.commit()
+        finally:
+            raw.close()
+        backup_module.require_control_plane_database(tmp_path / "control-plane.db")
+
+
+def test_a_newer_database_than_this_image_is_still_this_database(tmp_path) -> None:
+    """An image rolled back sees migrations it does not ship.
+
+    Refusing there denies the operator the backup command at the moment a bad
+    deploy is being undone. The shared prefix establishes identity; the tail
+    beyond it only says which side is newer.
+    """
+    seed = _database(tmp_path)
+    seed.migrate()
+    seed.close()
+    raw = sqlite3.connect(tmp_path / "control-plane.db")
+    try:
+        raw.execute(
+            "INSERT INTO schema_migrations VALUES"
+            " ('9999_from_a_newer_image.sql', '2026-09-01T00:00:00Z')"
+        )
+        raw.commit()
+    finally:
+        raw.close()
+
+    backup_module.require_control_plane_database(tmp_path / "control-plane.db")
+
+
+def test_validation_does_not_delete_a_dangling_sidecar_symlink(
+    tmp_path, monkeypatch
+) -> None:
+    """A nominally read-only check deleted an entry it never created.
+
+    The "which sidecars were here before" snapshot used `Path.exists()`, which
+    FOLLOWS symlinks — so a dangling `-wal` symlink answered False, was absent
+    from the snapshot, present after the read-only open, and unlinked by the
+    cleanup as though SQLite had just made it. Backup would silently destroy
+    filesystem state while validating a source it was told to leave alone.
+    """
+    seed = _database(tmp_path)
+    seed.migrate()
+    seed.close()
+    database = tmp_path / "control-plane.db"
+    for sidecar in ("-wal", "-shm"):
+        Path(f"{database}{sidecar}").unlink(missing_ok=True)
+    dangling = Path(f"{database}-wal")
+    dangling.symlink_to(tmp_path / "nothing-is-here")
+    monkeypatch.setenv("ABROLIA_CONTROL_PLANE_DB", str(database))
+    monkeypatch.setenv("ABROLIA_CONTROL_PLANE_BACKUP_KEY", BACKUP_KEY)
+
+    with pytest.raises(SystemExit, match="not a regular file"):
+        cli_main(["backup", str(tmp_path / "superseded.cpb")])
+
+    assert os.path.lexists(dangling), (
+        "validation deleted a sidecar entry the operator put there"
+    )
+    assert not (tmp_path / "superseded.cpb").exists()
+
+
+def test_a_sidecar_appearing_under_the_lock_stops_the_restore(
+    tmp_path, monkeypatch
+) -> None:
+    """The locked recheck asked about the database and nothing else.
+
+    Publication claims the database and marker names atomically, but claims
+    nothing for `-wal`/`-shm`. A generation that released its writer lock
+    between the outer check and this one leaves committed frames behind, which
+    the restored database then replays — rows silently replaced, with
+    `integrity_check` still reporting `ok`.
+    """
+    seed = _database(tmp_path)
+    seed.migrate()
+    archive = tmp_path / "restore-point.cpb"
+    backup_module.create_backup(seed, archive, backup_key=BACKUP_KEY_BYTES)
+    seed.close()
+    destination = tmp_path / "restored" / "control-plane.db"
+    destination.parent.mkdir()
+
+    stale = Path(f"{destination}-wal")
+    real_acquire = ControlPlaneDatabase.acquire_process_lock
+    entered: list[str] = []
+
+    def acquire(self):
+        result = real_acquire(self)
+        if self.path == destination and not stale.exists():
+            stale.write_bytes(b"frames from another generation")
+        return result
+
+    def restore_locked(*arguments, **keywords):
+        entered.append("materialise")
+        raise AssertionError("the locked recheck let a foreign sidecar through")
+
+    monkeypatch.setattr(ControlPlaneDatabase, "acquire_process_lock", acquire)
+    monkeypatch.setattr(backup_module, "_restore_locked", restore_locked)
+
+    with pytest.raises(backup_module.BackupError, match="leftover SQLite state"):
+        backup_module.restore_backup(
+            archive, destination, backup_key=BACKUP_KEY_BYTES
+        )
+
+    # Refused UNDER THE LOCK, before a database-sized image is decrypted and
+    # fsynced onto the volume this command exists to keep room on.
+    assert entered == [], entered
+    assert not destination.exists(), "a restore published beside foreign WAL frames"
+    assert not backup_module._pause_marker(destination).exists()
+    assert stale.read_bytes() == b"frames from another generation"
+
+
+def test_a_sidecar_appearing_during_decryption_stops_the_publication(
+    tmp_path, monkeypatch
+) -> None:
+    """Everything between the locked check and publication is a window.
+
+    Decrypting, fsyncing and integrity-checking a database-sized image is the
+    longest stretch of the restore, and publication claims only the database
+    and marker names — a `-wal` that arrives in that stretch is still there
+    afterwards, and the restored database replays its frames.
+    """
+    seed = _database(tmp_path)
+    seed.migrate()
+    archive = tmp_path / "restore-point.cpb"
+    backup_module.create_backup(seed, archive, backup_key=BACKUP_KEY_BYTES)
+    seed.close()
+    destination = tmp_path / "restored" / "control-plane.db"
+    destination.parent.mkdir()
+
+    stale = Path(f"{destination}-shm")
+    real_connect = sqlite3.connect
+
+    def connect(*arguments, **keywords):
+        # The integrity check on the materialised temporary: past the locked
+        # recheck, before anything has been published.
+        if not stale.exists():
+            stale.write_bytes(b"shared memory from another generation")
+        return real_connect(*arguments, **keywords)
+
+    monkeypatch.setattr(backup_module.sqlite3, "connect", connect)
+
+    with pytest.raises(backup_module.BackupError, match="leftover SQLite state"):
+        backup_module.restore_backup(
+            archive, destination, backup_key=BACKUP_KEY_BYTES
+        )
+
+    assert not destination.exists(), "a restore published beside foreign SQLite state"
+    assert not backup_module._pause_marker(destination).exists()
+    assert stale.read_bytes() == b"shared memory from another generation"
+
+
+def test_sidecar_cleanup_removes_only_the_entry_it_created(
+    tmp_path, monkeypatch
+) -> None:
+    """A NAME can be reused between closing the connection and cleaning up.
+
+    The cleanup unlinked every sidecar that had not been there before, by name.
+    A writer starting in that window creates its own `-wal` at the same path,
+    and a validation that was supposed to leave the bundle untouched deletes
+    it — taking that writer's committed frames with it.
+    """
+    seed = _database(tmp_path)
+    seed.migrate()
+    seed.close()
+    database = tmp_path / "control-plane.db"
+    for suffix in ("-wal", "-shm"):
+        Path(f"{database}{suffix}").unlink(missing_ok=True)
+    successor = Path(f"{database}-wal")
+    real_connect = sqlite3.connect
+
+    class SwapOnClose:
+        def __init__(self, connection):
+            self._connection = connection
+
+        def execute(self, *arguments):
+            return self._connection.execute(*arguments)
+
+        def close(self):
+            self._connection.close()
+            # Somebody else's `-wal`, at the same name, after this open let go.
+            successor.unlink(missing_ok=True)
+            successor.write_bytes(b"a live writer's frames")
+
+    def connect(*arguments, **keywords):
+        return SwapOnClose(real_connect(*arguments, **keywords))
+
+    monkeypatch.setattr(backup_module.sqlite3, "connect", connect)
+    with backup_module._read_only_sqlite(database) as connection:
+        connection.execute("PRAGMA integrity_check").fetchone()
+        assert successor.exists(), "the read-only open created no sidecar to own"
+
+    assert successor.read_bytes() == b"a live writer's frames", (
+        "cleanup unlinked by name and destroyed an entry it never created"
+    )
