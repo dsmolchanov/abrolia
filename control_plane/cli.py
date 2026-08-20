@@ -68,6 +68,14 @@ def _parser() -> argparse.ArgumentParser:
         required=True,
         help="the canonical path from fly.toml, currently holding the superseded database",
     )
+    install.add_argument(
+        "--target-already-freed",
+        action="store_true",
+        help=(
+            "the superseded database was archived off-volume and deleted to make"
+            " room, so --target does not exist yet"
+        ),
+    )
     commands.add_parser("resume-jobs", help="remove the exact post-restore worker pause")
     return parser
 
@@ -188,7 +196,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         # and refuses when it cannot, so the only credential-shaped dependency
         # it had came from the space-freeing it no longer does.
         print(json.dumps(
-            install_rollback(args.restored, args.target),
+            install_rollback(
+                args.restored,
+                args.target,
+                target_already_freed=args.target_already_freed,
+            ),
             sort_keys=True,
         ))
         return 0

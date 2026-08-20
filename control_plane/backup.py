@@ -343,6 +343,12 @@ def restore_backup(
             " stop it before restoring over that path"
         ) from error
     try:
+        # Re-checked INSIDE the lock. The check above runs before the lock is
+        # held, so another process could create that path in between and this
+        # would overwrite it — the refusal to clobber an existing target is the
+        # point, and a check made outside the lock is one the lock cannot back.
+        if destination.exists():
+            raise FileExistsError(destination)
         return _restore_locked(
             source,
             destination,
@@ -684,7 +690,9 @@ def _name_max(directory: Path) -> int:
         return 255
 
 
-def _preflight(restored: Path, target: Path, stamp: int) -> str:
+def _preflight(
+    restored: Path, target: Path, stamp: int, *, target_already_freed: bool
+) -> str:
     """Everything that can be known before the live database is touched.
 
     The first version checked `restored.is_file()` and `target.exists()` and
@@ -701,10 +709,29 @@ def _preflight(restored: Path, target: Path, stamp: int) -> str:
     if not _regular_file(restored):
         raise RollbackError(f"{restored} is not a regular file")
     if not target.exists():
-        raise RollbackError(f"nothing to supersede at {target}")
-    if not _regular_file(target):
+        if not target_already_freed:
+            raise RollbackError(
+                f"nothing to supersede at {target}. If the superseded database"
+                " was already archived off-volume and deleted to make room,"
+                " say so with --target-already-freed; otherwise check the path."
+            )
+        if not target.parent.is_dir():
+            raise RollbackError(f"{target.parent} is not a directory")
+        # The mode exists because the documented low-space recovery ends with
+        # the operator deleting the superseded database — and this command then
+        # refused, because it had nothing to supersede. Following the supported
+        # procedure produced an outage. It is a FLAG rather than an inference so
+        # that a mistyped `--target` cannot silently install a rollback at a
+        # path nobody meant.
+        for member in _bundle(target):
+            if member.exists():
+                raise RollbackError(
+                    f"{member} is still present, so the target was not freed;"
+                    " remove --target-already-freed"
+                )
+    elif not _regular_file(target):
         raise RollbackError(f"{target} is not a regular file")
-    if os.path.samefile(restored, target):
+    if target.exists() and os.path.samefile(restored, target):
         # `resolve()` catches a lexical alias and a symlink, and misses two hard
         # links to one inode — under which the install would leave the
         # superseded path and the canonical target pointing at the same migrated
@@ -770,13 +797,25 @@ def _is_a_copy(source: Path, destination: Path) -> bool:
     # and two containers on one volume share the namespace. `mkstemp` gets the
     # name from the kernel with O_EXCL, so the probe cannot collide with — or be
     # clobbered by — a concurrent one.
+    # Reserved on BOTH sides. `mkstemp` guarantees the name is free in `source`
+    # and says nothing about `destination`, which is where the probe is about to
+    # land — so a concurrent probe, or any file that happens to hold that name
+    # there, would be overwritten by the rename and then unlinked in the
+    # `finally`. Claim it in the destination first, and only rename onto a name
+    # this call owns.
     try:
         handle, name = tempfile.mkstemp(prefix=".volume-probe-", dir=source)
     except OSError:
         return True
     os.close(handle)
     probe = Path(name)
-    landed = destination / probe.name
+    try:
+        claim, landed_name = tempfile.mkstemp(prefix=".volume-probe-", dir=destination)
+    except OSError:
+        probe.unlink(missing_ok=True)
+        return True
+    os.close(claim)
+    landed = Path(landed_name)
     try:
         return not _rename_or_exdev(probe, landed)
     finally:
@@ -789,6 +828,7 @@ def install_rollback(
     target: Path | str,
     *,
     now: float | None = None,
+    target_already_freed: bool = False,
 ) -> dict[str, object]:
     """Put a restored database where the rolled-back image will open it.
 
@@ -832,20 +872,58 @@ def install_rollback(
     # `ControlPlaneDatabase` opens no connection until one is asked for, so this
     # takes the lock without touching SQLite. The preflight runs inside it,
     # because a check made before the lock is one another writer can invalidate.
-    guard = ControlPlaneDatabase(target_path)
-    try:
-        guard.acquire_process_lock()
-    except ProcessAlreadyRunning as error:
+    # Before the locks: a self-install would otherwise take the same lock twice
+    # from one process and be reported as "another process still owns", which is
+    # both wrong and unactionable.
+    if (
+        restored_path.exists()
+        and target_path.exists()
+        and os.path.samefile(restored_path, target_path)
+    ):
         raise RollbackError(
-            f"a control-plane writer still owns {target_path};"
-            " stop the service before installing a rollback"
-        ) from error
+            f"{restored_path} and {target_path} are the same file;"
+            " there is nothing to install"
+        )
+
+    # BOTH ends, and in a fixed order. The candidate is a control-plane database
+    # too: a `restore` still finishing at that path, or a second install reading
+    # it, would have its bundle moved out from under it. Target first, then
+    # source, always — two callers taking them in opposite orders is a deadlock,
+    # and a consistent order is what prevents it.
+    guards: list[ControlPlaneDatabase] = []
     try:
-        aside = _preflight(restored_path, target_path, stamp)
-        return _install_rollback_locked(restored_path, target_path, aside=aside)
+        for path, message in (
+            (
+                target_path,
+                f"a control-plane writer still owns {target_path};"
+                " stop the service before installing a rollback",
+            ),
+            (
+                restored_path,
+                f"another process still owns {restored_path};"
+                " let the restore finish before installing it",
+            ),
+        ):
+            guard = ControlPlaneDatabase(path)
+            try:
+                guard.acquire_process_lock()
+            except ProcessAlreadyRunning as error:
+                guard.close()
+                raise RollbackError(message) from error
+            guards.append(guard)
+        aside = _preflight(
+            restored_path,
+            target_path,
+            stamp,
+            target_already_freed=target_already_freed,
+        )
+        return _install_rollback_locked(
+            restored_path, target_path, aside=aside
+        )
     finally:
-        guard.release_process_lock()
-        guard.close()
+        for guard in reversed(guards):
+            guard.release_process_lock()
+            guard.close()
 
 
 def _install_rollback_locked(
@@ -867,11 +945,29 @@ def _install_rollback_locked(
         raise RollbackError(
             f"superseded files remain at the canonical path: {', '.join(remaining)}"
         )
-    report["superseded_kept_as"] = str(volume / aside)
+    # `None` in the already-freed mode: there was nothing to move aside, because
+    # the operator archived and deleted it to make room. Naming a path that
+    # holds nothing would read as a recovery copy that does not exist.
+    report["superseded_kept_as"] = (
+        str(volume / aside) if (volume / aside).exists() else None
+    )
 
-    for source, destination in zip(
-        _bundle(restored_path), _bundle(target_path), strict=True
-    ):
+    # The PAUSE FIRST, for the same reason `restore_backup` publishes it first:
+    # a database that becomes visible before its marker is a database that can
+    # be started without one. Installing in bundle order put the database at the
+    # canonical path and then the marker, so a crash or a failed copy in between
+    # left a startable, unreconciled rollback.
+    ordered = (
+        _pause_marker(restored_path),
+        restored_path,
+        *_sidecars(restored_path),
+    )
+    destinations = (
+        _pause_marker(target_path),
+        target_path,
+        *_sidecars(target_path),
+    )
+    for source, destination in zip(ordered, destinations, strict=True):
         if source.exists() and not _rename_or_exdev(source, destination):
             _copy_install(source, destination)
 

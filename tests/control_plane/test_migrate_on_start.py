@@ -1545,3 +1545,187 @@ def test_the_volume_probe_cannot_collide_with_a_concurrent_one(tmp_path) -> None
     # And nothing is left behind on either side.
     assert list(source.iterdir()) == []
     assert list(destination.iterdir()) == []
+
+
+def test_the_documented_low_space_recovery_runs_end_to_end(tmp_path, monkeypatch) -> None:
+    """The runbook's manual reclamation, executed exactly as written.
+
+    It previously ended in an outage: it told the operator to delete
+    `/data/control-plane.db` to release blocks, and the next `install-rollback`
+    refused with "nothing to supersede". Following the supported procedure left
+    the service database absent and the recovery command unusable.
+
+    So the whole sequence runs here — archive off-volume, verify it restores,
+    delete, install — and the volume has to end with a paused canonical
+    database.
+    """
+    volume, target, restored = _rollback_fixture(tmp_path)
+    off_volume = tmp_path / "off-volume"
+    off_volume.mkdir()
+    _constrain(monkeypatch, volume, capacity=target.stat().st_size * 3 // 2)
+
+    # Refused first, with the volume untouched — which is what sends an operator
+    # to the manual procedure.
+    before = _fingerprint(volume)
+    with pytest.raises(RollbackError, match="bytes and .* are free"):
+        install_rollback(restored, target, now=1800000042)
+    assert _fingerprint(volume) == before
+
+    # Step 1: archive the superseded database off-volume, and verify it opens.
+    superseded = ControlPlaneDatabase(target)
+    archive = off_volume / "control-plane-superseded.cpb"
+    try:
+        create_backup(superseded, archive, backup_key=BACKUP_KEY_BYTES)
+    finally:
+        superseded.close()
+    verify = restore_backup(
+        archive,
+        off_volume / "verify.db",
+        backup_key=BACKUP_KEY_BYTES,
+        apply_migrations=False,
+    )
+    verify.close()
+    assert "migrated_only" in _tables(off_volume / "verify.db")
+
+    # Step 2: only now release the blocks.
+    for path in _bundle_paths(target):
+        path.unlink(missing_ok=True)
+
+    # Step 3: install, saying the target is gone on purpose.
+    report = install_rollback(
+        restored, target, now=1800000043, target_already_freed=True
+    )
+
+    assert report["superseded_kept_as"] is None
+    assert report["workers"] == "paused"
+    assert target.exists(), "the documented recovery ended without a database"
+    assert "migrated_only" not in _tables(target), "the rollback was not installed"
+    installed = ControlPlaneDatabase(target)
+    try:
+        assert installed.workers_paused
+    finally:
+        installed.close()
+
+
+def _bundle_paths(database: Path) -> tuple[Path, ...]:
+    return backup_module._bundle(database)
+
+
+def test_the_freed_target_mode_refuses_a_target_that_was_not_freed(
+    tmp_path, monkeypatch
+) -> None:
+    """A leftover member means the target is still there under another name.
+
+    The flag says "I archived and deleted it"; if any bundle member is still
+    present that is not true, and installing over it would separate a database
+    from its own sidecars.
+    """
+    volume, target, restored = _rollback_fixture(tmp_path)
+    _constrain(monkeypatch, volume, capacity=target.stat().st_size * 10)
+    target.unlink()
+    (volume / "control-plane.db-wal").write_bytes(b"\x00" * 4096)
+    before = _fingerprint(volume)
+
+    with pytest.raises(RollbackError, match="was not freed"):
+        install_rollback(
+            restored, target, now=1800000042, target_already_freed=True
+        )
+
+    assert _fingerprint(volume) == before
+
+
+def test_a_missing_target_without_the_flag_says_what_to_do(tmp_path, monkeypatch) -> None:
+    volume, target, restored = _rollback_fixture(tmp_path)
+    _constrain(monkeypatch, volume, capacity=target.stat().st_size * 10)
+    for path in _bundle_paths(target):
+        path.unlink(missing_ok=True)
+
+    with pytest.raises(RollbackError, match="--target-already-freed"):
+        install_rollback(restored, target, now=1800000042)
+
+
+def test_the_pause_marker_is_installed_before_the_database(tmp_path, monkeypatch) -> None:
+    """A database visible before its marker is one that can be started unpaused.
+
+    Installing in bundle order put the database at the canonical path first, so
+    a crash or a failed copy before the marker arrived left a startable,
+    unreconciled rollback.
+    """
+    volume, target, restored = _rollback_fixture(tmp_path)
+    _constrain(monkeypatch, volume, capacity=target.stat().st_size * 10)
+    order: list[str] = []
+    real_replace = os.replace
+
+    def replace(source, destination, **kwargs):
+        landed = Path(destination)
+        if landed == target:
+            order.append("database")
+        elif landed == _pause_marker_path(target):
+            order.append("marker")
+        return real_replace(source, destination, **kwargs)
+
+    monkeypatch.setattr(os, "replace", replace)
+    install_rollback(restored, target, now=1800000042)
+
+    # Two entries per file: `_rename_or_exdev` attempts the rename, and on
+    # `EXDEV` `_copy_install` publishes the temporary. What matters is that
+    # EVERY marker event precedes every database event — the marker is durably
+    # in place before the database it guards becomes visible.
+    assert set(order) == {"marker", "database"}, order
+    assert max(i for i, v in enumerate(order) if v == "marker") < min(
+        i for i, v in enumerate(order) if v == "database"
+    ), order
+
+
+def test_a_writer_on_the_candidate_stops_the_install(tmp_path, monkeypatch) -> None:
+    """The candidate is a control-plane database too.
+
+    A `restore` still finishing at that path, or a second install reading it,
+    would have its bundle moved out from under it.
+    """
+    volume, target, restored = _rollback_fixture(tmp_path)
+    _constrain(monkeypatch, volume, capacity=target.stat().st_size * 10)
+    before = _fingerprint(volume)
+
+    holder = ControlPlaneDatabase(restored)
+    holder.acquire_process_lock()
+    try:
+        with pytest.raises(RollbackError, match="still owns"):
+            install_rollback(restored, target, now=1800000042)
+    finally:
+        holder.release_process_lock()
+        holder.close()
+
+    assert _fingerprint(volume) == before
+    assert "migrated_only" in _tables(target)
+
+
+def test_a_restore_target_created_after_the_check_is_not_clobbered(
+    tmp_path, monkeypatch
+) -> None:
+    """The existence check has to be inside the lock the refusal depends on."""
+    seed = _database(tmp_path)
+    seed.migrate()
+    archive = tmp_path / "control-plane.cpb"
+    create_backup(seed, archive, backup_key=BACKUP_KEY_BYTES)
+    seed.close()
+
+    destination = tmp_path / "restored"
+    destination.mkdir()
+    target = destination / "control-plane.db"
+    real_acquire = ControlPlaneDatabase.acquire_process_lock
+
+    def acquire_then_race(self):
+        real_acquire(self)
+        # Another process wins the path between the outer check and the lock.
+        if not target.exists():
+            target.write_bytes(b"someone else got here first")
+
+    monkeypatch.setattr(ControlPlaneDatabase, "acquire_process_lock", acquire_then_race)
+
+    with pytest.raises(FileExistsError):
+        restore_backup(
+            archive, target, backup_key=BACKUP_KEY_BYTES, apply_migrations=False
+        )
+
+    assert target.read_bytes() == b"someone else got here first"

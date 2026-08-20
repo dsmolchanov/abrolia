@@ -156,11 +156,25 @@ abrolia-control-plane restore /tmp/control-plane-superseded.cpb \
 
 # 2. Only now release the blocks.
 rm -f /data/control-plane.db /data/control-plane.db-wal /data/control-plane.db-shm
+
+# 3. Install, telling the command the target is gone on purpose.
+abrolia-control-plane install-rollback \
+  --restored /tmp/control-plane-rollback.db \
+  --target /data/control-plane.db \
+  --target-already-freed
 ```
 
 Never skip step 1. Discarding a restore point to reclaim space is the one move
 that turns a disk problem into a data-loss problem, and the pre-migrate archive
 covers the state *before* the migration — not the writes taken after it.
+
+Step 3 needs the flag because step 2 deleted the database the command would
+otherwise supersede, and a missing `--target` is far more often a typo than a
+deliberate state. With the flag it verifies that the whole bundle really is
+gone — a leftover `-wal` means the target was not freed — and then installs with
+every other check intact. Without step 3's flag the command refuses and says so,
+which is how this gap was found: the documented procedure previously ended with
+no database and a command that would not run.
 
 Before anything moves, the command also refuses if a control-plane writer still
 holds `/data/control-plane.db.writer.lock` (the same lock `serve` takes —
