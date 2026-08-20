@@ -414,6 +414,13 @@ def create_backup(
     identically.
     """
     destination = Path(target)
+    # BEFORE the occupancy check, because the dangerous aliases are the ones
+    # that are ABSENT. `<db>.workers-paused` is normally not there, so occupancy
+    # said yes and the authenticated archive was published as the live pause
+    # marker: the backup reported success and every worker afterwards treated
+    # the database as an unreconciled restore and stopped doing durable work. A
+    # nominal backup silently disabled production.
+    _refuse_alias(destination, database.path, what="the database being archived")
     if _present(destination):
         # `lexists`, because a DANGLING symlink is reported absent by
         # `Path.exists()` — and `_publish`'s `os.replace` would then silently
@@ -695,6 +702,72 @@ def _free_bytes(directory: Path) -> int:
     return int(stats.f_bavail * stats.f_frsize)
 
 
+def _writer_lock(database: Path) -> Path:
+    """Where `ControlPlaneDatabase.acquire_process_lock` puts its lock file.
+
+    Part of the namespace an operation owns even though it is not part of the
+    bundle: an archive published over it is an archive published over the thing
+    that decides whether anyone else may write.
+    """
+    return database.with_name(f"{database.name}.writer.lock")
+
+
+def _namespace(database: Path) -> tuple[Path, ...]:
+    """Every pathname a control-plane database's operations own."""
+    return (*_bundle(database), _writer_lock(database))
+
+
+def _identity(path: Path) -> tuple:
+    """A name that can be compared before the entry behind it exists.
+
+    The PARENT is resolved and the final component is not: resolving the whole
+    path would follow `<db>-wal` to whatever it points at, and the question is
+    about the entry itself. Resolving the parent is what catches an alias
+    reached through a symlinked directory, which comparing strings does not.
+    """
+    try:
+        parent = path.parent.resolve()
+    except OSError:
+        parent = path.parent
+    return (parent, path.name)
+
+
+def _refuse_alias(
+    candidate: Path,
+    owner: Path,
+    *,
+    what: str,
+    error: type[RuntimeError] = None,  # noqa: RUF013 - resolved below
+) -> None:
+    """Refuse a user-supplied path that names part of `owner`'s namespace.
+
+    Nothing here creates or opens anything: the answer has to be known BEFORE
+    the operation starts, because by the time an archive has been published over
+    `<db>.workers-paused` the damage is a paused production service, and by the
+    time a rollback has moved a candidate's own marker aside there may be no
+    database at the canonical path at all.
+
+    Both by name and by inode. A name comparison catches the alias the operator
+    typed; comparing entries catches two hard links to one file, which no amount
+    of path normalisation will. `os.path.samefile` is the obvious way to ask and
+    the wrong one: it FOLLOWS symlinks, so it raises `FileNotFoundError` on a
+    dangling one — an entry this has to be able to reason about rather than
+    crash on. `lstat` asks about the entries themselves.
+    """
+    error = error or BackupError
+    identity = _identity(candidate)
+    entry = _inode(candidate)
+    for member in _namespace(owner):
+        if identity == _identity(member) or (
+            entry is not None and entry == _inode(member)
+        ):
+            raise error(
+                f"{candidate} is {member}, which belongs to {what} at {owner}."
+                " Choose a path outside that database's bundle; writing there"
+                " would disable or destroy the thing being protected."
+            )
+
+
 def _bundle(database: Path) -> tuple[Path, ...]:
     """Every file that has to travel with a database for it to be usable.
 
@@ -964,6 +1037,34 @@ def _name_max(directory: Path) -> int:
         return 255
 
 
+def _refuse_overlap(restored: Path, target: Path) -> None:
+    """Neither side's namespace may name any part of the other's.
+
+    Includes each database in the other's comparison, so the plain
+    self-install — the same file named twice — is one case of the general rule
+    rather than a separate check that happened to be the only one made.
+    """
+    if _identity(restored) == _identity(target) or (
+        _inode(restored) is not None and _inode(restored) == _inode(target)
+    ):
+        # Named separately because it is the case an operator actually reaches,
+        # and "there is nothing to install" says more than "these namespaces
+        # overlap". `_inode` compares entries, so two hard links to one database
+        # are caught where `resolve()` would report two different paths.
+        raise RollbackError(
+            f"{restored} and {target} are the same file; there is nothing to"
+            " install"
+        )
+    for candidate in _namespace(restored):
+        _refuse_alias(
+            candidate, target, what="the rollback target", error=RollbackError
+        )
+    for candidate in _namespace(target):
+        _refuse_alias(
+            candidate, restored, what="the restored candidate", error=RollbackError
+        )
+
+
 def _preflight(
     restored: Path, target: Path, stamp: int, *, target_already_freed: bool
 ) -> str:
@@ -980,6 +1081,10 @@ def _preflight(
     Returns the reserved superseded-bundle name, because reserving it is part of
     deciding whether the install can proceed at all.
     """
+    # Re-asked under the locks. The check before them runs unlocked, so a
+    # symlink retargeted in between could alias the two namespaces after the
+    # question had already been answered.
+    _refuse_overlap(restored, target)
     if not _regular_file(restored):
         raise RollbackError(f"{restored} is not a regular file")
     if not target.exists():
@@ -1005,15 +1110,6 @@ def _preflight(
                 )
     elif not _regular_file(target):
         raise RollbackError(f"{target} is not a regular file")
-    if target.exists() and os.path.samefile(restored, target):
-        # `resolve()` catches a lexical alias and a symlink, and misses two hard
-        # links to one inode — under which the install would leave the
-        # superseded path and the canonical target pointing at the same migrated
-        # database while reporting a successful rollback. `samefile` compares
-        # (st_dev, st_ino), which is the question actually being asked.
-        raise RollbackError(
-            f"{restored} and {target} are the same file; there is nothing to install"
-        )
     marker = _pause_marker(restored)
     if not marker.exists():
         # Checked HERE rather than after the install. `restore` writes this
@@ -1329,15 +1425,15 @@ def install_rollback(
     # Before the locks: a self-install would otherwise take the same lock twice
     # from one process and be reported as "another process still owns", which is
     # both wrong and unactionable.
-    if (
-        restored_path.exists()
-        and target_path.exists()
-        and os.path.samefile(restored_path, target_path)
-    ):
-        raise RollbackError(
-            f"{restored_path} and {target_path} are the same file;"
-            " there is nothing to install"
-        )
+    # The two DATABASES were compared, and nothing else. `--target
+    # <restored>.workers-paused` is a different regular file, so it passed:
+    # the superseded loop then moved the candidate's own marker aside, renamed
+    # the candidate database onto that marker's pathname, and the missing-pause
+    # check raised from outside the undo block — leaving the candidate split
+    # across two names with no database at the intended canonical path, and
+    # nothing to retry from. Every pathname on both sides, before any lock is
+    # taken and before anything moves.
+    _refuse_overlap(restored_path, target_path)
 
     # BOTH ends, and in a fixed order. The candidate is a control-plane database
     # too: a `restore` still finishing at that path, or a second install reading

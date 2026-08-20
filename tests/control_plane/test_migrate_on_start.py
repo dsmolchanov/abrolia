@@ -1004,6 +1004,10 @@ def test_a_restore_with_no_pause_marker_is_refused_before_anything_moves(
     assert _fingerprint(volume) == before, "the volume was modified by a refused install"
 
 
+def _sidecars_of(database: Path) -> tuple[Path, ...]:
+    return tuple(Path(f"{database}{suffix}") for suffix in ("-wal", "-shm"))
+
+
 def _fingerprint(directory: Path) -> dict[str, bytes]:
     """Every file under `directory`, by name and content.
 
@@ -2927,3 +2931,131 @@ def test_the_schema_sentinels_come_from_the_migrations_themselves(tmp_path) -> N
     assert present - created <= {"schema_migrations", "sqlite_sequence"}, sorted(
         present - created
     )
+
+
+@pytest.mark.parametrize("alias", ["", "-wal", "-shm", ".workers-paused", ".writer.lock"])
+def test_backup_refuses_a_target_inside_the_live_bundle(
+    tmp_path, monkeypatch, alias
+) -> None:
+    """The dangerous aliases are the ones that are ABSENT.
+
+    `<db>.workers-paused` is normally not there, so the occupancy check said the
+    name was free and the authenticated archive was published as the live pause
+    marker. The backup reported success; every worker afterwards read the
+    database as an unreconciled restore and stopped doing durable work. A
+    nominal backup silently disabled production.
+    """
+    seed = _database(tmp_path)
+    seed.migrate()
+    seed.close()
+    database = tmp_path / "control-plane.db"
+    for sidecar in _sidecars_of(database):
+        sidecar.unlink(missing_ok=True)
+    before = _fingerprint(tmp_path)
+    monkeypatch.setenv("ABROLIA_CONTROL_PLANE_DB", str(database))
+    monkeypatch.setenv("ABROLIA_CONTROL_PLANE_BACKUP_KEY", BACKUP_KEY)
+
+    with pytest.raises(SystemExit, match="belongs to the database being archived"):
+        cli_main(["backup", f"{database}{alias}"])
+
+    assert _fingerprint(tmp_path) == before, "the refusal mutated the volume"
+    assert not backup_module._pause_marker(database).exists(), (
+        "the backup paused the workers it was meant to leave alone"
+    )
+
+
+def test_backup_refuses_an_alias_reached_through_a_symlinked_directory(
+    tmp_path, monkeypatch
+) -> None:
+    """String comparison does not see this one; resolving the parent does."""
+    volume = tmp_path / "data"
+    volume.mkdir()
+    seed = ControlPlaneDatabase(volume / "control-plane.db")
+    seed.migrate()
+    seed.close()
+    database = volume / "control-plane.db"
+    for sidecar in _sidecars_of(database):
+        sidecar.unlink(missing_ok=True)
+    link = tmp_path / "by-another-name"
+    link.symlink_to(volume, target_is_directory=True)
+    before = _fingerprint(volume)
+    monkeypatch.setenv("ABROLIA_CONTROL_PLANE_DB", str(database))
+    monkeypatch.setenv("ABROLIA_CONTROL_PLANE_BACKUP_KEY", BACKUP_KEY)
+
+    with pytest.raises(SystemExit, match="belongs to the database being archived"):
+        cli_main(["backup", str(link / "control-plane.db.workers-paused")])
+
+    assert _fingerprint(volume) == before
+    assert not backup_module._pause_marker(database).exists()
+
+
+@pytest.mark.parametrize("alias", ["-wal", "-shm", ".workers-paused", ".writer.lock"])
+def test_install_rollback_refuses_a_target_inside_the_candidate(
+    tmp_path, monkeypatch, alias
+) -> None:
+    """Only the two DATABASES were compared, and everything else passed.
+
+    `--target <restored>.workers-paused` is a different regular file, so the
+    superseded loop moved the candidate's own marker aside, renamed the
+    candidate database onto that marker's pathname, and the missing-pause check
+    raised from OUTSIDE the undo block — leaving the candidate split across two
+    names, no database at the intended canonical path, and nothing to retry
+    from.
+    """
+    volume, target, restored = _rollback_fixture(tmp_path)
+    _constrain(monkeypatch, volume, capacity=target.stat().st_size * 10)
+    volume_before = _fingerprint(volume)
+    staging_before = _fingerprint(restored.parent)
+
+    with pytest.raises(RollbackError, match="belongs to"):
+        install_rollback(restored, Path(f"{restored}{alias}"), now=1800000042)
+
+    assert _fingerprint(volume) == volume_before
+    assert _fingerprint(restored.parent) == staging_before, (
+        "the refusal moved part of the rollback candidate"
+    )
+
+
+@pytest.mark.parametrize("alias", ["-wal", "-shm", ".workers-paused", ".writer.lock"])
+def test_install_rollback_refuses_a_candidate_inside_the_target(
+    tmp_path, monkeypatch, alias
+) -> None:
+    """The rule is symmetric: neither namespace may name part of the other."""
+    volume, target, restored = _rollback_fixture(tmp_path)
+    _constrain(monkeypatch, volume, capacity=target.stat().st_size * 10)
+    volume_before = _fingerprint(volume)
+    staging_before = _fingerprint(restored.parent)
+
+    with pytest.raises(RollbackError, match="belongs to"):
+        install_rollback(Path(f"{target}{alias}"), target, now=1800000042)
+
+    assert _fingerprint(volume) == volume_before
+    assert _fingerprint(restored.parent) == staging_before
+
+
+def test_install_rollback_refuses_a_hard_linked_bundle_member(
+    tmp_path, monkeypatch
+) -> None:
+    """A different name for the same entry, which no path comparison can see.
+
+    `--target /data/aliased.db` looks unrelated to the candidate until you ask
+    what it refers to: the candidate's own pause marker. Normalising paths
+    answers "two different files"; comparing entries answers correctly.
+    """
+    volume, target, restored = _rollback_fixture(tmp_path)
+    _constrain(monkeypatch, volume, capacity=target.stat().st_size * 10)
+    marker = backup_module._pause_marker(restored)
+    assert marker.exists(), "the fixture candidate has no pause marker to alias"
+    # Inside the staging directory: `_constrain` simulates EXDEV between these
+    # two directories, and a hard link cannot cross a device anyway. The alias
+    # this guards against is a name in the SAME directory as its referent.
+    aliased = restored.parent / "aliased.db"
+    os.link(marker, aliased)
+    volume_before = _fingerprint(volume)
+    staging_before = _fingerprint(restored.parent)
+
+    with pytest.raises(RollbackError, match="belongs to"):
+        install_rollback(restored, aliased, now=1800000042)
+
+    assert _fingerprint(volume) == volume_before
+    assert _fingerprint(restored.parent) == staging_before

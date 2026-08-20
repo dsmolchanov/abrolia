@@ -255,6 +255,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = create_backup(
                 database, args.target, backup_key=backup_key_from_env()
             )
+        except BackupError as error:
+            # A refusal, not a crash. `create_backup` rejects a target that
+            # aliases the live bundle — `<db>.workers-paused` being the one that
+            # matters, because it is normally absent and publishing an archive
+            # there pauses every worker — and an operator who mistyped `--target`
+            # needs the message, not a traceback.
+            raise SystemExit(f"backup refused: {error}") from error
         finally:
             database.release_process_lock()
             database.close()
