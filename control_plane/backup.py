@@ -251,6 +251,23 @@ def _reusable_pre_migrate_backup(
     return None
 
 
+def _claim(source: Path, destination: Path) -> None:
+    """Move `source` onto `destination`, refusing to replace anything.
+
+    `os.replace` is atomic and CLOBBERS, so guarding it with a check leaves a
+    window: another process creates the final name in between and the rename
+    destroys it silently. `os.link` is the atomic version of the question this
+    code actually asks — it fails with `EEXIST` rather than replacing — so the
+    name is claimed or it is not, with nothing in between for a race to occupy.
+
+    Same-filesystem only, which every caller already is: the temporary is
+    created beside its destination, and a cross-filesystem move is handled by
+    `_rename_or_exdev` reporting `EXDEV` instead.
+    """
+    os.link(source, destination)
+    source.unlink(missing_ok=True)
+
+
 class AmbiguousPublication(BackupError):
     """The destination may or may not exist after a failed publication.
 
@@ -290,13 +307,12 @@ def _publish(temporary: Path, destination: Path) -> None:
     will not sync stops the migration instead of silently proceeding without a
     durable restore point.
     """
-    if _present(destination):
-        # Re-checked HERE, not only before the work. Materialising an image and
-        # encrypting it takes as long as the database is big, and an entry
-        # created in that window was invisible to the check at the top —
-        # `os.replace` would then destroy it without a word.
-        raise FileExistsError(destination)
-    os.replace(temporary, destination)
+    # ATOMIC, not checked. Re-checking here closed the wide window — an entry
+    # created while a database-sized image was being encrypted — and left the
+    # narrow one, between the check and the rename. `_claim` has no window:
+    # `os.link` fails with `EEXIST` rather than replacing, so this either takes
+    # a name nobody held or takes nothing.
+    _claim(temporary, destination)
     try:
         _fsync_directory(destination.parent)
     except OSError:
@@ -660,7 +676,7 @@ def _rename_or_exdev(source: Path, destination: Path) -> bool:
     is what makes it safe to ask first and decide afterwards.
     """
     try:
-        os.replace(source, destination)
+        _claim(source, destination)
     except OSError as error:
         if error.errno == errno.EXDEV:
             return False
@@ -937,8 +953,17 @@ def _is_a_copy(source: Path, destination: Path) -> bool:
         return True
     os.close(claim)
     landed = Path(landed_name)
+    # `mkstemp` reserved the destination name so a concurrent probe could not
+    # take it; release it just before claiming, because `_claim` refuses to
+    # replace an existing entry and would otherwise refuse our own reservation.
+    landed.unlink(missing_ok=True)
     try:
         return not _rename_or_exdev(probe, landed)
+    except FileExistsError:
+        # Something took the name in that instant. The question cannot be
+        # answered, and "assume it is a copy" is the conservative answer: it
+        # leads to the space check rather than past it.
+        return True
     finally:
         probe.unlink(missing_ok=True)
         landed.unlink(missing_ok=True)
@@ -1099,7 +1124,7 @@ def _undo(moved: list[tuple[Path, Path]]) -> None:
     for source, destination in reversed(moved):
         try:
             if _present(destination) and not _present(source):
-                destination.rename(source)
+                _claim(destination, source)
         except OSError:
             continue
 
@@ -1130,7 +1155,11 @@ def _install_rollback_locked(
                 landed = path.with_name(
                     path.name.replace(target_path.name, aside, 1)
                 )
-                path.rename(landed)
+                # Claimed, not renamed: `_reserve_aside` checks the whole bundle
+                # is free and another process can still take one of those names
+                # before this loop reaches it. The reservation narrows the
+                # window; only the claim closes it.
+                _claim(path, landed)
                 moved.append((path, landed))
     except BaseException:
         _undo(moved)

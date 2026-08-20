@@ -584,24 +584,26 @@ def _durability_trace(monkeypatch, published) -> list[str]:
     own temporary churn cannot be mistaken for it.
     """
     trace: list[str] = []
-    real_fsync, real_replace = os.fsync, os.replace
+    real_fsync, real_link = os.fsync, os.link
     real_migrate = ControlPlaneDatabase.migrate
 
     def fsync(fd):
         trace.append("fsync:dir" if stat.S_ISDIR(os.fstat(fd).st_mode) else "fsync:file")
         return real_fsync(fd)
 
-    def replace(source, target, **kwargs):
+    def link(source, target, **kwargs):
+        # Publication is an atomic CLAIM now — `os.link`, which refuses to
+        # replace — not `os.replace`. The trace follows the code.
         if published(Path(target)):
             trace.append("rename")
-        return real_replace(source, target, **kwargs)
+        return real_link(source, target, **kwargs)
 
     def migrate(self, directory=None):
         trace.append("migrate")
         return real_migrate(self, directory)
 
     monkeypatch.setattr(os, "fsync", fsync)
-    monkeypatch.setattr(os, "replace", replace)
+    monkeypatch.setattr(os, "link", link)
     monkeypatch.setattr(ControlPlaneDatabase, "migrate", migrate)
     return trace
 
@@ -701,22 +703,22 @@ def test_the_rollback_restore_is_published_durably_too(tmp_path, monkeypatch) ->
     target = tmp_path / "restored" / "control-plane.db"
     marker = _pause_marker_path(target)
     trace: list[str] = []
-    real_fsync, real_replace = os.fsync, os.replace
+    real_fsync, real_link = os.fsync, os.link
 
     def fsync(fd):
         trace.append("fsync:dir" if stat.S_ISDIR(os.fstat(fd).st_mode) else "fsync:file")
         return real_fsync(fd)
 
-    def replace(source, destination, **kwargs):
+    def link(source, destination, **kwargs):
         landed = Path(destination)
         if landed == target:
             trace.append("publish:database")
         elif landed == marker:
             trace.append("publish:marker")
-        return real_replace(source, destination, **kwargs)
+        return real_link(source, destination, **kwargs)
 
     monkeypatch.setattr(os, "fsync", fsync)
-    monkeypatch.setattr(os, "replace", replace)
+    monkeypatch.setattr(os, "link", link)
     restored = restore_backup(
         archive, target, backup_key=BACKUP_KEY_BYTES, apply_migrations=False
     )
@@ -805,12 +807,12 @@ def _constrain(monkeypatch, volume: Path, capacity: int) -> None:
     loopback mount or a tmpfs, so such a test would skip on macOS and on any
     runner without them, which is a guard that is not one.
     """
-    real_replace = os.replace
+    real_link = os.link
 
-    def replace(source, target, **kwargs):
+    def link(source, target, **kwargs):
         if Path(target).parent == volume and Path(source).parent != volume:
             raise OSError(errno.EXDEV, "Cross-device link")
-        return real_replace(source, target, **kwargs)
+        return real_link(source, target, **kwargs)
 
     real_free = backup_module._free_bytes
 
@@ -820,7 +822,7 @@ def _constrain(monkeypatch, volume: Path, capacity: int) -> None:
         used = sum(path.stat().st_size for path in volume.iterdir() if path.is_file())
         return max(0, capacity - used)
 
-    monkeypatch.setattr(os, "replace", replace)
+    monkeypatch.setattr(os, "link", link)
     monkeypatch.setattr(backup_module, "_free_bytes", free)
 
 
@@ -1696,9 +1698,9 @@ def test_the_pause_marker_is_installed_before_the_database(tmp_path, monkeypatch
     restored.with_name(f"{restored.name}-wal").write_bytes(b"\x00" * 4096)
     _constrain(monkeypatch, volume, capacity=target.stat().st_size * 10)
     order: list[str] = []
-    real_replace = os.replace
+    real_link = os.link
 
-    def replace(source, destination, **kwargs):
+    def link(source, destination, **kwargs):
         landed = Path(destination)
         if landed == target:
             order.append("database")
@@ -1706,9 +1708,9 @@ def test_the_pause_marker_is_installed_before_the_database(tmp_path, monkeypatch
             order.append("marker")
         elif landed.name.endswith(("-wal", "-shm")):
             order.append("sidecar")
-        return real_replace(source, destination, **kwargs)
+        return real_link(source, destination, **kwargs)
 
-    monkeypatch.setattr(os, "replace", replace)
+    monkeypatch.setattr(os, "link", link)
     install_rollback(restored, target, now=1800000042)
 
     # Two entries per file: `_rename_or_exdev` attempts the rename, and on
@@ -2139,16 +2141,16 @@ def test_a_failure_midway_leaves_the_original_bundle_standing(tmp_path, monkeypa
     (volume / f"{target.name}-wal").write_bytes(b"\x00" * 4096)
     _constrain(monkeypatch, volume, capacity=target.stat().st_size * 10)
     before = _fingerprint(volume)
-    real_rename = Path.rename
+    real_link = os.link
     seen = {"count": 0}
 
-    def fail_on_the_second_move(self, landed):
+    def fail_on_the_second_move(source, destination, **kwargs):
         seen["count"] += 1
         if seen["count"] == 2:
             raise OSError(errno.EIO, "the volume gave up mid-bundle")
-        return real_rename(self, landed)
+        return real_link(source, destination, **kwargs)
 
-    monkeypatch.setattr(Path, "rename", fail_on_the_second_move)
+    monkeypatch.setattr(os, "link", fail_on_the_second_move)
 
     with pytest.raises(OSError, match="gave up mid-bundle"):
         install_rollback(restored, target, now=1800000042)
@@ -2246,3 +2248,37 @@ def test_an_unsyncable_removal_keeps_the_worker_pause(tmp_path, monkeypatch) -> 
     assert _pause_marker_path(target).exists(), (
         "the pause was removed while the database it guards may have survived"
     )
+
+
+def test_publication_claims_a_name_and_never_replaces_one(tmp_path) -> None:
+    """`_claim` refuses an occupied name; it does not check and then rename.
+
+    What this can and cannot show is worth being exact about. The race being
+    closed — another process taking the final name between a check and a rename
+    — is not reproducible in-process: any seam that would let a test occupy that
+    instant is a seam the non-atomic version does not have, so a test built on
+    one proves only that the seam was called. That is exactly why the code must
+    not depend on a check at all.
+
+    So this asserts the primitive's contract directly: an occupied destination
+    is refused, its content is untouched, and the source survives for the caller
+    to clean up. `os.link` gives that with no window; a check followed by
+    `os.replace` gives it only when nobody intervenes.
+    """
+    source = tmp_path / "incoming"
+    source.write_bytes(b"the new archive")
+    occupied = tmp_path / "already-here"
+    occupied.write_bytes(b"somebody else's file")
+
+    with pytest.raises(FileExistsError):
+        backup_module._claim(source, occupied)
+
+    assert occupied.read_bytes() == b"somebody else's file"
+    assert source.read_bytes() == b"the new archive"
+
+    # And it does move onto a free name, so the refusal is not the only
+    # behaviour it has.
+    free = tmp_path / "free-name"
+    backup_module._claim(source, free)
+    assert free.read_bytes() == b"the new archive"
+    assert not source.exists()
