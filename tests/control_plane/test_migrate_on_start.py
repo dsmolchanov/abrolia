@@ -221,7 +221,7 @@ def test_the_rollback_procedure_matches_the_paths_it_depends_on() -> None:
     # the manual procedure — and carry it in the safe order, archive verified
     # before anything is deleted.
     archive_at = doc.index("abrolia-control-plane backup /tmp/control-plane-superseded.cpb")
-    verify_at = doc.index("--target /tmp/verify.db --no-migrate")
+    verify_at = doc.index('--target "$verify/control-plane.db" --no-migrate')
     delete_at = doc.index("rm -f /data/control-plane.db /data/control-plane.db-wal")
     assert archive_at < verify_at < delete_at, (
         "the documented order lets an operator delete before verifying"
@@ -1874,3 +1874,50 @@ def test_a_dangling_symlink_in_the_bundle_is_refused(tmp_path, monkeypatch) -> N
 
     assert _fingerprint(volume) == before
     assert os.path.lexists(dangling), "the refusal removed the entry it objected to"
+
+
+def test_a_symlinked_snapshot_is_not_accepted_as_the_restore_point(tmp_path) -> None:
+    """The archive has to be ON the volume, not point off it.
+
+    A symlink matching the glob — to an archive in `/tmp` or any other ephemeral
+    filesystem — authenticated perfectly and was returned as the restore point,
+    so the migration proceeded believing a durable snapshot sat beside the
+    database while removing the link's target left no rollback artifact at all.
+    Proving something durable exists on the volume is the entire job of this
+    check.
+    """
+    directory = tmp_path / "migrations"
+    directory.mkdir()
+    (directory / "9999_pilot_probe.sql").write_text(
+        "CREATE TABLE pilot_probe (id TEXT PRIMARY KEY);\n", encoding="utf-8"
+    )
+    elsewhere = tmp_path / "ephemeral"
+    elsewhere.mkdir()
+
+    seed = _database(tmp_path)
+    seed.migrate()
+    revision = seed.applied_revision()
+    # A genuine, authenticating archive — taken from this very database, so
+    # content matching cannot be what rejects it.
+    real = elsewhere / "offsite.bak"
+    create_backup(seed, real, backup_key=BACKUP_KEY_BYTES)
+    seed.close()
+
+    link = tmp_path / f"control-plane.db.pre-migrate-{revision}-1800000000.bak"
+    link.symlink_to(real)
+    assert backup_module._authenticated_digest(link, BACKUP_KEY_BYTES) is not None, (
+        "the fixture link does not authenticate, so this proves nothing"
+    )
+
+    database = _database(tmp_path)
+    try:
+        archive = create_pre_migrate_backup(
+            database, backup_key=BACKUP_KEY_BYTES, directory=directory
+        )
+    finally:
+        database.close()
+
+    assert archive is not None
+    assert archive != link, "a symlink off the volume was reused as the restore point"
+    assert not archive.is_symlink()
+    assert archive.parent == tmp_path

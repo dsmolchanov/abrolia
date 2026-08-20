@@ -167,9 +167,19 @@ def _reusable_pre_migrate_backup(
     Reuse rather than prune. Deleting a restore point to reclaim space is the one
     move that turns a disk problem into a data-loss problem.
     """
+    # Regular files on THIS volume only. A symlink matching the glob — to an
+    # archive in `/tmp` or any other ephemeral filesystem — authenticated
+    # perfectly and was returned as the restore point, so the migration
+    # proceeded believing a durable snapshot sat beside the database when
+    # removing the link's target left no rollback artifact at all. The whole
+    # point of this check is that something durable exists on the volume.
     candidates = sorted(
-        database.path.parent.glob(
-            f"{database.path.name}.pre-migrate-{revision}-*.bak"
+        (
+            candidate
+            for candidate in database.path.parent.glob(
+                f"{database.path.name}.pre-migrate-{revision}-*.bak"
+            )
+            if _regular_file(candidate)
         ),
         reverse=True,
     )

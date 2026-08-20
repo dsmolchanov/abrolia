@@ -161,8 +161,11 @@ writer held the lock a moment earlier; that is not the same as a guarantee.
 #    `backup` does not migrate — the reason you are here is often a migration
 #    that fails, and a command that repeats it would exit before writing.
 abrolia-control-plane backup /tmp/control-plane-superseded.cpb
-abrolia-control-plane restore /tmp/control-plane-superseded.cpb \
-  --target /tmp/verify.db --no-migrate && rm -f /tmp/verify.db /tmp/verify.db*
+#    Verify into a directory of its own and delete THAT — `rm -f /tmp/verify.db*`
+#    also consumes `/tmp/verify.db-notes`, `/tmp/verify.db-old`, or anything
+#    else that happens to share the prefix.
+verify=$(mktemp -d) && abrolia-control-plane restore /tmp/control-plane-superseded.cpb \
+  --target "$verify/control-plane.db" --no-migrate && rm -rf "$verify"
 
 # 2. Only now release the blocks. ALL FOUR: the pause marker is part of the
 #    bundle, and a survivor makes step 3 refuse with "target was not freed"
