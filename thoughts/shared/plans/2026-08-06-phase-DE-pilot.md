@@ -380,7 +380,8 @@ CREATE TABLE channel_bindings (
 `control_plane/backup.py`, `control_plane/cli.py`, `control_plane/config.py`,
 `control_plane/migrations/*`, `docs/control-plane-restore.md`,
 `tests/control_plane/test_migrate_on_start.py`,
-`tests/control_plane/test_db.py`, `AGENTS.repo-invariants.md`.
+`tests/control_plane/test_db.py`, `AGENTS.repo-invariants.md`,
+`tests/control_plane/test_plan_inventory.py`.
 
 **Branches:** `codex/phase-E9-backup-before-migrate`.
 
@@ -411,6 +412,12 @@ and named no test module at all, while the step's acceptance depends on two:
   moments earlier and caused the next boot to reject that snapshot and write
   another. The migrate-on-start suite consumes that property; `test_db.py` is
   where it is established.
+
+`tests/control_plane/test_plan_inventory.py` — **added 2026-08-21.** The scope
+check itself, whose `**Files:**` pattern matched only the first line of an
+inventory. Step E9's runs to four, so most of its declared paths were invisible
+and the check reported them all undeclared the moment this branch caught up with
+main. It failed closed, which is the right direction, and it was still wrong.
 
 **Scope revised again 2026-08-21.** `AGENTS.repo-invariants.md` — seven rounds
 reported one class of defect: an operation acting on a pathname it had validated
