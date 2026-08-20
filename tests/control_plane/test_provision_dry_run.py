@@ -1881,3 +1881,156 @@ def test_a_stale_restriction_receipt_blocks_the_runtime_report(container) -> Non
     assert plan.table_writes == []
     assert plan.runtime_resources == []
     assert plan.secrets == []
+
+
+def _requeue_under_another_provider(container, household_id: str) -> None:
+    """Make the newest runtime intent name a provider this deployment is not."""
+    other = "fake-channel"
+    assert other != container.config.runtime_provider
+    with container.database.write() as connection:
+        connection.execute(
+            "UPDATE provisioning_jobs SET provider = ?"
+            " WHERE household_id = ? AND kind = 'runtime'"
+            " AND operation = 'ensure_runtime'"
+            " AND status IN ('pending','running','waiting_user','outcome_unknown')",
+            (other, household_id),
+        )
+
+
+@pytest.mark.parametrize(
+    "kind, operation",
+    [
+        ("runtime", "ensure_runtime"),
+        ("runtime", "ensure_secret_namespace"),
+        ("email_identity", "provision_email_identity"),
+        ("whatsapp_identity", "provision_whatsapp_identity"),
+        ("channel_binding", "bind_primary_channel"),
+    ],
+)
+def test_a_cancellation_does_not_bury_an_unsettled_provider_intent(
+    container, kind, operation
+) -> None:
+    """`_supersede_unsettled_jobs` preserves that job ON PURPOSE.
+
+    A job past its provider boundary becomes
+    `outcome_unknown/cancel_requires_reconciliation` — the service is saying it
+    does not know what exists upstream. The cancellation branch then overwrote
+    that with "start a new one rather than provisioning from this", which is
+    advice to provision over provider state that may already be there. Any
+    kind of job can be in that position, not only `ensure_runtime`.
+    """
+    household_id = _household_with_profile(container)
+    _verify_all_steps(container, household_id)
+    account_id, session_id = _PRINCIPALS[household_id]
+    workflow = container.database.query_one(
+        "SELECT id FROM onboarding_workflows WHERE household_id = ?", (household_id,)
+    )
+    with container.database.write() as connection:
+        # Past the provider boundary when the cancel arrives, which is the whole
+        # precondition: `pending` jobs are simply cancelled and need no
+        # reconciliation.
+        container.jobs.create(
+            connection,
+            household_id=household_id,
+            workflow_id=workflow["id"],
+            kind=kind,
+            operation=operation,
+            intent_key=f"{household_id}:{operation}:mid-flight",
+            request={},
+            provider=container.config.runtime_provider,
+            now=BASE_TIME,
+        )
+        connection.execute(
+            "UPDATE provisioning_jobs SET status = 'running' WHERE household_id = ?"
+            " AND operation = ?",
+            (household_id, operation),
+        )
+
+    container.onboarding.cancel(
+        household_id,
+        context=_context(
+            container, household_id, "cancel", account_id=account_id,
+            session_id=session_id,
+        ),
+    )
+
+    plan = plan_onboarding(container, household_id)
+
+    quarantined = container.database.query(
+        "SELECT id FROM provisioning_jobs WHERE household_id = ?"
+        " AND error_code = 'cancel_requires_reconciliation'",
+        (household_id,),
+    )
+    assert quarantined, "the fixture produced nothing needing reconciliation"
+    assert "reconcile" in (plan.blocked_by or "").lower(), plan.blocked_by
+    assert "start a new one" not in (plan.blocked_by or ""), (
+        "the cancellation label buried an intent that reached its provider"
+    )
+    assert any(str(row["id"]) in (plan.blocked_by or "") for row in quarantined), (
+        "the report does not name the job an operator has to reconcile"
+    )
+    assert plan.table_writes == []
+    assert plan.runtime_resources == []
+    assert plan.secrets == []
+
+
+def test_deletion_outranks_a_provider_mismatch(container) -> None:
+    """A configuration diagnostic is not a fact about the world.
+
+    `DeletionService.delete` preserves a leased `ensure_runtime` job, which
+    names the provider it was queued under. Restarting under a different
+    `ABROLIA_RUNTIME_PROVIDER` then made the mismatch branch — which ran after
+    the deletion branch and simply assigned over it — tell the operator to
+    "cancel and re-plan" a household whose only valid path is deletion.
+    """
+    household_id = _household_with_profile(container)
+    _verify_all_steps(container, household_id)
+    with container.database.write() as connection:
+        connection.execute(
+            "UPDATE households SET status = 'deleting' WHERE id = ?", (household_id,)
+        )
+    # The job's provider is durable and the configuration is not, so the
+    # mismatch is made by moving the job — which is what a restart under a
+    # different `ABROLIA_RUNTIME_PROVIDER` amounts to. `ControlPlaneConfig` is
+    # frozen; rewriting the row is both possible and closer to the real thing.
+    _requeue_under_another_provider(container, household_id)
+
+    plan = plan_onboarding(container, household_id)
+
+    assert "deleting" in (plan.blocked_by or ""), plan.blocked_by
+    assert "re-plan" not in (plan.blocked_by or ""), (
+        "a deleting household was described as re-plannable"
+    )
+    assert "provider mismatch" not in (plan.blocked_by or "")
+    assert plan.table_writes == []
+
+
+def test_an_older_unresolved_intent_outranks_a_provider_mismatch(container) -> None:
+    """Reconciliation first, whatever the configuration now says."""
+    household_id = _household_with_profile(container)
+    _verify_all_steps(container, household_id)
+    workflow = container.database.query_one(
+        "SELECT id FROM onboarding_workflows WHERE household_id = ?", (household_id,)
+    )
+    with container.database.write() as connection:
+        container.jobs.create(
+            connection,
+            household_id=household_id,
+            workflow_id=workflow["id"],
+            kind="runtime",
+            operation="ensure_runtime",
+            intent_key=f"{household_id}:ensure_runtime:a-second-intent",
+            request={},
+            provider=container.config.runtime_provider,
+            now=BASE_TIME + 1,
+        )
+    _requeue_under_another_provider(container, household_id)
+
+    plan = plan_onboarding(container, household_id)
+
+    assert len(plan.unresolved_runtime_jobs) > 1, "the fixture left only one intent"
+    assert "earlier runtime intent" in (plan.blocked_by or ""), plan.blocked_by
+    assert "provider mismatch" not in (plan.blocked_by or ""), (
+        "a configuration diagnostic displaced an outstanding provider effect"
+    )
+    assert plan.table_writes == []

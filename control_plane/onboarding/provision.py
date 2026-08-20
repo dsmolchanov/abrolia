@@ -497,6 +497,24 @@ def _revision_diff(
     }
 
 
+#: `OnboardingService._supersede_unsettled_jobs` writes
+#: `<reason>_requires_reconciliation` for any job that had already reached its
+#: provider when a cancel or reset arrived. That intent outlives the workflow
+#: label: the job may have created upstream state, and only an inspection can
+#: say. Matched by SUFFIX so a new reason needs no change here.
+RECONCILE_SUFFIX = "_requires_reconciliation"
+
+
+def _describe_jobs(jobs: list[dict[str, Any]]) -> str:
+    """`<id> (<status>/<error_code>)`, joined — the operator's handle on them."""
+    return ", ".join(
+        f"{job['job_id']} ({job['status']}"
+        + (f"/{job['error_code']}" if job.get("error_code") else "")
+        + ")"
+        for job in jobs
+    )
+
+
 def plan_onboarding(
     container: ControlPlaneContainer, household_id: str
 ) -> ProvisionPlan:
@@ -666,26 +684,23 @@ def plan_onboarding(
             # pending operation — and an operator provisioning on top of it
             # creates the conflict the quarantine exists to prevent.
             older_intent_unresolved = len(unresolved) > 1
-            if older_intent_unresolved:
-                older = ", ".join(
-                    f"{job['job_id']} ({job['status']}"
-                    + (f"/{job['error_code']}" if job["error_code"] else "")
-                    + ")"
-                    for job in plan.unresolved_runtime_jobs[1:]
-                )
-                models_an_operation = False
-                plan.rehearsal = (
-                    f"an earlier runtime intent is unresolved ({older}), so"
-                    " nothing about the newest job is rehearsed. Reconciliation"
-                    " comes first: the outstanding intent may already have"
-                    " created a runtime, and what the newest job would do"
-                    " depends on what that one did."
-                )
-                plan.blocked_by = (
-                    f"an earlier runtime intent is still unresolved: {older}."
-                    " Reconcile it with `abrolia-control-plane reconcile"
-                    " <job-id>` before provisioning on top of it."
-                )
+            older = _describe_jobs(plan.unresolved_runtime_jobs[1:])
+            # A job the service QUARANTINED — `_supersede_unsettled_jobs` moves
+            # anything past the provider boundary to `outcome_unknown` with a
+            # `<reason>_requires_reconciliation` code — and it applies to every
+            # kind, not just `ensure_runtime`. That intent stays the controlling
+            # recovery action until a reconcile settles it, whatever the
+            # workflow label says about itself.
+            quarantined = _describe_jobs(
+                [
+                    job
+                    for job in (
+                        *plan.unresolved_runtime_jobs,
+                        *plan.pending_step_jobs,
+                    )
+                    if str(job.get("error_code") or "").endswith(RECONCILE_SUFFIX)
+                ]
+            )
             if runtime_job is not None:
                 plan.pending_runtime_job = {
                     "job_id": runtime_job["id"],
@@ -782,18 +797,6 @@ def plan_onboarding(
             ).fetchone()
             household_status = str((household or {})["status"] or "") if household else ""
             being_deleted = household_status in {"deleting", "deleted"}
-            if being_deleted:
-                models_an_operation = False
-                plan.rehearsal = (
-                    f"the household is `{household_status}`; there is no"
-                    " onboarding operation to rehearse. Any runtime job still"
-                    " recorded is preserved for reconciliation by the deletion,"
-                    " not for provisioning."
-                )
-                plan.blocked_by = (
-                    f"the household is {household_status}; it cannot be"
-                    " provisioned"
-                )
 
             # A job's provider is durable; the SECRET SINK is not. `build`
             # selects one sink from the current configuration, so after a
@@ -816,7 +819,80 @@ def plan_onboarding(
             provider_mismatch = (
                 runtime_job is not None and job_provider != configured_provider
             )
-            if provider_mismatch:
+            cancelled_workflow = str(workflow["state"]) == WorkflowState.CANCELLED.value
+            failed_runtime = (
+                issued is not None
+                and runtime_job is None
+                and settled_status in {"failed", "cancelled"}
+            )
+
+            # ONE ordered, mutually exclusive classifier.
+            #
+            # These used to be a run of independent `if` blocks that each
+            # assigned `rehearsal` and `blocked_by`, so the LAST one to match
+            # won regardless of which mattered. Cancelling a household whose job
+            # had crossed the provider boundary replaced "reconcile this
+            # quarantined intent" with "start a new one"; restarting under a
+            # different `ABROLIA_RUNTIME_PROVIDER` replaced an outstanding
+            # reconciliation, or a deletion, with advice to cancel and re-plan.
+            # Each overwrite pointed an operator at an action that provisions
+            # over provider state which may already exist.
+            #
+            # Strongest first: an unresolved provider effect and a household
+            # being deleted are facts about the world, and a workflow label or a
+            # configuration mismatch is not.
+            if being_deleted:
+                models_an_operation = False
+                plan.rehearsal = (
+                    f"the household is `{household_status}`; there is no"
+                    " onboarding operation to rehearse. Any runtime job still"
+                    " recorded is preserved for reconciliation by the deletion,"
+                    " not for provisioning."
+                )
+                plan.blocked_by = (
+                    f"the household is {household_status}; it cannot be"
+                    " provisioned"
+                )
+            elif older_intent_unresolved:
+                models_an_operation = False
+                plan.rehearsal = (
+                    f"an earlier runtime intent is unresolved ({older}), so"
+                    " nothing about the newest job is rehearsed. Reconciliation"
+                    " comes first: the outstanding intent may already have"
+                    " created a runtime, and what the newest job would do"
+                    " depends on what that one did."
+                )
+                plan.blocked_by = (
+                    f"an earlier runtime intent is still unresolved: {older}."
+                    " Reconcile it with `abrolia-control-plane reconcile"
+                    " <job-id>` before provisioning on top of it."
+                )
+            elif quarantined:
+                models_an_operation = False
+                plan.rehearsal = (
+                    f"an intent that reached its provider is unsettled"
+                    f" ({quarantined}); the service preserved it deliberately."
+                    " Nothing is rehearsed: what that job did upstream is not"
+                    " in durable state, and only an inspection can say."
+                )
+                plan.blocked_by = (
+                    f"reconcile the unsettled intent first: {quarantined}."
+                    " `abrolia-control-plane reconcile <job-id>`. Starting again"
+                    " provisions over provider state that may already exist."
+                )
+            elif cancelled_workflow:
+                models_an_operation = False
+                plan.rehearsal = (
+                    "the onboarding workflow is `cancelled`; there is no pending"
+                    " operation to rehearse. Verified step results survive a"
+                    " cancellation, so the steps above describe what WAS done,"
+                    " not work that will resume."
+                )
+                plan.blocked_by = (
+                    "the onboarding workflow is cancelled; start a new one"
+                    " rather than provisioning from this"
+                )
+            elif provider_mismatch:
                 # Pending, and NOT executable. The job is still `pending`, the
                 # worker can still lease it, and saying "nothing is pending"
                 # told an operator there was no live work while the worker was
@@ -837,32 +913,7 @@ def plan_onboarding(
                     f" `{configured_provider}`. Restore the configuration the"
                     " job was queued under, or cancel and re-plan it."
                 )
-
-            cancelled_workflow = str(workflow["state"]) == WorkflowState.CANCELLED.value
-            if cancelled_workflow:
-                models_an_operation = False
-                plan.rehearsal = (
-                    "the onboarding workflow is `cancelled`; there is no pending"
-                    " operation to rehearse. Verified step results survive a"
-                    " cancellation, so the steps above describe what WAS done,"
-                    " not work that will resume."
-                )
-                plan.blocked_by = (
-                    "the onboarding workflow is cancelled; start a new one"
-                    " rather than provisioning from this"
-                )
-            if already_onboarded:
-                models_an_operation = False
-                plan.rehearsal = (
-                    f"revision {issued['revision']} is active and onboarding is"
-                    " complete; there is no pending operation to rehearse"
-                )
-            failed_runtime = (
-                issued is not None
-                and runtime_job is None
-                and settled_status in {"failed", "cancelled"}
-            )
-            if failed_runtime:
+            elif failed_runtime:
                 models_an_operation = False
                 plan.blocked_by = (
                     f"the runtime operation for revision {issued['revision']} is"
@@ -875,7 +926,7 @@ def plan_onboarding(
                     " intervention, not a stage this command can rehearse past."
                     " No write set is claimed."
                 )
-            if awaiting_activation:
+            elif awaiting_activation:
                 models_an_operation = False
                 plan.rehearsal = (
                     f"revision {issued['revision']} is issued and its runtime"
@@ -883,28 +934,18 @@ def plan_onboarding(
                     " bootstrap activation, whose writes this command does not"
                     " model. Nothing is rehearsed and no write set is claimed."
                 )
+            elif already_onboarded:
+                models_an_operation = False
+                plan.rehearsal = (
+                    f"revision {issued['revision']} is active and onboarding is"
+                    " complete; there is no pending operation to rehearse"
+                )
+
             # Every state that rehearses nothing skips the planning pass and
             # reaches the same gate below. One decision, one place: the previous
             # shape had the cancelled case return through a second mechanism, so
             # "does this state advertise future work" was answered twice.
-            if (
-                being_deleted
-                or provider_mismatch
-                or cancelled_workflow
-                or failed_runtime
-                or awaiting_activation
-                or already_onboarded
-                # Cleared `models_an_operation` above and was then left out of
-                # this list, so the planning pass ran anyway and overwrote the
-                # reconciliation narrative with the newest job's ordinary
-                # success path. The final gate still emptied the write set, so
-                # the report said in one field that an earlier intent blocks
-                # everything and in another that the replacement job runs
-                # cleanly — which reads as "the quarantined predecessor is
-                # compatible with this", the exact conclusion the quarantine
-                # exists to prevent an operator reaching.
-                or older_intent_unresolved
-            ):
+            if not models_an_operation:
                 pass
             elif already_planned and not _holds_current_restriction(
                 container, household_id
