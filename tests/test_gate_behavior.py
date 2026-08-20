@@ -48,6 +48,7 @@ if not argv or argv[0] != "api":
 
 endpoint = jq_filter = None
 fields = {}
+include_headers = False
 args = argv[1:]
 i = 0
 while i < len(args):
@@ -60,6 +61,8 @@ while i < len(args):
         i += 2
     elif a == "--paginate":
         i += 1
+    elif a == "-i":
+        include_headers = True; i += 1
     elif a.startswith("-"):
         i += 1
     else:
@@ -88,6 +91,13 @@ if endpoint in state.get("errors", []):
 
 if fields:
     data = state.get("post_response", {"id": 4242})
+    if include_headers:
+        status = str(data.get("status", "201")) if isinstance(data, dict) else "201"
+        headers = ["HTTP/2.0 %s" % status]
+        for name, value in (state.get("post_headers") or {}).items():
+            headers.append("%s: %s" % (name, value))
+        sys.stdout.write("\n".join(headers) + "\n\n" + json.dumps(data))
+        sys.exit(0)
 else:
     if endpoint not in state["responses"]:
         sys.stderr.write("gh stub: no fixture for %s\n" % endpoint)
@@ -150,13 +160,15 @@ def run_gate(tmp_path: Path):
         reactions: list[dict] | None = None,
         pr_reactions: list[dict] | None = None,
         errors: list[str] | None = None,
+        post_response: object | None = None,
+        post_headers: dict[str, str] | None = None,
         action: str = "opened",
         request_token: str = "",
         user_login: str = "codex-connected-human",
         env: dict[str, str] | None = None,
     ) -> GateResult:
         responses: dict[str, object] = {
-            "repos/o/r/pulls/1": {"head": {"sha": HEAD}},
+            "repos/o/r/pulls/1": {"head": {"sha": HEAD}, "number": 1},
             f"repos/o/r/commits/{HEAD}": {
                 "commit": {"committer": {"date": "2026-01-01T00:00:00Z"}}
             },
@@ -166,14 +178,17 @@ def run_gate(tmp_path: Path):
             "repos/o/r/issues/1/reactions": pr_reactions or [],
             "repos/o/r/issues/comments/4242/reactions": reactions or [],
             "user": {"login": user_login},
+            "repos/o/r": {"full_name": "o/r"},
         }
         for rid, body in (review_bodies or {}).items():
             responses[f"repos/o/r/pulls/1/reviews/{rid}"] = {"body": body}
 
-        state_path.write_text(
-            json.dumps({"responses": responses, "errors": errors or []}),
-            encoding="utf-8",
-        )
+        state = {"responses": responses, "errors": errors or []}
+        if post_response is not None:
+            state["post_response"] = post_response
+        if post_headers is not None:
+            state["post_headers"] = post_headers
+        state_path.write_text(json.dumps(state), encoding="utf-8")
         log_path.write_text("", encoding="utf-8")
         counts_path.write_text("{}", encoding="utf-8")
 
@@ -411,3 +426,90 @@ def test_existing_review_for_this_head_is_not_re_requested(run_gate) -> None:
     )
     assert result.may_merge
     assert result.posted_comments() == []
+
+
+def test_a_rejected_anchor_post_is_not_announced_as_success(run_gate) -> None:
+    """`--jq .id` on an error emits the error body, not nothing.
+
+    Observed in production: a `CODEX_REQUEST_TOKEN` missing the right permission
+    gets 403 "Resource not accessible by personal access token". The gate
+    captured that JSON as the comment id, logged `Posted ... (comment
+    {"message":"Resource not accessible...})`, and then timed out 900s later with
+    nothing to explain why. A gate whose whole purpose is stopping errors from
+    reading as success was doing it to itself.
+    """
+    result = run_gate(
+        action="synchronize",
+        request_token="pat-without-the-right-permission",
+        post_response={
+            "message": "Resource not accessible by personal access token",
+            "status": "403",
+        },
+    )
+
+    assert not result.may_merge
+    assert "Could not post the anchor comment" in result.output
+    assert "Resource not accessible" in result.output
+    assert "Posted an inventory-scoped" not in result.output
+
+
+def test_a_successful_anchor_post_is_still_recognised(run_gate) -> None:
+    """The counterpart: a real id must still be accepted.
+
+    `-i` prepends response headers, so the id extraction has to find the JSON
+    body among them — a success wrongly read as a failure would cost a review
+    generation on every push.
+    """
+    result = run_gate(
+        action="synchronize",
+        request_token="pat-with-the-right-permission",
+        post_response={"id": 5334512611},
+        post_headers={"x-github-request-id": "ABC:123"},
+    )
+
+    assert "Posted an inventory-scoped '@codex review' (comment 5334512611)" in (
+        result.output
+    )
+    assert "Could not post the anchor comment" not in result.output
+
+
+def test_the_failure_quotes_githubs_own_permission_answer(run_gate) -> None:
+    """GitHub says which permission would work; the gate should not guess.
+
+    An earlier version of this probe tested whether the token could READ the
+    repository and the pull request. On a public repository both are true for an
+    unauthenticated request, so the checks discriminated nothing — and the
+    conclusion drawn from them, that a permission was present but read-only, was
+    wrong. `x-accepted-github-permissions` is the API answering directly.
+    """
+    result = run_gate(
+        action="synchronize",
+        request_token="pat-without-pull-requests",
+        post_response={
+            "message": "Resource not accessible by personal access token",
+            "status": "403",
+        },
+        post_headers={
+            "x-accepted-github-permissions": "issues=write; pull_requests=write"
+        },
+    )
+
+    assert "would be accepted with: issues=write; pull_requests=write" in (
+        result.output
+    )
+    assert "Read and write" in result.output
+    # And it must not resurrect the read probes that proved nothing.
+    assert "can read" not in result.output
+
+
+def test_a_failure_without_the_header_still_says_what_to_check(run_gate) -> None:
+    """No header — say what to check rather than inventing a diagnosis."""
+    result = run_gate(
+        action="synchronize",
+        request_token="pat-scoped-to-another-repository",
+        post_response={"message": "Not Found", "status": "404"},
+    )
+
+    assert "Repository access" in result.output
+    assert "Pull requests" in result.output
+    assert "would be accepted with" not in result.output

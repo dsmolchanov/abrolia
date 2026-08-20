@@ -283,19 +283,74 @@ jobs:
             synchronize|reopened|ready_for_review|submitted)
               if [ -z "${ANCHOR_ID}" ] && [ -z "$(review_ids_for_head)" ]; then
                 REQUEST_BODY=$(printf '@codex review\n\nReturn ONE comprehensive inventory of every P0/P1 in this diff, grouped by the root invariant each violates. For each finding give the affected symbol, every sibling consumer with the same defect, the failing input or call path, impact, confidence, a safe remediation path, and the regression test that would represent the class. Completeness on this pass matters more than brevity — a finding held back costs a full review generation. See "Code Review Rules" in AGENTS.md.\n\n<!-- %s -->' "${ANCHOR}")
-                ANCHOR_ID=$(GH_TOKEN="${REQUEST_TOKEN:-${GH_TOKEN}}" \
-                  gh api "repos/${REPO}/issues/${PR}/comments" \
-                  -f body="${REQUEST_BODY}" \
-                  --jq '.id' 2>/dev/null || true)
+                # `--jq .id` on an ERROR response emits the error body, not
+                # nothing, and `|| true` hides the exit status — so a rejected
+                # post produced a non-empty ANCHOR_ID and was announced as a
+                # success. Observed for real: a PAT that authenticates but lacks
+                # `Issues: write` returns 403 "Resource not accessible by
+                # personal access token", and the gate logged
+                # `Posted ... (comment {"message":"Resource not accessible...})`
+                # before timing out 900s later with no explanation.
+                #
+                # A comment id is a positive integer. Anything else is a
+                # failure, whatever it looks like — this gate exists to stop
+                # errors reading as success, and it was doing it to itself.
+                # `-i` keeps the response headers. On a 403 GitHub returns
+                # `x-accepted-github-permissions`, which names the permissions
+                # that WOULD have been accepted — the authoritative answer,
+                # straight from the API, rather than something inferred.
+                ANCHOR_POST=$(GH_TOKEN="${REQUEST_TOKEN:-${GH_TOKEN}}" \
+                  gh api -i "repos/${REPO}/issues/${PR}/comments" \
+                  -f body="${REQUEST_BODY}" 2>&1 || true)
+                # `-i` prepends headers, so take the JSON body: from the
+                # first line that starts a JSON object to the end. Works with or
+                # without headers, which keeps this honest if `-i` is ever
+                # dropped.
+                ANCHOR_ID=$(printf '%s' "${ANCHOR_POST}" | sed -n '/^{/,$p' \
+                  | jq -r 'if type == "object" and (.id | type) == "number"
+                           then .id else empty end' 2>/dev/null || true)
+                case "${ANCHOR_ID}" in
+                  ''|*[!0-9]*) ANCHOR_ID="" ;;
+                esac
                 if [ -n "${ANCHOR_ID}" ]; then
                   echo "Posted an inventory-scoped '@codex review' (comment ${ANCHOR_ID}) anchored to this head."
                 else
-                  # Fork PRs get a read-only GITHUB_TOKEN, so the anchor cannot
-                  # be created. Head-bound signals that need no anchor — a review
-                  # for this commit, or a summary comment naming it — still
-                  # apply; only a bare 👍 becomes unusable.
+                  # Two ways to get here, and the operator needs to tell them
+                  # apart: a fork PR's read-only GITHUB_TOKEN, or a
+                  # CODEX_REQUEST_TOKEN missing `Issues: write` on this
+                  # repository. Head-bound signals that need no anchor — a
+                  # review for this commit, or a summary comment naming it —
+                  # still apply; only a bare 👍 becomes unusable.
                   ANCHOR_FAILED=1
-                  echo "::warning::Could not post the anchor comment (read-only token, likely a fork PR). Falling back to head-bound signals: a Codex review of this commit, or a summary comment naming it."
+                  echo "::warning::Could not post the anchor comment. GitHub said: $(printf '%s' "${ANCHOR_POST}" | tr -d '\n' | cut -c1-300)"
+                  if [ -n "${REQUEST_TOKEN}" ]; then
+                    # Read probes are NOT used here, deliberately. This
+                    # repository is public, so "can the token read the repo /
+                    # the pull request" is true for an unauthenticated request
+                    # and proves nothing about the token — an earlier version of
+                    # this probe reported exactly that and led to a wrong
+                    # conclusion about which permission was missing.
+                    #
+                    # GitHub answers the question itself. On a 403 it returns
+                    # `x-accepted-github-permissions` listing what would have
+                    # been accepted; there is nothing to infer.
+                    # `|| true` is load-bearing: `set -o pipefail` is on, and
+                    # grep exits 1 when the header is absent — which is exactly
+                    # the case this branch exists to handle. Without it the job
+                    # aborts here instead of printing the guidance.
+                    ACCEPTED=$(printf '%s' "${ANCHOR_POST}" \
+                      | grep -i '^x-accepted-github-permissions:' \
+                      | head -1 | cut -d: -f2- | tr -d '\r' | sed 's/^ *//' \
+                      || true)
+                    if [ -n "${ACCEPTED}" ]; then
+                      echo "::warning::GitHub says this request would be accepted with: ${ACCEPTED}. Grant one of those to CODEX_REQUEST_TOKEN on ${REPO}, as 'Read and write' — a permission listed at 'Read' is not enough to post."
+                    else
+                      echo "::warning::CODEX_REQUEST_TOKEN (identity ${ANCHOR_AUTHOR}) could not comment on pull request #${PR} and GitHub returned no x-accepted-github-permissions header. Check that ${REPO} is listed under the token's 'Repository access', and that 'Pull requests' is granted as 'Read and write'."
+                    fi
+                  else
+                    echo "::warning::No CODEX_REQUEST_TOKEN is set, so this used GITHUB_TOKEN. A read-only token is expected on fork PRs."
+                  fi
+                  echo "::warning::Falling back to head-bound signals: a Codex review of this commit, or a summary comment naming it."
                 fi
               fi
               ;;
