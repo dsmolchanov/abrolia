@@ -223,6 +223,17 @@ if (page === "onboarding") {
       selection.special_category_restriction_receipt_id = crypto.randomUUID();
       selection.special_category_restriction_text_version = form.elements.special_category_restriction_text_version.value;
       selection.special_category_restriction_text_sha256 = form.elements.special_category_restriction_text_sha256.value;
+      // The Art 9(2)(a) consent is rendered only in a real-email rollout, so
+      // its inputs are absent in the synthetic circuit. Send it when the family
+      // gave it and let the server decide whether it was required — the
+      // browser is not trusted to make that call.
+      const householdConsent = form.elements.special_category_household_consent;
+      if (householdConsent && householdConsent.checked) {
+        selection.special_category_household_consent = true;
+        selection.special_category_household_receipt_id = crypto.randomUUID();
+        selection.special_category_household_text_version = form.elements.special_category_household_text_version.value;
+        selection.special_category_household_text_sha256 = form.elements.special_category_household_text_sha256.value;
+      }
     }
     if (option === "shared_abrolia") selection = {kind: option, member_phone_test_ref: "synthetic-phone:owner", privacy_notice_receipt_id: crypto.randomUUID()};
     if (option === "dedicated_number") selection = {kind: option, phone_test_ref: "synthetic-phone:owner", privacy_notice_receipt_id: crypto.randomUUID(), linked_device_risk_receipt_id: crypto.randomUUID()};

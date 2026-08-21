@@ -49,9 +49,41 @@ def _require_email_content_restriction(
 
 
 @router.get("/api/v1/onboarding/consent/special-category-content-restriction")
-def email_content_restriction_contract() -> JSONResponse:
-    """Expose the exact copy and digest API clients must acknowledge."""
+def email_content_restriction_contract(
+    current: Annotated[CurrentHousehold, Depends(current_household)],
+) -> JSONResponse:
+    """Expose the exact copy and digest API clients must acknowledge.
+
+    Authenticated like every other route on this router. The copy is not a
+    secret — it is shown to the family before they accept it — but the
+    repository rule is that every route carries an auth dependency, and an
+    unauthenticated endpoint on the onboarding API is a surface whether or not
+    today's response happens to be public. `current` is unused deliberately: the
+    contract is the same for every household, and the dependency is here to
+    authenticate the caller, not to select the copy.
+    """
+    del current
     purpose = "special_category_content_restriction"
+    version, copy = consent_version_and_text(purpose)
+    _, sha256 = consent_version_and_sha(purpose)
+    return JSONResponse({
+        "purpose": purpose,
+        "text_version": version,
+        "text": copy,
+        "text_sha256": sha256,
+    })
+
+
+@router.get("/api/v1/onboarding/consent/special-category-household-content")
+def household_content_consent_contract(
+    current: Annotated[CurrentHousehold, Depends(current_household)],
+) -> JSONResponse:
+    """Art 9(2)(a) copy and digest; required only in a real-email rollout.
+
+    Authenticated, for the same reason as its sibling above.
+    """
+    del current
+    purpose = "special_category_household_content"
     version, copy = consent_version_and_text(purpose)
     _, sha256 = consent_version_and_sha(purpose)
     return JSONResponse({

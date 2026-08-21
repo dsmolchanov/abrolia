@@ -16,7 +16,11 @@ from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
 import httpx
 
-from control_plane.privacy.consent import consent_version_and_sha
+from control_plane.privacy.consent import (
+    HOUSEHOLD_CONTENT_PURPOSE,
+    consent_version_and_sha,
+    processes_real_household_content,
+)
 from hermes_cloud.core.config import DEFAULT_DB_PATH, ENV_DB
 from hermes_cloud.core.db import open_database
 from hermes_cloud.core.dsar import export_household, is_deleted, wipe_household
@@ -78,6 +82,7 @@ ENV_RUNTIME_PORT = "HERMES_RUNTIME_PORT"
 ENV_BOOTSTRAP_RETRY_SECONDS = "HERMES_BOOTSTRAP_RETRY_SECONDS"
 ENV_RUNTIME_DSAR_TOKEN = "HERMES_RUNTIME_DSAR_TOKEN"
 ENV_RUNTIME_DELETION_MARKER = "HERMES_RUNTIME_DELETION_MARKER"
+ENV_RUNTIME_CONSENT_MARKER = "HERMES_RUNTIME_CONSENT_MARKER"
 ENV_NERVE_RUNTIME_URL = "ABROLIA_NERVE_RUNTIME_URL"
 ENV_NERVE_REST_URL = "ABROLIA_NERVE_REST_URL"
 ENV_NERVE_WORKER_SECONDS = "ABROLIA_NERVE_WORKER_SECONDS"
@@ -136,6 +141,14 @@ class RuntimeService:
         self.deletion_marker = Path(
             self.env.get(ENV_RUNTIME_DELETION_MARKER)
             or self.activation_path.with_name("runtime-deleted.json")
+        )
+        # Withdrawal has to stop a runtime that is ALREADY serving, and the
+        # manifest it serves is immutable — the receipt embedded in it stays
+        # valid-looking forever. A local marker is the only signal that reaches
+        # a running instance, which is why deletion already works this way.
+        self.consent_marker = Path(
+            self.env.get(ENV_RUNTIME_CONSENT_MARKER)
+            or self.activation_path.with_name("consent-withdrawn.json")
         )
         self._gmail_runtime: EmailRuntimeService | None = None
         self._gmail_client: Any | None = None
@@ -207,27 +220,99 @@ class RuntimeService:
         # Liveness deliberately does not depend on bootstrap/control-plane state.
         return Probe(200, {"status": "ok"})
 
-    def _ready_manifest(self) -> tuple[RuntimeManifest | None, str]:
+    def _ready_manifest(
+        self, *, for_data_subject_request: bool = False
+    ) -> tuple[RuntimeManifest | None, str]:
+        """Resolve the manifest, and whether this runtime may serve from it.
+
+        `for_data_subject_request` relaxes exactly two CONSENT conditions: a
+        withdrawn consent, and consent currency. Withdrawal under Art. 7(3)
+        stops PROCESSING; it does not extinguish the Art. 15 and Art. 17 rights
+        over data already held, and an arrangement in which exercising one right
+        destroys the others is not a rights regime. Currency is relaxed for the
+        same reason and one more: bumping the restriction copy makes every
+        pre-existing runtime's receipt stale, which would take export and
+        deletion down for exactly the households that had been running longest.
+        Deletion still takes precedence — there is then nothing left to export,
+        and the caller is told exactly that.
+
+        It relaxes nothing about IDENTITY. The activation status, the runtime
+        reference and the manifest revision are checked on every path, DSAR
+        included. Returning the manifest before them let an export run against a
+        runtime that was never validly activated for this instance, and let a
+        delete or a Google revocation act on a stale provider binding — wiping
+        data while revoking the wrong credential and leaving the current one
+        live. "Which data subject\'s runtime is this" is not a consent question,
+        and it is the one question a DSAR must get right.
+        """
         if self.deletion_marker.is_file():
             return None, "runtime_deleted"
+        if not for_data_subject_request and self.consent_marker.is_file():
+            # Checked before the manifest is even loaded: the manifest cannot
+            # express this state, and the Art 9(2)(a) copy promises withdrawal
+            # "stops further processing", not "stops it at the next delivery".
+            return None, "consent_withdrawn"
         try:
             manifest = load_runtime_manifest(self.manifest_path, env=self.env)
         except ManifestError:
             return None, "manifest_missing_or_invalid"
-        restriction_version, restriction_sha = consent_version_and_sha(
-            REQUIRED_CONTENT_RESTRICTION_PURPOSE
-        )
-        if manifest.consent is None or (
-            REQUIRED_CONTENT_RESTRICTION_PURPOSE
-            not in manifest.consent.required_purposes
-            or not any(
-                receipt.purpose == REQUIRED_CONTENT_RESTRICTION_PURPOSE
-                and receipt.text_version == restriction_version
-                and hmac.compare_digest(receipt.text_sha256, restriction_sha)
-                for receipt in manifest.consent.receipts
-            )
-        ):
-            return None, "content_restriction_not_current"
+        # Consent currency is the second and last thing a DSAR relaxes.
+        # Everything below this block is identity, and applies to every
+        # caller.
+        if not for_data_subject_request:
+            # Enforce EVERY purpose the manifest declares authoritative, not one
+            # hard-coded name. The control plane already decides which consents a
+            # household owes — including the Art. 9(2)(a) household-content consent
+            # for real-email households — and naming a single purpose here meant a
+            # runtime stayed ready while any other required consent was revoked or
+            # superseded.
+            if manifest.consent is None:
+                # A manifest with no consent block is the legacy shape, and it is
+                # the S5 restriction it is missing — keep the established reason.
+                return None, "content_restriction_not_current"
+            if REQUIRED_CONTENT_RESTRICTION_PURPOSE not in (
+                manifest.consent.required_purposes
+            ):
+                # The S5 boundary is required of every household, synthetic or not,
+                # so a manifest that omits it is malformed rather than permissive.
+                return None, "content_restriction_not_current"
+            # What the household OWES is derived from the provider, exactly as the
+            # control plane derives it — not read back from what the manifest
+            # happens to declare. A schema-v1 manifest issued before the Art 9(2)(a)
+            # purpose existed can name `nerve-managed` or `gmail` and declare only
+            # the restriction; validating "every declared purpose" then found
+            # nothing wrong with it and kept serving real family content with no
+            # Art. 9 condition at all.
+            owed = set(manifest.consent.required_purposes)
+            if processes_real_household_content(manifest.email.provider_kind):
+                owed.add(HOUSEHOLD_CONTENT_PURPOSE)
+            for purpose in sorted(owed):
+                if purpose not in manifest.consent.required_purposes:
+                    # Owed but not declared: the manifest predates the purpose and
+                    # carries no receipt for it. Only a new revision can fix that.
+                    return None, "consent_not_current"
+                # A manifest may legitimately name a purpose this build does not
+                # know: during a rolling addition the control plane issues the new
+                # purpose before every runtime carries the copy for it. The parser
+                # accepts any non-empty string, so this lookup would raise KeyError
+                # — and readiness is not the only caller. `can_start_workers` reads
+                # it OUTSIDE the worker loops' exception handlers, so the raise
+                # terminated ingress worker threads rather than returning a 503.
+                # An unknown purpose is unverifiable, which is not-current, which is
+                # the fail-closed answer.
+                try:
+                    version, sha256 = consent_version_and_sha(purpose)
+                except KeyError:
+                    return None, "consent_not_current"
+                if not any(
+                    receipt.purpose == purpose
+                    and receipt.text_version == version
+                    and hmac.compare_digest(receipt.text_sha256, sha256)
+                    for receipt in manifest.consent.receipts
+                ):
+                    if purpose == REQUIRED_CONTENT_RESTRICTION_PURPOSE:
+                        return None, "content_restriction_not_current"
+                    return None, "consent_not_current"
         try:
             state = load_activation_state(self.activation_path)
         except BootstrapError:
@@ -238,7 +323,7 @@ class RuntimeService:
             return None, "runtime_ref_mismatch"
         if not state_matches_manifest(state, manifest):
             return None, "revision_mismatch"
-        return manifest, "active"
+        return manifest, "dsar" if for_data_subject_request else "active"
 
     def readyz(self) -> Probe:
         manifest, reason = self._ready_manifest()
@@ -550,10 +635,27 @@ class RuntimeService:
         start = _t.time()
         path = str(environ.get("PATH_INFO") or "")
         method = str(environ.get("REQUEST_METHOD") or "GET").upper()
-        if path == "/v1/email/nerve/webhook" and method == "POST":
+        # Authenticated BEFORE any handler runs, for every internal route at
+        # once, so a handler is reached only by an authenticated caller.
+        refusal = (
+            self._authenticate_internal(
+                method, str(environ.get("HTTP_AUTHORIZATION") or "")
+            )
+            if path in self.INTERNAL_ROUTES
+            else None
+        )
+        if refusal is not None:
+            probe = refusal
+        elif path == "/v1/email/nerve/webhook" and method == "POST":
             probe = self._nerve_webhook(environ)
         elif path in {"/v1/whatsapp/webhook", "/webhooks/whatsapp"} and method == "POST":
             probe = self._whatsapp_webhook(environ)
+        elif path == "/internal/v1/consent/revoke":
+            probe = self._consent_revoke(
+                method,
+                str(environ.get("HTTP_AUTHORIZATION") or ""),
+                self._request_body(environ),
+            )
         elif path in {"/internal/v1/dsar/export", "/internal/v1/dsar/delete"}:
             probe = self._dsar(path, method, str(environ.get("HTTP_AUTHORIZATION") or ""))
         elif path == "/internal/v1/email/google/revoke":
@@ -667,6 +769,156 @@ class RuntimeService:
             },
         )
 
+    #: Internal routes that require the runtime DSAR credential. Named here, so
+    #: adding a route without adding it to this table is a route with no
+    #: authentication — visible in one place rather than buried in a handler.
+    INTERNAL_ROUTES = frozenset({
+        "/internal/v1/consent/revoke",
+        "/internal/v1/dsar/export",
+        "/internal/v1/dsar/delete",
+        "/internal/v1/email/google/revoke",
+    })
+
+    def _authenticate_internal(self, method: str, authorization: str) -> Probe | None:
+        """The gate, OUTSIDE the handlers, or None when the caller may proceed.
+
+        Each handler used to do this itself. The comparisons were correct, and
+        the rule they broke is a checkable one: authentication performed inside
+        a handler is authentication a future early return, or a second dispatch
+        path, can step over — and there is no signature to inspect that would
+        show it missing. Hoisted here, a route either appears in
+        `INTERNAL_ROUTES` and is authenticated, or it does not exist.
+
+        The handlers keep their own checks as defence in depth; this is what
+        makes the property structural.
+        """
+        expected = self.env.get(ENV_RUNTIME_DSAR_TOKEN, "")
+        if method != "POST" or not expected:
+            # 404 rather than 401: an unconfigured runtime does not admit that
+            # these routes exist.
+            return Probe(404, {"status": "not_found"})
+        prefix = "Bearer "
+        supplied = (
+            authorization[len(prefix) :] if authorization.startswith(prefix) else ""
+        )
+        if not supplied or not hmac.compare_digest(supplied, expected):
+            return Probe(401, {"status": "unauthorized"})
+        return None
+
+    @staticmethod
+    def _request_body(environ: dict) -> bytes:
+        try:
+            length = int(environ.get("CONTENT_LENGTH") or 0)
+        except (TypeError, ValueError):
+            return b""
+        if length <= 0:
+            return b""
+        stream = environ.get("wsgi.input")
+        if stream is None:
+            return b""
+        try:
+            return bytes(stream.read(min(length, 64 * 1024)))
+        except Exception:
+            return b""
+
+    def _generation_verdict(self, body: bytes) -> str:
+        """`match`, `superseded`, or `undecidable` — never a guess.
+
+        The first version answered a boolean and folded "cannot tell" into
+        "match", which marks. That is wrong in the one window where it matters:
+        deliver revision A's stop after `serve_runtime` has opened its socket but
+        BEFORE the background bootstrap has installed revision B's manifest, and
+        the `ManifestError` branch classified the stale generation as current,
+        wrote the permanent marker, and bootstrap never clears or re-checks it.
+        A fully consented runtime is then suspended for good by a withdrawal
+        nobody made against it.
+
+        "Cannot tell" is now its own answer, and the caller defers. A runtime
+        whose manifest is missing or unreadable is not serving anything —
+        `readyz`, `require_ready` and `can_start_workers` all go through
+        `_ready_manifest` and fail — so deferring the marker stops no processing
+        that is happening, while marking the wrong generation stops processing
+        that is lawful.
+        """
+        if not body:
+            # No generation named: a control plane that predates this field.
+            # Nothing to compare, and nothing to defer for.
+            return "match"
+        try:
+            named = json.loads(body.decode("utf-8")).get("receipt_ids")
+        except (ValueError, UnicodeDecodeError, AttributeError):
+            return "match"
+        named = {
+            receipt for receipt in (named or []) if isinstance(receipt, str) and receipt
+        }
+        if not named:
+            return "match"
+        try:
+            manifest = load_runtime_manifest(self.manifest_path, env=self.env)
+        except ManifestError:
+            return "undecidable"
+        if manifest.consent is None or not manifest.consent.receipts:
+            return "undecidable"
+        held = {receipt.receipt_id for receipt in manifest.consent.receipts}
+        return "superseded" if held.isdisjoint(named) else "match"
+
+    def _consent_revoke(
+        self, method: str, authorization: str, body: bytes = b""
+    ) -> Probe:
+        """Stop serving because a consent behind this runtime was withdrawn.
+
+        Unconditional once authenticated, with ONE exception. It must succeed on
+        a runtime that is already deleted, not yet active, or serving a manifest
+        that cannot be parsed: withdrawal that fails because the runtime is in an
+        awkward state is withdrawal that did not happen, and Art. 7(3) gives the
+        family a right to it, not an attempt at it. Idempotent — the marker is
+        the state, and re-posting rewrites the same file.
+
+        The exception is a stop that names a consent generation this runtime is
+        demonstrably not serving. A withdrawal from revision A whose job is
+        unreachable, while the household re-consents and reprovisions as
+        revision B, would otherwise authenticate against B — the runtime
+        reference is the household's stable app name and does not change — and
+        suspend a runtime nobody withdrew, indefinitely.
+
+        The test is deliberately one-sided. Only a POSITIVE mismatch declines:
+        the request names receipts, the manifest parses, it declares receipts,
+        and none of them match. Anything else — no receipts named (a control
+        plane that predates this), an unreadable manifest, a manifest with no
+        consent block — marks. Fail closed toward stopping, because the cost of
+        stopping a runtime that could have kept running is recoverable and the
+        cost of not stopping one is not.
+        """
+        expected = self.env.get(ENV_RUNTIME_DSAR_TOKEN, "")
+        if method != "POST" or not expected:
+            return Probe(404, {"status": "not_found"})
+        prefix = "Bearer "
+        supplied = (
+            authorization[len(prefix) :] if authorization.startswith(prefix) else ""
+        )
+        if not supplied or not hmac.compare_digest(supplied, expected):
+            return Probe(401, {"status": "unauthorized"})
+        verdict = self._generation_verdict(body)
+        if verdict == "superseded":
+            # Acknowledged, not obeyed: the job is satisfied and stops retrying,
+            # and this runtime keeps serving the consent it actually holds.
+            return Probe(200, {"state": "superseded_generation"})
+        if verdict == "undecidable":
+            # RETRYABLE, not marked. The manifest is not readable yet — most
+            # likely mid-bootstrap — so which generation this runtime serves is
+            # not yet a fact. The control plane treats a non-200/410 as
+            # `outcome_unknown` and comes back; by then the manifest exists and
+            # the question has an answer. Marking now is how a stale stop
+            # suspends a runtime that was about to be lawfully consented.
+            return Probe(503, {"status": "generation_undecidable"})
+        try:
+            atomic_write(self.consent_marker, b'{"status":"consent_withdrawn"}')
+        except OSError:
+            # The control plane retries; reporting success here would record a
+            # withdrawal that never reached disk and would not survive a restart.
+            return Probe(503, {"status": "consent_marker_unavailable"})
+        return Probe(200, {"state": "consent_withdrawn"})
+
     def _dsar(self, path: str, method: str, authorization: str) -> Probe:
         expected = self.env.get(ENV_RUNTIME_DSAR_TOKEN, "")
         if method != "POST" or not expected:
@@ -680,7 +932,7 @@ class RuntimeService:
                 return Probe(200, {"state": "absent"})
             return Probe(410, {"status": "runtime_deleted"})
         try:
-            manifest, _reason = self._ready_manifest()
+            manifest, _reason = self._ready_manifest(for_data_subject_request=True)
             if manifest is None:
                 raise RuntimeNotReady("runtime is not active")
             with open_database(self.database_path) as database:
@@ -711,7 +963,7 @@ class RuntimeService:
         if not supplied or not hmac.compare_digest(supplied, expected):
             return Probe(401, {"status": "unauthorized"})
         try:
-            manifest, _reason = self._ready_manifest()
+            manifest, _reason = self._ready_manifest(for_data_subject_request=True)
             if manifest is None:
                 raise RuntimeNotReady("runtime is not active")
             if not self._revoke_google_credential(manifest):

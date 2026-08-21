@@ -129,7 +129,7 @@ def _provision_runtime(api_harness) -> RuntimeBootstrap:
             last_name="Owner",
             family_language="en",
             timezone="Europe/Prague",
-            country_code="CZ",
+            country_code="DE",
             residency_mode="eu-app",
         ),
         context=_context(active, world, 1),

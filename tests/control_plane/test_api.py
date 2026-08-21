@@ -30,7 +30,7 @@ def _profile(**changes: str) -> dict[str, str]:
         "last_name": "Owner",
         "family_language": "en",
         "timezone": "Europe/Prague",
-        "country_code": "CZ",
+        "country_code": "DE",
         "residency_mode": "eu-app",
     }
     payload.update(changes)

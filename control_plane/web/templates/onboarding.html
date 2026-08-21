@@ -7,6 +7,21 @@
   <input type="hidden" name="idempotency_key" value="{{ idempotency_key }}">
   <input type="hidden" name="version" value="{{ snapshot.version }}">
 {%- endmacro %}
+{# The Art 9(2)(a) consent is asked for exactly where real family content can
+   arrive, decided PER OPTION by the same predicate the server gate uses. In the
+   synthetic circuit there is no personal data and so no question of a
+   condition, and demanding a consent that is not needed would itself be
+   misleading. Keying this on the managed-rollout flag said nothing about Gmail,
+   which routes to a real provider unconditionally: the form rendered no consent
+   and the server then rejected the submission for lacking it. #}
+{% macro household_consent_fields(option) -%}
+  {%- if household_consent_required[option] %}
+  <input type="hidden" name="special_category_household_text_version" value="{{ special_category_household_version }}">
+  <input type="hidden" name="special_category_household_text_sha256" value="{{ special_category_household_sha256 }}">
+  <label class="consent"><input type="checkbox" name="special_category_household_consent" value="yes" aria-describedby="special-category-household-content" required>
+    I give explicit consent to the exact Art. 9(2)(a) statement above.</label>
+  {%- endif %}
+{%- endmacro %}
 <section class="onboarding-shell" data-version="{{ snapshot.version if snapshot else 0 }}" data-workflow-state="{{ snapshot.state.value }}">
   <header class="onboarding-heading">
     <div>
@@ -47,6 +62,12 @@
       <strong>{{ special_category_restriction_version }}:</strong>
       {{ special_category_restriction_text }}
     </p>
+    {%- if household_consent_required.values() | select | list %}
+    <p id="special-category-household-content" class="consent-copy">
+      <strong>{{ special_category_household_version }}:</strong>
+      {{ special_category_household_text }}
+    </p>
+    {%- endif %}
     <div class="cards">
       <form method="post" action="/onboarding/select/email_identity">
         {{ command_fields() }}<input type="hidden" name="kind" value="abrolia_managed">
@@ -55,6 +76,7 @@
         <input type="hidden" name="special_category_restriction_text_sha256" value="{{ special_category_restriction_sha256 }}">
         <label class="consent"><input type="checkbox" name="special_category_restriction_acknowledged" value="yes" aria-describedby="special-category-content-restriction" required>
           I acknowledge the exact special-category content restriction above.</label>
+        {{ household_consent_fields("abrolia_managed") }}
         <button class="card recommended" data-select="email_identity" data-kind="abrolia_managed">
           <span class="badge">Recommended</span> <strong>@abrolia.com</strong>
           <span>Managed assistant inbox with a synthetic pilot identity.</span>
@@ -66,6 +88,7 @@
         <input type="hidden" name="special_category_restriction_text_sha256" value="{{ special_category_restriction_sha256 }}">
         <label class="consent"><input type="checkbox" name="special_category_restriction_acknowledged" value="yes" aria-describedby="special-category-content-restriction" required>
           I acknowledge the exact special-category content restriction above.</label>
+        {{ household_consent_fields("gmail_agent") }}
         <button class="card" data-select="email_identity" data-kind="gmail_agent">
           <strong>Separate agent Gmail</strong>
           <span>A dedicated agent account with OAuth — never your personal Gmail or an app password.</span>
@@ -82,6 +105,7 @@
           I understand that changing apex MX records can interrupt existing family mail; a dedicated subdomain is recommended.</label>
         <label class="consent"><input type="checkbox" name="special_category_restriction_acknowledged" value="yes" aria-describedby="special-category-content-restriction" required>
           I acknowledge the exact special-category content restriction above.</label>
+        {{ household_consent_fields("family_domain") }}
         <button class="card" data-select="email_identity" data-kind="family_domain">
           <strong>Your family domain</strong><span>Use a dedicated assistant address on a domain you control.</span>
         </button>

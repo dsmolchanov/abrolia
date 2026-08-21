@@ -348,6 +348,57 @@ writes the runtime tombstone and a mode-`0600` deletion marker before control
 plane deprovisions the exact Machine, volume and app; repeated delete returns
 the same proven `absent` state.
 
+## Consent withdrawal (Art. 7(3))
+
+The Art 9(2)(a) copy tells the family their consent "can be withdrawn at any
+time in one step at help@abrolia.com". That address is a mailbox a human reads,
+so this is the command that human runs:
+
+```bash
+fly ssh console -a abrolia-control-plane -C \
+  "python -m control_plane.cli withdraw-consent <household-id> special_category_household_content"
+```
+
+It prints what it did and nothing that identifies the household beyond the id
+you supplied:
+
+```json
+{"purpose": "...", "receipts_revoked": 1, "revisions_revoked": 1, "runtime_notified": true}
+```
+
+Four things happen, and you should check the last two:
+
+1. The receipt is marked `revoked_at`. Every control-plane boundary — planner,
+   provisioning worker, bootstrap activation — reads `revoked_at IS NULL`, so
+   nothing further is provisioned or activated from this moment.
+2. Every standing configuration revision moves to `revoked`, so none can be
+   activated later.
+3. The upstream inbox is disconnected — the same teardown an onboarding reset
+   schedules. Stopping our runtime does not stop the processor: a provisioned
+   Nerve or Gmail mailbox keeps receiving and storing whatever is forwarded to
+   it, and that is the boundary the DPA covers.
+4. A runtime job is queued to tell the instance that is ALREADY serving. Until
+   that job succeeds the household's runtime keeps processing: it re-reads a
+   local manifest whose receipt stays valid-looking forever, and the database
+   is invisible to it. `runtime_notified: false` means no runtime was
+   provisioned, which is fine. `true` means the job exists but has not
+   necessarily run.
+
+Confirm the third with the worker and the runtime's own probe:
+
+```bash
+fly ssh console -a abrolia-control-plane -C "python -m control_plane.cli worker"
+curl -s http://<runtime-ref>.internal:8080/readyz | jq .reason   # consent_withdrawn
+```
+
+An unreachable runtime leaves the job `outcome_unknown` and it retries — that is
+deliberate, because the family has a right to the withdrawal and not merely to
+an attempt at it. Do not mark it resolved until `readyz` reports
+`consent_withdrawn`.
+
+Withdrawing `special_category_content_restriction` stops the household
+entirely: every household owes that purpose regardless of provider.
+
 ## Crash and release checks
 
 Exercise every window from the Phase 1 plan: before/after lease, provider

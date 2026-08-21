@@ -284,6 +284,56 @@ def test_eu_strict_manifest_fails_without_explicit_provider(tmp_path: Path) -> N
     assert config.residency_mode == "eu-strict"
 
 
+# The three cases the Phase A residency gate names individually. They were
+# listed in the plan and marked as passing while only the combined test above
+# existed, and `eu-app` had no coverage at all — so the gate was asserting
+# something nobody had checked. Kept as separate functions because the gate
+# refers to them by name.
+
+
+def test_eu_strict_fails_closed_without_vertex(tmp_path: Path) -> None:
+    """No Vertex EU, no boot. The downgrade is refused, not silently accepted."""
+    path = tmp_path / "household.toml"
+    path.write_text(runtime_manifest(residency_mode="eu-strict"), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="refusing downgrade"):
+        load_config(manifest_path=path, env={})
+
+    # And not by an unset variable alone: an explicit falsehood is still a no.
+    for denial in ("false", "0", "", "no"):
+        with pytest.raises(RuntimeError, match="refusing downgrade"):
+            load_config(
+                manifest_path=path, env={"HERMES_VERTEX_EU_ENABLED": denial}
+            )
+
+
+def test_eu_app_boots_without_vertex(tmp_path: Path) -> None:
+    """The case that had no test at all.
+
+    `eu-app` must NOT inherit the strict requirement — if it did, the gate would
+    be fail-closed for a reason unrelated to residency and the strict mode's
+    guarantee would be untestable.
+    """
+    path = tmp_path / "household.toml"
+    path.write_text(runtime_manifest(residency_mode="eu-app"), encoding="utf-8")
+
+    config = load_config(manifest_path=path, env={})
+
+    assert config.residency_mode == "eu-app"
+
+
+def test_eu_strict_boots_with_vertex_enabled(tmp_path: Path) -> None:
+    """The permitted path stays permitted, or the refusal above proves nothing."""
+    path = tmp_path / "household.toml"
+    path.write_text(runtime_manifest(residency_mode="eu-strict"), encoding="utf-8")
+
+    config = load_config(
+        manifest_path=path, env={"HERMES_VERTEX_EU_ENABLED": "true"}
+    )
+
+    assert config.residency_mode == "eu-strict"
+
+
 def test_validate_manifest_command_is_safe_and_actionable(
     tmp_path: Path, capsys
 ) -> None:

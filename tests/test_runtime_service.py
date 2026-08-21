@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 
+from control_plane.privacy.consent import consent_version_and_sha
 from hermes_cloud.core.db import open_database
 from hermes_cloud.core.runtime_manifest import compute_config_sha256, parse_runtime_manifest
 from hermes_cloud.runtime import service as runtime_service_module
@@ -31,12 +32,21 @@ RUNTIME_REF = "fly:abrolia-hh-test"
 TOKEN = "synthetic-bootstrap-token-canary"
 
 
+_RESTRICTION_VERSION, _RESTRICTION_SHA = consent_version_and_sha(
+    "special_category_content_restriction"
+)
+_HOUSEHOLD_VERSION, _HOUSEHOLD_SHA = consent_version_and_sha(
+    "special_category_household_content"
+)
+
+
 def manifest_toml(
     *,
     with_email_binding: bool = False,
     email_provider: str = "nerve-managed",
     with_content_restriction: bool = True,
-    content_restriction_sha: str = "64221529a01cff070f1f614451eecaa5c6ed28a2b7c5d6af6f56e5ef5054e509",
+    with_household_consent: bool = True,
+    content_restriction_sha: str = _RESTRICTION_SHA,
 ) -> str:
     body = '''\
 schema_version = 1
@@ -77,18 +87,35 @@ provider_binding_ref = '{binding_ref}'
 secret_binding_ref = "HERMES_EMAIL_BINDING"
 """
     if with_content_restriction:
+        # A real email provider owes the Art 9(2)(a) consent too, and the
+        # runtime derives that from the provider rather than reading it back
+        # from the manifest — so a fixture naming a real provider must carry it,
+        # exactly as a manifest the control plane issues would.
+        real_content = email_provider not in {"fake-email", "synthetic"}
+        purposes = ['"special_category_content_restriction"']
+        if real_content and with_household_consent:
+            purposes.append('"special_category_household_content"')
         body += f"""\
 
 [consent]
 authority = "control_plane"
 enforcement = "required"
-required_purposes = ["special_category_content_restriction"]
+required_purposes = [{", ".join(purposes)}]
 
 [[consent.receipts]]
 receipt_id = "10000000-0000-4000-8000-000000000031"
 purpose = "special_category_content_restriction"
-text_version = "special-category-content-restriction-v1"
+text_version = "{_RESTRICTION_VERSION}"
 text_sha256 = "{content_restriction_sha}"
+"""
+        if real_content and with_household_consent:
+            body += f"""\
+
+[[consent.receipts]]
+receipt_id = "10000000-0000-4000-8000-000000000034"
+purpose = "special_category_household_content"
+text_version = "{_HOUSEHOLD_VERSION}"
+text_sha256 = "{_HOUSEHOLD_SHA}"
 """
     digest = compute_config_sha256(body)
     return body.replace("schema_version = 1\n", f'schema_version = 1\nconfig_sha256 = "{digest}"\n')

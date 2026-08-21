@@ -127,6 +127,25 @@ def _selection(
                 "special_category_restriction_text_sha256", ""
             ),
         }
+        # The Art 9(2)(a) consent rides along on every email option, exactly as
+        # the restriction does. The form only renders it in a real-email
+        # rollout, so an absent checkbox here contributes nothing and the
+        # server-side gate stays the single place that decides whether it was
+        # required — the browser is not trusted to make that call.
+        household_binding: dict[str, Any] = {}
+        if form.get("special_category_household_consent") == "yes":
+            household_binding = {
+                "special_category_household_consent": True,
+                "special_category_household_receipt_id": _receipt_id(
+                    context, household_id, "special_category_household_content"
+                ),
+                "special_category_household_text_version": form.get(
+                    "special_category_household_text_version", ""
+                ),
+                "special_category_household_text_sha256": form.get(
+                    "special_category_household_text_sha256", ""
+                ),
+            }
         if option == "abrolia_managed":
             return {
                 "kind": option,
@@ -134,6 +153,7 @@ def _selection(
                 "special_category_restriction_acknowledged": True,
                 "special_category_restriction_receipt_id": restriction_receipt_id,
                 **restriction_binding,
+                **household_binding,
             }
         if option == "gmail_agent":
             return {
@@ -142,6 +162,7 @@ def _selection(
                 "special_category_restriction_acknowledged": True,
                 "special_category_restriction_receipt_id": restriction_receipt_id,
                 **restriction_binding,
+                **household_binding,
             }
         return {
             "kind": option,
@@ -151,6 +172,7 @@ def _selection(
             "special_category_restriction_acknowledged": True,
             "special_category_restriction_receipt_id": restriction_receipt_id,
             **restriction_binding,
+            **household_binding,
         }
     if kind is StepKind.WHATSAPP:
         if form.get("privacy_notice_accepted") != "yes":

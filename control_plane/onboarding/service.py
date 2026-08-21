@@ -27,7 +27,11 @@ from control_plane.onboarding.contracts import (
     WorkflowConflict,
 )
 from control_plane.onboarding.state import CHECK, RETRY, SAVE_PROFILE, SELECT, next_status
-from control_plane.privacy.consent import consent_version_and_sha
+from control_plane.privacy.art9 import real_content_refusal
+from control_plane.privacy.consent import (
+    consent_version_and_sha,
+    processes_real_household_content,
+)
 from control_plane.repositories.households import HouseholdsRepository
 from control_plane.repositories.jobs import JobsRepository
 from control_plane.repositories.onboarding import OnboardingRepository, WorkflowRecord
@@ -259,11 +263,77 @@ class OnboardingService:
             StepKind.PRIMARY_CHANNEL: "fake-channel",
         }[kind]
 
+    def email_option_processes_real_content(self, option: str) -> bool:
+        """Whether this email option routes to a provider handling real content.
+
+        The gate below and the onboarding page must agree about this, and they
+        did not: the server started keying on the provider while the page still
+        keyed on the managed-rollout flag, so with `ABROLIA_REAL_EMAIL_ENABLED=0`
+        the Gmail form rendered no consent and the server then rejected the
+        submission for lacking it — browser onboarding became impossible. One
+        predicate, asked by both.
+        """
+        return processes_real_household_content(
+            self._provider_for(StepKind.EMAIL, option)
+        )
+
+    #: Consent evidence is control-plane-only. A provider is told which mailbox
+    #: to create, never which conditions the family accepted or what receipt
+    #: records them — that is accountability data with no purpose at the
+    #: provider, and sending it would be a disclosure the notices do not cover.
+    CONSENT_FIELDS = frozenset({
+        "special_category_restriction_acknowledged",
+        "special_category_restriction_receipt_id",
+        "special_category_restriction_text_version",
+        "special_category_restriction_text_sha256",
+        "special_category_household_consent",
+        "special_category_household_receipt_id",
+        "special_category_household_text_version",
+        "special_category_household_text_sha256",
+    })
+
+    def _provider_safe_selection(
+        self, kind: StepKind, selection: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        """Strip consent evidence from anything crossing to a provider.
+
+        One function for every provider-bound path. It was previously inline in
+        `select` alone, so a RETRY of the same step, and the inspect request
+        raised by `check`, both forwarded the full durable selection — the
+        consent flag, receipt id, version and digest — to Nerve or Google. The
+        boundary held on the first attempt and leaked on the second.
+        """
+        if kind is not StepKind.EMAIL or selection is None:
+            return selection
+        return {
+            key: value
+            for key, value in selection.items()
+            if key not in self.CONSENT_FIELDS
+        }
+
     def _assert_email_rollout(self, household_id: str, selection: dict[str, Any]) -> None:
-        if not self.real_email_enabled:
+        # Gate on the PROVIDER this selection routes to, not on the managed
+        # rollout flag. `gmail_agent` goes to `google-oauth` unconditionally —
+        # it is a real provider even when `ABROLIA_REAL_EMAIL_ENABLED=0` — so
+        # keying on the flag let Gmail past the consent and Art. 9(4) checks
+        # entirely. The web form hides the consent in that configuration and the
+        # worker rejects the job for a missing receipt, but an API client that
+        # supplies the receipts reached a real provider with no country
+        # validation at all. Real content is the condition; the flag only ever
+        # described the managed and domain paths.
+        provider = self._provider_for(
+            StepKind.EMAIL, str(selection.get("kind") or "")
+        )
+        if not processes_real_household_content(provider):
             return
+        # The allowlist is a ROLLOUT control and stays tied to its flag: it
+        # limits which households the managed and domain paths are switched on
+        # for. The consent and country checks below are CONTENT controls and
+        # follow the provider, because that is what determines whether real
+        # family data can arrive.
         if (
-            selection.get("kind") != "gmail_agent"
+            self.real_email_enabled
+            and selection.get("kind") != "gmail_agent"
             and household_id not in self.real_email_household_allowlist
         ):
             raise InvalidTransition("real email is not enabled for this household")
@@ -274,31 +344,49 @@ class OnboardingService:
             raise InvalidTransition(
                 "real email requires the special-category content restriction receipt"
             )
+        # The Art 9(2)(a) condition is only reachable where real family content
+        # can actually arrive; synthetic households process no personal data.
+        if (
+            selection.get("special_category_household_consent") is not True
+            or not selection.get("special_category_household_receipt_id")
+        ):
+            raise InvalidTransition(
+                "real email requires the Art 9(2)(a) household content consent"
+            )
+        # Consent is necessary but not sufficient. Art. 9(4) lets a member state
+        # keep further conditions, and lawful-bases.md section 3 refuses real
+        # data outright for any country whose result has not been entered — so
+        # the profile's country is checked here, on the last hop before a real
+        # provider can be selected, and not only in the manifest.
+        profile = self.households.profile(household_id)
+        refusal = real_content_refusal(
+            (profile or {}).get("country_code")
+        )
+        if refusal is not None:
+            raise InvalidTransition(f"real email is not permitted: {refusal}")
 
     @staticmethod
-    def _record_email_content_restriction(
+    def _record_email_consent_receipt(
         connection,
         *,
         parsed: dict[str, Any],
         household_id: str,
         account_id: str,
         now: float,
+        purpose: str,
+        prefix: str,
+        accepted_field: str,
+        mismatch_error: str,
     ) -> None:
-        receipt_id = parsed.get("special_category_restriction_receipt_id")
-        if (
-            parsed.get("special_category_restriction_acknowledged") is not True
-            or not receipt_id
-        ):
+        receipt_id = parsed.get(f"{prefix}_receipt_id")
+        if parsed.get(accepted_field) is not True or not receipt_id:
             return
-        purpose = "special_category_content_restriction"
         text_version, text_sha = consent_version_and_sha(purpose)
         if (
-            parsed.get("special_category_restriction_text_version") != text_version
-            or parsed.get("special_category_restriction_text_sha256") != text_sha
+            parsed.get(f"{prefix}_text_version") != text_version
+            or parsed.get(f"{prefix}_text_sha256") != text_sha
         ):
-            raise InvalidTransition(
-                "special-category content restriction text version does not match"
-            )
+            raise InvalidTransition(mismatch_error)
         existing = connection.execute(
             "SELECT household_id, account_id, purpose, text_version, text_sha256"
             " FROM consent_receipts WHERE id = ?",
@@ -413,12 +501,33 @@ class OnboardingService:
                 (row["id"], kind.value),
             ).fetchone()
             if kind is StepKind.EMAIL:
-                self._record_email_content_restriction(
+                self._record_email_consent_receipt(
                     connection,
                     parsed=parsed,
                     household_id=household_id,
                     account_id=context.account_id,
                     now=now,
+                    purpose="special_category_content_restriction",
+                    prefix="special_category_restriction",
+                    accepted_field="special_category_restriction_acknowledged",
+                    mismatch_error=(
+                        "special-category content restriction text version"
+                        " does not match"
+                    ),
+                )
+                self._record_email_consent_receipt(
+                    connection,
+                    parsed=parsed,
+                    household_id=household_id,
+                    account_id=context.account_id,
+                    now=now,
+                    purpose="special_category_household_content",
+                    prefix="special_category_household",
+                    accepted_field="special_category_household_consent",
+                    mismatch_error=(
+                        "Art 9(2)(a) household content consent text version"
+                        " does not match"
+                    ),
                 )
             if kind is StepKind.WHATSAPP:
                 household_row = connection.execute(
@@ -447,19 +556,7 @@ class OnboardingService:
                 "onboarding_steps", f"{row['id']}:{kind.value}", "selection", parsed
             )
             intent_key = f"{household_id}:{kind.value}:{selection_kind}:{attempt}"
-            provider_selection = parsed
-            if kind is StepKind.EMAIL:
-                provider_selection = {
-                    key: value
-                    for key, value in parsed.items()
-                    if key
-                    not in {
-                        "special_category_restriction_acknowledged",
-                        "special_category_restriction_receipt_id",
-                        "special_category_restriction_text_version",
-                        "special_category_restriction_text_sha256",
-                    }
-                }
+            provider_selection = self._provider_safe_selection(kind, parsed)
             job_request = {
                 "step_kind": kind.value,
                 "selection": provider_selection,
@@ -621,7 +718,9 @@ class OnboardingService:
                     "email_identity_id": identity.id,
                     "household_id": household_id,
                     "option": identity.option.value,
-                    "selection": self.onboarding.selection(row["id"], kind),
+                    "selection": self._provider_safe_selection(
+                        kind, self.onboarding.selection(row["id"], kind)
+                    ),
                 })
             inspect_id, _ = self.jobs.create(
                 connection,
@@ -698,6 +797,15 @@ class OnboardingService:
             if replay:
                 return replay
             row = self._scoped_workflow(connection, context.account_id, household_id)
+            if kind is StepKind.EMAIL:
+                # The SAME gate `select` runs, on the CURRENT configuration. A
+                # retry rebuilds the job against whatever provider the
+                # deployment routes to now, so a selection that was synthetic
+                # when it was made can be dispatched to a real one — past an
+                # Art. 9(4) country refusal or a household allowlist that has
+                # since changed. The worker rechecks receipts and knows nothing
+                # about either, so this is the only place the question is asked.
+                self._assert_email_rollout(household_id, parsed)
             self._check_version(row, context.expected_version)
             step = connection.execute(
                 "SELECT * FROM onboarding_steps WHERE workflow_id = ? AND kind = ?",
@@ -708,7 +816,7 @@ class OnboardingService:
             intent_key = f"{household_id}:{kind.value}:{parsed['kind']}:{attempt}"
             job_request = {
                 "step_kind": kind.value,
-                "selection": parsed,
+                "selection": self._provider_safe_selection(kind, parsed),
                 "attempt": attempt,
             }
             if kind is StepKind.EMAIL and self.email_identities is not None:
@@ -808,6 +916,85 @@ class OnboardingService:
                 now=now,
             )
             return CommandResult(snapshot)
+
+    def disconnect_for_withdrawal(
+        self,
+        connection,
+        household_id: str,
+        *,
+        resource_types: frozenset[str],
+        now: float,
+    ) -> list[str]:
+        """Tear down the provider resources a withdrawn consent authorised.
+
+        Stopping the runtime stops OUR processing. It does nothing about the
+        mailbox already provisioned at Nerve or Google, or the WhatsApp identity
+        already registered, which keep receiving and storing whatever is sent to
+        them — so without this, withdrawal left processing running at the
+        processor boundary, which is the boundary the family cannot see and the
+        one the DPA covers.
+
+        `resource_types` comes from `WITHDRAWAL_SCOPES` and is what makes this
+        specific to the consent withdrawn. It used to be `{"email_identity"}`
+        unconditionally, for every purpose, so withdrawing a WhatsApp consent
+        deprovisioned the household's inbox and the mail in it while leaving the
+        WhatsApp resource alone.
+
+        Reuses the same cleanup the onboarding reset schedules, rather than a
+        second teardown path: two ways to disconnect a provider resource is two
+        ways for one of them to be wrong.
+        """
+        if not resource_types:
+            return []
+        if "email_identity" in resource_types and self.email_identities is None:
+            resource_types = resource_types - {"email_identity"}
+            if not resource_types:
+                return []
+        row = connection.execute(
+            "SELECT id, version FROM onboarding_workflows WHERE household_id = ?",
+            (household_id,),
+        ).fetchone()
+        if row is None:
+            return []
+        # Quarantine BEFORE enumerating what to tear down, because the two
+        # cover different things and the gap between them was the bug. The
+        # cleanup scan below can only schedule teardown for resources already
+        # recorded in `external_resources`; an `ensure` or `inspect` that has
+        # crossed the Nerve/Google boundary and not yet come back has no row to
+        # find, so the scan cannot see it and withdrawal left it running.
+        #
+        # Superseding the in-flight job first hands that case to the worker's
+        # existing compensation: `_superseded` now sees the quarantine at the
+        # barrier and routes a ready result to `_cleanup_cancelled_result`
+        # instead of `_finish_step`, and `_schedule_cancelled_waiting_cleanup`
+        # attaches a teardown job to a late `ProviderWaiting` reference. Both
+        # already existed for cancel and reset. This is the same disconnect,
+        # so it is the same path — two ways to disconnect an inbox is two ways
+        # for one of them to be wrong.
+        self._supersede_unsettled_jobs(
+            connection,
+            household_id=household_id,
+            reason="withdrawal",
+            now=now,
+            # The job kinds match the resource types one for one: a resource is
+            # torn down and the in-flight job that would create another one is
+            # quarantined, for the same consent and no other.
+            kinds=set(resource_types),
+        )
+        job_ids = self._schedule_registered_cleanup(
+            connection,
+            household_id=household_id,
+            workflow_id=row["id"],
+            workflow_version=row["version"],
+            now=now,
+            resource_types=set(resource_types),
+        )
+        if "email_identity" in resource_types and self.email_identities is not None:
+            self.email_identities.repository.begin_disconnect(
+                connection, household_id, now=now
+            )
+            self._finish_safe_email_disconnect(connection, household_id, now=now)
+        return job_ids
 
     def _schedule_registered_cleanup(
         self,
@@ -913,25 +1100,60 @@ class OnboardingService:
         household_id: str,
         reason: str,
         now: float,
+        kinds: set[str] | None = None,
     ) -> None:
         # A pending job has never crossed the provider boundary and is safe to
         # cancel. Running and waiting-user jobs may already have created
         # upstream state, so preserve their durable intent for explicit
         # inspect/reconcile/compensation instead of claiming they are absent.
+        #
+        # A consent revocation is exempt from both, like cleanup. It is not part
+        # of the onboarding attempt being superseded — it carries an Art. 7(3)
+        # withdrawal to a runtime that is still serving. Cancelling it left that
+        # runtime processing indefinitely, since nothing would re-enqueue the
+        # stop; an owner resetting an unrelated step must not silently undo a
+        # withdrawal.
+        #
+        # `kinds` narrows the sweep to one part of the workflow. Withdrawal
+        # tears down the inbox, and superseding the household's unrelated
+        # in-flight jobs is not part of that.
+        restriction = ""
+        parameters: tuple = ()
+        if kinds is not None:
+            restriction = f" AND kind IN ({','.join('?' * len(kinds))})"
+            parameters = tuple(sorted(kinds))
         connection.execute(
             "UPDATE provisioning_jobs SET status = 'cancelled', settled_at = ?,"
             " updated_at = ?, lease_until = NULL, leased_by = NULL,"
             " error_code = ? WHERE household_id = ? AND status = 'pending'"
-            " AND kind NOT IN ('cleanup','bootstrap_cleanup')",
-            (now, now, f"{reason}_before_provider_call", household_id),
+            " AND kind NOT IN ('cleanup','bootstrap_cleanup')"
+            " AND operation != 'revoke_consent'" + restriction,
+            (now, now, f"{reason}_before_provider_call", household_id, *parameters),
         )
         connection.execute(
+            # `outcome_unknown` belongs in this sweep too. A provider call that
+            # timed out after possibly creating a resource leaves exactly that
+            # state with no `external_resources` row, and the sweep rewrote only
+            # `running` and `waiting_user` — so the job never received the
+            # quarantine. A later reconcile then either failed the real-email
+            # job at the missing-consent precheck without inspecting or
+            # deprovisioning the inbox that may exist, or let a WhatsApp or
+            # channel result pass `_finish_step` as an ordinary success. The
+            # ambiguity is the reason to quarantine it, not a reason to skip it.
+            #
+            # A job ALREADY carrying a `_requires_reconciliation` code keeps it:
+            # it is quarantined, both reasons route to the same compensation,
+            # and overwriting would erase which command an operator was told to
+            # run.
             "UPDATE provisioning_jobs SET status = 'outcome_unknown', settled_at = ?,"
             " updated_at = ?, lease_until = NULL, leased_by = NULL,"
             " error_code = ? WHERE household_id = ?"
-            " AND status IN ('running','waiting_user')"
-            " AND kind NOT IN ('cleanup','bootstrap_cleanup')",
-            (now, now, f"{reason}_requires_reconciliation", household_id),
+            " AND status IN ('running','waiting_user','outcome_unknown')"
+            " AND COALESCE(error_code, '') NOT LIKE '%!_requires!_reconciliation'"
+            " ESCAPE '!'"
+            " AND kind NOT IN ('cleanup','bootstrap_cleanup')"
+            " AND operation != 'revoke_consent'" + restriction,
+            (now, now, f"{reason}_requires_reconciliation", household_id, *parameters),
         )
 
     def _finish_safe_email_disconnect(

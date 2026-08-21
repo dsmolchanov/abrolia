@@ -4,19 +4,30 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import threading
 import time
 from collections.abc import Sequence
+from pathlib import Path
 
 import uvicorn
 
 from control_plane.api.app import create_app
 from control_plane.auth.mailer import ConsoleMailer, Mailer
-from control_plane.backup import create_backup, restore_backup
-from control_plane.config import ControlPlaneConfig
+from control_plane.backup import (
+    BackupError,
+    create_backup,
+    install_rollback,
+    require_control_plane_database,
+    restore_backup,
+)
+from control_plane.config import ControlPlaneConfig, backup_key_from_env
 from control_plane.container import ControlPlaneContainer
+from control_plane.db import ControlPlaneDatabase, ProcessAlreadyRunning
 from control_plane.observability import StructuredLogger
+from control_plane.privacy.consent import CONSENT_TEXTS
+from control_plane.privacy.withdraw import ConsentNotHeld
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -49,7 +60,49 @@ def _parser() -> argparse.ArgumentParser:
     restore = commands.add_parser("restore", help="restore into a new, worker-paused DB")
     restore.add_argument("archive")
     restore.add_argument("--target", required=True)
+    restore.add_argument(
+        "--no-migrate",
+        action="store_true",
+        help="rollback restore: keep the archived schema, apply no migration",
+    )
+    install = commands.add_parser(
+        "install-rollback",
+        help="move a restored database to the path the rolled-back image opens",
+    )
+    install.add_argument(
+        "--restored",
+        required=True,
+        help="the database written by `restore --no-migrate`",
+    )
+    install.add_argument(
+        "--target",
+        required=True,
+        help="the canonical path from fly.toml, currently holding the superseded database",
+    )
+    install.add_argument(
+        "--target-already-freed",
+        action="store_true",
+        help=(
+            "the superseded database was archived off-volume and deleted to make"
+            " room, so --target does not exist yet"
+        ),
+    )
     commands.add_parser("resume-jobs", help="remove the exact post-restore worker pause")
+    # The operator boundary for Art. 7(3). The consent copy advertises a
+    # mailbox, not a button, so withdrawal arrives as mail to a human — this
+    # is the command that human runs. A self-service route needs an
+    # authenticated session and belongs with the account UI; until it exists,
+    # a right that only tests can exercise is not a right.
+    withdraw = commands.add_parser(
+        "withdraw-consent",
+        help="withdraw one consent for one household (Art. 7(3))",
+    )
+    withdraw.add_argument("household_id")
+    withdraw.add_argument(
+        "purpose",
+        choices=sorted(CONSENT_TEXTS),
+        help="the consent purpose being withdrawn",
+    )
     return parser
 
 
@@ -141,12 +194,122 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "serve":
         return _serve(args)
     if args.command == "restore":
-        config = ControlPlaneConfig.from_env()
+        # `backup_key_from_env`, NOT `ControlPlaneConfig.from_env`. Recovery
+        # must not require the rest of the deployment to be intact: reading the
+        # key through the full config made this refuse to run when any unrelated
+        # secret was missing, which withdrew the rollback path in precisely the
+        # state it exists for.
         restored = restore_backup(
-            args.archive, args.target, backup_key=config.backup_key
+            args.archive,
+            args.target,
+            backup_key=backup_key_from_env(),
+            apply_migrations=not args.no_migrate,
         )
         restored.close()
-        print(json.dumps({"status": "restored", "workers": "paused"}))
+        print(json.dumps({
+            "status": "restored",
+            "workers": "paused",
+            "migrated": not args.no_migrate,
+        }, sort_keys=True))
+        return 0
+    if args.command == "backup":
+        # NOT through `_container()`. That builds the whole application and
+        # `ControlPlaneContainer.build` migrates — so on the principal call path
+        # for this command, a persistently failing pending migration, it would
+        # repeat that migration and exit before writing anything. The one
+        # command an operator reaches for when a deployment is broken must not
+        # require the deployment to work.
+        #
+        # The writer lock is still taken, and the same way, because archiving a
+        # database another process is writing produces an archive of a moment
+        # that never existed.
+        database_path = Path(
+            os.environ.get("ABROLIA_CONTROL_PLANE_DB", "data/control-plane.db")
+        )
+        # `sqlite3.connect` CREATES a missing file, so an unset, mistyped or
+        # unmounted path produced a new empty database, a valid authenticated
+        # archive of nothing, and a verification restore that PASSED — an empty
+        # database satisfies `integrity_check` and `foreign_key_check`. The
+        # operator then deletes the real `/data` bundle believing it is
+        # archived.
+        #
+        # `is_file()` alone did not close that: a zero-byte file, an unrelated
+        # SQLite database, or a symlink to either all pass it. What this command
+        # must establish is that the path IS the control-plane database, so it
+        # checks the shape of the entry, that it opens as SQLite, and that it
+        # carries the migration ledger every control-plane database has. A
+        # recovery command archiving the wrong file is worse than one that
+        # refuses.
+        # A side-effect-free existence check first, because acquiring the lock
+        # CREATES the parent directory and the lock file — and doing that for an
+        # unmounted or mistyped path is itself the mutation this command must
+        # not make.
+        if not os.path.lexists(database_path):
+            raise SystemExit(
+                f"backup found no database at {database_path};"
+                " refusing rather than archiving an empty one"
+            )
+        # Then LOCK, then validate. Validating and then locking leaves a
+        # window in which another process replaces the database, so the command
+        # authenticates one file and archives another — and `_readable_sqlite`
+        # can remove sidecars a writer starting in that window has just created.
+        # Exclusive ownership is a precondition of the check, not a companion
+        # to it.
+        database = ControlPlaneDatabase(database_path)
+        try:
+            database.acquire_process_lock()
+        except ProcessAlreadyRunning as error:
+            raise SystemExit(
+                f"backup refused: {error}. Stop the service first."
+            ) from error
+        try:
+            # The ENTRY that was proved, carried into the snapshot. Validation
+            # opens and closes its own read-only connection, `database` has not
+            # opened one yet, and the writer lock is advisory — so a rename in
+            # between would have this authenticate a file nobody checked and
+            # report a valid archive of the wrong generation, after which the
+            # runbook permits deleting the real bundle.
+            identity = require_control_plane_database(database_path)
+        except BackupError as error:
+            database.release_process_lock()
+            database.close()
+            raise SystemExit(f"backup refused: {error}") from error
+        try:
+            result = create_backup(
+                database,
+                args.target,
+                backup_key=backup_key_from_env(),
+                identity=identity,
+            )
+        except BackupError as error:
+            # A refusal, not a crash. `create_backup` rejects a target that
+            # aliases the live bundle — `<db>.workers-paused` being the one that
+            # matters, because it is normally absent and publishing an archive
+            # there pauses every worker — and an operator who mistyped `--target`
+            # needs the message, not a traceback.
+            raise SystemExit(f"backup refused: {error}") from error
+        finally:
+            database.release_process_lock()
+            database.close()
+        print(json.dumps({"status": "created", "path": str(result)}))
+        return 0
+    if args.command == "install-rollback":
+        # No container: this command runs with the service stopped, and building
+        # one would open the target and create WAL sidecars on the very volume
+        # it is trying to free. Same recovery-only key as `restore`, for the
+        # same reason — the two are one documented procedure and must have the
+        # same preconditions.
+        # No backup key either: this command reads no archive. It moves files
+        # and refuses when it cannot, so the only credential-shaped dependency
+        # it had came from the space-freeing it no longer does.
+        print(json.dumps(
+            install_rollback(
+                args.restored,
+                args.target,
+                target_already_freed=args.target_already_freed,
+            ),
+            sort_keys=True,
+        ))
         return 0
     if args.command == "runtime-health":
         # This read/compare/projection command is safe to run beside the
@@ -162,6 +325,33 @@ def main(argv: Sequence[str] | None = None) -> int:
             results = active.runtime_health.reconcile_all(now=time.time())
             print(json.dumps([result.__dict__ for result in results], sort_keys=True))
             return 0
+    if args.command == "withdraw-consent":
+        # Handled before the locking container below. `serve` holds the
+        # nonblocking writer flock for the life of the process, so a command
+        # that takes it can only run with production stopped — and an Art. 7(3)
+        # withdrawal that requires taking the service down is not the one-step
+        # withdrawal the consent copy promises. The work here is one short
+        # transaction plus a queued job, which SQLite serialises on its own;
+        # the flock guards against a second long-running WORKER, which this is
+        # not. Routing it through the running process instead would need an
+        # authenticated admin surface, and that belongs with the account UI.
+        with _container(lock=False) as active:
+            try:
+                result = active.withdrawal.withdraw(
+                    args.household_id, args.purpose, now=time.time()
+                )
+            except ConsentNotHeld as error:
+                raise SystemExit(str(error)) from error
+            # No identifiers beyond the one supplied: the operator already knows
+            # it, and the log must not gain a new copy.
+            print(json.dumps({
+                "purpose": result.purpose,
+                "receipts_revoked": result.receipts_revoked,
+                "revisions_revoked": result.revisions_revoked,
+                "runtime_notified": result.runtime_notified,
+            }, sort_keys=True))
+            return 0
+
     mailer = ConsoleMailer() if args.command == "invite" else None
     with _container(mailer=mailer) as active:
         if args.command == "migrate":
@@ -200,12 +390,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "invite":
             result = active.magic_links.issue(args.email)
             print(json.dumps({"status": "issued", "expires_at": result.expires_at}))
-            return 0
-        if args.command == "backup":
-            result = create_backup(
-                active.database, args.target, backup_key=active.config.backup_key
-            )
-            print(json.dumps({"status": "created", "path": str(result)}))
             return 0
         if args.command == "resume-jobs":
             active.database.resume_workers()

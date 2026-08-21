@@ -171,7 +171,7 @@ def test_verified_choice_changes_require_an_explicit_reset_control(api_harness) 
         "last_name": "Owner",
         "family_language": "en",
         "timezone": "Europe/Prague",
-        "country_code": "CZ",
+        "country_code": "DE",
         "residency_mode": "eu-app",
         "idempotency_key": "reset-ui-profile",
     }
@@ -217,7 +217,7 @@ def test_onboarding_remains_usable_through_server_forms_without_javascript(
             "last_name": "Form",
             "family_language": "en",
             "timezone": "Europe/Prague",
-            "country_code": "CZ",
+            "country_code": "DE",
             "residency_mode": "eu-app",
         },
         follow_redirects=False,
@@ -290,7 +290,7 @@ def test_no_js_whatsapp_duplicate_post_replays_same_consent_receipt(api_harness)
             "last_name": "Owner",
             "family_language": "en",
             "timezone": "Europe/Prague",
-            "country_code": "CZ",
+            "country_code": "DE",
             "residency_mode": "eu-app",
         },
         follow_redirects=False,
@@ -372,7 +372,7 @@ def test_no_js_email_requires_and_records_english_content_restriction(api_harnes
             "last_name": "Owner",
             "family_language": "ru",
             "timezone": "Europe/Prague",
-            "country_code": "CZ",
+            "country_code": "DE",
             "residency_mode": "eu-app",
         },
         follow_redirects=False,
@@ -414,7 +414,9 @@ def test_no_js_email_requires_and_records_english_content_restriction(api_harnes
     )
     assert dict(receipt) == {
         "purpose": "special_category_content_restriction",
-        "text_version": "special-category-content-restriction-v1",
+        "text_version": consent_version_and_sha(
+            "special_category_content_restriction"
+        )[0],
         "locale": "en",
         "revoked_at": None,
     }
@@ -455,3 +457,42 @@ def test_every_progressive_onboarding_command_enforces_origin_and_csrf(
         headers={"Origin": api_harness.config.public_origin},
         data={**form, "csrf_token": "wrong-csrf"},
     ).status_code == 403
+
+
+def test_the_onboarding_page_authenticates_through_a_dependency(api_harness) -> None:
+    """An auth dependency is checkable; an inline `try` is one edit from bypass.
+
+    The inline version behaved correctly — it redirected — and that is the point
+    of the rule it broke: a dependency is visible in the route's signature and
+    survives an early return added above it later, where an inline check would
+    simply be stepped over.
+
+    Behaviour is unchanged: an unauthenticated browser still gets a 303 to
+    `/start`, not a 401 it would render as an error page.
+    """
+    from control_plane.api.app import create_app
+    from control_plane.api.dependencies import browser_session
+
+    unauthenticated = api_harness.client.get("/onboarding", follow_redirects=False)
+    assert unauthenticated.status_code == 303
+    assert unauthenticated.headers["location"] == "/start"
+
+    app = create_app(active_container=api_harness.container)
+    route = next(
+        candidate
+        for candidate in app.routes
+        if getattr(candidate, "path", None) == "/onboarding"
+    )
+    assert any(
+        dependant.call is browser_session
+        for dependant in route.dependant.dependencies
+    ), "the page's authentication is not a declared dependency"
+
+
+def test_an_authenticated_onboarding_page_still_renders(api_harness) -> None:
+    api_harness.authenticate(api_harness.create_principal())
+
+    page = api_harness.client.get("/onboarding")
+
+    assert page.status_code == 200
+    assert "onboarding" in page.text.lower()

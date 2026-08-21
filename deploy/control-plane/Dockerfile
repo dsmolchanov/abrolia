@@ -41,4 +41,7 @@ RUN pip install --no-cache-dir /wheels/* && rm -rf /wheels
 USER abrolia
 WORKDIR /home/abrolia
 EXPOSE 8080
-CMD ["abrolia-control-plane", "serve", "--host", "0.0.0.0", "--port", "8080"]
+# Migrate-on-start with backup-before-migrate: a pending migration is applied
+# only after an authenticated snapshot of the volume database succeeds, and any
+# failure stops the container before `serve` can open the schema.
+CMD ["sh", "-c", "python -m control_plane.db migrate --backup-first && exec abrolia-control-plane serve --host 0.0.0.0 --port 8080"]

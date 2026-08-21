@@ -84,7 +84,7 @@ class ControlPlaneStack:
             "last_name": "Family",
             "family_language": "en",
             "timezone": "Europe/Prague",
-            "country_code": "CZ",
+            "country_code": "DE",
             "residency_mode": "eu-app",
         }
         values.update(changes)
