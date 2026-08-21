@@ -145,7 +145,7 @@ available only for durable bootstrap-secret cleanup.
 `tests/control_plane/*`, `tests/control_plane/email/*`,
 `tests/test_config_and_cli.py`, `tests/test_consent_withdrawal_runtime.py`,
 `tests/test_nerve_runtime.py`, `tests/test_runtime_dsar.py`,
-`tests/test_runtime_service.py`.
+`tests/test_runtime_service.py`, `AGENTS.repo-invariants.md`.
 
 **Branches:** `codex/phase-A-controller-identity`.
 
@@ -164,6 +164,13 @@ reached further than that:
   the text the receipt hashes.
 - the test modules, which an inventory listing only implementation files cannot
   detect a change to. Step E9 recorded the same correction for the same reason.
+
+- `AGENTS.repo-invariants.md` — the withdrawal-teardown rule. `AGENTS.md` says
+  a defect class reported twice is one missing rule rather than N findings, and
+  "a shutdown must reach every reference it can name without asking the
+  provider" arrived three times: a mutating `inspect` believed read-only, then a
+  refusal that abandoned the teardown, then a read of the request that missed
+  the durably recorded reference.
 
 An inventory is corrected rather than the changes reverted; a path that turned
 out to be load-bearing is declared with the reason it was needed.
