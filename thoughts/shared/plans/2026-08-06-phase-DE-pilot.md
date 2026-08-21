@@ -167,12 +167,94 @@ After `codex/phase-E-pilotization` merges, the system can onboard a pilot househ
 
 #### Step E1 — Durable 3-step onboarding machine
 
-**Files:** `control_plane/onboarding/state.py`, `control_plane/onboarding/provision.py`, `control_plane/onboarding/transitions.py`, `control_plane/migrations/0001_control_plane.sql` (if new columns needed), `docs/onboarding-runbook.md`.
+**Files:** `control_plane/onboarding/state.py`, `control_plane/onboarding/provision.py`, `control_plane/onboarding/transitions.py`, `control_plane/migrations/0001_control_plane.sql` (if new columns needed), `docs/onboarding-runbook.md`, `control_plane/container.py`, `control_plane/db.py`, `control_plane/provisioning/fakes.py`, `control_plane/privacy/consent.py`, `control_plane/provisioning/worker.py`, `tests/control_plane/test_provision_dry_run.py`, `tests/control_plane/test_plan_inventory.py`, `AGENTS.repo-invariants.md`.
+
+**Branches:** `codex/phase-E-provision-dry-run`.
+
+**Report narrowed 2026-08-20.** The rehearsal grew a second job beyond the
+no-mutation guarantee: predicting which job the worker would take next, and
+summarising the household's state in derived booleans. That prediction had to
+agree with `JobsRepository.lease` in every edge case — a future `not_before`, a
+held lease, paused workers, a provider the configuration no longer registers, a
+kind dispatched without one — and eleven review rounds went into reconciling it
+while the finding count rose rather than fell.
+
+The command now reports durable FACTS and one label for what it rehearsed. The
+fields `lease` reads are all present, so an operator can see the answer; the
+report no longer asserts it. `−207` lines of implementation and `−379` of tests
+went with the claims. The no-mutation half — the read-only snapshot, the
+refusals, the `committed` proof — is untouched, and it is what Step E1 asked
+for.
+
+**Scope corrected 2026-08-20**, on the same reading that corrected Step E9: an
+inventory listing only the modules a step was expected to touch cannot detect
+the ones it turned out to need, and a changed file outside the plan is a
+blocker under the repository rules. Four were missing rather than unnecessary:
+
+- `control_plane/container.py` and `control_plane/db.py` — `apply_migrations`
+  and `preserve_journal_mode`, the two flags that let the rehearsal open a
+  database without migrating it or rewriting its journal mode. The dry-run's
+  no-mutation guarantee is enforced there, not in `provision.py`.
+- `control_plane/provisioning/fakes.py` — the `plan` method by which a provider
+  states what it will create, so the report describes the CONFIGURED provider
+  rather than assuming Fly.
+- `tests/control_plane/test_provision_dry_run.py` — the step's own suite.
+- `control_plane/repositories/jobs.py` — **added and then reverted
+  2026-08-20.** `LEASABLE_SQL` was extracted so the rehearsal could ask
+  `JobsRepository.lease`'s own question instead of restating it. The narrowing
+  above then removed the prediction entirely, and with it the only consumer:
+  the report states `not_before`, `lease_until` and `status` and leaves the
+  conclusion to the reader. An extraction with no caller is an unrelated
+  refactor riding along in this step, so the file is back as it was.
+- `control_plane/privacy/consent.py` and `control_plane/provisioning/worker.py`
+  — **added 2026-08-20**, for the same reason and by the same remedy.
+  `_run_once` checks the special-category content restriction BEFORE dispatching
+  any provider: stale or revoked, it fails the queued runtime job, revokes the
+  revision and the bootstrap tokens, and returns the workflow to email.
+  Reporting the ordinary success path over that describes an operation whose
+  first act is to undo itself, so the rehearsal asks the worker's question —
+  `CURRENT_RESTRICTION_RECEIPT_SQL`, which now lives beside the consent rules it
+  is about and is read by `_holds_current_restriction` in `provision.py` and by
+  `ProvisioningWorker._has_current_email_content_restriction` alike.
+
+`AGENTS.repo-invariants.md` — **added 2026-08-21.** Five rounds reported the
+same class: the report describing an operation other than the one the worker
+would perform. `AGENTS.md` says a class that recurs is one missing rule, so the
+rule is written down there and enforced by a parameterised check in this step's
+own suite.
+
+Three corrections in three rounds is a mechanism failing, not three oversights.
+`tests/control_plane/test_plan_inventory.py` now compares this branch's changed
+implementation paths against the inventories above and fails on an undeclared
+one, so the next omission is caught before a review generation is spent on it.
 
 **Durable 3-step machine:** `email → WhatsApp → primary`.
 
 - Each step has `step_id ∈ {email, whatsapp, primary}`, `status ∈ {pending, provisioning, waiting_user, verified, failed, skipped}`, and `version` for idempotency.
-- `provision.py --dry-run` lists the exact writes it would make (tables, household `config_revision` diff, Fly resource names, secret names) without mutating DB or calling providers — used by operator before every real pilot onboarding.
+- `provision.py --dry-run` reports what the next real onboarding will do, mutating nothing and calling no provider — used by the operator before every real pilot onboarding. It reports the household `config_revision` diff (key paths, never values), the resource names **of the pending job's own provider** (Fly names only where that job is a Fly one), the secret names, and the tables the pending operation writes **where durable state determines them**; where it does not, it says so and points at the command that would settle it.
+
+  **Amended 2026-08-19.** The criterion previously read "lists the exact writes it would make". Six review rounds established that exactness is not achievable for every state without executing the operation, which is the one thing the command must never do:
+
+  - A pending runtime job in `outcome_unknown` is reconciled next, and `ProvisioningWorker._reconcile` branches on `provider.inspect()` — settle, fail, or re-run preparation. The branch depends on an answer only the provider holds.
+  - `_finish_runtime` itself branches on workflow state, and the two branches write very different sets (nine tables from `runtime_provisioning`, two from `activating`), so a single advertised set was wrong for one of them.
+
+  Naming one branch as "exact" is false precision, and an operator acting on it is worse off than one told to go and look. So the promise is now: exact where it is knowable, explicit uncertainty where it is not, and never a guess presented as a fact.
+
+**The guarantee, stated exactly.** The database file and its `-wal` are left
+byte-identical. The `-shm` shared-memory index is not covered: SQLite must map
+it to read a WAL database at all, so a read-only open creates one where a
+crashed writer left none, and refreshes one that exists. That file holds no
+durable data and is rebuilt from the WAL, but it IS a change to the directory,
+and a fingerprint over `/data` will see it.
+
+Two consequences an operator should know. A rehearsal needs permission to create
+`-shm` beside the database, and will fail without it rather than silently
+reading stale pages. And "mutates nothing" is a claim about the data, not about
+every inode — the earlier unconditional wording promised more than any
+implementation that opens the file through SQLite can deliver, and promising it
+is how the guarantee stops being checkable.
+
+  The no-mutation half is unchanged and was **strengthened** in the same rounds, because it turned out to be doing less than it claimed. The command must not migrate the database (`ControlPlaneContainer.build` did, before its own transaction opened), must not create one that is absent (`sqlite3.connect` did), must not rewrite the journal mode (`PRAGMA journal_mode=WAL` is persistent), must roll its rehearsal back, and must attribute only rows it minted itself — a count taken across the rollback blamed the API worker's concurrent commits on the dry-run.
 - Fix-before-effect: advancing a step is a durable `onboarding_transitions` append before any provider effect; stale `version` → `409 conflict`.
 - Downstream invalidation: if `email` step is reset (delete/reconnect), `whatsapp` and `primary` steps that depended on that `config_revision` are invalidated (`needs_revalidation`) and must be re-confirmed.
 - Idempotency: re-POSTing the same `Idempotency-Key` for the same `step_id+version` returns the same response snapshot without re-calling the provider.
@@ -294,7 +376,60 @@ CREATE TABLE channel_bindings (
 
 #### Step E9 — Release tag, migrate-on-start, restore drill
 
-**Files:** `deploy/control-plane/Dockerfile`, `control_plane/db.py`, `control_plane/migrations/*`, `docs/control-plane-restore.md`.
+**Files:** `deploy/control-plane/Dockerfile`, `control_plane/db.py`,
+`control_plane/backup.py`, `control_plane/cli.py`, `control_plane/config.py`,
+`control_plane/migrations/*`, `docs/control-plane-restore.md`,
+`tests/control_plane/test_migrate_on_start.py`,
+`tests/control_plane/test_db.py`, `AGENTS.repo-invariants.md`,
+`tests/control_plane/test_plan_inventory.py`.
+
+**Branches:** `codex/phase-E9-backup-before-migrate`.
+
+**Scope revised 2026-08-19.** The original list named only the entrypoint, the
+database module, the migrations and the restore documentation. Three more turned
+out to be load-bearing for the step's own guarantees, and the list is corrected
+rather than the changes reverted:
+
+- `control_plane/backup.py` — the pre-migrate snapshot itself lives here, along
+  with the reuse that stops a restart loop filling the volume and the
+  authentication that stops an unopenable archive satisfying the gate.
+- `control_plane/cli.py` — the `restore --no-migrate` rollback path the drill
+  depends on.
+- `control_plane/config.py` — `decode_key_material`, shared so the startup step
+  and the application cannot disagree about whether a backup key is valid. That
+  disagreement stopped the container from booting on a perfectly good key.
+
+**Scope revised again 2026-08-20.** The list named implementation modules only,
+and named no test module at all, while the step's acceptance depends on two:
+
+- `tests/control_plane/test_migrate_on_start.py` — the step's own suite,
+  referenced further down this plan but never inventoried here.
+- `tests/control_plane/test_db.py` — one assertion, tightened from "the ledger
+  is empty" to "the ledger is ABSENT". It belongs with the database module
+  rather than with the migrate-on-start suite because it is a property of
+  `migrate()` itself: creating `schema_migrations` outside the batch
+  transaction autocommitted, which made the file differ from a snapshot taken
+  moments earlier and caused the next boot to reject that snapshot and write
+  another. The migrate-on-start suite consumes that property; `test_db.py` is
+  where it is established.
+
+`tests/control_plane/test_plan_inventory.py` — **added 2026-08-21.** The scope
+check itself, whose `**Files:**` pattern matched only the first line of an
+inventory. Step E9's runs to four, so most of its declared paths were invisible
+and the check reported them all undeclared the moment this branch caught up with
+main. It failed closed, which is the right direction, and it was still wrong.
+
+**Scope revised again 2026-08-21.** `AGENTS.repo-invariants.md` — seven rounds
+reported one class of defect: an operation acting on a pathname it had validated
+at an earlier moment. `AGENTS.md` says a class that recurs is one missing rule
+rather than N findings, so the rule is recorded there and enforced by
+parameterised checks in this step's own suite.
+
+An inventory that lists only implementation files cannot detect a changed test,
+which is how this one went unlisted through several revisions. The general
+remedy — a check comparing a branch's changed paths against its plan's
+inventory — is a repository mechanism rather than a Step E9 change, and belongs
+with `AGENTS.repo-invariants.md`.
 
 **Tag:**
 
@@ -304,18 +439,61 @@ CREATE TABLE channel_bindings (
 
 - Container entrypoint runs `python -m control_plane.db migrate --backup-first` — creates a timestamped `/data/control-plane.db.pre-migrate-<rev>.bak` before applying any new `control_plane/migrations/*.sql`; migration failure → container exits non-zero, no partial schema.
 
+**Rollback install.** Added 2026-08-20, **revised the same day.** The drill's
+rollback was a column of `mv` commands in `docs/control-plane-restore.md`, and
+three of its steps have a failure that does not announce itself: the install is
+a cross-filesystem COPY when the restore was staged off the volume (and renaming
+the superseded database aside frees no blocks, so it still ends in `ENOSPC`); a
+superseded `-wal` left at the canonical path is replayed into the restore; and
+the worker pause is a sibling file that does not travel with the database. Prose
+cannot be executed by a test, which is why the previous check could only assert
+that `/tmp` appeared on the page while the documented procedure still failed.
+`abrolia-control-plane install-rollback` performs the sequence with those checks
+attached.
+
+It **refuses** the low-space case rather than resolving it. The first version
+archived the superseded database off-volume and deleted it to make room, which
+made a command an operator runs to move a file capable of destroying the only
+copy of every write taken after the migration — and it needed the backup key, a
+staging directory, capacity arithmetic and collision-free archive naming to do
+it. That surface produced nine review blockers over three rounds. Freeing space
+is a decision with data-loss consequences and belongs to whoever knows what else
+is on the machine, so the command checks before anything moves, reports the
+bytes needed and the bytes free, and leaves `/data` untouched. The runbook
+carries the manual procedure — archive off-volume, verify it restores, only then
+delete — and a test asserts that order, because a page documenting deletion
+before verification is worse than one documenting nothing.
+
 **Restore drill (reuse Phase B procedure):**
 
 - Perform the isolated backup/restore smoke again on the Phase E schema (now including `channel_preferences` / `channel_bindings` / usage tables); record `integrity_check`, `foreign_key_check`, pause-marker mode, smoke without leasing, resume, new onboarding through rev 1, destroy temp app.
 
 ### Phase E Acceptance Criteria
 
-- [ ] Durable 3-step machine with `provision.py --dry-run` listing exact writes without mutation; fix-before-effect; idempotency; downstream invalidation.
+- [x] Durable 3-step machine with `provision.py --dry-run` listing the pending operation's writes **where durable state determines them** and saying so where it does not, without mutation; fix-before-effect; idempotency; downstream invalidation. ("Exact writes" was the original wording and it was false — see the amendment below.) The machine, its version checks, idempotent replay and `reset_from` downstream invalidation were already durable in `control_plane/onboarding/{state,service}.py`; `control_plane/onboarding/provision.py` adds the rehearsal and `tests/control_plane/test_provision_dry_run.py` proves it commits nothing (4 tests).
 
 ```bash
 python -m control_plane.onboarding.provision --dry-run --household <test-uuid> 2>&1 | head -n 80
-# expect: tables, config_revision diff, Fly resource names, secret names — no DB write
+# expect: no DB write, and a report of durable state.
+# `rehearsal` says what THIS RUN rehearsed, and `table_writes` belongs to that —
+# the planning pass before a revision is issued, the SUCCESS PATH of the pending
+# runtime operation after, nothing when the next step is a provider-dependent
+# reconcile or a precondition is unmet. `pending_step_jobs` and
+# `unresolved_runtime_jobs` list every unsettled job with its status, error
+# code, not_before, lease_until, provider and — where the work is internal and
+# deterministic — its own table_writes. `workers_paused` says whether the queue
+# is moving. Resources and secrets come from the pending job's own provider.
 ```
+
+**Criterion amended 2026-08-20.** It originally read "listing exact writes" and
+"Fly resource names" unconditionally, and the runbook promised the same. Neither
+was true: a revision that is already issued means no planning pass runs, a
+provider-dependent reconcile has no knowable write set, the default
+`dry-run-runtime` provider creates no Fly resources, and a terminal or complete
+workflow has no pending operation to describe. An operator following the
+documented verification could reject correct output, or rely on precision the
+implementation deliberately does not claim. `docs/onboarding-runbook.md` now
+carries the state-by-state contract.
 
 - [ ] `channel_preferences` table exists; household-row primary/fallback; fallback is verified owner email not agent inbox; source-channel reply + permanent-failure fallback + `outcome_unknown` no-duplicate:
 
@@ -361,7 +539,7 @@ pytest tests/test_onboarding.py tests/test_google_oauth.py -q
 pytest -p no:cacheprovider -m "not live" -q
 ```
 
-- [ ] Release tag + backup-before-migrate + restore drill evidenced.
+- [ ] Release tag + backup-before-migrate + restore drill evidenced. Backup-before-migrate landed: `python -m control_plane.db migrate --backup-first` is the container entrypoint step and fails closed without the dedicated backup key (`tests/control_plane/test_migrate_on_start.py`, 5 tests). The release tag and the Phase E restore drill remain operator actions.
 
 ---
 

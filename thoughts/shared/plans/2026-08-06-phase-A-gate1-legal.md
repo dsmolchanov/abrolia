@@ -132,7 +132,41 @@ acknowledgement path; and an already-active runtime refuses readiness when its
 manifest lacks the current version+SHA receipt. Exact activation replays remain
 available only for durable bootstrap-secret cleanup.
 
-**Files:** `docs/privacy/lawful-bases.md:92-162` (§3), `docs/privacy/dpia.md:48-57` (R7 row) + `docs/privacy/dpia.md:118-137` (§5 preconditions), `docs/privacy/privacy-notice-{en,ru}.md` (§ Other people's data / Children / legal bases para), onboarding copy `control_plane/onboarding/*` + `control_plane/api/*`, provisioning/activation enforcement in `control_plane/provisioning/*`, and steady-state readiness in `hermes_cloud/runtime/service.py` if consent copy lives there.
+**Files:** `docs/privacy/lawful-bases.md`, `docs/privacy/dpia.md`,
+`docs/privacy/privacy-notice-en.md`, `docs/privacy/privacy-notice-ru.md`,
+`docs/privacy/processors.md`, `docs/onboarding-runbook.md`, `README.md`,
+`control_plane/onboarding/*`, `control_plane/api/*`,
+`control_plane/provisioning/*`, `control_plane/privacy/*`,
+`control_plane/repositories/jobs.py`, `control_plane/models.py`,
+`control_plane/container.py`, `control_plane/cli.py`,
+`control_plane/web/static/onboarding.js`,
+`control_plane/web/templates/onboarding.html`,
+`hermes_cloud/runtime/service.py`, `.check-fixtures-allow`,
+`tests/control_plane/*`, `tests/control_plane/email/*`,
+`tests/test_config_and_cli.py`, `tests/test_consent_withdrawal_runtime.py`,
+`tests/test_nerve_runtime.py`, `tests/test_runtime_dsar.py`,
+`tests/test_runtime_service.py`.
+
+**Branches:** `codex/phase-A-controller-identity`.
+
+**Scope corrected 2026-08-21.** The original line named the documents plus three
+directory globs, written before the consent was implemented rather than merely
+declared. Enforcing one purpose fail-closed at four boundaries — planner,
+provisioning worker, bootstrap, runtime readiness — and adding withdrawal
+reached further than that:
+
+- `control_plane/privacy/*` — `art9.py`, `consent.py` and `withdraw.py`, where
+  the purposes, the current-receipt predicate and the withdrawal scopes live.
+- `control_plane/repositories/jobs.py`, `control_plane/models.py`,
+  `control_plane/container.py`, `control_plane/cli.py` — the job kinds, the
+  wiring and the operator commands the enforcement needs.
+- `control_plane/web/*` — the consent copy an owner actually reads, which is
+  the text the receipt hashes.
+- the test modules, which an inventory listing only implementation files cannot
+  detect a change to. Step E9 recorded the same correction for the same reason.
+
+An inventory is corrected rather than the changes reverted; a path that turned
+out to be load-bearing is declared with the reason it was needed.
 
 **Edits:**
 

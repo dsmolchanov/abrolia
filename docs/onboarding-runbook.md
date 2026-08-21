@@ -144,6 +144,90 @@ The link token is displayed once to that operator, stored only as a hash, and
 expires after 15 minutes. Do not paste it into tickets, chat, screenshots, or
 logs. Start the service again, open the link, and verify that a replay fails.
 
+### Pre-onboarding rehearsal (`--dry-run`)
+
+Before every pilot onboarding, rehearse it. **What the command reports depends
+on the state the household is in**, and that is deliberate — the earlier
+promise of "the exact writes" was false for several ordinary states, and a
+report that claims precision it does not have is worse than one that says so.
+
+```bash
+python -m control_plane.onboarding.provision --dry-run --household <household-uuid>
+```
+
+It never calls a provider and never commits a row; if a commit is ever observed
+it exits non-zero instead of printing a report. It refuses to run without
+`--dry-run`, and takes no process lock, so it is safe while the API serves. It
+rehearses against a read-only snapshot of the database rather than the live
+file, which is what makes "mutates nothing" structural rather than a list of
+closed holes.
+
+The guarantee is precise rather than absolute: **the database file and its
+`-wal` are left byte-identical; the `-shm` shared-memory index is not covered.**
+SQLite must map `-shm` to read a WAL database at all, so a read-only open
+creates one where a crashed writer left none and refreshes one that exists. It
+holds no durable data and is rebuilt from the WAL. Two things follow: the
+rehearsal needs permission to create that file beside the database, and a
+fingerprint taken over `/data` will show it.
+
+Always reported: the workflow state and per-step statuses, and — when a step is
+not yet verified — `blocked_by` and `unverified_steps` naming exactly what is
+missing.
+
+The report states **facts and one label**, and stops there.
+
+`rehearsal` says what THIS RUN rehearsed — a planning pass, a pending runtime
+operation's success path, or nothing — so `table_writes` is never read as the
+write set of something that was not rehearsed. `blocked_by` names what prevents
+the next onboarding operation, where durable state determines it.
+
+Everything else is durable state, reported as it is:
+
+- `steps` / `unverified_steps` — where the household is.
+- `pending_step_jobs` — every unsettled job that runs before `ensure_runtime`,
+  with its `status`, `error_code`, `not_before`, `lease_until` and `provider`.
+- `unresolved_runtime_jobs` — every unsettled `ensure_runtime` intent, likewise.
+  An `error_code` ending `_requires_reconciliation` means a provider effect
+  nobody has settled; `abrolia-control-plane reconcile <job-id>` settles it, and
+  it should be settled before provisioning on top of it.
+- `workers_paused` — `JobsRepository.lease` returns nothing at all while this is
+  set, so a queue of pending jobs is not a queue that is moving.
+- `committed` / `uncommitted_revision_delta` — the no-mutation proof.
+
+**It does not tell you which job the worker will take next.** It used to, and
+that claim had to agree with `lease` in every edge case — a future `not_before`,
+a held lease, a paused deployment, a provider the configuration no longer
+registers, a kind dispatched without one. Eleven review rounds went into
+reconciling it and the disagreements kept coming. The fields above are what
+`lease` reads; an operator can see the answer, and a report that asserts it can
+be wrong.
+
+`runtime_resources` comes from the provider of the **pending job**, which is not
+always the configured one. A job carries its provider durably and the worker
+dispatches through it, so a job queued under `dry-run-runtime` still runs
+synthetically after a restart with `ABROLIA_RUNTIME_PROVIDER=fly-runtime`.
+`pending_runtime_job.provider` names it.
+
+**A job whose provider is not the configured one is reported as blocked.** The
+provider is durable but the secret sink is not — the container builds one sink
+from the current configuration — so the worker would dispatch the job's provider
+and then hand its reference to the other provider's sink, passing
+`synthetic-runtime:<household-id>` to `fly secrets import --app` and stalling the
+job at `outcome_unknown`. The two are usable only as a pair. `blocked_by` names
+both sides; restore the configuration the job was queued under, or cancel and
+re-plan it.
+
+Under a Fly job it is the deterministic app, volume and Machine names; under
+`dry-run-runtime` the single `synthetic-runtime:<household-id>` reference that
+provider actually creates. A provider that cannot describe its resources, or one
+the deployment no longer registers, is reported as unable to say rather than
+guessed at.
+
+`secrets` gives **names** only, never values: `HERMES_BOOTSTRAP_TOKEN` and
+`HERMES_RUNTIME_DSAR_TOKEN`, plus any email secret binding that is currently
+live. A retained install receipt whose identity has since been reset is audit
+history, not a live binding, and is not listed.
+
 Complete profile preflight with an IANA timezone, then the three choices in
 order. The default synthetic path is managed `@abrolia.com`, shared WhatsApp
 Beta, then Telegram. Reload after each step: the server-side workflow version

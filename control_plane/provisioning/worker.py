@@ -82,6 +82,22 @@ DNS_POLL_MAX_JOB_ATTEMPTS = 5
 COMPENSATED_STEP_KINDS = frozenset(CONTENT_RESOURCE_TYPES)
 
 
+def requires_current_content_restriction(
+    kind: str, operation: str, provider: str
+) -> bool:
+    """Whether `_run_once` gates this job on the special-category receipt.
+
+    Shared with `onboarding.provision`, which reports what the worker will do
+    and therefore has to ask the worker's own question rather than restate it —
+    the same remedy `CURRENT_RECEIPT_SQL` gave the receipt lookup.
+    Restating it meant the report checked only an already-planned runtime job
+    while the gate also covers every non-fake email-identity job.
+    """
+    return (kind == "email_identity" and provider != "fake-email") or (
+        kind == "runtime" and operation != "ensure_secret_namespace"
+    )
+
+
 class ProvisioningWorker:
     def __init__(
         self,
@@ -465,12 +481,25 @@ class ProvisioningWorker:
                 return purpose
         return None
 
+    def _has_current_email_content_restriction(self, household_id: str) -> bool:
+        """The content restriction, asked through the general predicate.
+
+        Step E1 shares this precondition with `onboarding.provision`, which
+        reports what the worker will do; Phase A generalised the same question
+        to every purpose a manifest can require. Keeping both spellings would
+        be two chances to disagree about one thing, which is the defect each
+        change was made to remove — so the narrow question is the general one
+        with `CONTENT_RESTRICTION_PURPOSE` bound, and there is one predicate.
+        """
+        return self.jobs.db.query_one(
+            CURRENT_RECEIPT_SQL,
+            current_receipt_params(household_id, CONTENT_RESTRICTION_PURPOSE),
+        ) is not None
+
     @staticmethod
     def _requires_current_email_content_restriction(job: JobRecord) -> bool:
-        return (
-            job.kind == "email_identity" and job.provider != "fake-email"
-        ) or (
-            job.kind == "runtime" and job.operation != "ensure_secret_namespace"
+        return requires_current_content_restriction(
+            job.kind, job.operation, job.provider
         )
 
     def _block_for_missing_content_restriction(
