@@ -201,9 +201,11 @@ OAuth / History is explicitly deferred to the start of Phase E and remains track
 `tests/control_plane/email/conftest.py`,
 `tests/control_plane/test_art9_household_consent.py`,
 `tests/control_plane/test_real_email_wiring.py`,
-`tests/control_plane/test_provisioning_jobs.py`.
+`tests/control_plane/test_provisioning_jobs.py`, `control_plane/api/app.py`,
+`control_plane/email/models.py`, `control_plane/web/templates/onboarding.html`,
+`tests/control_plane/test_ui_contract.py`.
 
-**Branches:** `codex/phase-F-email-option-kill-switches`.
+**Branches:** `codex/phase-F-email-option-kill-switches`, `codex/phase-F-hide-cut-email-cards`.
 
 **Scope corrected 2026-08-21.** "feature-flag table" named a document rather
 than the code, and the module that implements the switches was never listed —
@@ -232,6 +234,14 @@ reach a provider (`_run_once` and `_reconcile`), reading the flag at call time
 and exempting shutdown work so teardown is never stranded. Recorded as an
 invariant, this being the second instance of the class after the Art. 9(2)(a)
 content restriction.
+
+**Round 3, 2026-08-21.** The onboarding page still rendered all three cards. A
+cut option was refused on submit, so this was a courtesy rather than a hole, but
+the page and the gate must not disagree about what is on offer — the same pair
+that already diverged once over the Art. 9(2)(a) consent and made browser
+onboarding impossible. The page now asks the gate's own predicate
+(`email_option_offered`), and enumerates options from `EMAIL_SELECTION_KINDS`
+rather than a fourth hard-coded list.
 
 **Changes:**
 1. Per-provider flags: `ABROLIA_MANAGED_EMAIL_ENABLED`, `ABROLIA_BYO_EMAIL_ENABLED`, `ABROLIA_GMAIL_ENABLED`, `ABROLIA_WHATSAPP_SHARED_ENABLED`, `ABROLIA_WHATSAPP_DEDICATED_ENABLED`, `ABROLIA_WEB_PUSH_ENABLED` — all `default off`, fail-closed; flag toggle tested in Phase C/D/E suites.

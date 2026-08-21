@@ -62,7 +62,7 @@
       <strong>{{ special_category_restriction_version }}:</strong>
       {{ special_category_restriction_text }}
     </p>
-    {%- if household_consent_required.values() | select | list %}
+    {%- if household_consent_copy_shown %}
     <p id="special-category-household-content" class="consent-copy">
       <strong>{{ special_category_household_version }}:</strong>
       {{ special_category_household_text }}
@@ -82,6 +82,7 @@
           <span>Managed assistant inbox with a synthetic pilot identity.</span>
         </button>
       </form>
+      {%- if email_option_offered["gmail_agent"] %}
       <form method="post" action="/onboarding/select/email_identity">
         {{ command_fields() }}<input type="hidden" name="kind" value="gmail_agent">
         <input type="hidden" name="special_category_restriction_text_version" value="{{ special_category_restriction_version }}">
@@ -94,6 +95,8 @@
           <span>A dedicated agent account with OAuth — never your personal Gmail or an app password.</span>
         </button>
       </form>
+      {%- endif %}
+      {%- if email_option_offered["family_domain"] %}
       <form method="post" action="/onboarding/select/email_identity">
         {{ command_fields() }}<input type="hidden" name="kind" value="family_domain">
         <input type="hidden" name="special_category_restriction_text_version" value="{{ special_category_restriction_version }}">
@@ -110,6 +113,7 @@
           <strong>Your family domain</strong><span>Use a dedicated assistant address on a domain you control.</span>
         </button>
       </form>
+      {%- endif %}
     </div>
   </section>
 

@@ -17,6 +17,7 @@ from control_plane.api.dependencies import BrowserSession, SeeOther, browser_ses
 from control_plane.config import ControlPlaneConfig
 from control_plane.container import ControlPlaneContainer
 from control_plane.db import new_id
+from control_plane.email.models import EMAIL_SELECTION_KINDS
 from control_plane.observability import HealthReporter, HealthSnapshot
 from control_plane.onboarding.contracts import WorkflowConflict
 from control_plane.privacy.consent import consent_version_and_sha, consent_version_and_text
@@ -185,8 +186,35 @@ def create_app(
                 "household_consent_required": {
                     option: active_container.onboarding
                     .email_option_processes_real_content(option)
-                    for option in ("abrolia_managed", "gmail_agent", "family_domain")
+                    for option in EMAIL_SELECTION_KINDS
                 },
+                # Which options this deployment offers at all, from the gate's
+                # own predicate. A card the server would refuse is a card the
+                # family should not be shown — but the hiding is the courtesy
+                # and the gate is the enforcement, so the page reads the answer
+                # rather than the flag.
+                "email_option_offered": {
+                    option: active_container.onboarding.email_option_offered(option)
+                    for option in EMAIL_SELECTION_KINDS
+                },
+                # The Art. 9(2)(a) statement is shown if and only if some
+                # RENDERED form asks for that consent. The two dicts had to be
+                # intersected somewhere and a Jinja expression is the wrong
+                # place: with both switches off the only offered option is the
+                # synthetic managed one, but `gmail_agent` still counts as real
+                # content because it maps to `google-oauth`, so the aggregate
+                # alone put explicit-consent language on the page for a
+                # processing path nobody could choose. Kept separate from
+                # `household_consent_required`, whose per-option answer stays
+                # true for a hidden option — it is required, it is merely not
+                # on offer, and a consent question is the last place to blur
+                # that.
+                "household_consent_copy_shown": any(
+                    active_container.onboarding.email_option_offered(option)
+                    and active_container.onboarding
+                    .email_option_processes_real_content(option)
+                    for option in EMAIL_SELECTION_KINDS
+                ),
             },
         )
 
