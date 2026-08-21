@@ -97,7 +97,20 @@ makes a review loop unable to terminate.
   vacated landed on the very same `(st_dev, st_ino)` and an inode-only check
   called it ours. Anything whose correctness depends on WHICH FILE this is
   compares a digest taken at validation time, at every point that asks and not
-  only at the reversal.
+  only at the reversal. "Every point" has had to be swept twice; the class
+  check `test_no_ownership_check_accepts_a_recycled_inode` parameterises the
+  sites so the next one is found by running something rather than by reading.
+
+  Ownership is captured when the entry is CREATED, not when it is cleaned up.
+  Capturing at cleanup records whoever holds the name by then, which for
+  `_read_only_sqlite` meant an interloper's sidecar was recorded as owned and
+  unlinked. Where creation is somebody else's to do — SQLite makes `-wal` and
+  `-shm` on first read, not at connect — the operation forces it, with a
+  statement of its own, before any caller code can run.
+
+  An identity needs something to distinguish it: the volume probes carry random
+  bytes because every empty file has the same digest, so identifying them by
+  content would be identifying them by nothing.
 
   This applies to REVERSAL as much as to publication, which is the half that
   was missed first: `_undo` verified the inode alone, so a landed member

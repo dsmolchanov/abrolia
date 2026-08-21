@@ -110,11 +110,18 @@ def create_pre_migrate_backup(
 CHUNK_BYTES = 1 << 16
 
 
-def _require_identity(path: Path, expected: tuple[int, int] | None) -> None:
-    """Refuse if `path` no longer names the entry that was validated."""
+def _require_identity(path: Path, expected) -> None:
+    """Refuse if `path` is no longer what was validated — by CONTENT.
+
+    An inode is not the answer to "is this the same database": a process
+    holding an open descriptor rewrites it in place without the inode moving,
+    and a freed inode is handed straight back. Either way the archive would
+    hold a generation nobody validated, and the runbook then licenses deleting
+    the real bundle against it.
+    """
     if expected is None:
         return
-    if _inode(path) != expected:
+    if _identity_or_unreadable(path) != expected:
         raise BackupError(
             f"{path} is not the database that was validated; it was replaced"
             " while this backup was running. Nothing has been archived — an"
@@ -764,7 +771,7 @@ def restore_backup(
         guard.close()
 
 
-def _withdraw_pause(destination: Path, owned: tuple[int, int] | None) -> None:
+def _withdraw_pause(destination: Path, owned) -> None:
     """Take back the pause THIS invocation published, and no other.
 
     Three ways not to remove it, and the asymmetry is deliberate: a spare pause
@@ -773,7 +780,10 @@ def _withdraw_pause(destination: Path, owned: tuple[int, int] | None) -> None:
 
     * Nothing was published — including the `EEXIST` case, where the marker at
       that path is another restore's.
-    * The entry is no longer the one that was published.
+    * The entry is no longer the one that was published, by inode OR by
+      content: `_publish` hands back both, and discarding the digest left this
+      unlinking another operation's marker whenever the filesystem reused the
+      published inode.
     * A database now occupies the target. Whatever put it there, it is better
       paused than not, and this invocation cannot tell which.
 
@@ -782,10 +792,10 @@ def _withdraw_pause(destination: Path, owned: tuple[int, int] | None) -> None:
     direction; raising `AmbiguousPublication` from a cleanup path would replace
     the caller's diagnosis with a symptom.
     """
-    if owned is None:
+    if owned is None or owned[0] is None:
         return
     pause = _pause_marker(destination)
-    if _inode(pause) != owned or _present(destination):
+    if _identity_or_unreadable(pause) != owned or _present(destination):
         return
     pause.unlink(missing_ok=True)
 
@@ -920,7 +930,7 @@ def _restore_locked(
         marker = Path(f"{temporary}.workers-paused")
         # The inode THIS invocation publishes, so the cleanups below can tell
         # the marker they created from one that arrived while they were working.
-        owned_marker: tuple[int, int] | None = None
+        owned_marker = None
         try:
             marker.write_text(
                 "restore requires explicit reconciliation\n", encoding="utf-8"
@@ -928,9 +938,8 @@ def _restore_locked(
             os.chmod(marker, 0o600)
             with open(marker, "rb") as handle:
                 os.fsync(handle.fileno())
-            owned_marker, _digest, _proven = _publish(
-                marker, _pause_marker(destination)
-            )
+            published_marker = _publish(marker, _pause_marker(destination))
+            owned_marker = (published_marker[0], published_marker[1])
         except OSError as error:
             marker.unlink(missing_ok=True)
             # `owned_marker` is None on EVERY failure here, which is the point.
@@ -1247,17 +1256,34 @@ def _read_only_sqlite(path: Path):
         connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
     except sqlite3.Error as error:
         raise RollbackError(f"{path} does not open as SQLite: {error}") from error
+    # AT CREATION, not at cleanup. SQLite makes `-wal` when the connection
+    # opens, and capturing ownership only at the end meant an actor who
+    # replaced that sidecar during the body had THEIR entry recorded as owned
+    # and unlinked — a nominally read-only validation deleting somebody else's
+    # data. What this call owns is what appeared as a direct result of its own
+    # open, identified by inode AND content: a freed inode is handed straight
+    # back, so the inode alone would still match a replacement.
+    # Force them into existence NOW. `-wal` and `-shm` appear on the first read
+    # rather than at connect, so capturing ownership straight after
+    # `sqlite3.connect` missed them and capturing it at cleanup recorded
+    # whatever held the name by then — including an interloper's file, which the
+    # unlink below then deleted. One statement of our own makes SQLite create
+    # them while nothing else has run. A file that is not SQLite at all raises
+    # here and is suppressed: the caller's own checks say so, and this only
+    # needed the side effect.
+    with contextlib.suppress(sqlite3.Error):
+        connection.execute("PRAGMA schema_version").fetchone()
+    created = {
+        sidecar: _identity_or_unreadable(sidecar)
+        for sidecar in _sidecars(path)
+        if sidecar not in inherited and _present(sidecar)
+    }
     try:
         yield connection
     finally:
-        created = {
-            sidecar: _inode(sidecar)
-            for sidecar in _sidecars(path)
-            if sidecar not in inherited and _present(sidecar)
-        }
         connection.close()
-        for sidecar, inode in created.items():
-            if inode is not None and _inode(sidecar) == inode:
+        for sidecar, identity in created.items():
+            if identity[0] is not None and _identity_or_unreadable(sidecar) == identity:
                 sidecar.unlink(missing_ok=True)
 
 
@@ -1524,36 +1550,47 @@ def _is_a_copy(source: Path, destination: Path) -> bool:
     # there, would be overwritten by the rename and then unlinked in the
     # `finally`. Claim it in the destination first, and only rename onto a name
     # this call owns.
+    # RANDOM CONTENT, not an empty file. These probes are identified by their
+    # bytes as well as their inode, and every empty file has the same digest —
+    # so an interloper's empty replacement would match and be deleted, which is
+    # the defect the content check exists to prevent.
+    witness = os.urandom(32)
     try:
         handle, name = tempfile.mkstemp(prefix=".volume-probe-", dir=source)
     except OSError:
         return True
-    os.close(handle)
+    with os.fdopen(handle, "wb") as opened:
+        opened.write(witness)
     probe = Path(name)
     try:
         claim, landed_name = tempfile.mkstemp(prefix=".volume-probe-", dir=destination)
     except OSError:
         probe.unlink(missing_ok=True)
         return True
-    os.close(claim)
+    with os.fdopen(claim, "wb") as opened:
+        opened.write(os.urandom(32))
     landed = Path(landed_name)
-    # The INODES this call owns. Both names can be taken by somebody else in the
-    # windows below — `landed` after an `EXDEV` result, `probe` after a
-    # successful move vacates it — and the cleanup used to unlink both
-    # unconditionally, deleting an interloper's file. Cleanup now removes a name
-    # only while it still refers to the entry this call created.
-    owned = {probe: _inode(probe), landed: _inode(landed)}
+    # The ENTRIES this call owns, by inode and by content. Both names can be
+    # taken by somebody else in the windows below — `landed` after an `EXDEV`
+    # result, `probe` after a successful move vacates it — and the cleanup used
+    # to unlink both unconditionally, deleting an interloper's file. An
+    # inode-only record is not enough either: a freed inode is handed straight
+    # back, so a replacement at a vacated name can carry it.
+    owned = {
+        probe: _identity_or_unreadable(probe),
+        landed: _identity_or_unreadable(landed),
+    }
     # `mkstemp` reserved the destination name so a concurrent probe could not
     # take it; release it just before claiming, because `_claim` refuses to
     # replace an existing entry and would otherwise refuse our own reservation.
     landed.unlink(missing_ok=True)
-    owned[landed] = None
+    owned[landed] = (None, None)
     try:
         moved = _rename_or_exdev(probe, landed)
         if moved:
             # The probe's inode is at `landed` now, and `probe` is vacant.
             owned[landed] = owned[probe]
-            owned[probe] = None
+            owned[probe] = (None, None)
         return not moved
     except FileExistsError:
         # Something took the name in that instant. The question cannot be
@@ -1561,8 +1598,8 @@ def _is_a_copy(source: Path, destination: Path) -> bool:
         # leads to the space check rather than past it.
         return True
     finally:
-        for path, inode in owned.items():
-            if inode is not None and _inode(path) == inode:
+        for path, identity in owned.items():
+            if identity[0] is not None and _identity_or_unreadable(path) == identity:
                 path.unlink(missing_ok=True)
 
 
@@ -1637,7 +1674,7 @@ def _shipped_migrations() -> tuple[str, ...]:
     return tuple(sorted(entry.name for entry in MIGRATIONS_DIR.glob("*.sql")))
 
 
-def require_control_plane_database(path: Path) -> tuple[int, int]:
+def require_control_plane_database(path: Path):
     """Establish that `path` IS the control-plane database, not merely a file.
 
     A recovery command that archives the wrong file is worse than one that
@@ -1665,8 +1702,8 @@ def require_control_plane_database(path: Path) -> tuple[int, int]:
     `_readable_sqlite` makes, with the same bundle validation and sidecar
     cleanup.
 
-    RETURNS the entry it proved, so the caller can require that the same one is
-    still there when the snapshot is taken. This function opens and closes its
+    RETURNS the identity it proved — inode AND digest — so the caller can
+    require that the same bytes are still there when the snapshot is taken. This function opens and closes its
     own read-only connection and the writer lock is advisory, so without that
     the proof and the archive could be about two different files.
     """
@@ -1790,8 +1827,12 @@ def require_control_plane_database(path: Path) -> tuple[int, int]:
             " database this file is not, so archiving it would authorise"
             " deleting the real one"
         )
-    entry = _inode(path)
-    if entry is None:
+    # The full identity, not the inode: an in-place rewrite through an open
+    # descriptor keeps the inode, and a freed inode is handed straight back, so
+    # neither alone answers "is the file I am about to archive the one I just
+    # validated".
+    entry = _identity_or_unreadable(path)
+    if entry[0] is None:
         raise BackupError(f"{path} vanished while it was being validated")
     return entry
 

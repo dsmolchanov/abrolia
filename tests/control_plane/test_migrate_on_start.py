@@ -4356,3 +4356,97 @@ def test_ownership_is_not_fooled_by_a_recycled_inode(tmp_path) -> None:
     # And it still removes what it did publish.
     backup_module._withdraw(destination, inode, digest)
     assert not destination.exists()
+
+
+@pytest.mark.parametrize(
+    "site",
+    ["backup-source", "read-only-sidecar", "restore-pause", "volume-probe"],
+)
+def test_no_ownership_check_accepts_a_recycled_inode(tmp_path, site) -> None:
+    """The rule, at every site that asks it — not only the ones reported.
+
+    A freed inode is handed straight back, and a descriptor rewrites a file in
+    place without the inode moving. Either way an entry can carry the inode of
+    the one this operation published or created while holding somebody else's
+    bytes. Each of these four asked by inode alone at some point in this
+    branch's history, and each was found separately; the class check is what
+    stops the fifth being found the same way.
+    """
+    if site == "backup-source":
+        subject = tmp_path / "control-plane.db"
+        seed = ControlPlaneDatabase(subject)
+        seed.migrate()
+        seed.close()
+        for sidecar in _sidecars_of(subject):
+            sidecar.unlink(missing_ok=True)
+        identity = backup_module.require_control_plane_database(subject)
+        assert identity[1] is not None, "validation returned no content proof"
+        # Same inode as far as the check can tell, different bytes.
+        with pytest.raises(backup_module.BackupError, match="not the database"):
+            backup_module._require_identity(subject, (identity[0], b"other bytes"))
+        # And the real identity still passes.
+        backup_module._require_identity(subject, identity)
+    elif site == "read-only-sidecar":
+        subject = tmp_path / "control-plane.db"
+        seed = ControlPlaneDatabase(subject)
+        seed.migrate()
+        seed.close()
+        for sidecar in _sidecars_of(subject):
+            sidecar.unlink(missing_ok=True)
+        successor = Path(f"{subject}-wal")
+        real_close = sqlite3.Connection.close
+
+        with backup_module._read_only_sqlite(subject) as connection:
+            connection.execute("PRAGMA integrity_check").fetchone()
+            assert successor.exists(), "the read-only open created no sidecar"
+            # Replaced between the ownership capture and the unlink. Written
+            # elsewhere and renamed in, so the inode is allocated while the
+            # original still holds its own.
+            replacement = successor.with_name("a-successor")
+            replacement.write_bytes(b"a live writer's frames")
+            os.replace(replacement, successor)
+        assert real_close is sqlite3.Connection.close
+        assert successor.read_bytes() == b"a live writer's frames", (
+            "the read-only validation deleted an entry it did not create"
+        )
+    elif site == "restore-pause":
+        destination = tmp_path / "control-plane.db"
+        marker = backup_module._pause_marker(destination)
+        marker.write_bytes(b"another restore's pause")
+        current = backup_module._content_identity(marker)
+        backup_module._withdraw_pause(destination, (current[0], b"other bytes"))
+        assert marker.read_bytes() == b"another restore's pause", (
+            "the restore withdrew a pause marker it did not publish"
+        )
+        backup_module._withdraw_pause(destination, current)
+        assert not marker.exists(), "the restore failed to withdraw its own pause"
+    else:
+        source = tmp_path / "source"
+        destination = tmp_path / "destination"
+        source.mkdir()
+        destination.mkdir()
+        witnesses: list[bytes] = []
+        real_rename = backup_module._rename_or_exdev
+
+        def rename(probe, landed, journal=None):
+            witnesses.append(Path(probe).read_bytes())
+            witnesses.append(Path(landed).read_bytes() if Path(landed).exists() else b"")
+            return real_rename(probe, landed, journal)
+
+        monkeypatch_local = pytest.MonkeyPatch()
+        monkeypatch_local.setattr(backup_module, "_rename_or_exdev", rename)
+        try:
+            backup_module._is_a_copy(source, destination)
+        finally:
+            monkeypatch_local.undo()
+
+        # The probes carry CONTENT, and different content. Empty files all have
+        # the same digest, so identifying a probe by its bytes would be
+        # identifying it by nothing — and a replacement that landed on a
+        # recycled inode would match and be deleted.
+        assert witnesses, "the probe never reached the rename"
+        assert len(witnesses[0]) == 32, witnesses[0]
+        assert witnesses[0] != witnesses[1], "the two probes are indistinguishable"
+        # And nothing is left behind either way.
+        assert list(source.iterdir()) == [], list(source.iterdir())
+        assert list(destination.iterdir()) == [], list(destination.iterdir())
