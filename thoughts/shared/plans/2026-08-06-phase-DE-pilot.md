@@ -367,6 +367,28 @@ CREATE TABLE channel_bindings (
 - Every early-access anchor targets the single public request section and the asset sanitizer,
   Ruff and hermetic test suite pass.
 
+#### Step E6b — Production PWA packaging
+
+**Files:** `pyproject.toml`, `deploy/control-plane/Dockerfile`, `tests/test_packaging.py`.
+
+**Branches:** `codex/package-pwa-production`.
+
+**Scope:**
+
+- Include the top-level `web/` shell and its static assets in the runtime wheel at `web/`,
+  matching the installed path already resolved by `control_plane.api.app.PWA_ROOT`.
+- Copy the PWA source into the production wheel-builder stage before `pip wheel`; the runtime
+  stage keeps installing that artifact, so source checkouts and deployed control planes serve one
+  PWA bundle without a Python-version-specific site-packages path.
+
+**Acceptance:**
+
+- A hermetic packaging test builds the runtime wheel without dependencies or build isolation and
+  verifies that the HTML shell, manifest, service worker, stylesheet, controller, favicon, and
+  both app icons are present under `web/`.
+- A production-boundary check guarantees the Docker builder copies `web/` before it builds the
+  runtime wheel.
+
 #### Step E7 — Observability
 
 **Files:** `control_plane/observability.py`, `hermes_cloud/core/observability.py`, `deploy/control-plane/Dockerfile` (log config), `docs/onboarding-runbook.md` (alert runbook).

@@ -1,6 +1,6 @@
-# Both runtime packages are installed as the Abrolia distribution:
+# The runtime packages and PWA assets are installed as the Abrolia distribution:
 # source-tree tests retain `pythonpath = ["."]`, while packaging includes
-# the household runtime and the metadata-only onboarding control plane.
+# the household runtime, onboarding control plane, and its Web shell.
 
 [build-system]
 requires = ["setuptools>=75", "wheel"]
@@ -31,11 +31,12 @@ hermes-cloud = "hermes_cloud.cli:main"
 abrolia-control-plane = "control_plane.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["hermes_cloud*", "control_plane*"]
+include = ["hermes_cloud*", "control_plane*", "web*"]
 
 [tool.setuptools.package-data]
 hermes_cloud = ["core/migrations/*.sql"]
 control_plane = ["migrations/*.sql", "web/templates/*.html", "web/static/*"]
+web = ["*.html", "*.json", "*.js", "static/*"]
 
 [tool.ruff]
 line-length = 110
