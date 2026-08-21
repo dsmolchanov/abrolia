@@ -157,6 +157,16 @@ jobs:
         uses: superfly/flyctl-actions/setup-flyctl@ed8efb33836e8b2096c7fd3ba1c8afe303ebbff1
         with:
           version: 0.4.58
+      - name: Require a ready control plane before mutation
+        run: |
+          set -euo pipefail
+          readiness="$(
+            curl --fail --silent --show-error --location \
+              --retry 5 --retry-all-errors --retry-delay 2 \
+              --connect-timeout 10 --max-time 30 \
+              https://app.abrolia.com/readyz
+          )"
+          jq -e '.status == "ready"' <<<"$readiness" >/dev/null
       - name: Recheck main immediately before publishing the control plane
         env:
           DEPLOY_SHA: ${{ github.event.workflow_run.head_sha }}
