@@ -93,12 +93,21 @@ class ControlPlaneContainer:
         acquire_process_lock: bool = False,
         runtime_exporter: RuntimeExporter | None = None,
         runtime_deleter: RuntimeDeleter | None = None,
+        apply_migrations: bool = True,
+        preserve_journal_mode: bool = False,
     ) -> ControlPlaneContainer:
         config.validate()
-        database = ControlPlaneDatabase(config.database_path)
+        database = ControlPlaneDatabase(
+            config.database_path, preserve_journal_mode=preserve_journal_mode
+        )
         if acquire_process_lock:
             database.acquire_process_lock()
-        database.migrate()
+        if apply_migrations:
+            # A caller that promises to mutate nothing cannot migrate on the way
+            # in: `migrate()` commits schema changes and `schema_migrations`
+            # rows before the caller's own transaction ever opens, so they fall
+            # outside any rollback it performs.
+            database.migrate()
         cipher = FieldCipher(config.encryption_keys, config.active_encryption_key_version)
         lookup = LookupHasher(config.lookup_hmac_key)
         token_hasher = LookupHasher(config.token_hmac_key)
