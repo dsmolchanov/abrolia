@@ -369,7 +369,8 @@ CREATE TABLE channel_bindings (
 
 #### Step E6b — Production PWA packaging
 
-**Files:** `pyproject.toml`, `deploy/control-plane/Dockerfile`, `tests/test_packaging.py`.
+**Files:** `pyproject.toml`, `requirements-dev.txt`, `deploy/control-plane/Dockerfile`,
+`tests/test_packaging.py`.
 
 **Branches:** `codex/package-pwa-production`.
 
@@ -380,6 +381,8 @@ CREATE TABLE channel_bindings (
 - Copy the PWA source into the production wheel-builder stage before `pip wheel`; the runtime
   stage keeps installing that artifact, so source checkouts and deployed control planes serve one
   PWA bundle without a Python-version-specific site-packages path.
+- Install the project's declared setuptools/wheel build backend in the development environment so
+  the artifact regression remains network-independent under `--no-build-isolation` in CI.
 
 **Acceptance:**
 
