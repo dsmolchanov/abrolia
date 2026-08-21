@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
+  <rect width="1200" height="630" fill="#f7fafc"/>
+  <path d="M760 0h440v630H660c-58-104-72-224-42-360 25-112 73-202 142-270Z" fill="#cdeff2"/>
+  <circle cx="106" cy="568" r="105" fill="#ffb09f"/>
+  <g transform="translate(80 68)">
+    <g transform="translate(0 2) scale(.32)" fill="none" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M18 21 C31 8 50 8 58 18 C67 29 59 43 45 50 C31 57 14 54 10 45 C6 36 16 27 29 25 C43 23 54 29 59 41 C65 54 77 55 91 43" stroke="#2457f5" stroke-width="4.6"/>
+      <circle cx="105" cy="43" r="5" fill="#ffb09f" stroke="none"/>
+    </g>
+    <text x="46" y="31" fill="#18222d" font-family="Avenir Next,Segoe UI,sans-serif" font-size="30" font-weight="700" letter-spacing="-1">Abrolia</text>
+  </g>
+  <text x="80" y="215" fill="#2457f5" font-family="SFMono-Regular,Cascadia Code,monospace" font-size="15" font-weight="700" letter-spacing="1.7">A FAMILY OPERATIONS ASSISTANT FOR LIFE ABROAD</text>
+  <text x="80" y="305" fill="#18222d" font-family="Avenir Next,Segoe UI,sans-serif" font-size="68" font-weight="700" letter-spacing="-3.5">Family admin abroad,</text>
+  <text x="80" y="380" fill="#18222d" font-family="Avenir Next,Segoe UI,sans-serif" font-size="68" font-weight="700" letter-spacing="-3.5">finally clear.</text>
+  <path d="M516 395c110-8 198-6 265 5" fill="none" stroke="#ffb09f" stroke-width="16" stroke-linecap="square"/>
+  <text x="80" y="455" fill="#536170" font-family="Avenir Next,Segoe UI,sans-serif" font-size="25">Unfamiliar school messages → clear, human-approved next steps.</text>
+  <g transform="translate(735 88)">
+    <rect x="0" y="0" width="385" height="456" rx="28" fill="#18222d"/>
+    <rect x="30" y="66" width="145" height="320" rx="18 4 4 18" fill="#fff"/>
+    <rect x="210" y="66" width="145" height="320" rx="4 18 18 4" fill="#fff"/>
+    <text x="50" y="102" fill="#536170" font-family="SFMono-Regular,Cascadia Code,monospace" font-size="9" font-weight="700">SCHOOL INBOX · DE</text>
+    <circle cx="59" cy="140" r="16" fill="#cdeff2"/>
+    <text x="83" y="137" fill="#18222d" font-family="Avenir Next,Segoe UI,sans-serif" font-size="10" font-weight="700">Sonnenweg Schule</text>
+    <text x="50" y="184" fill="#18222d" font-family="Avenir Next,Segoe UI,sans-serif" font-size="14" font-weight="700">Wandertag am</text>
+    <text x="50" y="202" fill="#18222d" font-family="Avenir Next,Segoe UI,sans-serif" font-size="14" font-weight="700">Donnerstag</text>
+    <rect x="50" y="230" width="93" height="11" rx="2" fill="#e4ddfb"/>
+    <rect x="50" y="251" width="106" height="7" rx="2" fill="#d9e0e7"/>
+    <rect x="50" y="269" width="82" height="7" rx="2" fill="#d9e0e7"/>
+    <rect x="50" y="287" width="98" height="7" rx="2" fill="#d9e0e7"/>
+    <text x="228" y="102" fill="#536170" font-family="SFMono-Regular,Cascadia Code,monospace" font-size="9" font-weight="700">PROPOSED PLAN</text>
+    <rect x="228" y="128" width="37" height="44" rx="5" fill="#e4ddfb"/>
+    <text x="276" y="146" fill="#18222d" font-family="Avenir Next,Segoe UI,sans-serif" font-size="14" font-weight="700">Museum trip</text>
+    <text x="276" y="163" fill="#536170" font-family="Avenir Next,Segoe UI,sans-serif" font-size="9">For Leo · School</text>
+    <line x1="228" y1="200" x2="337" y2="200" stroke="#d9e0e7"/>
+    <text x="228" y="223" fill="#536170" font-family="Avenir Next,Segoe UI,sans-serif" font-size="9">WHEN</text>
+    <text x="273" y="223" fill="#18222d" font-family="Avenir Next,Segoe UI,sans-serif" font-size="10" font-weight="700">Thu · 08:15</text>
+    <line x1="228" y1="242" x2="337" y2="242" stroke="#d9e0e7"/>
+    <text x="228" y="265" fill="#536170" font-family="Avenir Next,Segoe UI,sans-serif" font-size="9">DUE</text>
+    <text x="273" y="265" fill="#18222d" font-family="Avenir Next,Segoe UI,sans-serif" font-size="10" font-weight="700">€12 · Tue</text>
+    <rect x="228" y="319" width="109" height="38" rx="7" fill="#2457f5"/>
+    <text x="249" y="343" fill="#fff" font-family="Avenir Next,Segoe UI,sans-serif" font-size="10" font-weight="700">Review &amp; approve</text>
+    <path d="M174 224h36" stroke="#9adce1" stroke-width="4"/>
+    <circle cx="192" cy="224" r="11" fill="#ffb09f" stroke="#18222d" stroke-width="5"/>
+    <text x="128" y="423" fill="#fff" font-family="SFMono-Regular,Cascadia Code,monospace" font-size="10" font-weight="700" letter-spacing="1">ABROLIA PROPOSES · YOU DECIDE</text>
+  </g>
+</svg>

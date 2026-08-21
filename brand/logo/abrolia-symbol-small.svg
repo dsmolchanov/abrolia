@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="40" viewBox="0 0 64 40" role="img" aria-labelledby="title desc">
+  <title id="title">Abrolia small-size symbol</title>
+  <desc id="desc">An optically strengthened handwritten a symbol for small sizes.</desc>
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M8 12 C14 5 25 5 29 10 C34 16 30 23 23 27 C16 30 8 28 6 23 C4 18 9 14 15 13 C22 12 28 15 30 21 C33 27 39 28 46 22" stroke="#2457F5" stroke-width="4.2"/>
+    <circle cx="55" cy="22" r="4.2" fill="#FFB09F" stroke="none"/>
+  </g>
+</svg>

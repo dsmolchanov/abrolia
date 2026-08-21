@@ -5,12 +5,19 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="light">
     <title>{% block title %}Abrolia{% endblock %}</title>
+    <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
     <link rel="stylesheet" href="/static/onboarding.css">
     <script src="/static/onboarding.js" defer></script>
   </head>
   <body data-page="{% block page %}base{% endblock %}">
     <header class="site-header">
-      <a class="brand" href="/">Abrolia</a>
+      <a class="brand" href="/" aria-label="Abrolia home">
+        <svg class="brand-mark" viewBox="0 0 120 68" aria-hidden="true" data-abrolia-logo="handwritten-a">
+          <path class="brand-stroke" d="M18 21 C31 8 50 8 58 18 C67 29 59 43 45 50 C31 57 14 54 10 45 C6 36 16 27 29 25 C43 23 54 29 59 41 C65 54 77 55 91 43" />
+          <circle class="brand-dot" cx="105" cy="43" r="5" />
+        </svg>
+        <span>Abrolia</span>
+      </a>
       <span class="environment">Synthetic staging — no real family data</span>
     </header>
     <main>{% block content %}{% endblock %}</main>

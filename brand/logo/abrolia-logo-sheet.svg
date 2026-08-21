@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1200" viewBox="0 0 1600 1200" role="img" aria-labelledby="title desc">
+  <title id="title">Abrolia logo system</title>
+  <desc id="desc">A brand-book presentation sheet with primary, stacked, symbol, monochrome, reversed, and small-size Abrolia logo variants.</desc>
+  <rect width="1600" height="1200" fill="#F7FAFC"/>
+  <text x="96" y="92" fill="#2457F5" font-family="SFMono-Regular, Cascadia Code, monospace" font-size="18" font-weight="700" letter-spacing="2.2">ABROLIA · LOGO SYSTEM 01</text>
+  <text x="96" y="153" fill="#18222D" font-family="Avenir Next, Avenir, Segoe UI, sans-serif" font-size="52" font-weight="700" letter-spacing="-2.2">Easy communication, wherever family life happens.</text>
+  <text x="96" y="195" fill="#536170" font-family="Avenir Next, Avenir, Segoe UI, sans-serif" font-size="21">One open a. One easy line of conversation.</text>
+
+  <rect x="96" y="250" width="1408" height="300" rx="34" fill="#FFFFFF" stroke="#D9E0E7"/>
+  <text x="136" y="300" fill="#536170" font-family="SFMono-Regular, Cascadia Code, monospace" font-size="15" font-weight="700" letter-spacing="1.5">PRIMARY · HORIZONTAL</text>
+  <g transform="translate(250 350) scale(2.1)">
+    <g transform="translate(8 10)" fill="none" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M18 21 C31 8 50 8 58 18 C67 29 59 43 45 50 C31 57 14 54 10 45 C6 36 16 27 29 25 C43 23 54 29 59 41 C65 54 77 55 91 43" stroke="#2457F5" stroke-width="4.6"/>
+      <circle cx="105" cy="43" r="5" fill="#FFB09F" stroke="none"/>
+    </g>
+    <text x="142" y="77" fill="#18222D" font-family="Avenir Next, Avenir, Segoe UI, sans-serif" font-size="70" font-weight="700" letter-spacing="-3.2">Abrolia</text>
+  </g>
+
+  <rect x="96" y="582" width="446" height="446" rx="34" fill="#CDEFF2"/>
+  <text x="136" y="632" fill="#536170" font-family="SFMono-Regular, Cascadia Code, monospace" font-size="15" font-weight="700" letter-spacing="1.5">SECONDARY · STACKED</text>
+  <g transform="translate(130 680)">
+    <g transform="translate(92 0) scale(1.25)" fill="none" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M18 21 C31 8 50 8 58 18 C67 29 59 43 45 50 C31 57 14 54 10 45 C6 36 16 27 29 25 C43 23 54 29 59 41 C65 54 77 55 91 43" stroke="#2457F5" stroke-width="4.6"/>
+      <circle cx="105" cy="43" r="5" fill="#FFB09F" stroke="none"/>
+    </g>
+    <text x="190" y="182" text-anchor="middle" fill="#18222D" font-family="Avenir Next, Avenir, Segoe UI, sans-serif" font-size="68" font-weight="700" letter-spacing="-3.1">Abrolia</text>
+  </g>
+
+  <rect x="574" y="582" width="446" height="213" rx="34" fill="#FFFFFF" stroke="#D9E0E7"/>
+  <text x="614" y="632" fill="#536170" font-family="SFMono-Regular, Cascadia Code, monospace" font-size="15" font-weight="700" letter-spacing="1.5">SYMBOL · COLOUR</text>
+  <g transform="translate(691 648) scale(1.85)" fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M18 21 C31 8 50 8 58 18 C67 29 59 43 45 50 C31 57 14 54 10 45 C6 36 16 27 29 25 C43 23 54 29 59 41 C65 54 77 55 91 43" stroke="#2457F5" stroke-width="4.6"/>
+    <circle cx="105" cy="43" r="5" fill="#FFB09F" stroke="none"/>
+  </g>
+
+  <rect x="574" y="827" width="446" height="201" rx="34" fill="#18222D"/>
+  <text x="614" y="877" fill="#CDEFF2" font-family="SFMono-Regular, Cascadia Code, monospace" font-size="15" font-weight="700" letter-spacing="1.5">REVERSED · DARK</text>
+  <g transform="translate(691 888) scale(1.85)" fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M18 21 C31 8 50 8 58 18 C67 29 59 43 45 50 C31 57 14 54 10 45 C6 36 16 27 29 25 C43 23 54 29 59 41 C65 54 77 55 91 43" stroke="#6E8BFF" stroke-width="4.6"/>
+    <circle cx="105" cy="43" r="5" fill="#FFB09F" stroke="none"/>
+  </g>
+
+  <rect x="1052" y="582" width="452" height="213" rx="34" fill="#FFFFFF" stroke="#D9E0E7"/>
+  <text x="1092" y="632" fill="#536170" font-family="SFMono-Regular, Cascadia Code, monospace" font-size="15" font-weight="700" letter-spacing="1.5">MONOCHROME</text>
+  <g transform="translate(1172 648) scale(1.85)" fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M18 21 C31 8 50 8 58 18 C67 29 59 43 45 50 C31 57 14 54 10 45 C6 36 16 27 29 25 C43 23 54 29 59 41 C65 54 77 55 91 43" stroke="#18222D" stroke-width="4.6"/>
+    <circle cx="105" cy="43" r="5" fill="#18222D" stroke="none"/>
+  </g>
+
+  <rect x="1052" y="827" width="452" height="201" rx="34" fill="#E4DDFB"/>
+  <text x="1092" y="877" fill="#536170" font-family="SFMono-Regular, Cascadia Code, monospace" font-size="15" font-weight="700" letter-spacing="1.5">SMALL SIZE · OPTICAL</text>
+  <g transform="translate(1110 923) scale(1.2)" fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M8 12 C14 5 25 5 29 10 C34 16 30 23 23 27 C16 30 8 28 6 23 C4 18 9 14 15 13 C22 12 28 15 30 21 C33 27 39 28 46 22" stroke="#2457F5" stroke-width="4.2"/>
+    <circle cx="55" cy="22" r="4.2" fill="#FFB09F" stroke="none"/>
+  </g>
+  <g transform="translate(1240 932) scale(.8)" fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M8 12 C14 5 25 5 29 10 C34 16 30 23 23 27 C16 30 8 28 6 23 C4 18 9 14 15 13 C22 12 28 15 30 21 C33 27 39 28 46 22" stroke="#2457F5" stroke-width="4.2"/>
+    <circle cx="55" cy="22" r="4.2" fill="#FFB09F" stroke="none"/>
+  </g>
+  <g transform="translate(1345 938) scale(.55)" fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M8 12 C14 5 25 5 29 10 C34 16 30 23 23 27 C16 30 8 28 6 23 C4 18 9 14 15 13 C22 12 28 15 30 21 C33 27 39 28 46 22" stroke="#2457F5" stroke-width="4.2"/>
+    <circle cx="55" cy="22" r="4.2" fill="#FFB09F" stroke="none"/>
+  </g>
+  <text x="1110" y="1001" fill="#536170" font-family="SFMono-Regular, Cascadia Code, monospace" font-size="13">32 px</text>
+  <text x="1240" y="1001" fill="#536170" font-family="SFMono-Regular, Cascadia Code, monospace" font-size="13">24 px</text>
+  <text x="1345" y="1001" fill="#536170" font-family="SFMono-Regular, Cascadia Code, monospace" font-size="13">16 px</text>
+
+  <circle cx="108" cy="1100" r="10" fill="#2457F5"/>
+  <text x="132" y="1107" fill="#536170" font-family="SFMono-Regular, Cascadia Code, monospace" font-size="15">COBALT · #2457F5</text>
+  <circle cx="367" cy="1100" r="10" fill="#FFB09F"/>
+  <text x="391" y="1107" fill="#536170" font-family="SFMono-Regular, Cascadia Code, monospace" font-size="15">CORAL · #FFB09F</text>
+  <circle cx="630" cy="1100" r="10" fill="#18222D"/>
+  <text x="654" y="1107" fill="#536170" font-family="SFMono-Regular, Cascadia Code, monospace" font-size="15">INK · #18222D</text>
+  <text x="1504" y="1107" text-anchor="end" fill="#536170" font-family="SFMono-Regular, Cascadia Code, monospace" font-size="15">CLEAR SPACE = 1.5 CORAL DOT DIAMETERS</text>
+</svg>

@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="520" height="104" viewBox="0 0 520 104" role="img" aria-labelledby="title desc">
+  <title id="title">Abrolia reversed logo on ink</title>
+  <desc id="desc">The handwritten Abrolia a logo reversed for use on its dark ink colour.</desc>
+  <rect width="520" height="104" rx="12" fill="#18222D"/>
+  <g transform="translate(8 10)" fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M18 21 C31 8 50 8 58 18 C67 29 59 43 45 50 C31 57 14 54 10 45 C6 36 16 27 29 25 C43 23 54 29 59 41 C65 54 77 55 91 43" stroke="#6E8BFF" stroke-width="4.6"/>
+    <circle cx="105" cy="43" r="5" fill="#FFB09F" stroke="none"/>
+  </g>
+  <text x="142" y="77" fill="#F7FAFC" font-family="Avenir Next, Avenir, Segoe UI, sans-serif" font-size="70" font-weight="700" letter-spacing="-3.2">Abrolia</text>
+</svg>
