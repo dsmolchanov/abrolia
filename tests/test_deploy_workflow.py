@@ -190,11 +190,15 @@ def test_fly_deploy_uses_the_root_context_and_pinned_target() -> None:
         "--remote-only --yes --ha=false --wait-timeout 10m"
     ) in control_plane
     setup = raw.index("Install the pinned Fly CLI")
+    readiness = raw.index("Require a ready control plane before mutation")
     recheck = raw.index(
         "Recheck main immediately before publishing the control plane"
     )
     deploy = raw.index("flyctl deploy .")
-    assert setup < recheck < deploy
+    assert setup < readiness < recheck < deploy
+    preflight = raw[readiness:recheck]
+    assert "https://app.abrolia.com/readyz" in preflight
+    assert '.status == "ready"' in preflight
 
 
 def test_live_verification_is_required_for_both_frontends() -> None:
