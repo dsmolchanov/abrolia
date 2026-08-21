@@ -90,10 +90,14 @@ makes a review loop unable to terminate.
 
   The general shape is TOCTOU, and the general remedy is that identity travels
   with the operation rather than being re-derived from the filesystem. Inode
-  equality is necessary and NOT sufficient: a process holding an open
-  descriptor rewrites a file in place without the inode moving, so anything
-  whose correctness depends on the CONTENTS compares a digest taken at
-  validation time.
+  equality is necessary and NOT sufficient, for two measured reasons. A process
+  holding an open descriptor rewrites a file in place without the inode moving.
+  And a filesystem hands the just-freed inode straight back — Linux did, on the
+  CI runner, where an unrelated file written at a name this operation had
+  vacated landed on the very same `(st_dev, st_ino)` and an inode-only check
+  called it ours. Anything whose correctness depends on WHICH FILE this is
+  compares a digest taken at validation time, at every point that asks and not
+  only at the reversal.
 
   This applies to REVERSAL as much as to publication, which is the half that
   was missed first: `_undo` verified the inode alone, so a landed member
