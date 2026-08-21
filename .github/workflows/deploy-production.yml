@@ -1,0 +1,214 @@
+name: deploy-production
+
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: >-
+    ${{ github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.event == 'push' &&
+        github.event.workflow_run.head_branch == 'main' &&
+        github.event.workflow_run.head_repository.full_name == github.repository &&
+        'abrolia-production' ||
+        format('abrolia-nondeploy-{0}', github.run_id) }}
+  cancel-in-progress: false
+  # GitHub added multi-run concurrency queues in May 2026. This prevents a
+  # failed/stale workflow_run from evicting a valid green release waiting here.
+  queue: max
+
+jobs:
+  authorize-release:
+    name: authorize current green main
+    if: >-
+      ${{ github.event.workflow_run.conclusion == 'success' &&
+          github.event.workflow_run.event == 'push' &&
+          github.event.workflow_run.head_branch == 'main' &&
+          github.event.workflow_run.head_repository.full_name == github.repository }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require the tested commit to remain the main tip
+        env:
+          DEPLOY_SHA: ${{ github.event.workflow_run.head_sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          current_sha="$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)"
+          test "$current_sha" = "$DEPLOY_SHA"
+
+  deploy-landing:
+    name: deploy landing
+    needs: authorize-release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment:
+      name: production-landing
+      url: https://abrolia.com
+    steps:
+      - name: Check out the tested commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
+        with:
+          node-version: "24"
+      - name: Install the pinned Vercel CLI
+        run: npm install --global vercel@48.6.0
+      - name: Build the landing artifact
+        env:
+          NO_COLOR: "1"
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ vars.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ vars.VERCEL_PROJECT_ID }}
+        run: |
+          set -euo pipefail
+          : "${VERCEL_TOKEN:?production-landing VERCEL_TOKEN is not configured}"
+          : "${VERCEL_ORG_ID:?production-landing VERCEL_ORG_ID is not configured}"
+          : "${VERCEL_PROJECT_ID:?production-landing VERCEL_PROJECT_ID is not configured}"
+
+          vercel pull --yes --environment=production --cwd landing --token "$VERCEL_TOKEN"
+          vercel build --prod --cwd landing --token "$VERCEL_TOKEN"
+      - name: Recheck main immediately before publishing the landing page
+        env:
+          DEPLOY_SHA: ${{ github.event.workflow_run.head_sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          current_sha="$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)"
+          test "$current_sha" = "$DEPLOY_SHA"
+      - name: Publish the prebuilt landing artifact
+        id: deploy
+        env:
+          NO_COLOR: "1"
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ vars.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ vars.VERCEL_PROJECT_ID }}
+        run: |
+          set -euo pipefail
+          : "${VERCEL_TOKEN:?production-landing VERCEL_TOKEN is not configured}"
+          : "${VERCEL_ORG_ID:?production-landing VERCEL_ORG_ID is not configured}"
+          : "${VERCEL_PROJECT_ID:?production-landing VERCEL_PROJECT_ID is not configured}"
+
+          deployment_url="$(
+            vercel deploy --prebuilt --prod --yes --cwd landing --token "$VERCEL_TOKEN"
+          )"
+          case "$deployment_url" in
+            https://*.vercel.app) ;;
+            *) echo "Vercel returned an invalid deployment URL" >&2; exit 1 ;;
+          esac
+          printf 'url=%s\n' "$deployment_url" >> "$GITHUB_OUTPUT"
+      - name: Verify the deployment and canonical landing domain
+        env:
+          DEPLOYMENT_URL: ${{ steps.deploy.outputs.url }}
+        run: |
+          set -euo pipefail
+          fetch() {
+            curl --fail --silent --show-error --location \
+              --retry 5 --retry-all-errors --retry-delay 2 \
+              --connect-timeout 10 --max-time 30 "$1"
+          }
+
+          deployed_body="$(fetch "${DEPLOYMENT_URL%/}/")"
+          expected_body="$(<landing/index.html)"
+          test "$deployed_body" = "$expected_body"
+          grep -F 'data-abrolia-logo="handwritten-a"' <<<"$deployed_body"
+          grep -F 'id="join"' <<<"$deployed_body"
+
+          canonical_matches=false
+          for _attempt in {1..12}; do
+            if canonical_body="$(fetch https://abrolia.com/)" && \
+              [[ "$canonical_body" == "$expected_body" ]]
+            then
+              canonical_matches=true
+              break
+            fi
+            sleep 5
+          done
+          test "$canonical_matches" = true
+          expected_favicon="$(sha256sum landing/favicon.svg | cut -d ' ' -f1)"
+          deployed_favicon="$(fetch "${DEPLOYMENT_URL%/}/favicon.svg" | sha256sum | cut -d ' ' -f1)"
+          canonical_favicon="$(fetch https://abrolia.com/favicon.svg | sha256sum | cut -d ' ' -f1)"
+          test "$deployed_favicon" = "$expected_favicon"
+          test "$canonical_favicon" = "$expected_favicon"
+
+  deploy-control-plane:
+    name: deploy control plane
+    needs: authorize-release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    environment:
+      name: production-control-plane
+      url: https://app.abrolia.com
+    steps:
+      - name: Check out the tested commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+      - name: Install the pinned Fly CLI
+        uses: superfly/flyctl-actions/setup-flyctl@ed8efb33836e8b2096c7fd3ba1c8afe303ebbff1
+        with:
+          version: 0.4.58
+      - name: Recheck main immediately before publishing the control plane
+        env:
+          DEPLOY_SHA: ${{ github.event.workflow_run.head_sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          current_sha="$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)"
+          test "$current_sha" = "$DEPLOY_SHA"
+      - name: Deploy the synthetic control plane
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+          NO_COLOR: "1"
+        run: |
+          set -euo pipefail
+          : "${FLY_API_TOKEN:?production-control-plane FLY_API_TOKEN is not configured}"
+          flyctl deploy . \
+            --app abrolia-control-plane-synthetic \
+            --config deploy/control-plane/fly.toml \
+            --dockerfile deploy/control-plane/Dockerfile \
+            --remote-only \
+            --yes \
+            --ha=false \
+            --wait-timeout 10m
+      - name: Verify control-plane health and public frontend assets
+        run: |
+          set -euo pipefail
+          fetch() {
+            curl --fail --silent --show-error --location \
+              --retry 12 --retry-all-errors --retry-delay 5 \
+              --connect-timeout 10 --max-time 30 "$1"
+          }
+
+          health="$(fetch https://app.abrolia.com/healthz)"
+          jq -e '.status == "healthy"' <<<"$health" >/dev/null
+
+          readiness="$(fetch https://app.abrolia.com/readyz)"
+          jq -e '.status == "ready"' <<<"$readiness" >/dev/null
+
+          start="$(fetch https://app.abrolia.com/start)"
+          grep -F 'data-abrolia-logo="handwritten-a"' <<<"$start"
+
+          pwa="$(fetch https://app.abrolia.com/pwa/index.html)"
+          expected_pwa="$(<web/index.html)"
+          test "$pwa" = "$expected_pwa"
+          grep -F 'data-abrolia-logo="handwritten-a"' <<<"$pwa"
+
+          for asset in manifest.json sw.js static/app.css static/app.js \
+            static/favicon.svg static/icon-192.png static/icon-512.png
+          do
+            expected_hash="$(sha256sum "web/$asset" | cut -d ' ' -f1)"
+            deployed_hash="$(
+              fetch "https://app.abrolia.com/pwa/$asset" | sha256sum | cut -d ' ' -f1
+            )"
+            test "$deployed_hash" = "$expected_hash"
+          done

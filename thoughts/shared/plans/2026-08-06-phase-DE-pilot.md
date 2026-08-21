@@ -392,6 +392,35 @@ CREATE TABLE channel_bindings (
 - A production-boundary check guarantees the Docker builder copies `web/` before it builds the
   runtime wheel.
 
+#### Step E6c — Green-CI production deployment
+
+**Files:** `.github/workflows/ci.yml`, `.github/workflows/deploy-production.yml`,
+`tests/test_deploy_workflow.py`, `landing/README.md`.
+
+**Branches:** `codex/production-deploy-ci`.
+
+**Scope:**
+
+- Deploy the landing page and synthetic control plane only after the complete `ci` workflow has
+  succeeded for a first-party push to `main`; a pull request, manual dispatch, failed CI, fork or
+  stale successful run cannot receive deployment credentials or change production.
+- Give Vercel and Fly separate GitHub environments and provider-scoped credentials. Build the
+  Vercel output in CI before publishing it, and give Fly the repository root as its explicit build
+  context so the packaged PWA is present in the production image.
+- Serialise releases without cancelling an in-flight Fly rollout. Pin every third-party Action and
+  CLI version used on the privileged path, including the CI Actions whose result authorises it.
+- Make success include live checks of the generated Vercel deployment, the canonical landing
+  domain, control-plane health and every public PWA shell asset introduced by E6a/E6b.
+
+**Acceptance:**
+
+- A deterministic, dependency-free workflow contract suite proves the event/commit gate, current
+  `main` check, immutable dependencies, environment-secret isolation, provider commands,
+  non-cancelling concurrency and live smoke coverage.
+- Merging this branch starts one release workflow only after all protected main checks pass; the
+  run publishes the exact tested commit to both providers and verifies `abrolia.com` and
+  `app.abrolia.com` before reporting success.
+
 #### Step E7 — Observability
 
 **Files:** `control_plane/observability.py`, `hermes_cloud/core/observability.py`, `deploy/control-plane/Dockerfile` (log config), `docs/onboarding-runbook.md` (alert runbook).
