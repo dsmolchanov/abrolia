@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">Abrolia app icon</title>
+  <desc id="desc">The handwritten Abrolia a symbol on a light rounded square.</desc>
+  <rect width="512" height="512" rx="116" fill="#F7FAFC"/>
+  <g transform="translate(39 151) scale(3.65)" fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M18 21 C31 8 50 8 58 18 C67 29 59 43 45 50 C31 57 14 54 10 45 C6 36 16 27 29 25 C43 23 54 29 59 41 C65 54 77 55 91 43" stroke="#2457F5" stroke-width="4.6"/>
+    <circle cx="105" cy="43" r="5" fill="#FFB09F" stroke="none"/>
+  </g>
+</svg>

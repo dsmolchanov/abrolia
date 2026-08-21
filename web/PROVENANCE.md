@@ -1,5 +1,7 @@
 # Происхождение web assets
 
-- `static/icon-192.png` — synthetic PNG generated via `python3 -c "from PIL import Image; Image.new('RGB',(192,192),'#0a0a0a').save('web/static/icon-192.png')"`; no photo, no donor data
-- `static/icon-512.png` — synthetic PNG generated via `python3 -c "from PIL import Image; Image.new('RGB',(512,512),'#0a0a0a').save('web/static/icon-512.png')"`; no photo, no donor data
+- `static/app-icon.svg` — original Abrolia vector artwork from the repository brand master; no photo, donor material, or external asset
+- `static/favicon.svg` — original Abrolia vector artwork derived from the small-size brand master
+- `static/icon-192.png` — raster export of `static/app-icon.svg` at 192×192
+- `static/icon-512.png` — raster export of `static/app-icon.svg` at 512×512
 - `sw.js` — synthetic service worker shell, no external data

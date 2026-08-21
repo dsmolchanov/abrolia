@@ -3,35 +3,27 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<link rel="manifest" href="/manifest.json">
+<meta name="theme-color" content="#f7fafc">
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="static/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="static/app.css">
+<script src="static/app.js" defer></script>
 <title>Abrolia — Web chat</title>
 </head>
 <body>
+<header class="app-header">
+<a class="brand" href="index.html" aria-label="Abrolia home">
+  <svg class="brand-mark" viewBox="0 0 120 68" aria-hidden="true" data-abrolia-logo="handwritten-a">
+    <path class="brand-stroke" d="M18 21 C31 8 50 8 58 18 C67 29 59 43 45 50 C31 57 14 54 10 45 C6 36 16 27 29 25 C43 23 54 29 59 41 C65 54 77 55 91 43" />
+    <circle class="brand-dot" cx="105" cy="43" r="5" />
+  </svg>
+  <span>Abrolia</span>
+</a>
+</header>
 <main id="chat">
 <p>Web chat — authenticated via same pipeline. P11 push disabled in Phase E.</p>
 <form id="form"><input id="input" type="text" placeholder="Сообщение"><button type="submit">Отправить</button></form>
 <div id="messages"></div>
 </main>
-<script>
-const form = document.getElementById('form');
-const input = document.getElementById('input');
-const messages = document.getElementById('messages');
-form.addEventListener('submit', async (e) => {
-  e.preventDefault();
-  const text = input.value.trim();
-  if (!text) return;
-  const res = await fetch('/api/web/message', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({text})
-  });
-  const data = await res.json().catch(() => ({}));
-  const p = document.createElement('p');
-  p.textContent = data.reply || data.detail || 'ошибка';
-  messages.appendChild(p);
-  input.value = '';
-});
-if ('serviceWorker' in navigator) { navigator.serviceWorker.register('/sw.js').catch(()=>{}); }
-</script>
 </body>
 </html>
