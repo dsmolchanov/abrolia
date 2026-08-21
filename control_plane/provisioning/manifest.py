@@ -43,6 +43,7 @@ class ConsentReceiptV1(BaseModel):
     receipt_id: str = Field(min_length=1, max_length=128)
     purpose: Literal[
         "special_category_content_restriction",
+        "special_category_household_content",
         "whatsapp_channel_privacy",
         "whatsapp_linked_device_risk",
     ]
@@ -57,6 +58,7 @@ class ConsentAuthorityV1(BaseModel):
     required_purposes: tuple[
         Literal[
             "special_category_content_restriction",
+            "special_category_household_content",
             "whatsapp_channel_privacy",
             "whatsapp_linked_device_risk",
         ],

@@ -19,10 +19,16 @@ from control_plane.email.models import (
 from control_plane.models import StepKind, StepStatus
 from control_plane.observability import StructuredLogger
 from control_plane.onboarding.contracts import CommandResult
-from control_plane.privacy.consent import consent_version_and_sha
+from control_plane.privacy.consent import (
+    CONTENT_RESTRICTION_PURPOSE,
+    HOUSEHOLD_CONTENT_PURPOSE,
+    consent_version_and_sha,
+)
+from control_plane.providers.email.nerve_client import org_teardown_ref
 from control_plane.provisioning.contracts import (
     InspectResult,
     InspectState,
+    OutcomeUnknown,
     ProviderRateLimited,
     ProviderRegistry,
     ProviderRejected,
@@ -40,6 +46,18 @@ BASE_TIME = 1_800_000_000.0
 _RESTRICTION_VERSION, _RESTRICTION_SHA = consent_version_and_sha(
     "special_category_content_restriction"
 )
+_HOUSEHOLD_VERSION, _HOUSEHOLD_SHA = consent_version_and_sha(
+    "special_category_household_content"
+)
+# A real provider owes the Art 9(2)(a) consent as well as the S5 restriction,
+# and an unrecognised provider counts as real by design (fail-closed). The two
+# tests below deliberately wire `future-real-email`, so they carry both.
+REAL_PROVIDER_CONSENT = {
+    "special_category_household_consent": True,
+    "special_category_household_receipt_id": "10000000-0000-4000-8000-000000000024",
+    "special_category_household_text_version": _HOUSEHOLD_VERSION,
+    "special_category_household_text_sha256": _HOUSEHOLD_SHA,
+}
 EMAIL_SELECTION = {
     "kind": "abrolia_managed",
     "local_part": "family-agent",
@@ -770,7 +788,7 @@ def test_email_job_rechecks_current_content_restriction_before_provider(
     cp_stack.service.select(
         cp_stack.household.id,
         StepKind.EMAIL,
-        EMAIL_SELECTION,
+        {**EMAIL_SELECTION, **REAL_PROVIDER_CONSENT},
         context=cp_stack.context(),
         now=BASE_TIME + 2,
     )
@@ -800,7 +818,7 @@ def test_email_reconcile_rechecks_current_content_restriction_before_provider(
     cp_stack.service.select(
         cp_stack.household.id,
         StepKind.EMAIL,
-        EMAIL_SELECTION,
+        {**EMAIL_SELECTION, **REAL_PROVIDER_CONSENT},
         context=cp_stack.context(),
         now=BASE_TIME + 2,
     )
@@ -1508,3 +1526,161 @@ def test_superseded_runtime_reconcile_absent_resolves_without_recreate(cp_stack)
     assert resolved.status == "cancelled"
     assert cp_stack.jobs.get(unknown.job_id).status == "cancelled"
     assert calls == ["prepare", "stage-secret"]
+
+
+@pytest.mark.parametrize(
+    ("carrier", "provider"),
+    [
+        ("durable-reference", "nerve-managed"),
+        ("derived-reference", "google-oauth"),
+        ("derived-org-reference", "nerve-managed"),
+    ],
+)
+def test_a_shutdown_tears_down_what_it_can_name_without_asking_the_provider(
+    cp_stack, carrier, provider
+) -> None:
+    """Teardown reaches every reference the control plane can NAME.
+
+    `_shutdown_probe` may not call a provider — no email provisioner has a
+    reliably read-only inspector — so what it can act on is durable state and
+    arithmetic on identifiers this side already holds. It read only the
+    immutable request, which is the one place Google OAuth and Nerve BYO do NOT
+    put their reference: they persist it through `settle` into
+    `external_ref_ciphertext`. A known binding or domain therefore stayed live
+    after a withdrawal quarantined its job.
+
+    Where nothing was recorded, derivation helps only if it yields the
+    provider's OWN teardown contract. Google's does: `deprovision` takes
+    `google-oauth:<identity_id>` and the identity id is in the request. Nerve's
+    does not — its `_Refs` carries provider-assigned org, webhook and key ids —
+    so a reference derived for Nerve would be one its deprovisioner refuses,
+    and scheduling it would manufacture a failed cleanup job in place of a
+    teardown. That case must schedule NOTHING and stay quarantined.
+
+    The three cases are parameterised over real provider names for a reason: an
+    earlier version used `fake-email`, whose fake accepts any reference, so the
+    test agreed with itself about a reference no real provider would take.
+    """
+    cp_stack.complete_profile()
+    # A REAL email selection, carrying both Art 9(2)(a) receipts. A real
+    # provider is gated on them, so a synthetic selection would settle at the
+    # consent precondition and never reach the shutdown path this is about.
+    restriction_version, restriction_sha = consent_version_and_sha(
+        CONTENT_RESTRICTION_PURPOSE
+    )
+    household_version, household_sha = consent_version_and_sha(
+        HOUSEHOLD_CONTENT_PURPOSE
+    )
+    cp_stack.service.select(
+        cp_stack.household.id,
+        StepKind.EMAIL,
+        {
+            "kind": "abrolia_managed",
+            "local_part": "family-agent",
+            "special_category_restriction_acknowledged": True,
+            "special_category_restriction_receipt_id": (
+                "10000000-0000-4000-8000-0000000000a1"
+            ),
+            "special_category_restriction_text_version": restriction_version,
+            "special_category_restriction_text_sha256": restriction_sha,
+            "special_category_household_consent": True,
+            "special_category_household_receipt_id": (
+                "10000000-0000-4000-8000-0000000000a2"
+            ),
+            "special_category_household_text_version": household_version,
+            "special_category_household_text_sha256": household_sha,
+        },
+        context=cp_stack.context(),
+        now=BASE_TIME + 2,
+    )
+    called: list[str] = []
+
+    class RecordsEveryCall(DeterministicFakeProvisioner):
+        def ensure(self, intent, idempotency_key):
+            called.append("ensure")
+            del intent, idempotency_key
+            # Created upstream, then the call did not answer.
+            raise OutcomeUnknown("the provider did not answer")
+
+        def inspect(self, intent, idempotency_key):
+            called.append("inspect")
+            raise AssertionError("a shutdown must not inspect")
+
+        def reconcile(self, intent, idempotency_key):
+            called.append("reconcile")
+            raise AssertionError("a shutdown must not reconcile")
+
+    # Registered under a REAL provider name. The derived reference is gated on
+    # the provider being one that creates upstream state, so a fixture using
+    # `fake-email` would exercise the gate rather than the behaviour.
+    registry = ProviderRegistry()
+    registry.register(provider, RecordsEveryCall("email"))
+    worker = cp_stack.make_worker(providers=registry, now=BASE_TIME + 3)
+    # The job's provider is durable and the config is frozen, so the realistic
+    # state is made by moving the row rather than by flipping a flag.
+    with cp_stack.database.write() as connection:
+        connection.execute(
+            "UPDATE provisioning_jobs SET provider = ?"
+            " WHERE household_id = ? AND kind = 'email_identity'",
+            (provider, cp_stack.household.id),
+        )
+    settled = worker.run_once()
+    assert settled.status == "outcome_unknown", settled
+
+    identity = cp_stack.database.query_one(
+        "SELECT id FROM email_identities WHERE household_id = ?",
+        (cp_stack.household.id,),
+    )
+    assert identity is not None, "the fixture produced no email identity"
+
+    # The withdrawal quarantines the in-flight job, exactly as
+    # `_supersede_unsettled_jobs` does.
+    with cp_stack.database.write() as connection:
+        if carrier == "durable-reference":
+            # Where `settle` puts a `ProviderWaiting.external_ref`: the column,
+            # not the immutable request. How it got there is incidental; that
+            # the shutdown READS it is the point.
+            cp_stack.jobs.settle(
+                connection,
+                settled.job_id,
+                status="outcome_unknown",
+                external_ref="nerve:org:already-created",
+                error_code="withdraw_requires_reconciliation",
+                now=BASE_TIME + 4,
+            )
+        else:
+            connection.execute(
+                "UPDATE provisioning_jobs SET status = 'outcome_unknown',"
+                " error_code = 'withdraw_requires_reconciliation', settled_at = ?"
+                " WHERE id = ?",
+                (BASE_TIME + 4, settled.job_id),
+            )
+    called.clear()
+
+    worker.reconcile(settled.job_id)
+
+    # Resolving the provider OBJECT is not a provider call; asking it anything
+    # is. The first version of this asserted on registry lookups and failed for
+    # a reason that had nothing to do with the invariant.
+    assert called == [], f"the shutdown called the provider: {called}"
+    cleanup = cp_stack.database.query(
+        "SELECT id FROM provisioning_jobs WHERE household_id = ? AND kind = 'cleanup'",
+        (cp_stack.household.id,),
+    )
+    assert cleanup, f"nothing was scheduled to tear down the {carrier}"
+    # The reference on the cleanup job's own request. `external_resources`
+    # stores it encrypted, so the plain-text assertion belongs here.
+    refs = {
+        cp_stack.jobs.request(row["id"]).get("external_ref")
+        for row in cleanup
+    }
+    # Each is the shape that provider's OWN `deprovision` accepts. The point
+    # of naming them here rather than asserting "some reference" is that an
+    # earlier version scheduled an org LOOKUP key, which every real
+    # deprovisioner refuses.
+    if carrier == "durable-reference":
+        assert "nerve:org:already-created" in refs, refs
+    elif provider == "google-oauth":
+        assert f"google-oauth:{identity['id']}" in refs, refs
+    else:
+        assert org_teardown_ref(cp_stack.household.id, identity["id"]) in refs, refs

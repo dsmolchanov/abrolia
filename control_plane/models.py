@@ -139,39 +139,43 @@ class ProfileInput(DurableContract):
         return value.strip()
 
 
-class ManagedEmailSelection(DurableContract):
+class SpecialCategoryConsent(DurableContract):
+    """Receipts every email selection may carry.
+
+    The restriction bounds what may be sent at all; the household consent is the
+    Art 9(2)(a) condition and is required only in a real-email rollout
+    (docs/privacy/lawful-bases.md section 3).
+    """
+
+    special_category_restriction_acknowledged: Literal[True] | None = None
+    special_category_restriction_receipt_id: str | None = Field(
+        default=None, min_length=36, max_length=36, pattern=_UUID_TEXT_PATTERN
+    )
+    special_category_restriction_text_version: str | None = None
+    special_category_restriction_text_sha256: str | None = None
+    special_category_household_consent: Literal[True] | None = None
+    special_category_household_receipt_id: str | None = Field(
+        default=None, min_length=36, max_length=36, pattern=_UUID_TEXT_PATTERN
+    )
+    special_category_household_text_version: str | None = None
+    special_category_household_text_sha256: str | None = None
+
+
+class ManagedEmailSelection(SpecialCategoryConsent):
     kind: Literal["abrolia_managed"] = "abrolia_managed"
     local_part: str = Field(pattern=r"^[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?$")
-    special_category_restriction_acknowledged: Literal[True] | None = None
-    special_category_restriction_receipt_id: str | None = Field(
-        default=None, min_length=36, max_length=36, pattern=_UUID_TEXT_PATTERN
-    )
-    special_category_restriction_text_version: str | None = None
-    special_category_restriction_text_sha256: str | None = None
 
 
-class GmailAgentSelection(DurableContract):
+class GmailAgentSelection(SpecialCategoryConsent):
     kind: Literal["gmail_agent"] = "gmail_agent"
     separate_agent_account_acknowledged: Literal[True]
-    special_category_restriction_acknowledged: Literal[True] | None = None
-    special_category_restriction_receipt_id: str | None = Field(
-        default=None, min_length=36, max_length=36, pattern=_UUID_TEXT_PATTERN
-    )
-    special_category_restriction_text_version: str | None = None
-    special_category_restriction_text_sha256: str | None = None
 
 
-class FamilyDomainSelection(DurableContract):
+class FamilyDomainSelection(SpecialCategoryConsent):
     kind: Literal["family_domain"] = "family_domain"
     domain: str = Field(min_length=3, max_length=253)
     local_part: str = "assistant"
     mx_change_acknowledged: bool = False
-    special_category_restriction_acknowledged: Literal[True] | None = None
-    special_category_restriction_receipt_id: str | None = Field(
-        default=None, min_length=36, max_length=36, pattern=_UUID_TEXT_PATTERN
-    )
-    special_category_restriction_text_version: str | None = None
-    special_category_restriction_text_sha256: str | None = None
 
     @field_validator("domain")
     @classmethod

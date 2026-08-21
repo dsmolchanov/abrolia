@@ -12,6 +12,7 @@ from control_plane.email.models import (
     EmailProvisionIntent,
 )
 from control_plane.providers.email.nerve_client import (
+    ORG_TEARDOWN_REF_PREFIX,
     NerveAdminClient,
     email_org_external_ref,
 )
@@ -316,7 +317,38 @@ class NerveManagedEmailProvisioner:
             InspectState.READY, self._result(recovered_refs, secret=bundle)
         )
 
+    def _teardown_by_org_ref(self, org_external_ref: str) -> InspectResult:
+        """Delete everything under an org named by its computed reference.
+
+        The path a withdrawal takes when the provider call that created the org
+        never recorded what it made. `get_org` is a plain GET and every list
+        below is read-only: this discovers, it does not provision, and it
+        issues no key and rotates no webhook — which is what made `inspect`
+        unusable here.
+
+        Idempotent by construction. A missing org means nothing was created, and
+        every delete tolerates a 404, so an operator can run this twice.
+        """
+        org = self.client.get_org(external_ref=org_external_ref)
+        org_id = str(org.get("org_id", ""))
+        if not org_id:
+            return InspectResult(InspectState.ABSENT)
+        for webhook in self.client.list_webhooks(org_id=org_id):
+            self.client.delete(f"/v1/webhooks/{webhook['id']}", org_id=org_id)
+        for key in self.client.list_keys(org_id=org_id):
+            self.client.delete(f"/v1/keys/{key['id']}", org_id=org_id)
+        for inbox in self.client.list_inboxes(org_id=org_id):
+            self.client.delete(f"/v1/inboxes/{inbox['id']}", org_id=org_id)
+        for grant in self.client.list_grants(org_id=org_id):
+            self.client.delete(f"/v1/domain-grants/{grant['id']}")
+        self.client.delete(f"/v1/orgs/{org_id}")
+        return InspectResult(InspectState.ABSENT)
+
     def deprovision(self, external_ref: str) -> InspectResult:
+        if external_ref.startswith(ORG_TEARDOWN_REF_PREFIX):
+            return self._teardown_by_org_ref(
+                external_ref[len(ORG_TEARDOWN_REF_PREFIX) :]
+            )
         refs = _Refs.decode(external_ref)
         identity_id = self._identity_id(refs.stable_ref)
         self.client.delete(f"/v1/webhooks/{refs.webhook_id}", org_id=refs.org_id)

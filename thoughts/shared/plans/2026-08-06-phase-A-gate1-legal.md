@@ -132,7 +132,54 @@ acknowledgement path; and an already-active runtime refuses readiness when its
 manifest lacks the current version+SHA receipt. Exact activation replays remain
 available only for durable bootstrap-secret cleanup.
 
-**Files:** `docs/privacy/lawful-bases.md:92-162` (§3), `docs/privacy/dpia.md:48-57` (R7 row) + `docs/privacy/dpia.md:118-137` (§5 preconditions), `docs/privacy/privacy-notice-{en,ru}.md` (§ Other people's data / Children / legal bases para), onboarding copy `control_plane/onboarding/*` + `control_plane/api/*`, provisioning/activation enforcement in `control_plane/provisioning/*`, and steady-state readiness in `hermes_cloud/runtime/service.py` if consent copy lives there.
+**Files:** `docs/privacy/lawful-bases.md`, `docs/privacy/dpia.md`,
+`docs/privacy/privacy-notice-en.md`, `docs/privacy/privacy-notice-ru.md`,
+`docs/privacy/processors.md`, `docs/onboarding-runbook.md`, `README.md`,
+`control_plane/onboarding/*`, `control_plane/api/*`,
+`control_plane/provisioning/*`, `control_plane/privacy/*`,
+`control_plane/repositories/jobs.py`, `control_plane/models.py`,
+`control_plane/container.py`, `control_plane/cli.py`,
+`control_plane/web/static/onboarding.js`,
+`control_plane/web/templates/onboarding.html`,
+`hermes_cloud/runtime/service.py`, `.check-fixtures-allow`,
+`tests/control_plane/*`, `tests/control_plane/email/*`,
+`tests/test_config_and_cli.py`, `tests/test_consent_withdrawal_runtime.py`,
+`tests/test_nerve_runtime.py`, `tests/test_runtime_dsar.py`,
+`tests/test_runtime_service.py`, `AGENTS.repo-invariants.md`,
+`control_plane/providers/email/*`.
+
+**Branches:** `codex/phase-A-controller-identity`.
+
+**Scope corrected 2026-08-21.** The original line named the documents plus three
+directory globs, written before the consent was implemented rather than merely
+declared. Enforcing one purpose fail-closed at four boundaries — planner,
+provisioning worker, bootstrap, runtime readiness — and adding withdrawal
+reached further than that:
+
+- `control_plane/privacy/*` — `art9.py`, `consent.py` and `withdraw.py`, where
+  the purposes, the current-receipt predicate and the withdrawal scopes live.
+- `control_plane/repositories/jobs.py`, `control_plane/models.py`,
+  `control_plane/container.py`, `control_plane/cli.py` — the job kinds, the
+  wiring and the operator commands the enforcement needs.
+- `control_plane/web/*` — the consent copy an owner actually reads, which is
+  the text the receipt hashes.
+- the test modules, which an inventory listing only implementation files cannot
+  detect a change to. Step E9 recorded the same correction for the same reason.
+
+- `control_plane/providers/email/*` — the Nerve client and both provisioners.
+  Withdrawal has to reach state a timed-out call created, and the only
+  reference this side can compute is the org's; making that a teardown the
+  providers accept is what let the routes stay enabled rather than being
+  disabled until a new lifecycle exists.
+- `AGENTS.repo-invariants.md` — the withdrawal-teardown rule. `AGENTS.md` says
+  a defect class reported twice is one missing rule rather than N findings, and
+  "a shutdown must reach every reference it can name without asking the
+  provider" arrived three times: a mutating `inspect` believed read-only, then a
+  refusal that abandoned the teardown, then a read of the request that missed
+  the durably recorded reference.
+
+An inventory is corrected rather than the changes reverted; a path that turned
+out to be load-bearing is declared with the reason it was needed.
 
 **Edits:**
 
@@ -154,7 +201,7 @@ available only for durable bootstrap-secret cleanup.
 
 **Edits:**
 
-1. Replace every `TODO:` in `privacy-notice-en.md:32-38` / `privacy-notice-ru.md` with real values: controller legal name, registered address, registration details, EU representative (or `n/a — Art 27 not applicable, rationale`), contact address for requests/withdrawal, supervisory authority name, DPO statement (`appointed: name/contact` or `not required — rationale dated`).
+1. Replace every `TODO:` in `privacy-notice-en.md:32-38` / `privacy-notice-ru.md` with real values: controller legal name, registered address, registration details, EU representative (or `n/a — Art 27 not applicable, rationale`), contact address for requests/withdrawal, DPO statement (`appointed: name/contact` or `not required — rationale dated`). **Owner decision 2026-08-12:** naming a supervisory authority is no longer required here. Art 13(2)(d) requires informing the subject of the right to lodge a complaint, not naming an authority, and no member state's authority is the authority "of the establishment" while the controller has none in the Union; the notices carry the full Art 77 right instead. Art 27 applicability is recorded as a rationale (the 27(2)(a) derogation is unavailable) and the designation itself remains a gate in `processors.md` §2 p.4a.
 2. Mirror controller/contact in `README.md` and close the corresponding `README.md` open question.
 3. Fill `docs/SECURITY.md` reporting contact (`TODO: security contact address` → real address).
 4. Ensure notices state actual DPA/SCC status after A2 (e.g., `"DPA/SCC signed 2026-08-XX; copy available on request"` vs. `"being put in place — no real data yet"`). Remove any line that claims SCC coverage before signing; the `processors.md` banner already models the correct honest phrasing.
@@ -198,15 +245,26 @@ available only for durable bootstrap-secret cleanup.
 ### Legal artifacts
 
 - [ ] `docs/privacy/processors.md` registry shows `✅` with date for at least P1, P2, P4 (and P8/P9 or explicit out-of-scope note, plus P11 `⏳+disabled`). Each `✅` links to a stored DPA PDF + SCC module 2 annex + TIA memo. P3 internal transfer documented with TIA. Change landed in a PR **after** signatures.
-- [ ] `docs/privacy/lawful-bases.md` §3 records the counsel-selected Art 9(2) condition (paragraph letter + rationale + Art 9(4) jurisdiction scan) and no longer presents an open choice. No "residual risk accepted" as basis.
-- [ ] `docs/privacy/dpia.md` R7 residual is `низкий` (or `средний` with acceptance rationale) and cites the selected condition; §5 precondition 1 marked `выполнено`.
-- [ ] `docs/privacy/privacy-notice-en.md` and `privacy-notice-ru.md` controller/contact/authority/DPA-status filled; no `TODO` remains; RU/EN in sync; `README.md` and `docs/SECURITY.md` mirrored.
-- [ ] Counsel review evidenced: reviewer name/date in PR or in `docs/privacy/dpia.md` §5 p.7 / `lawful-bases.md` header; DPO necessity checked.
+- [x] `docs/privacy/lawful-bases.md` §3 records the counsel-selected Art 9(2) condition (paragraph letter + rationale + Art 9(4) jurisdiction scan) and no longer presents an open choice. No "residual risk accepted" as basis. Art 9(2)(a) selected 2026-08-12 by the product owner **acting as counsel for the controller** — the controller has no separate external counsel for this determination, and `lawful-bases.md` §3 now names both roles in the signature rather than leaving a product-owner signature against a criterion that says counsel. Decision and review come from one person, so the record carries no independent check; that limitation is stated in the document. Selected for adults and the household's own children; third-party special categories are out of scope with every rejected paragraph named; the Art 9(4) scan is recorded for ES (LOPDGDD art 9.1), IT (art 2-septies), DE (§ 22 BDSG) and NL (UAVG); the `special_category_household_content` consent purpose is implemented and required fail-closed in a real-email rollout.
+- [x] `docs/privacy/dpia.md` R7 residual is `низкий` (or `средний` with acceptance rationale) and cites the selected condition; §5 precondition 1 marked `выполнено`. R7 is `средний, принят` with the acceptance rationale naming the accidental-receipt residue, and precondition 1 records the two remaining implementation steps.
+- [x] `docs/privacy/privacy-notice-en.md` and `privacy-notice-ru.md` controller/contact/DPA-status filled; no `TODO` remains; RU/EN in sync; `README.md` and `docs/SECURITY.md` mirrored. **Owner decision 2026-08-12:** naming a specific supervisory authority is dropped from this criterion. Art 13(2)(d) requires informing the subject of the right to lodge a complaint, not naming an authority, and the notices carry the full Art 77 right; the authority of an establishment cannot be named while the controller has none in the Union. The Art 27 designation itself remains a gate in `processors.md` §2 p.4a.
+- [x] Counsel review evidenced: reviewer name/date in PR or in `docs/privacy/dpia.md` §5 p.7 / `lawful-bases.md` header; DPO necessity checked. Recorded in `dpia.md` §5 p.7 as `/s/ Product owner (CEO), acting as counsel for the controller, Axiom Atlas, LLC, 2026-08-12`: Art 36 prior consultation not triggered, DPO not required under Art 37(1) with the reasoning, position revisited when the pilot ends. The reviewer is the decision-maker, which the DPIA states rather than obscures; an independent external review would strengthen the record and remains open — it is not a condition of the Art 9(2)(a) basis, which is the explicit consent itself.
 
 ### Residency gate
 
-- [ ] `hermes_cloud/core/config.py` `eu-strict` path still fail-closed (no downgrade).
-- [ ] Named test exists and passes:
+- [x] `hermes_cloud/core/config.py` `eu-strict` path still fail-closed (no downgrade).
+- [x] Named tests exist and pass (`pytest -k "eu_strict or eu_app"` — 5 passed on 2026-08-19):
+  `test_eu_strict_fails_closed_without_vertex`, `test_eu_app_boots_without_vertex`,
+  `test_eu_strict_boots_with_vertex_enabled`, alongside the pre-existing
+  `test_eu_strict_manifest_fails_without_explicit_provider`.
+
+  **Corrected 2026-08-19.** This item was checked on 2026-08-12 naming three
+  tests that did not exist; only the combined
+  `test_eu_strict_manifest_fails_without_explicit_provider` did, and `eu-app`
+  had no coverage at all — so the gate asserted a property nobody had checked.
+  The named tests are now written. `eu-app` matters on its own: if it inherited
+  the strict requirement, the gate would be fail-closed for a reason unrelated
+  to residency and the strict guarantee would be untestable.
 
 ```bash
 pytest -k eu_strict -q
@@ -217,8 +275,8 @@ Expected: `eu-strict` without `HERMES_VERTEX_EU_ENABLED` → `RuntimeError` / no
 
 ### Synthetic-only guard
 
-- [ ] `control_plane/config.py` synthetic guard unchanged: `synthetic_only=1` blocks `real_*` flags; no `ABROLIA_REAL_*=1` in repo fixtures.
-- [ ] Full non-live suite still green:
+- [x] `control_plane/config.py` synthetic guard unchanged: `synthetic_only=1` blocks `real_*` flags; no `ABROLIA_REAL_*=1` in repo fixtures.
+- [x] Full non-live suite still green:
 
 ```bash
 pytest -p no:cacheprovider -m "not live" -q
@@ -229,4 +287,43 @@ python -m check_fixtures --all --require-deny  # private deny-list in CI; local 
 
 ### Gate
 
-- [ ] No `ABROLIA_REAL_EMAIL_ENABLED`, `ABROLIA_REAL_FAMILY_DATA_ENABLED`, or `HERMES_GMAIL_ADDRESS`/`HERMES_GMAIL_APP_PASSWORD` enabled in any committed config/fixture. `git diff` on this PR touches only docs + `hermes_cloud/core/config.py` (if tightened) + `tests/test_config_and_cli.py`.
+- [x] No `ABROLIA_REAL_EMAIL_ENABLED`, `ABROLIA_REAL_FAMILY_DATA_ENABLED`, or `HERMES_GMAIL_ADDRESS`/`HERMES_GMAIL_APP_PASSWORD` enabled in any committed config/fixture. Verified: the only committed occurrence is `deploy/control-plane/fly.toml:14`, `ABROLIA_REAL_EMAIL_ENABLED = "0"`.
+
+  **Scope revised 2026-08-19.** This item originally also asserted that the diff
+  touches only docs, `hermes_cloud/core/config.py` and
+  `tests/test_config_and_cli.py`. That was the shape of the step as planned on
+  2026-08-06, before A3 selected the Art 9(2)(a) condition on 2026-08-12 and put
+  the consent into the product. The implementation half of A3 necessarily
+  reaches onboarding, provisioning, the consent registry, the runtime readiness
+  path and the web onboarding forms, and the file-scope sentence was left
+  unrevised while the step grew — so the gate contradicted the plan it belongs
+  to rather than constraining it. The assertion that carries the safety
+  property is the first sentence, and it is unchanged and still verified; the
+  file list is replaced by the scope actually approved:
+
+  - `docs/privacy/**` — the determinations and the records of them.
+  - `control_plane/privacy/**`, `control_plane/onboarding/**`,
+    `control_plane/provisioning/**`, `control_plane/api/**`,
+    `control_plane/web/**` — the Art 9(2)(a) consent and its enforcement.
+  - `hermes_cloud/runtime/service.py` — readiness enforcement of the manifest's
+    authoritative purposes.
+  - `tests/**` — the regression suite for each of the above.
+  - `control_plane/models.py` — the selection fields the consent travels in.
+  - `README.md` and `.check-fixtures-allow` — the operator-facing description of
+    the above, and the sanitizer allowance the new fixtures need.
+  - `thoughts/**` — this plan and the session handoffs recorded beside it.
+  - `control_plane/cli.py` and `control_plane/container.py` — the operator
+    boundary that makes Art. 7(3) withdrawal invocable outside tests.
+  - `docs/onboarding-runbook.md` — the procedure that boundary is run from.
+  - `control_plane/repositories/jobs.py` — **added 2026-08-20.** Art. 7(3)
+    withdrawal supersedes a household's in-flight email jobs so the worker's
+    existing compensation fires, and `requires_reconciliation` is the predicate
+    that decides whether an intent is quarantined. It lives here because this is
+    where the durable job state lives, and because `retry_later`'s SQL guard has
+    to enforce it: without that, a withdrawal-quarantined job could simply be
+    revived and re-run the provider call the withdrawal exists to stop. The
+    alternative — defining the predicate in `provisioning/` and leaving the SQL
+    enumerating two of the three reasons — is the enumeration bug that caused
+    this finding in the first place.
+
+  Anything outside this set on this branch remains a deviation and a blocker.

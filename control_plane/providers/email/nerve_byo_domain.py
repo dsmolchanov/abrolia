@@ -12,6 +12,7 @@ from control_plane.email.models import (
     EmailProvisionIntent,
 )
 from control_plane.providers.email.nerve_client import (
+    ORG_TEARDOWN_REF_PREFIX,
     NerveAdminClient,
     email_org_external_ref,
 )
@@ -269,7 +270,33 @@ class NerveByoDomainProvisioner:
             else InspectResult(InspectState.ABSENT)
         )
 
+    def _teardown_by_org_ref(self, org_external_ref: str) -> InspectResult:
+        """The BYO twin of the managed teardown: resolve, then delete.
+
+        Same reason and same guarantees — read-only discovery, tolerant
+        deletes, idempotent. The only difference is that a BYO org owns a
+        DOMAIN rather than a grant against the platform's.
+        """
+        org = self.client.get_org(external_ref=org_external_ref)
+        org_id = str(org.get("org_id", ""))
+        if not org_id:
+            return InspectResult(InspectState.ABSENT)
+        for webhook in self.client.list_webhooks(org_id=org_id):
+            self.client.delete(f"/v1/webhooks/{webhook['id']}", org_id=org_id)
+        for key in self.client.list_keys(org_id=org_id):
+            self.client.delete(f"/v1/keys/{key['id']}", org_id=org_id)
+        for inbox in self.client.list_inboxes(org_id=org_id):
+            self.client.delete(f"/v1/inboxes/{inbox['id']}", org_id=org_id)
+        for domain in self.client.list_domains(org_id=org_id):
+            self.client.delete(f"/v1/domains/{domain['id']}", org_id=org_id)
+        self.client.delete(f"/v1/orgs/{org_id}")
+        return InspectResult(InspectState.ABSENT)
+
     def deprovision(self, external_ref: str) -> InspectResult:
+        if external_ref.startswith(ORG_TEARDOWN_REF_PREFIX):
+            return self._teardown_by_org_ref(
+                external_ref[len(ORG_TEARDOWN_REF_PREFIX) :]
+            )
         refs = _ByoRefs.decode(external_ref)
         if refs.webhook_id:
             self.client.delete(f"/v1/webhooks/{refs.webhook_id}", org_id=refs.org_id)

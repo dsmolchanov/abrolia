@@ -26,6 +26,8 @@ from control_plane.config import ControlPlaneConfig, backup_key_from_env
 from control_plane.container import ControlPlaneContainer
 from control_plane.db import ControlPlaneDatabase, ProcessAlreadyRunning
 from control_plane.observability import StructuredLogger
+from control_plane.privacy.consent import CONSENT_TEXTS
+from control_plane.privacy.withdraw import ConsentNotHeld
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -86,6 +88,21 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     commands.add_parser("resume-jobs", help="remove the exact post-restore worker pause")
+    # The operator boundary for Art. 7(3). The consent copy advertises a
+    # mailbox, not a button, so withdrawal arrives as mail to a human — this
+    # is the command that human runs. A self-service route needs an
+    # authenticated session and belongs with the account UI; until it exists,
+    # a right that only tests can exercise is not a right.
+    withdraw = commands.add_parser(
+        "withdraw-consent",
+        help="withdraw one consent for one household (Art. 7(3))",
+    )
+    withdraw.add_argument("household_id")
+    withdraw.add_argument(
+        "purpose",
+        choices=sorted(CONSENT_TEXTS),
+        help="the consent purpose being withdrawn",
+    )
     return parser
 
 
@@ -308,6 +325,33 @@ def main(argv: Sequence[str] | None = None) -> int:
             results = active.runtime_health.reconcile_all(now=time.time())
             print(json.dumps([result.__dict__ for result in results], sort_keys=True))
             return 0
+    if args.command == "withdraw-consent":
+        # Handled before the locking container below. `serve` holds the
+        # nonblocking writer flock for the life of the process, so a command
+        # that takes it can only run with production stopped — and an Art. 7(3)
+        # withdrawal that requires taking the service down is not the one-step
+        # withdrawal the consent copy promises. The work here is one short
+        # transaction plus a queued job, which SQLite serialises on its own;
+        # the flock guards against a second long-running WORKER, which this is
+        # not. Routing it through the running process instead would need an
+        # authenticated admin surface, and that belongs with the account UI.
+        with _container(lock=False) as active:
+            try:
+                result = active.withdrawal.withdraw(
+                    args.household_id, args.purpose, now=time.time()
+                )
+            except ConsentNotHeld as error:
+                raise SystemExit(str(error)) from error
+            # No identifiers beyond the one supplied: the operator already knows
+            # it, and the log must not gain a new copy.
+            print(json.dumps({
+                "purpose": result.purpose,
+                "receipts_revoked": result.receipts_revoked,
+                "revisions_revoked": result.revisions_revoked,
+                "runtime_notified": result.runtime_notified,
+            }, sort_keys=True))
+            return 0
+
     mailer = ConsoleMailer() if args.command == "invite" else None
     with _container(mailer=mailer) as active:
         if args.command == "migrate":

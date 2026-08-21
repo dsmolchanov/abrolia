@@ -164,3 +164,47 @@ makes a review loop unable to terminate.
   `not_before`, held leases, paused workers and creation order. Every attempt to
   predict the ranking has produced a finding; attaching facts to each job has
   produced none.
+
+### Withdrawal tears down what it can NAME, and never asks the provider
+
+- **No code path that exists because a consent went away may call a provider to
+  discover what that provider holds. It must reach every reference the control
+  plane can name from durable state or from arithmetic on identifiers it
+  already has: the job's request, its `external_ref_ciphertext`, and — for an
+  email identity — `email_org_external_ref(household_id, identity_id)`, which is
+  a pure function computed before the first provider call.** Enforced by
+  `tests/control_plane/test_provisioning_jobs.py::test_a_shutdown_tears_down_what_it_can_name_without_asking_the_provider`,
+  which parameterises the durable and derived carriers and asserts the
+  provisioner is never called.
+
+  Recorded after this class arrived three times. First: `inspect` was believed
+  read-only and is not — `NerveManagedEmailProvisioner.inspect` deletes and
+  reissues the API key and rotates the webhook, and
+  `GoogleOAuthEmailProvisioner.inspect_intent` calls `ensure` — so a shutdown
+  mutated a withdrawn household's provider state to find out what it had. Then:
+  refusing to look at all abandoned the teardown the quarantine exists for.
+  Then: reading only the immutable request missed the reference Google OAuth and
+  Nerve BYO persist through `settle`, leaving a known binding or domain live.
+
+  A derived reference counts only if it is the reference the job's OWN provider
+  accepts for teardown. Google's `deprovision` takes
+  `google-oauth:<identity_id>`, which is arithmetic on the request. Nerve's
+  decodes a `_Refs` of provider-assigned org, webhook and key ids, which nothing
+  here can construct — and scheduling an `email_org_external_ref` lookup key in
+  its place produces a cleanup the deprovisioner refuses: a failed job standing
+  in for a teardown, which is worse than scheduling nothing, because the inbox
+  is live either way and one of the two says it was handled. Where no acceptable
+  reference exists the job stays quarantined and says so — and where the
+  provider can resolve a computed reference with a READ-ONLY lookup, the
+  teardown is built rather than the capability disabled. Both Nerve routes
+  accept `nerve-org:<org_external_ref>` and resolve it through `get_org`, a
+  plain GET, deleting what is found under the org. A worker-level test can only
+  assert the string it scheduled; that the concrete provisioner ACCEPTS that
+  string is a separate assertion and belongs beside the provisioner.
+
+  The rule is not "never look" and not "ask the provider" — it is that looking
+  means reading what this side already knows. A reference computed before a
+  provider call is knowable even when that call created state and then timed out
+  without recording anything, which is the case an earlier version of
+  `_shutdown_probe` called undiscoverable in its own docstring. It is derivable,
+  and a docstring admitting a gap is not a substitute for closing it.

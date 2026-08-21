@@ -7,6 +7,7 @@ import pytest
 from control_plane.email.models import EmailOption, EmailProvisionIntent
 from control_plane.models import StepKind
 from control_plane.privacy.consent import consent_version_and_sha
+from control_plane.providers.email.nerve_client import org_teardown_ref
 from control_plane.providers.email.nerve_managed import (
     NERVE_SECRET_BINDING,
     NerveManagedEmailProvisioner,
@@ -30,6 +31,9 @@ WEBHOOK_ID = "00000000-0000-4000-8000-000000000006"
 _RESTRICTION_VERSION, _RESTRICTION_SHA = consent_version_and_sha(
     "special_category_content_restriction"
 )
+_HOUSEHOLD_VERSION, _HOUSEHOLD_SHA = consent_version_and_sha(
+    "special_category_household_content"
+)
 MANAGED_SELECTION = {
     "kind": "abrolia_managed",
     "local_part": "family-agent",
@@ -37,6 +41,10 @@ MANAGED_SELECTION = {
     "special_category_restriction_receipt_id": "10000000-0000-4000-8000-000000000023",
     "special_category_restriction_text_version": _RESTRICTION_VERSION,
     "special_category_restriction_text_sha256": _RESTRICTION_SHA,
+    "special_category_household_consent": True,
+    "special_category_household_receipt_id": "10000000-0000-4000-8000-000000000033",
+    "special_category_household_text_version": _HOUSEHOLD_VERSION,
+    "special_category_household_text_sha256": _HOUSEHOLD_SHA,
 }
 
 
@@ -617,3 +625,50 @@ def test_worker_rejects_duplicate_key_noncanonical_nerve_reference(cp_stack) -> 
 
     assert failed.status == "outcome_unknown"
     assert failed.error_code == "outcome_unknown"
+
+
+def test_the_derived_teardown_reference_is_one_this_provider_accepts() -> None:
+    """The assertion the withdrawal test could not make for itself.
+
+    A worker-level test schedules a cleanup and can only check the string it
+    put on the job. Whether the CONCRETE provisioner accepts that string is a
+    different question, and the earlier version of this work got it wrong
+    precisely because its fake accepted anything: `deprovision` decodes a
+    `_Refs` of provider-assigned ids and refuses a bare org reference, so the
+    cleanup would have settled failed with the inbox still receiving.
+
+    `nerve-org:<org_external_ref>` is resolved through `get_org` — a GET — and
+    everything found under the org is deleted. Nothing is created, no key is
+    issued and no webhook rotated, which is what disqualified `inspect`.
+    """
+    client = FakeNerveAdmin()
+    provisioner = NerveManagedEmailProvisioner(client)
+    reference = org_teardown_ref("household-1", "identity-1")
+
+    result = provisioner.deprovision(reference)
+
+    assert result.state is InspectState.ABSENT
+    assert client.deleted, "nothing was deleted for a reference that resolves"
+    paths = [path for path, _org in client.deleted]
+    assert f"/v1/orgs/{ORG_ID}" in paths, paths
+    # Discovery only: a teardown that provisions is the defect this replaced.
+    # `key_calls` counts key issuance, which `inspect` performs and this must
+    # not.
+    assert client.key_calls == 0, client.key_calls
+
+
+def test_an_org_that_was_never_created_is_already_absent() -> None:
+    """Idempotent: an operator can run the reconcile twice.
+
+    The reference is derived, so it exists whether or not the provider call
+    that would have used it got anywhere. A lookup that finds nothing means
+    nothing was created, which is a successful teardown and not an error.
+    """
+    client = FakeNerveAdmin()
+    client.get_org = lambda *, external_ref: {}
+    provisioner = NerveManagedEmailProvisioner(client)
+
+    result = provisioner.deprovision(org_teardown_ref("household-1", "identity-1"))
+
+    assert result.state is InspectState.ABSENT
+    assert not client.deleted, client.deleted

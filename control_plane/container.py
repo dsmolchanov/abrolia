@@ -29,6 +29,7 @@ from control_plane.privacy.export import (
 )
 from control_plane.privacy.retention import RetentionService
 from control_plane.privacy.runtime import PrivateRuntimeDsarClient
+from control_plane.privacy.withdraw import ConsentWithdrawalService
 from control_plane.providers.email.google_oauth import (
     GoogleOAuthClient,
     GoogleOAuthProvisioner,
@@ -81,6 +82,7 @@ class ControlPlaneContainer:
     bootstrap: BootstrapService
     exporter: HouseholdExporter
     deletion: DeletionService
+    withdrawal: ConsentWithdrawalService
     retention: RetentionService
     runtime_health: RuntimeReadinessMonitor
 
@@ -254,6 +256,9 @@ class ControlPlaneContainer:
             providers,
             runtime=runtime_deleter,
         )
+        withdrawal = ConsentWithdrawalService(
+            database, jobs=jobs, onboarding=onboarding
+        )
         retention = RetentionService(accounts)
         runtime_health = RuntimeReadinessMonitor(database)
         return cls(
@@ -284,6 +289,7 @@ class ControlPlaneContainer:
             bootstrap,
             exporter,
             deletion,
+            withdrawal,
             retention,
             runtime_health,
         )

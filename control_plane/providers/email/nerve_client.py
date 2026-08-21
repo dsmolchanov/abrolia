@@ -17,6 +17,20 @@ def email_org_external_ref(household_id: str, identity_id: str) -> str:
     return f"arbolia:household:{household_id}:email:{identity_id}"
 
 
+#: A teardown reference the control plane can COMPUTE, for the state a provider
+#: call created before it timed out. `deprovision` normally takes ids the
+#: provider assigned, which nothing on this side can reconstruct — so a
+#: withdrawal had no way to reach an org whose creation was never recorded.
+#: This form carries the org's `external_ref` instead, which is derived from the
+#: household and the identity before the first call, and both Nerve
+#: provisioners resolve it with a read-only lookup.
+ORG_TEARDOWN_REF_PREFIX = "nerve-org:"
+
+
+def org_teardown_ref(household_id: str, identity_id: str) -> str:
+    return f"{ORG_TEARDOWN_REF_PREFIX}{email_org_external_ref(household_id, identity_id)}"
+
+
 @dataclass(frozen=True)
 class NerveAdminSettings:
     base_url: str

@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from control_plane.privacy.consent import consent_version_and_sha
 from hermes_cloud.core.db import open_database
 from hermes_cloud.core.runtime_manifest import compute_config_sha256, parse_runtime_manifest
 from hermes_cloud.email.contracts import EmailBinding
@@ -28,6 +29,14 @@ INBOX_ID = "00000000-0000-4000-8000-000000000002"
 THREAD_ID = "00000000-0000-4000-8000-000000000003"
 MESSAGE_ID = "00000000-0000-4000-8000-000000000004"
 ATTACHMENT_ID = "00000000-0000-4000-8000-000000000005"
+
+
+_RESTRICTION_VERSION, _RESTRICTION_SHA = consent_version_and_sha(
+    "special_category_content_restriction"
+)
+_HOUSEHOLD_VERSION, _HOUSEHOLD_SHA = consent_version_and_sha(
+    "special_category_household_content"
+)
 
 
 def binding(provider: str = "nerve-managed") -> EmailBinding:
@@ -291,13 +300,19 @@ secret_binding_ref = "ABROLIA_NERVE_EMAIL_CREDENTIALS"
 [consent]
 authority = "control_plane"
 enforcement = "required"
-required_purposes = ["special_category_content_restriction"]
+required_purposes = ["special_category_content_restriction", "special_category_household_content"]
 
 [[consent.receipts]]
 receipt_id = "10000000-0000-4000-8000-000000000032"
 purpose = "special_category_content_restriction"
-text_version = "special-category-content-restriction-v1"
-text_sha256 = "64221529a01cff070f1f614451eecaa5c6ed28a2b7c5d6af6f56e5ef5054e509"
+text_version = "{_RESTRICTION_VERSION}"
+text_sha256 = "{_RESTRICTION_SHA}"
+
+[[consent.receipts]]
+receipt_id = "10000000-0000-4000-8000-000000000035"
+purpose = "special_category_household_content"
+text_version = "{_HOUSEHOLD_VERSION}"
+text_sha256 = "{_HOUSEHOLD_SHA}"
 '''
     digest = compute_config_sha256(content)
     return content.replace(
