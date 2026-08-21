@@ -17,6 +17,7 @@ from control_plane.api.dependencies import BrowserSession, SeeOther, browser_ses
 from control_plane.config import ControlPlaneConfig
 from control_plane.container import ControlPlaneContainer
 from control_plane.db import new_id
+from control_plane.email.models import EMAIL_SELECTION_KINDS
 from control_plane.observability import HealthReporter, HealthSnapshot
 from control_plane.onboarding.contracts import WorkflowConflict
 from control_plane.privacy.consent import consent_version_and_sha, consent_version_and_text
@@ -185,7 +186,16 @@ def create_app(
                 "household_consent_required": {
                     option: active_container.onboarding
                     .email_option_processes_real_content(option)
-                    for option in ("abrolia_managed", "gmail_agent", "family_domain")
+                    for option in EMAIL_SELECTION_KINDS
+                },
+                # Which options this deployment offers at all, from the gate's
+                # own predicate. A card the server would refuse is a card the
+                # family should not be shown — but the hiding is the courtesy
+                # and the gate is the enforcement, so the page reads the answer
+                # rather than the flag.
+                "email_option_offered": {
+                    option: active_container.onboarding.email_option_offered(option)
+                    for option in EMAIL_SELECTION_KINDS
                 },
             },
         )

@@ -17,6 +17,21 @@ def _restriction_form_binding() -> dict[str, str]:
     }
 
 
+def _household_form_binding() -> dict[str, str]:
+    """The Art. 9(2)(a) consent the real-provider options also require.
+
+    `gmail_agent` routes to `google-oauth`, a real provider, so the gate demands
+    this consent as well as the restriction. Without it a refused post says only
+    that something was missing — which is not what a kill-switch test is for.
+    """
+    version, sha256 = consent_version_and_sha("special_category_household_content")
+    return {
+        "special_category_household_consent": "yes",
+        "special_category_household_text_version": version,
+        "special_category_household_text_sha256": sha256,
+    }
+
+
 def test_verify_page_moves_fragment_to_post_and_clears_browser_history(api_harness) -> None:
     page = api_harness.client.get("/auth/verify#token=fragment-secret-canary")
     script = api_harness.client.get("/static/onboarding.js")
@@ -28,7 +43,15 @@ def test_verify_page_moves_fragment_to_post_and_clears_browser_history(api_harne
     assert "window.location.replace(result.next)" in script.text
 
 
-def test_onboarding_page_has_canonical_options_and_privacy_copy(api_harness) -> None:
+def test_onboarding_page_has_canonical_options_and_privacy_copy(
+    api_harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # This is the FULL card set: ordering, copy and per-card consent bindings.
+    # `family_domain` and `gmail_agent` are cut from MVP and hidden unless their
+    # kill switches are on, so the contract they belong to has to turn them on.
+    # What the page does when they are off is asserted below, on its own terms.
+    monkeypatch.setenv("ABROLIA_BYO_EMAIL_ENABLED", "1")
+    monkeypatch.setenv("ABROLIA_GMAIL_ENABLED", "1")
     world = api_harness.create_principal("ui-owner@family.test")
     api_harness.authenticate(world)
     page = api_harness.client.get("/onboarding")
@@ -496,3 +519,156 @@ def test_an_authenticated_onboarding_page_still_renders(api_harness) -> None:
 
     assert page.status_code == 200
     assert "onboarding" in page.text.lower()
+
+
+# ---------------------------------------------------------------------------
+# The MVP cut, on the page.
+#
+# Hiding a card is a courtesy — `OnboardingService.select` refuses a cut option
+# either way, and `ProvisioningWorker` refuses it again at the provider call for
+# work already queued. What the page must never do is DISAGREE with the gate.
+# That has gone wrong here before, in the other direction: the server started
+# keying the Art. 9(2)(a) consent on the provider while the page still keyed it
+# on the rollout flag, so the form rendered no consent and the server then
+# rejected the submission for lacking it — browser onboarding became impossible.
+# ---------------------------------------------------------------------------
+
+CUT_CARDS = {
+    "gmail_agent": "ABROLIA_GMAIL_ENABLED",
+    "family_domain": "ABROLIA_BYO_EMAIL_ENABLED",
+}
+
+
+def _email_cards(html: str) -> set[str]:
+    return {
+        kind
+        for kind in ("abrolia_managed", "gmail_agent", "family_domain")
+        if f'data-kind="{kind}"' in html
+    }
+
+
+@pytest.mark.parametrize(
+    "enabled",
+    [
+        frozenset(),
+        frozenset({"gmail_agent"}),
+        frozenset({"family_domain"}),
+        frozenset({"gmail_agent", "family_domain"}),
+    ],
+    ids=["neither", "gmail-only", "byo-only", "both"],
+)
+def test_the_page_offers_exactly_the_options_the_server_would_accept(
+    api_harness, monkeypatch: pytest.MonkeyPatch, enabled: frozenset[str]
+) -> None:
+    """Every combination, not just all-off.
+
+    Asserting only the both-off case would pass just as well if the template
+    hard-coded the managed card and dropped the other two outright, which is a
+    different product.
+    """
+
+    for option, env_name in CUT_CARDS.items():
+        monkeypatch.setenv(env_name, "1" if option in enabled else "0")
+    world = api_harness.create_principal(f"cut-{'-'.join(sorted(enabled)) or 'none'}@family.test")
+    api_harness.authenticate(world)
+
+    html = api_harness.client.get("/onboarding").text
+
+    # Managed is deliberately ungated: something must always be offerable, or
+    # the page is a dead end.
+    assert _email_cards(html) == {"abrolia_managed"} | set(enabled)
+
+
+@pytest.mark.parametrize("option", sorted(CUT_CARDS))
+def test_a_hidden_card_is_also_refused_when_submitted_anyway(
+    api_harness, monkeypatch: pytest.MonkeyPatch, option: str
+) -> None:
+    """The page is not the enforcement, and this is what says so.
+
+    A form can be replayed, scripted, or posted from a page rendered before the
+    operator flipped the switch. Hiding the card must not be the only thing
+    stopping the option.
+    """
+
+    monkeypatch.setenv(CUT_CARDS[option], "0")
+    world = api_harness.create_principal(f"replay-{option}@family.test")
+    api_harness.authenticate(world)
+    origin = api_harness.mutation_headers
+
+    html = api_harness.client.get("/onboarding").text
+    assert f'data-kind="{option}"' not in html, "the card was rendered after all"
+
+    shared = {
+        "csrf_token": world.session.csrf_token,
+        "idempotency_key": f"replay-{option}",
+        "version": "0",
+        "first_name": "Test",
+        "last_name": "Family",
+        "family_language": "en",
+        "timezone": "Europe/Prague",
+        "country_code": "DE",
+        "residency_mode": "eu-app",
+    }
+    assert api_harness.client.post(
+        "/onboarding/profile", headers=origin, data=shared, follow_redirects=False
+    ).status_code == 303
+    assert api_harness.container.worker.run_once().status == "succeeded"
+
+    posted = api_harness.client.post(
+        "/onboarding/select/email_identity",
+        headers=origin,
+        data={
+            "csrf_token": world.session.csrf_token,
+            "idempotency_key": f"replay-select-{option}",
+            "version": "1",
+            "kind": option,
+            "domain": "family.example.test",
+            "local_part": "assistant",
+            "special_category_restriction_acknowledged": "yes",
+            **_restriction_form_binding(),
+            **_household_form_binding(),
+        },
+        follow_redirects=False,
+    )
+    # The route redirects on rejection too, so the status code says nothing.
+    # `?error=selection` is what a refused command looks like here.
+    assert posted.status_code == 303
+    assert posted.headers["location"] == "/onboarding?error=selection"
+
+    # And the durable state is the real assertion: no email identity was
+    # selected, whatever the page did.
+    snapshot = api_harness.container.onboarding_repository.snapshot(
+        world.household.id
+    )
+    assert snapshot.current_step.value == "email_identity", (
+        "the workflow moved past the step a cut option was supposed to fail"
+    )
+    assert api_harness.container.database.query_one(
+        "SELECT 1 FROM email_identities WHERE household_id = ?",
+        (world.household.id,),
+    ) is None, "a cut option created an email identity"
+
+    # The control. Without it, "refused" proves only that SOMETHING refused —
+    # a malformed field, a missing acknowledgement, the wrong version — and the
+    # test would pass with the kill switch removed entirely. The identical post
+    # must succeed once the operator turns the option back on.
+    monkeypatch.setenv(CUT_CARDS[option], "1")
+    allowed = api_harness.client.post(
+        "/onboarding/select/email_identity",
+        headers=origin,
+        data={
+            "csrf_token": world.session.csrf_token,
+            "idempotency_key": f"allowed-select-{option}",
+            "version": "1",
+            "kind": option,
+            "domain": "family.example.test",
+            "local_part": "assistant",
+            "special_category_restriction_acknowledged": "yes",
+            **_restriction_form_binding(),
+            **_household_form_binding(),
+        },
+        follow_redirects=False,
+    )
+    assert allowed.headers["location"] == "/onboarding", (
+        "the switch was not the reason the first post was refused"
+    )

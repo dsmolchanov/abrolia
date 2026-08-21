@@ -90,11 +90,21 @@ class EmailOption(StrEnum):
 
     @classmethod
     def from_selection(cls, kind: str) -> EmailOption:
-        return cls({
-            "abrolia_managed": cls.MANAGED_ABROLIA,
-            "gmail_agent": cls.GMAIL,
-            "family_domain": cls.OWN_DOMAIN,
-        }[kind])
+        return cls(_SELECTION_KINDS[kind])
+
+
+#: Selection kind -> option, in the order the onboarding page offers them.
+#:
+#: Ordered and module-level so the page can enumerate the options instead of
+#: hard-coding them a fourth time. `from_selection` reads the same mapping: the
+#: page must not be able to offer a kind the server cannot resolve.
+_SELECTION_KINDS = {
+    "abrolia_managed": EmailOption.MANAGED_ABROLIA,
+    "gmail_agent": EmailOption.GMAIL,
+    "family_domain": EmailOption.OWN_DOMAIN,
+}
+
+EMAIL_SELECTION_KINDS = tuple(_SELECTION_KINDS)
 
 
 class EmailIdentityStatus(StrEnum):

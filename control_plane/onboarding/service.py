@@ -264,6 +264,36 @@ class OnboardingService:
             StepKind.PRIMARY_CHANNEL: "fake-channel",
         }[kind]
 
+    def _require_email_option_offered(self, option: str) -> None:
+        """Refuse an option the deployment does not currently offer.
+
+        The one place that decides. `email_option_offered` is this question
+        asked without the exception, so the onboarding page and this gate cannot
+        answer it differently — the failure that predicate below was written for.
+        """
+        gated = GATED_EMAIL_OPTIONS.get(option)
+        if gated is None:
+            return
+        try:
+            check_provider_enabled(gated)
+        except RuntimeError as error:
+            raise InvalidTransition(str(error)) from error
+
+    def email_option_offered(self, option: str) -> bool:
+        """Whether the onboarding page should render this option at all.
+
+        Hiding a cut option is a courtesy, not the enforcement: the server
+        refuses it either way, and `ProvisioningWorker` refuses it again at the
+        provider call for work already queued. What this must not do is disagree
+        with the gate, so it asks the gate's own question rather than reading
+        the flag a second time.
+        """
+        try:
+            self._require_email_option_offered(option)
+        except InvalidTransition:
+            return False
+        return True
+
     def email_option_processes_real_content(self, option: str) -> bool:
         """Whether this email option routes to a provider handling real content.
 
@@ -322,12 +352,7 @@ class OnboardingService:
         # real content can arrive, so it runs ahead of the synthetic
         # early-return below: a disabled option stays disabled even where it
         # would route to a fake provider.
-        gated = GATED_EMAIL_OPTIONS.get(str(selection.get("kind") or ""))
-        if gated is not None:
-            try:
-                check_provider_enabled(gated)
-            except RuntimeError as error:
-                raise InvalidTransition(str(error)) from error
+        self._require_email_option_offered(str(selection.get("kind") or ""))
         # Gate on the PROVIDER this selection routes to, not on the managed
         # rollout flag. `gmail_agent` goes to `google-oauth` unconditionally —
         # it is a real provider even when `ABROLIA_REAL_EMAIL_ENABLED=0` — so
