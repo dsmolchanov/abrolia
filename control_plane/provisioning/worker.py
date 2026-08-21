@@ -1307,15 +1307,31 @@ class ProvisioningWorker:
         shutdown must not reach for one — mutating a withdrawn household's
         provider state to find out what it has is the failure, not the remedy.
 
-        What can be done safely is done. Anything recorded in
-        `external_resources` was already scheduled for teardown by
-        `disconnect_for_withdrawal`, and a reference this job carries in its own
-        request gets one here. What remains is state the provider may hold and
-        nobody wrote down, which is genuinely undiscoverable without a call this
-        must not make — so the job stays quarantined and the error code says an
-        operator's explicit reconcile is what settles it.
+        What can be done safely is done, and "safely" means reading durable
+        state — the database, and arithmetic on identifiers the control plane
+        already holds. Three sources, in order, none of them a provider call:
+
+        1. the immutable request, for a job that carried its reference in;
+        2. `external_ref_ciphertext`, which is where `settle` puts a
+           `ProviderWaiting.external_ref` — Google OAuth and Nerve BYO record
+           theirs there and nowhere else, so reading only the request left a
+           known binding or domain live after withdrawal;
+        3. the DERIVED org reference. `email_org_external_ref` is a pure
+           function of the household and the email identity, computed before
+           the first provider call rather than returned by it, so it is
+           knowable even when the call that used it timed out before anything
+           was written down. That is the case the previous version called
+           undiscoverable: it is not undiscoverable, it is derivable.
+
+        What genuinely remains beyond these is state under a reference nobody
+        can reconstruct, and there the job stays quarantined with the error code
+        naming the reconcile an operator has to run.
         """
         external_ref = request.get("external_ref")
+        if not (isinstance(external_ref, str) and external_ref):
+            external_ref = self._durable_external_ref(job)
+        if not (isinstance(external_ref, str) and external_ref):
+            external_ref = self._derived_email_org_ref(job, request)
         if isinstance(external_ref, str) and external_ref:
             cleanup = self._schedule_cancelled_waiting_cleanup(
                 job, request, external_ref
@@ -1323,6 +1339,31 @@ class ProvisioningWorker:
             if cleanup is not None:
                 return cleanup
         return self._shutdown_refusal(job, request)
+
+    def _durable_external_ref(self, job: JobRecord) -> str | None:
+        """The reference `settle` recorded, read from the database."""
+        try:
+            return self.jobs.external_ref(job.id)
+        except KeyError:
+            return None
+
+    def _derived_email_org_ref(
+        self, job: JobRecord, request: dict[str, Any]
+    ) -> str | None:
+        """The Nerve org reference, computed rather than looked up.
+
+        `NerveManagedEmailProvisioner.ensure` derives this from the household
+        and the identity BEFORE it calls anything, and uses it for every object
+        it creates. So a provider call that created an org and then timed out
+        leaves state whose reference this side can still name — which is what
+        makes teardown possible without asking the provider what it has.
+        """
+        if job.kind != "email_identity" or job.provider == "fake-email":
+            return None
+        identity_id = request.get("email_identity_id")
+        if not isinstance(identity_id, str) or not identity_id:
+            return None
+        return email_org_external_ref(job.household_id, identity_id)
 
     def _shutdown_refusal(self, job: JobRecord, request: dict[str, Any]) -> WorkResult:
         """Refuse to create, and keep the reason the job already carries.
@@ -1787,8 +1828,11 @@ class ProvisioningWorker:
                 # second one abandons exactly what the quarantine exists to
                 # clean up.
                 #
-                # `inspect` is read-only on every email provider, so a shutdown
-                # asks it and acts on the answer.
+                # It asks nothing. `inspect` is NOT read-only on any email
+                # provider — this comment used to say it was, which is the
+                # belief that put a mutating call in a withdrawal path — so the
+                # shutdown acts on durable state and on references it can
+                # derive. See `_shutdown_probe`.
                 return self._shutdown_probe(job, request)
             try:
                 result = reconcile_email(
