@@ -145,7 +145,8 @@ available only for durable bootstrap-secret cleanup.
 `tests/control_plane/*`, `tests/control_plane/email/*`,
 `tests/test_config_and_cli.py`, `tests/test_consent_withdrawal_runtime.py`,
 `tests/test_nerve_runtime.py`, `tests/test_runtime_dsar.py`,
-`tests/test_runtime_service.py`, `AGENTS.repo-invariants.md`.
+`tests/test_runtime_service.py`, `AGENTS.repo-invariants.md`,
+`control_plane/providers/email/*`.
 
 **Branches:** `codex/phase-A-controller-identity`.
 
@@ -165,6 +166,11 @@ reached further than that:
 - the test modules, which an inventory listing only implementation files cannot
   detect a change to. Step E9 recorded the same correction for the same reason.
 
+- `control_plane/providers/email/*` — the Nerve client and both provisioners.
+  Withdrawal has to reach state a timed-out call created, and the only
+  reference this side can compute is the org's; making that a teardown the
+  providers accept is what let the routes stay enabled rather than being
+  disabled until a new lifecycle exists.
 - `AGENTS.repo-invariants.md` — the withdrawal-teardown rule. `AGENTS.md` says
   a defect class reported twice is one missing rule rather than N findings, and
   "a shutdown must reach every reference it can name without asking the
