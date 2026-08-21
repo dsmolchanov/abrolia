@@ -24,7 +24,6 @@ from control_plane.privacy.consent import (
     HOUSEHOLD_CONTENT_PURPOSE,
     consent_version_and_sha,
 )
-from control_plane.providers.email.nerve_client import email_org_external_ref
 from control_plane.provisioning.contracts import (
     InspectResult,
     InspectState,
@@ -41,6 +40,7 @@ from control_plane.provisioning.fakes import (
 )
 from control_plane.provisioning.manifest_toml import manifest_to_toml
 from control_plane.provisioning.secrets import InMemorySecretSink
+from control_plane.repositories.jobs import requires_reconciliation
 
 BASE_TIME = 1_800_000_000.0
 _RESTRICTION_VERSION, _RESTRICTION_SHA = consent_version_and_sha(
@@ -1529,11 +1529,15 @@ def test_superseded_runtime_reconcile_absent_resolves_without_recreate(cp_stack)
 
 
 @pytest.mark.parametrize(
-    "carrier",
-    ["durable-reference", "derived-org-reference"],
+    ("carrier", "provider"),
+    [
+        ("durable-reference", "nerve-managed"),
+        ("derived-reference", "google-oauth"),
+        ("no-reference", "nerve-managed"),
+    ],
 )
 def test_a_shutdown_tears_down_what_it_can_name_without_asking_the_provider(
-    cp_stack, carrier
+    cp_stack, carrier, provider
 ) -> None:
     """Teardown reaches every reference the control plane can NAME.
 
@@ -1545,11 +1549,17 @@ def test_a_shutdown_tears_down_what_it_can_name_without_asking_the_provider(
     `external_ref_ciphertext`. A known binding or domain therefore stayed live
     after a withdrawal quarantined its job.
 
-    And a provider call that created an org before timing out records nothing
-    at all — which the previous version called undiscoverable. It is not:
-    `email_org_external_ref` is a pure function of the household and the
-    identity, computed BEFORE the first provider call and used for every object
-    created, so the reference is derivable even when nothing was written down.
+    Where nothing was recorded, derivation helps only if it yields the
+    provider's OWN teardown contract. Google's does: `deprovision` takes
+    `google-oauth:<identity_id>` and the identity id is in the request. Nerve's
+    does not — its `_Refs` carries provider-assigned org, webhook and key ids —
+    so a reference derived for Nerve would be one its deprovisioner refuses,
+    and scheduling it would manufacture a failed cleanup job in place of a
+    teardown. That case must schedule NOTHING and stay quarantined.
+
+    The three cases are parameterised over real provider names for a reason: an
+    earlier version used `fake-email`, whose fake accepts any reference, so the
+    test agreed with itself about a reference no real provider would take.
     """
     cp_stack.complete_profile()
     # A REAL email selection, carrying both Art 9(2)(a) receipts. A real
@@ -1604,15 +1614,15 @@ def test_a_shutdown_tears_down_what_it_can_name_without_asking_the_provider(
     # the provider being one that creates upstream state, so a fixture using
     # `fake-email` would exercise the gate rather than the behaviour.
     registry = ProviderRegistry()
-    registry.register("nerve-managed", RecordsEveryCall("email"))
+    registry.register(provider, RecordsEveryCall("email"))
     worker = cp_stack.make_worker(providers=registry, now=BASE_TIME + 3)
     # The job's provider is durable and the config is frozen, so the realistic
     # state is made by moving the row rather than by flipping a flag.
     with cp_stack.database.write() as connection:
         connection.execute(
-            "UPDATE provisioning_jobs SET provider = 'nerve-managed'"
+            "UPDATE provisioning_jobs SET provider = ?"
             " WHERE household_id = ? AND kind = 'email_identity'",
-            (cp_stack.household.id,),
+            (provider, cp_stack.household.id),
         )
     settled = worker.run_once()
     assert settled.status == "outcome_unknown", settled
@@ -1657,6 +1667,18 @@ def test_a_shutdown_tears_down_what_it_can_name_without_asking_the_provider(
         "SELECT id FROM provisioning_jobs WHERE household_id = ? AND kind = 'cleanup'",
         (cp_stack.household.id,),
     )
+    if carrier == "no-reference":
+        # Nerve, nothing recorded: there is no reference this side can build
+        # that its deprovisioner accepts, so nothing is scheduled and the job
+        # stays quarantined for an operator's explicit reconcile.
+        assert cleanup == [], (
+            "a cleanup was scheduled with a reference the provider will refuse"
+        )
+        quarantined = cp_stack.jobs.get(settled.job_id)
+        assert quarantined.status == "outcome_unknown"
+        assert requires_reconciliation(quarantined.error_code), quarantined
+        return
+
     assert cleanup, f"nothing was scheduled to tear down the {carrier}"
     # The reference on the cleanup job's own request. `external_resources`
     # stores it encrypted, so the plain-text assertion belongs here.
@@ -1667,4 +1689,5 @@ def test_a_shutdown_tears_down_what_it_can_name_without_asking_the_provider(
     if carrier == "durable-reference":
         assert "nerve:org:already-created" in refs, refs
     else:
-        assert email_org_external_ref(cp_stack.household.id, identity["id"]) in refs, refs
+        # The shape Google's own `deprovision` requires, not a lookup key.
+        assert f"google-oauth:{identity['id']}" in refs, refs

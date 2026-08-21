@@ -186,6 +186,16 @@ makes a review loop unable to terminate.
   Then: reading only the immutable request missed the reference Google OAuth and
   Nerve BYO persist through `settle`, leaving a known binding or domain live.
 
+  A derived reference counts only if it is the reference the job's OWN provider
+  accepts for teardown. Google's `deprovision` takes
+  `google-oauth:<identity_id>`, which is arithmetic on the request. Nerve's
+  decodes a `_Refs` of provider-assigned org, webhook and key ids, which nothing
+  here can construct — and scheduling an `email_org_external_ref` lookup key in
+  its place produces a cleanup the deprovisioner refuses: a failed job standing
+  in for a teardown, which is worse than scheduling nothing, because the inbox
+  is live either way and one of the two says it was handled. Where no acceptable
+  reference exists the job stays quarantined and says so.
+
   The rule is not "never look" and not "ask the provider" — it is that looking
   means reading what this side already knows. A reference computed before a
   provider call is knowable even when that call created state and then timed out

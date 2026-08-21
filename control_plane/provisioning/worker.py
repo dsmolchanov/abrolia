@@ -81,6 +81,11 @@ DNS_POLL_MAX_JOB_ATTEMPTS = 5
 #: created and then abandoned.
 COMPENSATED_STEP_KINDS = frozenset(CONTENT_RESOURCE_TYPES)
 
+#: The registered name of the Gmail provider, and the prefix of the reference
+#: its `deprovision` accepts. Named once because three places spell it and a
+#: teardown that spells it differently is a teardown the provider refuses.
+GOOGLE_OAUTH_PROVIDER = "google-oauth"
+
 
 def requires_current_content_restriction(
     kind: str, operation: str, provider: str
@@ -1034,7 +1039,7 @@ class ProvisioningWorker:
             if not isinstance(identity_id, str):
                 raise ProviderRejected("Gmail identity is missing")
             refs = public_result.get("provider_refs", {})
-            expected_ref = f"google-oauth:{identity_id}"
+            expected_ref = f"{GOOGLE_OAUTH_PROVIDER}:{identity_id}"
             if external_ref != expected_ref or refs.get("google_subject") != (
                 public_result.get("provider_subject")
             ):
@@ -1119,7 +1124,9 @@ class ProvisioningWorker:
             return {}, None
         if expected_provider == "gmail":
             typed = EmailGoogleOAuthPublicStatus.model_validate(public_result)
-            expected_ref = f"google-oauth:{request.get('email_identity_id', '')}"
+            expected_ref = (
+                f"{GOOGLE_OAUTH_PROVIDER}:{request.get('email_identity_id', '')}"
+            )
             if external_ref != expected_ref:
                 raise ValueError("Gmail waiting state has no durable identity reference")
             return typed.model_dump(mode="json", exclude_none=True), external_ref
@@ -1316,22 +1323,33 @@ class ProvisioningWorker:
            `ProviderWaiting.external_ref` — Google OAuth and Nerve BYO record
            theirs there and nowhere else, so reading only the request left a
            known binding or domain live after withdrawal;
-        3. the DERIVED org reference. `email_org_external_ref` is a pure
-           function of the household and the email identity, computed before
-           the first provider call rather than returned by it, so it is
-           knowable even when the call that used it timed out before anything
-           was written down. That is the case the previous version called
-           undiscoverable: it is not undiscoverable, it is derivable.
+        3. a DERIVED reference, but only where the provider's own teardown
+           contract is one this side can compute. Google's is:
+           `GoogleOAuthEmailProvisioner.deprovision` takes
+           `google-oauth:<identity_id>` and the identity id is in the request.
 
-        What genuinely remains beyond these is state under a reference nobody
-        can reconstruct, and there the job stays quarantined with the error code
-        naming the reconcile an operator has to run.
+        Nerve is not, and the difference matters more than the similarity.
+        `NerveManagedEmailProvisioner.deprovision` decodes a `_Refs` object
+        carrying the org, webhook and key ids the provider ASSIGNED; none of
+        them is derivable from anything this side holds. An earlier version
+        derived `email_org_external_ref` — a lookup key, not a teardown
+        reference — and scheduled it as the cleanup's `external_ref`. The
+        deprovisioner rejects it, so that produced a failed cleanup job and the
+        appearance of a teardown instead of one, which is worse than scheduling
+        nothing: the inbox stays live either way, and one of the two says it
+        was handled.
+
+        So for Nerve the job stays quarantined with the error code naming the
+        reconcile an operator has to run. Closing that properly needs either an
+        idempotent delete-by-`org_external_ref` on the provider, or a teardown
+        identity made durable before the first mutation. Both are lifecycle
+        changes, not a fix here.
         """
         external_ref = request.get("external_ref")
         if not (isinstance(external_ref, str) and external_ref):
             external_ref = self._durable_external_ref(job)
         if not (isinstance(external_ref, str) and external_ref):
-            external_ref = self._derived_email_org_ref(job, request)
+            external_ref = self._derived_teardown_ref(job, request)
         if isinstance(external_ref, str) and external_ref:
             cleanup = self._schedule_cancelled_waiting_cleanup(
                 job, request, external_ref
@@ -1347,23 +1365,24 @@ class ProvisioningWorker:
         except KeyError:
             return None
 
-    def _derived_email_org_ref(
+    def _derived_teardown_ref(
         self, job: JobRecord, request: dict[str, Any]
     ) -> str | None:
-        """The Nerve org reference, computed rather than looked up.
+        """A reference the job's OWN provider will accept for deprovision.
 
-        `NerveManagedEmailProvisioner.ensure` derives this from the household
-        and the identity BEFORE it calls anything, and uses it for every object
-        it creates. So a provider call that created an org and then timed out
-        leaves state whose reference this side can still name — which is what
-        makes teardown possible without asking the provider what it has.
+        Derivation is only useful where it produces the provider's teardown
+        contract. Google's is `google-oauth:<identity_id>` — arithmetic on a
+        value already in the request — so a call that created a binding and
+        then timed out is still tearable down. Nerve's is a `_Refs` object of
+        provider-assigned ids, so nothing here can construct it; returning a
+        lookup key instead would schedule a cleanup its deprovisioner refuses.
         """
-        if job.kind != "email_identity" or job.provider == "fake-email":
+        if job.kind != "email_identity" or job.provider != GOOGLE_OAUTH_PROVIDER:
             return None
         identity_id = request.get("email_identity_id")
         if not isinstance(identity_id, str) or not identity_id:
             return None
-        return email_org_external_ref(job.household_id, identity_id)
+        return f"{GOOGLE_OAUTH_PROVIDER}:{identity_id}"
 
     def _shutdown_refusal(self, job: JobRecord, request: dict[str, Any]) -> WorkResult:
         """Refuse to create, and keep the reason the job already carries.
