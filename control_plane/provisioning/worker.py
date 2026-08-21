@@ -36,7 +36,10 @@ from control_plane.privacy.consent import (
 )
 from control_plane.privacy.runtime import RUNTIME_REF
 from control_plane.privacy.withdraw import REVOKE_CONSENT_OPERATION
-from control_plane.providers.email.nerve_client import email_org_external_ref
+from control_plane.providers.email.nerve_client import (
+    email_org_external_ref,
+    org_teardown_ref,
+)
 from control_plane.provisioning.contracts import (
     InspectState,
     OutcomeUnknown,
@@ -85,6 +88,9 @@ COMPENSATED_STEP_KINDS = frozenset(CONTENT_RESOURCE_TYPES)
 #: its `deprovision` accepts. Named once because three places spell it and a
 #: teardown that spells it differently is a teardown the provider refuses.
 GOOGLE_OAUTH_PROVIDER = "google-oauth"
+
+#: The Nerve email routes, whose teardown reference is the computed org ref.
+NERVE_EMAIL_PROVIDERS = frozenset({"nerve-managed", "nerve-byo-domain"})
 
 
 def requires_current_content_restriction(
@@ -1328,22 +1334,19 @@ class ProvisioningWorker:
            `GoogleOAuthEmailProvisioner.deprovision` takes
            `google-oauth:<identity_id>` and the identity id is in the request.
 
-        Nerve is not, and the difference matters more than the similarity.
-        `NerveManagedEmailProvisioner.deprovision` decodes a `_Refs` object
-        carrying the org, webhook and key ids the provider ASSIGNED; none of
-        them is derivable from anything this side holds. An earlier version
-        derived `email_org_external_ref` — a lookup key, not a teardown
-        reference — and scheduled it as the cleanup's `external_ref`. The
-        deprovisioner rejects it, so that produced a failed cleanup job and the
-        appearance of a teardown instead of one, which is worse than scheduling
-        nothing: the inbox stays live either way, and one of the two says it
-        was handled.
+        Nerve's is too, now. Its `deprovision` used to take only a `_Refs`
+        object of provider-assigned ids, which nothing here can reconstruct —
+        so an org created by a call that then timed out was unreachable, and an
+        earlier version of this scheduled the org LOOKUP key as though it were
+        that contract, producing a cleanup the deprovisioner refused. Both
+        provisioners now also accept `nerve-org:<org_external_ref>` and resolve
+        it through `get_org`, a plain GET, deleting what is actually there.
+        Read-only discovery, tolerant deletes, idempotent: no key is issued and
+        no webhook rotated, which is what made `inspect` unusable here.
 
-        So for Nerve the job stays quarantined with the error code naming the
-        reconcile an operator has to run. Closing that properly needs either an
-        idempotent delete-by-`org_external_ref` on the provider, or a teardown
-        identity made durable before the first mutation. Both are lifecycle
-        changes, not a fix here.
+        What remains beyond these is state under a reference nobody can
+        reconstruct, and there the job stays quarantined with the error code
+        naming the reconcile an operator has to run.
         """
         external_ref = request.get("external_ref")
         if not (isinstance(external_ref, str) and external_ref):
@@ -1377,12 +1380,16 @@ class ProvisioningWorker:
         provider-assigned ids, so nothing here can construct it; returning a
         lookup key instead would schedule a cleanup its deprovisioner refuses.
         """
-        if job.kind != "email_identity" or job.provider != GOOGLE_OAUTH_PROVIDER:
+        if job.kind != "email_identity":
             return None
         identity_id = request.get("email_identity_id")
         if not isinstance(identity_id, str) or not identity_id:
             return None
-        return f"{GOOGLE_OAUTH_PROVIDER}:{identity_id}"
+        if job.provider == GOOGLE_OAUTH_PROVIDER:
+            return f"{GOOGLE_OAUTH_PROVIDER}:{identity_id}"
+        if job.provider in NERVE_EMAIL_PROVIDERS:
+            return org_teardown_ref(job.household_id, identity_id)
+        return None
 
     def _shutdown_refusal(self, job: JobRecord, request: dict[str, Any]) -> WorkResult:
         """Refuse to create, and keep the reason the job already carries.

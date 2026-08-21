@@ -24,6 +24,7 @@ from control_plane.privacy.consent import (
     HOUSEHOLD_CONTENT_PURPOSE,
     consent_version_and_sha,
 )
+from control_plane.providers.email.nerve_client import org_teardown_ref
 from control_plane.provisioning.contracts import (
     InspectResult,
     InspectState,
@@ -40,7 +41,6 @@ from control_plane.provisioning.fakes import (
 )
 from control_plane.provisioning.manifest_toml import manifest_to_toml
 from control_plane.provisioning.secrets import InMemorySecretSink
-from control_plane.repositories.jobs import requires_reconciliation
 
 BASE_TIME = 1_800_000_000.0
 _RESTRICTION_VERSION, _RESTRICTION_SHA = consent_version_and_sha(
@@ -1533,7 +1533,7 @@ def test_superseded_runtime_reconcile_absent_resolves_without_recreate(cp_stack)
     [
         ("durable-reference", "nerve-managed"),
         ("derived-reference", "google-oauth"),
-        ("no-reference", "nerve-managed"),
+        ("derived-org-reference", "nerve-managed"),
     ],
 )
 def test_a_shutdown_tears_down_what_it_can_name_without_asking_the_provider(
@@ -1667,18 +1667,6 @@ def test_a_shutdown_tears_down_what_it_can_name_without_asking_the_provider(
         "SELECT id FROM provisioning_jobs WHERE household_id = ? AND kind = 'cleanup'",
         (cp_stack.household.id,),
     )
-    if carrier == "no-reference":
-        # Nerve, nothing recorded: there is no reference this side can build
-        # that its deprovisioner accepts, so nothing is scheduled and the job
-        # stays quarantined for an operator's explicit reconcile.
-        assert cleanup == [], (
-            "a cleanup was scheduled with a reference the provider will refuse"
-        )
-        quarantined = cp_stack.jobs.get(settled.job_id)
-        assert quarantined.status == "outcome_unknown"
-        assert requires_reconciliation(quarantined.error_code), quarantined
-        return
-
     assert cleanup, f"nothing was scheduled to tear down the {carrier}"
     # The reference on the cleanup job's own request. `external_resources`
     # stores it encrypted, so the plain-text assertion belongs here.
@@ -1686,8 +1674,13 @@ def test_a_shutdown_tears_down_what_it_can_name_without_asking_the_provider(
         cp_stack.jobs.request(row["id"]).get("external_ref")
         for row in cleanup
     }
+    # Each is the shape that provider's OWN `deprovision` accepts. The point
+    # of naming them here rather than asserting "some reference" is that an
+    # earlier version scheduled an org LOOKUP key, which every real
+    # deprovisioner refuses.
     if carrier == "durable-reference":
         assert "nerve:org:already-created" in refs, refs
-    else:
-        # The shape Google's own `deprovision` requires, not a lookup key.
+    elif provider == "google-oauth":
         assert f"google-oauth:{identity['id']}" in refs, refs
+    else:
+        assert org_teardown_ref(cp_stack.household.id, identity["id"]) in refs, refs
