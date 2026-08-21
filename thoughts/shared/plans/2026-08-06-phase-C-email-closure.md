@@ -186,7 +186,29 @@ CREATE INDEX email_secret_installs_job_generation
 
 ### Slice C2 — BYO Domain Live (B-05)
 
-**Files:** `control_plane/providers/email/nerve_byo_domain.py`, `control_plane/api/email.py`, onboarding templates `control_plane/onboarding/*`, `control_plane/email/domain_policy.py`, `control_plane/provisioning/worker.py` (reuse C1 receipt), `tests/control_plane/email/test_byo*.py`, `docs/nerve-phase3-live-contract.md`.
+**Files:** `control_plane/providers/email/nerve_byo_domain.py`,
+`control_plane/api/email.py`, `control_plane/api/onboarding.py`,
+`control_plane/onboarding/*`, `control_plane/email/domain_policy.py`,
+`control_plane/email/repository.py`,
+`control_plane/provisioning/worker.py` (reuse C1 receipt),
+`tests/control_plane/email/test_byo*.py`,
+`tests/control_plane/email/byo_support.py`,
+`tests/control_plane/email/test_nerve_byo_domain.py`,
+`docs/nerve-phase3-live-contract.md`.
+
+**Branches:** `codex/phase-C2-byo-live-v3`.
+
+**Scope corrected 2026-08-21.** `test_byo*.py` covered the three new modules
+and not the two other files the split touched, and the API and repository
+changes the contract work needed were never listed:
+
+- `tests/control_plane/email/byo_support.py` — the fixtures and the selection
+  helper the split moved out of `test_nerve_byo_domain.py`. The glob does not
+  match it, and it is where every BYO selection is now built.
+- `tests/control_plane/email/test_nerve_byo_domain.py` — what remains after the
+  split, which the glob also does not match.
+- `control_plane/api/onboarding.py` and `control_plane/email/repository.py` —
+  the durable owned-domain record and the route that reads it.
 
 **No new code unless C1 receipt requires it.** Bounded backoff `30/60/120/300/600` seconds + manual `CHECK` button is the live policy; do not add unbounded polling.
 

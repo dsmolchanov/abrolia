@@ -28,8 +28,8 @@ from control_plane.container import ControlPlaneContainer
 from control_plane.db import MIGRATIONS_DIR, ControlPlaneDatabase
 from control_plane.models import USER_STEPS, WorkflowState
 from control_plane.privacy.consent import (
-    CURRENT_RESTRICTION_RECEIPT_SQL,
-    consent_version_and_sha,
+    CURRENT_RECEIPT_SQL,
+    current_receipt_params,
 )
 from control_plane.provisioning.contracts import ProviderRejected
 from control_plane.provisioning.fly import FlyRuntimeProvisioner
@@ -475,10 +475,9 @@ def _holds_current_restriction(
     container: ControlPlaneContainer, household_id: str
 ) -> bool:
     """The worker's own precondition, asked with the worker's own SQL."""
-    version, sha256 = consent_version_and_sha(CONTENT_RESTRICTION_PURPOSE)
     return container.database.query_one(
-        CURRENT_RESTRICTION_RECEIPT_SQL,
-        (household_id, CONTENT_RESTRICTION_PURPOSE, version, sha256),
+        CURRENT_RECEIPT_SQL,
+        current_receipt_params(household_id, CONTENT_RESTRICTION_PURPOSE),
     ) is not None
 
 

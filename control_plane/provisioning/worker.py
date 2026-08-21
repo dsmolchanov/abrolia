@@ -26,10 +26,20 @@ from control_plane.models import StepKind, StepStatus
 from control_plane.observability import StructuredLogger
 from control_plane.onboarding.state import VERIFY_RESULT, next_status
 from control_plane.privacy.consent import (
-    CURRENT_RESTRICTION_RECEIPT_SQL,
-    consent_version_and_sha,
+    CONTENT_RESOURCE_TYPES,
+    CONTENT_RESTRICTION_PURPOSE,
+    CURRENT_RECEIPT_SQL,
+    HOUSEHOLD_CONTENT_PURPOSE,
+    current_receipt_params,
+    manifest_required_purposes,
+    processes_real_household_content,
 )
-from control_plane.providers.email.nerve_client import email_org_external_ref
+from control_plane.privacy.runtime import RUNTIME_REF
+from control_plane.privacy.withdraw import REVOKE_CONSENT_OPERATION
+from control_plane.providers.email.nerve_client import (
+    email_org_external_ref,
+    org_teardown_ref,
+)
 from control_plane.provisioning.contracts import (
     InspectState,
     OutcomeUnknown,
@@ -43,7 +53,11 @@ from control_plane.provisioning.contracts import (
 from control_plane.provisioning.planner import DesiredSpecPlanner
 from control_plane.repositories.configs import ConfigRepository
 from control_plane.repositories.households import HouseholdsRepository
-from control_plane.repositories.jobs import JobRecord, JobsRepository
+from control_plane.repositories.jobs import (
+    JobRecord,
+    JobsRepository,
+    requires_reconciliation,
+)
 from control_plane.repositories.onboarding import OnboardingRepository, WorkflowRecord
 
 
@@ -62,6 +76,22 @@ DNS_POLL_DELAYS_SECONDS = (30.0, 60.0, 120.0, 300.0, 600.0)
 DNS_POLL_MAX_JOB_ATTEMPTS = len(DNS_POLL_DELAYS_SECONDS) + 1
 
 
+#: Step kinds whose late `ProviderWaiting` reference gets a teardown job. These
+#: are the kinds that can create a resource at a provider before recording it,
+#: and the set is derived from the withdrawal scope so the two cannot drift: a
+#: kind that withdrawal quarantines but this does not compensate is a resource
+#: created and then abandoned.
+COMPENSATED_STEP_KINDS = frozenset(CONTENT_RESOURCE_TYPES)
+
+#: The registered name of the Gmail provider, and the prefix of the reference
+#: its `deprovision` accepts. Named once because three places spell it and a
+#: teardown that spells it differently is a teardown the provider refuses.
+GOOGLE_OAUTH_PROVIDER = "google-oauth"
+
+#: The Nerve email routes, whose teardown reference is the computed org ref.
+NERVE_EMAIL_PROVIDERS = frozenset({"nerve-managed", "nerve-byo-domain"})
+
+
 def requires_current_content_restriction(
     kind: str, operation: str, provider: str
 ) -> bool:
@@ -69,7 +99,7 @@ def requires_current_content_restriction(
 
     Shared with `onboarding.provision`, which reports what the worker will do
     and therefore has to ask the worker's own question rather than restate it —
-    the same remedy `CURRENT_RESTRICTION_RECEIPT_SQL` gave the receipt lookup.
+    the same remedy `CURRENT_RECEIPT_SQL` gave the receipt lookup.
     Restating it meant the report checked only an already-planned runtime job
     while the gate also covers every non-fake email-identity job.
     """
@@ -95,6 +125,8 @@ class ProvisioningWorker:
         bootstrap_ttl_seconds: int = 3600,
         max_safe_attempts: int = 5,
         logger: StructuredLogger | None = None,
+        # Injected so tests can drive the withdrawal push without a network.
+        runtime_client: Any | None = None,
         clock=time.time,
     ) -> None:
         self.jobs = jobs
@@ -110,6 +142,7 @@ class ProvisioningWorker:
         self.bootstrap_ttl_seconds = bootstrap_ttl_seconds
         self.max_safe_attempts = max_safe_attempts
         self.logger = logger
+        self._runtime_client = runtime_client
         self.clock = clock
 
     def run_once(self) -> WorkResult | None:
@@ -189,9 +222,15 @@ class ProvisioningWorker:
         request = self.jobs.request(job.id)
         if job.kind == "bootstrap_cleanup":
             return self._cleanup_bootstrap(job, request)
+        if job.operation == REVOKE_CONSENT_OPERATION:
+            # Deliberately ahead of the consent precondition below: this job
+            # exists precisely because a consent was withdrawn, so gating it on
+            # holding that consent would make withdrawal unenforceable.
+            return self._revoke_runtime_consent(job, request)
         if (
             self._requires_current_email_content_restriction(job)
-            and not self._has_current_email_content_restriction(job.household_id)
+            and not self._is_shutdown_action(job)
+            and self._missing_current_consent_purpose(job) is not None
         ):
             return self._block_for_missing_content_restriction(job, request)
         provider = None
@@ -208,7 +247,7 @@ class ProvisioningWorker:
                     )
                 result = ensure_namespace(request["household_id"], job.intent_key)
                 current = self.jobs.get(job.id)
-                if current is None or current.status == "cancelled":
+                if self._superseded(current):
                     return self._cleanup_cancelled_namespace(job, result, provider)
                 return self._finish_secret_namespace(job, result)
             provider_request = request
@@ -293,7 +332,7 @@ class ProvisioningWorker:
                     else provider.ensure(provider_request, job.intent_key)
                 )
             current = self.jobs.get(job.id)
-            if current is None or current.status == "cancelled":
+            if self._superseded(current):
                 return self._cleanup_cancelled_result(job, result, provider)
             if job.kind == "runtime":
                 return self._finish_runtime(job, request, result, provider)
@@ -314,6 +353,13 @@ class ProvisioningWorker:
             return self._cleanup_cancelled_result(job, result, provider)
         except ProviderRateLimited as error:
             current = self.jobs.get(job.id)
+            # Deliberately NOT `_superseded` here. That predicate answers "was
+            # anything created that must be undone", and a rate-limited call
+            # created nothing. A quarantined job falls through instead, where
+            # `retry_later` already refuses to revive a `_requires_reconciliation`
+            # intent and `_durable_work_result` reports the quarantine it is
+            # actually in — which is strictly more informative than collapsing
+            # it to "cancelled" here.
             if current is None or current.status == "cancelled":
                 return WorkResult(job.id, "cancelled")
             if job.attempts >= self.max_safe_attempts:
@@ -350,18 +396,114 @@ class ProvisioningWorker:
                 job, request, "outcome_unknown", "outcome_unknown"
             )
 
+    @property
+    def runtime_client(self) -> Any:
+        if self._runtime_client is None:
+            import httpx
+
+            self._runtime_client = httpx.Client(timeout=10.0, follow_redirects=False)
+        return self._runtime_client
+
+    def _revoke_runtime_consent(
+        self, job: JobRecord, request: dict[str, Any]
+    ) -> WorkResult:
+        """Tell a live runtime to stop, because a consent behind it was withdrawn.
+
+        The receipt is already revoked before this job is created, so every
+        control-plane boundary is closed regardless of what happens here. What
+        is still open is the instance already serving: it re-reads a local
+        manifest whose embedded receipt stays valid-looking forever, so only a
+        signal delivered to that instance stops it.
+
+        Unreachable is `outcome_unknown`, never `failed`: the job must keep
+        retrying until the runtime confirms, because the family has a right to
+        the withdrawal and not merely to an attempt at it.
+        """
+        runtime_ref = str(request.get("runtime_ref") or "")
+        if not RUNTIME_REF.fullmatch(runtime_ref):
+            return self._mark_step_problem(
+                job, request, "failed", "runtime_ref_invalid"
+            )
+        token = self.configs.token_hasher.digest(f"runtime-dsar:{runtime_ref}")
+        try:
+            # The withdrawn generation goes with the request so the runtime can
+            # tell a stop meant for the revision it is serving from one left
+            # over by an earlier consent cycle at the same stable reference.
+            receipt_ids = [
+                receipt
+                for receipt in (request.get("receipt_ids") or [])
+                if isinstance(receipt, str) and receipt
+            ]
+            response = self.runtime_client.post(
+                f"http://{runtime_ref}.internal:8080/internal/v1/consent/revoke",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                },
+                content=json.dumps({"receipt_ids": receipt_ids}).encode("utf-8"),
+                timeout=10.0,
+            )
+        except Exception:
+            return WorkResult(job.id, "outcome_unknown", "runtime_unreachable")
+        # 410 is "already deleted": nothing left to stop, so the withdrawal is
+        # satisfied exactly as it is by a 200. Both must SETTLE — an unsettled
+        # job stays `running`, its lease expires, and the reclaimer resends an
+        # already-satisfied revocation forever.
+        if response.status_code not in (200, 410):
+            return WorkResult(job.id, "outcome_unknown", "runtime_refused")
+        now = self.clock()
+        with self.jobs.db.write() as connection:
+            self.jobs.settle(connection, job.id, status="succeeded", now=now)
+        return WorkResult(job.id, "succeeded")
+
+    def _required_consent_purposes(self, job: JobRecord) -> list[str]:
+        """Every purpose this job's household must currently hold.
+
+        For a runtime job that is whatever the revision being provisioned
+        declares authoritative, so this worker and the runtime that consumes the
+        same manifest cannot disagree about which consents are in force. For an
+        email identity it is derived from the provider being contacted: a real
+        provider can deliver real family content, which needs the Art. 9(2)(a)
+        consent as well as the S5 restriction.
+        """
+        if job.kind == "runtime" and job.desired_revision is not None:
+            try:
+                manifest = self.configs.manifest(
+                    job.household_id, job.desired_revision
+                )
+            except KeyError:
+                # No revision to read means nothing to relax: fall back to the
+                # floor that every household owes.
+                return [CONTENT_RESTRICTION_PURPOSE]
+            return manifest_required_purposes(manifest)
+        purposes = [CONTENT_RESTRICTION_PURPOSE]
+        if processes_real_household_content(job.provider):
+            purposes.append(HOUSEHOLD_CONTENT_PURPOSE)
+        return purposes
+
+    def _missing_current_consent_purpose(self, job: JobRecord) -> str | None:
+        """The first required purpose the household does not currently hold."""
+        for purpose in self._required_consent_purposes(job):
+            if self.jobs.db.query_one(
+                CURRENT_RECEIPT_SQL,
+                current_receipt_params(job.household_id, purpose),
+            ) is None:
+                return purpose
+        return None
+
     def _has_current_email_content_restriction(self, household_id: str) -> bool:
-        version, sha256 = consent_version_and_sha(
-            "special_category_content_restriction"
-        )
+        """The content restriction, asked through the general predicate.
+
+        Step E1 shares this precondition with `onboarding.provision`, which
+        reports what the worker will do; Phase A generalised the same question
+        to every purpose a manifest can require. Keeping both spellings would
+        be two chances to disagree about one thing, which is the defect each
+        change was made to remove — so the narrow question is the general one
+        with `CONTENT_RESTRICTION_PURPOSE` bound, and there is one predicate.
+        """
         return self.jobs.db.query_one(
-            CURRENT_RESTRICTION_RECEIPT_SQL,
-            (
-                household_id,
-                "special_category_content_restriction",
-                version,
-                sha256,
-            ),
+            CURRENT_RECEIPT_SQL,
+            current_receipt_params(household_id, CONTENT_RESTRICTION_PURPOSE),
         ) is not None
 
     @staticmethod
@@ -517,12 +659,20 @@ class ProvisioningWorker:
                 return self._mark_step_problem(
                     job, request, "outcome_unknown", "provider_result_invalid"
                 )
-            if external_ref is not None:
-                cleanup = self._schedule_cancelled_waiting_cleanup(
-                    job, request, external_ref
-                )
-                if cleanup is not None:
-                    return cleanup
+        # Every kind that can hold a quarantined external reference, not just
+        # email. Withdrawal quarantines WhatsApp and channel jobs too now, and
+        # this compensation stayed email-only — so a late `ProviderWaiting`
+        # carrying a newly created reference fell through to
+        # `_mark_step_problem`, which sees the quarantine and returns WITHOUT
+        # recording the reference or scheduling a teardown. An identity created
+        # at the provider, with nothing in our database that would ever delete
+        # it: the same shape as the email leak this path was written to close.
+        if external_ref is not None and job.kind in COMPENSATED_STEP_KINDS:
+            cleanup = self._schedule_cancelled_waiting_cleanup(
+                job, request, external_ref
+            )
+            if cleanup is not None:
+                return cleanup
         return self._mark_step_problem(
             job,
             request,
@@ -541,8 +691,7 @@ class ProvisioningWorker:
         if (
             current is None
             or current["status"] != "outcome_unknown"
-            or current["error_code"]
-            not in {"cancel_requires_reconciliation", "reset_requires_reconciliation"}
+            or not requires_reconciliation(current["error_code"])
         ):
             return None
         with self.jobs.db.write() as connection:
@@ -563,7 +712,10 @@ class ProvisioningWorker:
                 desired_revision=job.desired_revision,
                 request={
                     "resource_id": resource_id,
-                    "resource_type": "email_identity",
+                    # The job's OWN kind. Hard-coding `email_identity` here
+                    # would hand the cleanup worker a WhatsApp reference
+                    # labelled as an inbox.
+                    "resource_type": job.kind,
                     "external_ref": external_ref,
                     "email_identity_id": request.get("email_identity_id"),
                     "parent_job_id": job.id,
@@ -892,7 +1044,7 @@ class ProvisioningWorker:
             if not isinstance(identity_id, str):
                 raise ProviderRejected("Gmail identity is missing")
             refs = public_result.get("provider_refs", {})
-            expected_ref = f"google-oauth:{identity_id}"
+            expected_ref = f"{GOOGLE_OAUTH_PROVIDER}:{identity_id}"
             if external_ref != expected_ref or refs.get("google_subject") != (
                 public_result.get("provider_subject")
             ):
@@ -977,7 +1129,9 @@ class ProvisioningWorker:
             return {}, None
         if expected_provider == "gmail":
             typed = EmailGoogleOAuthPublicStatus.model_validate(public_result)
-            expected_ref = f"google-oauth:{request.get('email_identity_id', '')}"
+            expected_ref = (
+                f"{GOOGLE_OAUTH_PROVIDER}:{request.get('email_identity_id', '')}"
+            )
             if external_ref != expected_ref:
                 raise ValueError("Gmail waiting state has no durable identity reference")
             return typed.model_dump(mode="json", exclude_none=True), external_ref
@@ -1150,6 +1304,148 @@ class ProvisioningWorker:
             request,
             "failed",
             inspected.error_code or "provider_absent",
+        )
+
+    def _shutdown_probe(
+        self, job: JobRecord, request: dict[str, Any]
+    ) -> WorkResult:
+        """Tear down what is RECORDED, and never ask the provider.
+
+        The previous version called `provider.inspect`, on the belief that it is
+        read-only. It is not. `NerveManagedEmailProvisioner.inspect` routes to
+        `_recover_and_probe`, which deletes and reissues the API key and rotates
+        the webhook; `GoogleOAuthEmailProvisioner.inspect_intent` calls `ensure`
+        outright. There is no reliably read-only inspector to reach for, so a
+        shutdown must not reach for one — mutating a withdrawn household's
+        provider state to find out what it has is the failure, not the remedy.
+
+        What can be done safely is done, and "safely" means reading durable
+        state — the database, and arithmetic on identifiers the control plane
+        already holds. Three sources, in order, none of them a provider call:
+
+        1. the immutable request, for a job that carried its reference in;
+        2. `external_ref_ciphertext`, which is where `settle` puts a
+           `ProviderWaiting.external_ref` — Google OAuth and Nerve BYO record
+           theirs there and nowhere else, so reading only the request left a
+           known binding or domain live after withdrawal;
+        3. a DERIVED reference, but only where the provider's own teardown
+           contract is one this side can compute. Google's is:
+           `GoogleOAuthEmailProvisioner.deprovision` takes
+           `google-oauth:<identity_id>` and the identity id is in the request.
+
+        Nerve's is too, now. Its `deprovision` used to take only a `_Refs`
+        object of provider-assigned ids, which nothing here can reconstruct —
+        so an org created by a call that then timed out was unreachable, and an
+        earlier version of this scheduled the org LOOKUP key as though it were
+        that contract, producing a cleanup the deprovisioner refused. Both
+        provisioners now also accept `nerve-org:<org_external_ref>` and resolve
+        it through `get_org`, a plain GET, deleting what is actually there.
+        Read-only discovery, tolerant deletes, idempotent: no key is issued and
+        no webhook rotated, which is what made `inspect` unusable here.
+
+        What remains beyond these is state under a reference nobody can
+        reconstruct, and there the job stays quarantined with the error code
+        naming the reconcile an operator has to run.
+        """
+        external_ref = request.get("external_ref")
+        if not (isinstance(external_ref, str) and external_ref):
+            external_ref = self._durable_external_ref(job)
+        if not (isinstance(external_ref, str) and external_ref):
+            external_ref = self._derived_teardown_ref(job, request)
+        if isinstance(external_ref, str) and external_ref:
+            cleanup = self._schedule_cancelled_waiting_cleanup(
+                job, request, external_ref
+            )
+            if cleanup is not None:
+                return cleanup
+        return self._shutdown_refusal(job, request)
+
+    def _durable_external_ref(self, job: JobRecord) -> str | None:
+        """The reference `settle` recorded, read from the database."""
+        try:
+            return self.jobs.external_ref(job.id)
+        except KeyError:
+            return None
+
+    def _derived_teardown_ref(
+        self, job: JobRecord, request: dict[str, Any]
+    ) -> str | None:
+        """A reference the job's OWN provider will accept for deprovision.
+
+        Derivation is only useful where it produces the provider's teardown
+        contract. Google's is `google-oauth:<identity_id>` — arithmetic on a
+        value already in the request — so a call that created a binding and
+        then timed out is still tearable down. Nerve's is a `_Refs` object of
+        provider-assigned ids, so nothing here can construct it; returning a
+        lookup key instead would schedule a cleanup its deprovisioner refuses.
+        """
+        if job.kind != "email_identity":
+            return None
+        identity_id = request.get("email_identity_id")
+        if not isinstance(identity_id, str) or not identity_id:
+            return None
+        if job.provider == GOOGLE_OAUTH_PROVIDER:
+            return f"{GOOGLE_OAUTH_PROVIDER}:{identity_id}"
+        if job.provider in NERVE_EMAIL_PROVIDERS:
+            return org_teardown_ref(job.household_id, identity_id)
+        return None
+
+    def _shutdown_refusal(self, job: JobRecord, request: dict[str, Any]) -> WorkResult:
+        """Refuse to create, and keep the reason the job already carries.
+
+        A quarantined job stays quarantined; what it must not do is build new
+        upstream state. Overwriting `reset_requires_reconciliation` with a
+        generic code would erase which command an operator was told to run, for
+        no gain — the same argument that stopped the withdrawal sweep
+        overwriting an existing quarantine reason.
+        """
+        current = self.jobs.db.query_one(
+            "SELECT error_code FROM provisioning_jobs WHERE id = ?", (job.id,)
+        )
+        code = current["error_code"] if current is not None else None
+        return self._mark_step_problem(
+            job,
+            request,
+            "outcome_unknown",
+            code if requires_reconciliation(code) else "shutdown_requires_no_new_resource",
+        )
+
+    def _is_shutdown_action(self, job: JobRecord) -> bool:
+        """Work that exists BECAUSE a consent went away.
+
+        `revoke_consent` was already exempt from the consent precondition, with
+        the reasoning that gating it on holding the withdrawn consent would make
+        withdrawal unenforceable. A quarantined job is the same kind of work:
+        withdrawal settles an ambiguous provider call `outcome_unknown` so an
+        operator can reconcile it, and reconciling it means finding and tearing
+        down whatever the provider may have created. Requiring the consent that
+        the withdrawal necessarily revoked made that teardown unreachable — the
+        job settled `failed` at the precondition without the inbox ever being
+        inspected.
+        """
+        if job.operation == REVOKE_CONSENT_OPERATION:
+            return True
+        current = self.jobs.db.query_one(
+            "SELECT error_code FROM provisioning_jobs WHERE id = ?", (job.id,)
+        )
+        return current is not None and requires_reconciliation(current["error_code"])
+
+    def _superseded(self, current: JobRecord | None) -> bool:
+        """Has this intent stopped being the one the household still wants?
+
+        Every barrier below asks the same question after a provider call
+        returns, and each used to ask it as `current.status == "cancelled"`.
+        That missed the quarantine: cancel, reset and withdrawal supersede a
+        RUNNING job by settling it `outcome_unknown` with a
+        `_requires_reconciliation` code, never `cancelled`. A result arriving
+        afterwards was therefore recorded as an ordinary success, which for a
+        withdrawn household meant an inbox that kept receiving with no teardown
+        job attached to it.
+        """
+        return (
+            current is None
+            or current.status == "cancelled"
+            or requires_reconciliation(current.error_code)
         )
 
     def _cleanup_cancelled_result(
@@ -1378,9 +1674,15 @@ class ProvisioningWorker:
         request = self.jobs.request(job.id)
         if job.kind == "bootstrap_cleanup":
             return self._cleanup_bootstrap(job, request)
+        if job.operation == REVOKE_CONSENT_OPERATION:
+            # Deliberately ahead of the consent precondition below: this job
+            # exists precisely because a consent was withdrawn, so gating it on
+            # holding that consent would make withdrawal unenforceable.
+            return self._revoke_runtime_consent(job, request)
         if (
             self._requires_current_email_content_restriction(job)
-            and not self._has_current_email_content_restriction(job.household_id)
+            and not self._is_shutdown_action(job)
+            and self._missing_current_consent_purpose(job) is not None
         ):
             return self._block_for_missing_content_restriction(job, request)
         provider = self.providers.get(job.provider)
@@ -1452,7 +1754,7 @@ class ProvisioningWorker:
                 try:
                     result = ensure_namespace(request["household_id"], job.intent_key)
                     current = self.jobs.get(job.id)
-                    if current is None or current.status == "cancelled":
+                    if self._superseded(current):
                         return self._cleanup_cancelled_namespace(job, result, provider)
                     return self._finish_secret_namespace(job, result)
                 except _ProjectionCancelled:
@@ -1499,6 +1801,14 @@ class ProvisioningWorker:
                         inspected.error_code or "provider_rejected",
                     )
                 if inspected.state in {InspectState.ABSENT, InspectState.PENDING}:
+                    if self._is_shutdown_action(job):
+                        # A quarantined job is reconciled to find and remove
+                        # provider state, never to make more of it. Skipping the
+                        # consent precondition above is what lets the INSPECTION
+                        # happen; re-running `prepare` under that exemption
+                        # would hand a withdrawn household a brand-new resource,
+                        # which is the opposite of what the quarantine is for.
+                        return self._shutdown_refusal(job, request)
                     prepared = (
                         provider.prepare(request, job.intent_key)
                         if split_runtime
@@ -1531,6 +1841,24 @@ class ProvisioningWorker:
                 "selection": request["selection"],
                 "secret_namespace_ref": namespace_ref,
             }
+            if self._is_shutdown_action(job):
+                # `NerveManagedEmailProvisioner.reconcile` and its BYO-domain
+                # sibling delegate straight to `ensure`, which resumes the
+                # provisioning graph and can create an org, a domain, an inbox,
+                # a key or a webhook. So this must not call `reconcile` — but
+                # the first version of this guard simply returned, which refused
+                # the INSPECTION too and left the job permanently
+                # `outcome_unknown` with the inbox never found. Refusing to
+                # create and refusing to look are not the same refusal, and the
+                # second one abandons exactly what the quarantine exists to
+                # clean up.
+                #
+                # It asks nothing. `inspect` is NOT read-only on any email
+                # provider — this comment used to say it was, which is the
+                # belief that put a mutating call in a withdrawal path — so the
+                # shutdown acts on durable state and on references it can
+                # derive. See `_shutdown_probe`.
+                return self._shutdown_probe(job, request)
             try:
                 result = reconcile_email(
                     provider_request,
@@ -1652,11 +1980,7 @@ class ProvisioningWorker:
                 return WorkResult(job.id, "outcome_unknown", error_code)
             if (
                 current["status"] == "outcome_unknown"
-                and current["error_code"]
-                in {
-                    "cancel_requires_reconciliation",
-                    "reset_requires_reconciliation",
-                }
+                and requires_reconciliation(current["error_code"])
                 and job_status == "waiting_user"
             ):
                 # cancel/reset deliberately quarantined this in-flight intent.
@@ -1951,12 +2275,30 @@ class ProvisioningWorker:
         }
         with self.jobs.db.write() as connection:
             current_job = connection.execute(
-                "SELECT status FROM provisioning_jobs WHERE id = ?", (job.id,)
+                "SELECT status, error_code FROM provisioning_jobs WHERE id = ?",
+                (job.id,),
             ).fetchone()
             if current_job is None or current_job["status"] not in {
                 "running",
                 "outcome_unknown",
             }:
+                raise _ProjectionCancelled
+            if requires_reconciliation(current_job["error_code"]):
+                # The barrier before the provider call is not enough on its own.
+                # `_superseded` reads the job, the provider call takes as long as
+                # it takes, and a cancel, reset or withdrawal committing in that
+                # window leaves the job `outcome_unknown` with a
+                # `_requires_reconciliation` code — which this transaction used
+                # to accept, because it tested only the status. The disconnecting
+                # identity then failed `mark_verified` and the provider's newly
+                # created inbox was discarded with no `external_resources` row
+                # and no cleanup job: an untracked mailbox still receiving after
+                # withdrawal, which is the exact outcome the quarantine exists
+                # to prevent.
+                #
+                # Re-read INSIDE the write transaction, which is the only place
+                # the answer cannot go stale, and raise into the same
+                # compensation the cancelled path uses.
                 raise _ProjectionCancelled
             step = connection.execute(
                 "SELECT * FROM onboarding_steps WHERE workflow_id = ? AND kind = ?",

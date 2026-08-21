@@ -35,7 +35,14 @@ PLANS = REPOSITORY / "thoughts" / "shared" / "plans"
 #: Backticked tokens in an inventory line. Prose outside the backticks —
 #: "(if new columns needed)" — is commentary, not a path.
 _QUOTED = re.compile(r"`([^`]+)`")
-_INVENTORY = re.compile(r"^\*\*Files:\*\*(.*)$", re.MULTILINE)
+#: A `**Files:**` inventory, to the end of its PARAGRAPH. Anchoring to the end
+#: of the LINE read only the first line of a wrapped list — Step E9's runs to
+#: four — so most of its declared paths were invisible and every one of them
+#: looked undeclared. It failed closed, which is the right direction to be
+#: wrong in, and it was still wrong.
+_INVENTORY = re.compile(
+    r"^\*\*Files:\*\*(.*?)(?=\n[ \t]*\n|\Z)", re.MULTILINE | re.DOTALL
+)
 #: `hermes_cloud/execute/{email_send,nerve_send}.py`, as plans write it.
 _BRACES = re.compile(r"\{([^}]*)\}")
 
@@ -375,3 +382,31 @@ def test_a_branch_no_step_claims_is_a_hard_failure(tmp_path, monkeypatch) -> Non
 
     with pytest.raises(pytest.fail.Exception, match="0 plan steps claim the branch"):
         test_every_changed_path_is_declared_by_this_branch_s_plan_step()
+
+
+def test_a_wrapped_inventory_is_read_in_full(tmp_path) -> None:
+    """Real inventories wrap, and a line-anchored pattern reads one line of them.
+
+    Step E9's `**Files:**` runs to four lines. Matching to the end of the LINE
+    saw the first and reported every path on the others undeclared — a check
+    that fails closed, which is the right direction, and is still wrong.
+    """
+    plans = tmp_path / "plans"
+    plans.mkdir()
+    (plans / "wrapped.md").write_text(
+        "#### Step W\n\n"
+        "**Files:** `a/first.py`, `a/second.py`,\n"
+        "`a/third.py`,\n"
+        "`a/fourth.py`.\n\n"
+        "**Branches:** `some/branch`.\n\n"
+        "Prose after the inventory mentioning `a/not_declared.py` in passing.\n",
+        encoding="utf-8",
+    )
+
+    (_name, patterns, branches), = _steps(plans)
+
+    assert patterns == {"a/first.py", "a/second.py", "a/third.py", "a/fourth.py"}
+    assert branches == {"some/branch"}
+    # The paragraph, and not a word past it: prose below an inventory is not a
+    # declaration, or a plan could accidentally declare anything it discusses.
+    assert "a/not_declared.py" not in patterns

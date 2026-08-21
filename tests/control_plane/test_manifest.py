@@ -61,7 +61,7 @@ def _manifest(**changes) -> DesiredHouseholdSpecV1:
         "config_revision": 1,
         "family_language": "en",
         "timezone": "Europe/Prague",
-        "country_code": "CZ",
+        "country_code": "DE",
         "residency_mode": "eu-app",
         "actors": ActorsV1(owner="synthetic-owner", family=("synthetic-owner",)),
         "channels": ChannelsV1(primary="telegram"),
