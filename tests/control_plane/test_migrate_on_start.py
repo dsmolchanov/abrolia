@@ -4450,3 +4450,53 @@ def test_no_ownership_check_accepts_a_recycled_inode(tmp_path, site) -> None:
         # And nothing is left behind either way.
         assert list(source.iterdir()) == [], list(source.iterdir())
         assert list(destination.iterdir()) == [], list(destination.iterdir())
+
+
+def test_a_source_replaced_before_the_link_leaves_the_target_paused(
+    tmp_path, monkeypatch
+) -> None:
+    """The window between capturing the token and `os.link` consuming the name.
+
+    Publishing from the pinned descriptor would close it, and Python cannot:
+    `linkat(AT_EMPTY_PATH)` needs a privilege this process does not have. So
+    the question is what the code does when the window is used — and the answer
+    has to be that nothing startable is left behind.
+    """
+    seed = _database(tmp_path)
+    seed.migrate()
+    archive = tmp_path / "restore-point.cpb"
+    backup_module.create_backup(seed, archive, backup_key=BACKUP_KEY_BYTES)
+    seed.close()
+    destination = tmp_path / "restored" / "control-plane.db"
+    destination.parent.mkdir()
+    marker = backup_module._pause_marker(destination)
+    replaced: list[Path] = []
+    raw_link = os.link
+
+    def link(source, target, **keywords):
+        source = Path(source)
+        # Only the DATABASE publication, and only once: the marker publishes
+        # first and must be allowed to succeed.
+        if not replaced and Path(target) == destination:
+            replacement = source.with_name("an-imposter")
+            replacement.write_bytes(b"a database nobody restored")
+            os.replace(replacement, source)
+            replaced.append(source)
+        return raw_link(source, target, **keywords)
+
+    monkeypatch.setattr(backup_module.os, "link", link)
+
+    with pytest.raises(OSError) as raised:
+        backup_module.restore_backup(
+            archive, destination, backup_key=BACKUP_KEY_BYTES
+        )
+
+    monkeypatch.undo()
+    assert replaced, "the pre-link window was never reached"
+    # Whatever is at the target, it must not be startable. Either nothing
+    # landed, or what landed is paused.
+    if destination.exists():
+        assert marker.exists(), (
+            "a database this restore never authenticated is at the target with"
+            f" no worker pause beside it ({raised.value})"
+        )
