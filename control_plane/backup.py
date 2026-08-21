@@ -378,8 +378,12 @@ def _claim(
     source: Path,
     destination: Path,
     journal: list[_Move] | None = None,
-) -> tuple[int, int] | None:
+) -> tuple[tuple[int, int] | None, bytes | None, bool]:
     """Move `source` onto `destination`, refusing to replace anything.
+
+    RETURNS what it published — inode, digest, and whether either could be
+    established — taken from the source before the link. Every cleanup and
+    every reversal downstream is authorised against this and nothing else.
 
     `os.replace` is atomic and CLOBBERS, so guarding it with a check leaves a
     window: another process creates the final name in between and the rename
@@ -435,7 +439,7 @@ def _claim(
         _withdraw(destination, published)
         raise
     record.source_removed = True
-    return published
+    return (published, digest, proven)
 
 
 class _Substituted(BackupError, OSError):
@@ -527,7 +531,9 @@ def _withdraw(destination: Path, published: tuple[int, int] | None) -> None:
         raise AmbiguousPublication(destination) from error
 
 
-def _publish(temporary: Path, destination: Path) -> None:
+def _publish(
+    temporary: Path, destination: Path
+) -> tuple[tuple[int, int] | None, bytes | None, bool]:
     """Rename into place, then make the DIRECTORY ENTRY itself durable.
 
     `fsync` on the file persists its CONTENTS; it says nothing about the name
@@ -554,7 +560,7 @@ def _publish(temporary: Path, destination: Path) -> None:
     # narrow one, between the check and the rename. `_claim` has no window:
     # `os.link` fails with `EEXIST` rather than replacing, so this either takes
     # a name nobody held or takes nothing.
-    published = _claim(temporary, destination)
+    published, digest, proven = _claim(temporary, destination)
     try:
         _fsync_directory(destination.parent)
     except OSError:
@@ -573,6 +579,7 @@ def _publish(temporary: Path, destination: Path) -> None:
         # directory sync that failed.
         _withdraw(destination, published)
         raise
+    return (published, digest, proven)
 
 
 def create_backup(
@@ -908,8 +915,9 @@ def _restore_locked(
             os.chmod(marker, 0o600)
             with open(marker, "rb") as handle:
                 os.fsync(handle.fileno())
-            _publish(marker, _pause_marker(destination))
-            owned_marker = _inode(_pause_marker(destination))
+            owned_marker, _digest, _proven = _publish(
+                marker, _pause_marker(destination)
+            )
         except OSError as error:
             marker.unlink(missing_ok=True)
             # `owned_marker` is None on EVERY failure here, which is the point.
@@ -1141,7 +1149,13 @@ def _copy_install(
             writer.flush()
             os.fsync(writer.fileno())
         os.chmod(temporary, 0o600)
-        _publish(temporary, destination)
+        # The token comes FROM the publication. Reading it back off the
+        # destination afterwards described whoever held that name by then: an
+        # actor replacing it in that interval had their identity journalled, the
+        # final validation failed, and `_undo` was then authorised to move their
+        # file back over the validated candidate — losing the only retryable
+        # rollback generation without reporting an incomplete reversal.
+        published = _publish(temporary, destination)
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise
@@ -1151,9 +1165,7 @@ def _copy_install(
     # that never started. See `_Move`.
     # The bytes this call COPIED, taken from the temporary it owns rather than
     # from the destination it has just let go of.
-    landed_inode, landed_digest, landed_proven = _identity_before_publication(
-        destination
-    )
+    landed_inode, landed_digest, landed_proven = published
     record = _Move(
         source,
         destination,

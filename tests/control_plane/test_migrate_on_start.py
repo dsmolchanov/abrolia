@@ -3761,11 +3761,12 @@ def test_a_canonical_member_removed_after_it_lands_is_not_a_success(
     real_publish = backup_module._publish
 
     def publish(temporary, destination):
-        real_publish(temporary, destination)
+        published = real_publish(temporary, destination)
         if Path(destination) == target:
             # Somebody removes the canonical database the instant it lands.
             Path(destination).unlink()
 
+        return published
     monkeypatch.setattr(backup_module, "_publish", publish)
 
     with pytest.raises(backup_module.IncompleteReversal) as raised:
@@ -3858,11 +3859,12 @@ def test_no_move_primitive_deletes_an_entry_it_stopped_owning(
                 copying.pop()
 
         def publish(temporary, destination):
-            real_publish(temporary, destination)
+            published = real_publish(temporary, destination)
             # `_copy_install` removes its source after this returns.
             if copying:
                 usurp(copying[-1])
 
+            return published
         monkeypatch.setattr(backup_module, "_copy_install", copy_install)
         monkeypatch.setattr(backup_module, "_publish", publish)
 
@@ -3947,10 +3949,11 @@ def test_a_landed_member_removed_before_success_is_not_a_success(
     real_publish = backup_module._publish
 
     def publish(temporary, destination):
-        real_publish(temporary, destination)
+        published = real_publish(temporary, destination)
         if Path(destination) == landed:
             Path(destination).unlink()
 
+        return published
     monkeypatch.setattr(backup_module, "_publish", publish)
 
     with pytest.raises(RollbackError) as raised:
@@ -4258,3 +4261,66 @@ def test_the_withdrawal_token_predates_the_publication(
     assert os.path.lexists(destination), (
         "the withdrawal removed an entry another operation had put there"
     )
+
+
+@pytest.mark.parametrize("sentinel", ["regular", "hard-link", "symlink"])
+def test_a_copied_member_takes_its_token_from_the_publication(
+    tmp_path, monkeypatch, sentinel
+) -> None:
+    """`_copy_install` read the token back off the destination it had let go.
+
+    An actor replacing that destination in the interval had THEIR identity
+    journalled as the published one. Final validation then failed — correctly,
+    the landed bytes were not the validated ones — and `_undo` was authorised
+    to move their file back over the validated candidate, losing the only
+    retryable rollback generation without reporting an incomplete reversal.
+    """
+    volume, target, restored = _rollback_fixture(tmp_path)
+    _constrain(monkeypatch, volume, capacity=target.stat().st_size * 10)
+    bystander = volume / "not-yours.txt"
+    bystander.write_bytes(b"not yours to move")
+    candidate_before = _fingerprint(restored.parent)
+    swapped: list[Path] = []
+    real_publish = backup_module._publish
+
+    def publish(temporary, destination):
+        published = real_publish(temporary, destination)
+        landed = Path(destination)
+        if not swapped and landed.parent == volume:
+            landed.unlink(missing_ok=True)
+            if sentinel == "regular":
+                landed.write_bytes(b"somebody else's file")
+            elif sentinel == "hard-link":
+                os.link(bystander, landed)
+            else:
+                landed.symlink_to(bystander)
+            swapped.append(landed)
+        return published
+
+    monkeypatch.setattr(backup_module, "_publish", publish)
+
+    with pytest.raises(RollbackError) as raised:
+        install_rollback(restored, target, now=1800000042)
+
+    monkeypatch.undo()
+    assert swapped, "the publication window was never reached"
+    assert bystander.read_bytes() == b"not yours to move", (
+        "the reversal moved an entry this install never published"
+    )
+    # The promise is a DISJUNCTION, and asserting only its first half was
+    # wrong: refusing to move an interloper back is correct, and it leaves the
+    # candidate short a member. Either the candidate is intact, or the command
+    # says so and pauses — never the third thing, where somebody else's file
+    # has been moved over the candidate and the report calls it a reversal.
+    if _fingerprint(restored.parent) != candidate_before:
+        assert isinstance(raised.value, backup_module.IncompleteReversal), str(
+            raised.value
+        )
+        # A pause, or an explicit statement that none could be established.
+        # When the sentinel is a SYMLINK it occupies the marker name, and
+        # refusing to follow it is the correct conservative answer — so the
+        # command says so instead, which is the other acceptable outcome.
+        if raised.value.paused:
+            assert backup_module._pause_marker(target).exists()
+        else:
+            assert "do not start the service" in str(raised.value), str(raised.value)
