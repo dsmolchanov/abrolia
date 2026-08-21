@@ -304,7 +304,7 @@ On `abrolia-synthetic` with a dedicated `abrolia-agent-test-*@gmail.com` account
 
 ```bash
 pytest tests/test_gmail_api_ingest.py tests/test_gmail_api_oauth_grant.py -q
-pytest tests/control_plane/email -k gmail -q
+pytest tests/control_plane/email -k google -q
 rg -n "HERMES_GMAIL_ADDRESS|APP_PASSWORD|legacy_imap" hermes_cloud/ control_plane/ --glob '!tests/**' | grep -v "test_only"
 # expect: zero hits in prod path (only in hermes_cloud/core/config.py legacy gate + tests)
 ```
