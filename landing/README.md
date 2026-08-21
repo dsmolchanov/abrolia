@@ -14,8 +14,10 @@ Open `http://localhost:4173`.
 
 Production is deployed by `.github/workflows/deploy-production.yml`. A first-party push to
 `main` must finish the complete `ci` workflow successfully; the deploy workflow then builds this
-directory with the pinned Vercel CLI, publishes the prebuilt output, and verifies both the unique
-deployment URL and `https://abrolia.com` before reporting success.
+directory with the pinned Vercel CLI and publishes the prebuilt output. The generated Vercel URL
+stays behind Standard Deployment Protection; CI verifies that SSO challenge without a bypass
+secret, then compares the public `https://abrolia.com` HTML and favicon byte-for-byte with the
+tested checkout before reporting success.
 
 Re-run a failed GitHub deployment job for a transient provider error only while its commit remains
 the tip of `main`; otherwise let the newer green run deploy. Do not deploy this folder directly

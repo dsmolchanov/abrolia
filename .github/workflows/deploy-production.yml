@@ -111,21 +111,33 @@ jobs:
         run: |
           set -euo pipefail
           fetch() {
-            curl --fail --silent --show-error --location \
-              --retry 5 --retry-all-errors --retry-delay 2 \
-              --connect-timeout 10 --max-time 30 "$1"
+            local url="$1"
+            local destination="$2"
+            local status
+            status="$(
+              curl --fail --silent --show-error \
+                --retry 5 --retry-all-errors --retry-delay 2 \
+                --connect-timeout 10 --max-time 30 \
+                --output "$destination" --write-out '%{http_code}' "$url"
+            )"
+            test "$status" = 200
           }
 
-          deployed_body="$(fetch "${DEPLOYMENT_URL%/}/")"
-          expected_body="$(<landing/index.html)"
-          test "$deployed_body" = "$expected_body"
-          grep -F 'data-abrolia-logo="handwritten-a"' <<<"$deployed_body"
-          grep -F 'id="join"' <<<"$deployed_body"
+          protection_headers="$(
+            curl --silent --show-error --head \
+              --retry 5 --retry-all-errors --retry-delay 2 \
+              --connect-timeout 10 --max-time 30 \
+              "${DEPLOYMENT_URL%/}/"
+          )"
+          grep -Eq '^HTTP/[0-9.]+ 302[[:space:]]*$' <<<"$protection_headers"
+          grep -Eiq '^location: https://vercel\.com/sso-api\?url=' \
+            <<<"$protection_headers"
 
+          canonical_file="$RUNNER_TEMP/abrolia-canonical-index.html"
           canonical_matches=false
           for _attempt in {1..12}; do
-            if canonical_body="$(fetch https://abrolia.com/)" && \
-              [[ "$canonical_body" == "$expected_body" ]]
+            if fetch https://abrolia.com/ "$canonical_file" && \
+              cmp --silent landing/index.html "$canonical_file"
             then
               canonical_matches=true
               break
@@ -133,10 +145,13 @@ jobs:
             sleep 5
           done
           test "$canonical_matches" = true
+          grep -F 'data-abrolia-logo="handwritten-a"' "$canonical_file"
+          grep -F 'id="join"' "$canonical_file"
+
           expected_favicon="$(sha256sum landing/favicon.svg | cut -d ' ' -f1)"
-          deployed_favicon="$(fetch "${DEPLOYMENT_URL%/}/favicon.svg" | sha256sum | cut -d ' ' -f1)"
-          canonical_favicon="$(fetch https://abrolia.com/favicon.svg | sha256sum | cut -d ' ' -f1)"
-          test "$deployed_favicon" = "$expected_favicon"
+          canonical_favicon_file="$RUNNER_TEMP/abrolia-canonical-favicon.svg"
+          fetch https://abrolia.com/favicon.svg "$canonical_favicon_file"
+          canonical_favicon="$(sha256sum "$canonical_favicon_file" | cut -d ' ' -f1)"
           test "$canonical_favicon" = "$expected_favicon"
 
   deploy-control-plane:
