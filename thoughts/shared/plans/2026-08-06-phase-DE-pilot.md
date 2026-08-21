@@ -409,6 +409,8 @@ CREATE TABLE channel_bindings (
   context so the packaged PWA is present in the production image.
 - Serialise releases without cancelling an in-flight Fly rollout. Pin every third-party Action and
   CLI version used on the privileged path, including the CI Actions whose result authorises it.
+- Refuse to mutate the control plane when its existing production readiness gate is already red;
+  a deployment must not turn a known operational problem into an ambiguous rollout failure.
 - Make success include live checks of the generated Vercel deployment, the canonical landing
   domain, control-plane health and every public PWA shell asset introduced by E6a/E6b.
 
