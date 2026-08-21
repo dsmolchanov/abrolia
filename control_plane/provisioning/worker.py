@@ -240,7 +240,7 @@ class ProvisioningWorker:
             return self._block_for_missing_content_restriction(job, request)
         disabled = self._blocked_by_email_kill_switch(job)
         if disabled is not None:
-            return self._mark_step_problem(job, request, "failed", disabled)
+            return self._brake_email_option(job, request, disabled)
         provider = None
         result = None
         try:
@@ -1446,6 +1446,41 @@ class ProvisioningWorker:
             return f"email_option_disabled:{flag}"
         return None
 
+    def _brake_email_option(
+        self, job: JobRecord, request: dict[str, Any], code: str
+    ) -> WorkResult:
+        """Stop the next provider call without destroying what the job knows.
+
+        Settling terminally is only safe where the job is known never to have
+        reached a provider. Anywhere else it erases durable uncertainty: an
+        ambiguous job carries the reference an operator needs to find what was
+        created, and `failed` also takes it out of `outcome_unknown`, which is
+        the only status `reconcile` accepts — so the brake would strand exactly
+        the external org, domain or binding that turning the brake off exists to
+        clean up.
+
+        A first attempt that has not been reclaimed has not called anything yet,
+        so there is nothing to preserve and terminal failure is the honest
+        answer.
+
+        The code deliberately does NOT carry `RECONCILIATION_SUFFIX`. That
+        suffix means "quarantined", which `_is_shutdown_action` treats as exempt
+        — a braked job would immediately become work the brake no longer stops,
+        and the next `reconcile` would call the provider while the flag is still
+        off. Braked work stays braked until an operator turns the flag back on.
+        """
+        may_have_reached_the_provider = (
+            job.status == "outcome_unknown" or job.reclaimed or job.attempts > 1
+        )
+        if not may_have_reached_the_provider:
+            return self._mark_step_problem(job, request, "failed", code)
+        if job.status == "outcome_unknown":
+            # Already ambiguous and already reconcilable. Rewriting the row
+            # would replace the reconcilable state an operator is holding with
+            # the brake's own, less informative, reason.
+            return WorkResult(job.id, "outcome_unknown", job.error_code)
+        return self._mark_step_problem(job, request, "outcome_unknown", code)
+
     def _is_shutdown_action(self, job: JobRecord) -> bool:
         """Work that exists BECAUSE a consent went away.
 
@@ -1723,7 +1758,7 @@ class ProvisioningWorker:
             return self._block_for_missing_content_restriction(job, request)
         disabled = self._blocked_by_email_kill_switch(job)
         if disabled is not None:
-            return self._mark_step_problem(job, request, "failed", disabled)
+            return self._brake_email_option(job, request, disabled)
         provider = self.providers.get(job.provider)
         if job.kind == "cleanup":
             deferred = self._defer_runtime_cleanup(job, request)

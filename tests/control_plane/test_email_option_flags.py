@@ -33,6 +33,7 @@ from control_plane.provisioning.contracts import (
     ProviderRejected,
 )
 from control_plane.provisioning.fakes import synthetic_provider_registry
+from control_plane.repositories.jobs import requires_reconciliation
 
 GATED = {
     "family_domain": (
@@ -291,7 +292,9 @@ def _expire_the_lease(cp_stack, job_id: str, *, now: float) -> None:  # noqa: AN
 
 
 @pytest.mark.parametrize("option", sorted(PROVIDER_CASES))
-@pytest.mark.parametrize("path", ["fresh_ensure", "user_inspect", "reclaimed_inspect"])
+@pytest.mark.parametrize(
+    "path", ["fresh_ensure", "user_inspect", "reclaimed_inspect", "retried_ensure"]
+)
 def test_disabling_an_option_stops_work_that_is_already_queued(
     cp_stack, monkeypatch: pytest.MonkeyPatch, option: str, path: str
 ) -> None:
@@ -310,6 +313,14 @@ def test_disabling_an_option_stops_work_that_is_already_queued(
     )
     if path == "reclaimed_inspect":
         _expire_the_lease(cp_stack, job_id, now=now)
+    if path == "retried_ensure":
+        # A transient failure put the job back on the queue. `retry_later` keeps
+        # the attempt count, so the NEXT lease is attempt two — and attempt one
+        # may already have reached the provider before it failed.
+        with cp_stack.jobs.db.write() as connection:
+            connection.execute(
+                "UPDATE provisioning_jobs SET attempts = 1 WHERE id = ?", (job_id,)
+            )
 
     # The operator flips the switch. Nothing re-enters `select`.
     monkeypatch.setenv(env_name, "0")
@@ -321,9 +332,16 @@ def test_disabling_an_option_stops_work_that_is_already_queued(
 
     assert result is not None
     assert result.job_id == job_id
-    assert result.status == "failed"
-    assert result.error_code == f"email_option_disabled:{flag}"
     assert recorder.calls == [], f"provider was called on the {path} path"
+    assert result.error_code == f"email_option_disabled:{flag}"
+
+    # A reclaimed lease may have died AFTER the provider created something, so
+    # the brake may not settle it terminally: `failed` would erase the durable
+    # uncertainty and take the job out of the only status `reconcile` accepts,
+    # stranding whatever is upstream. A first attempt has called nothing.
+    ambiguous = {"reclaimed_inspect", "retried_ensure"}
+    expected = "outcome_unknown" if path in ambiguous else "failed"
+    assert result.status == expected
 
 
 @pytest.mark.parametrize("option", sorted(PROVIDER_CASES))
@@ -443,8 +461,17 @@ def test_operator_reconcile_also_stops_at_a_disabled_option(
     registry.register(provider_name, recorder)
     result = cp_stack.make_worker(providers=registry, now=now + 10).reconcile(job_id)
 
-    assert result.error_code == f"email_option_disabled:{flag}"
     assert recorder.calls == []
+    # Braked, not settled. Rewriting an already-ambiguous job would replace the
+    # reconcilable state an operator is holding with the brake's own reason, and
+    # `failed` would make the job unreconcilable for good.
+    assert result.status == "outcome_unknown"
+    assert result.error_code == "provider_outcome_unknown"
+    assert result.error_code != f"email_option_disabled:{flag}"
+    still = cp_stack.jobs.get(job_id)
+    assert still is not None
+    assert still.status == "outcome_unknown"
+    assert still.error_code == "provider_outcome_unknown"
 
 
 @pytest.mark.parametrize("option", sorted(PROVIDER_CASES))
@@ -484,3 +511,107 @@ def test_a_quarantined_job_is_not_blocked_by_a_disabled_option(
 
     assert result.error_code != f"email_option_disabled:{flag}"
     assert recorder.calls != [], "the switch blocked shutdown work"
+
+
+@pytest.mark.parametrize("option", sorted(PROVIDER_CASES))
+@pytest.mark.parametrize("braked_by", ["reclaimed_run_once", "operator_reconcile"])
+def test_a_braked_job_survives_to_be_reconciled_when_the_flag_returns(
+    cp_stack, monkeypatch: pytest.MonkeyPatch, option: str, braked_by: str
+) -> None:
+    """The brake must be reversible, or it strands what it stopped.
+
+    A lease can die AFTER the provider created an org, domain or binding and
+    before the result was settled. Settling that terminally `failed` would erase
+    the uncertainty AND take the job out of `outcome_unknown`, which is the only
+    status `reconcile` accepts — so the resource the brake was protecting could
+    never be found or torn down, and turning the flag back on would not help.
+    """
+
+    provider_name, env_name, flag = PROVIDER_CASES[option]
+    cp_stack.complete_profile()
+    _hold_the_content_restriction(cp_stack, now=1_760_000_000.0)
+
+    monkeypatch.setenv(env_name, "1")
+    now = 1_760_000_000.0
+    job_id = _queue_email_job(
+        cp_stack, provider=provider_name, operation="inspect", now=now
+    )
+    if braked_by == "reclaimed_run_once":
+        _expire_the_lease(cp_stack, job_id, now=now)
+    else:
+        with cp_stack.jobs.db.write() as connection:
+            connection.execute(
+                "UPDATE provisioning_jobs SET status = 'outcome_unknown',"
+                " error_code = 'provider_outcome_unknown' WHERE id = ?",
+                (job_id,),
+            )
+
+    monkeypatch.setenv(env_name, "0")
+    recorder = RecordingProvisioner()
+    registry = synthetic_provider_registry()
+    registry.register(provider_name, recorder)
+    worker = cp_stack.make_worker(providers=registry, now=now + 10)
+    if braked_by == "reclaimed_run_once":
+        worker.run_once()
+    else:
+        worker.reconcile(job_id)
+
+    assert recorder.calls == [], "the brake let a call through"
+    braked = cp_stack.jobs.get(job_id)
+    assert braked is not None
+    assert braked.status == "outcome_unknown", (
+        "the brake settled the job somewhere reconcile can never reach"
+    )
+
+    # The operator turns it back on. The job must now be reconcilable, and the
+    # provider must actually be reached — this is the half that proves the brake
+    # preserved a usable job rather than merely a differently-broken one.
+    monkeypatch.setenv(env_name, "1")
+    after = RecordingProvisioner()
+    registry_after = synthetic_provider_registry()
+    registry_after.register(provider_name, after)
+    cp_stack.make_worker(providers=registry_after, now=now + 20).reconcile(job_id)
+
+    assert after.calls != [], "the reconciled job never reached its provider"
+
+
+@pytest.mark.parametrize("option", sorted(PROVIDER_CASES))
+def test_the_brake_does_not_disguise_itself_as_quarantine(
+    cp_stack, monkeypatch: pytest.MonkeyPatch, option: str
+) -> None:
+    """A braked job must not become work the brake stops stopping.
+
+    `requires_reconciliation` is decided by the `_requires_reconciliation`
+    suffix alone, and `_is_shutdown_action` treats a quarantined job as exempt.
+    Had the brake's own error code carried that suffix, one braked job would
+    have been exempt on the very next pass and the provider would have been
+    called with the flag still off.
+    """
+
+    provider_name, env_name, flag = PROVIDER_CASES[option]
+    cp_stack.complete_profile()
+    _hold_the_content_restriction(cp_stack, now=1_760_000_000.0)
+
+    monkeypatch.setenv(env_name, "1")
+    now = 1_760_000_000.0
+    job_id = _queue_email_job(
+        cp_stack, provider=provider_name, operation="inspect", now=now
+    )
+    _expire_the_lease(cp_stack, job_id, now=now)
+    monkeypatch.setenv(env_name, "0")
+
+    registry = synthetic_provider_registry()
+    registry.register(provider_name, RecordingProvisioner())
+    cp_stack.make_worker(providers=registry, now=now + 10).run_once()
+
+    braked = cp_stack.jobs.get(job_id)
+    assert braked is not None
+    assert braked.error_code == f"email_option_disabled:{flag}"
+    assert not requires_reconciliation(braked.error_code)
+
+    # And so a second pass with the flag still off is still braked, not exempt.
+    second = RecordingProvisioner()
+    registry_second = synthetic_provider_registry()
+    registry_second.register(provider_name, second)
+    cp_stack.make_worker(providers=registry_second, now=now + 20).reconcile(job_id)
+    assert second.calls == [], "a braked job became exempt from its own brake"

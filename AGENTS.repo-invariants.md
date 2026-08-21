@@ -233,7 +233,7 @@ makes a review loop unable to terminate.
   `_assert_email_rollout` refused a disabled option at `select`, and every job
   already queued kept provisioning, which is the incident the switch exists for.
 
-  Two halves, both load-bearing.
+  Three halves, all load-bearing.
 
   **Read at call time, not at plan time.** A value captured when the job was
   created is the value the operator is trying to change. The queue is the whole
@@ -246,6 +246,21 @@ makes a review loop unable to terminate.
   through `_is_shutdown_action` rather than restating it; the reasoning it
   carries for the consent precondition is the same reasoning, and a second
   spelling is a second thing to get wrong.
+
+  **Braking is not failing.** Settling a braked job terminally is only safe
+  where it is known never to have reached a provider — a first attempt that was
+  not reclaimed. Anywhere else `failed` erases durable uncertainty AND moves the
+  job out of `outcome_unknown`, the only status `reconcile` accepts, so the
+  brake strands exactly the external org, domain or binding that turning the
+  brake off exists to clean up. An already-ambiguous job is left untouched,
+  because rewriting it replaces the reconcilable state an operator is holding
+  with the brake's own, less informative, reason. Enforced by
+  `test_a_braked_job_survives_to_be_reconciled_when_the_flag_returns`, which
+  brakes, re-enables, and asserts the provider is then actually reached — the
+  second half being what distinguishes a preserved job from a differently-broken
+  one. And the brake's error code must NOT carry `RECONCILIATION_SUFFIX`: that
+  suffix means quarantined, `_is_shutdown_action` treats quarantined as exempt,
+  and a braked job would be exempt from its own brake on the very next pass.
 
   The selection-layer check still earns its place — it keeps a cut option off
   the screen instead of failing after a user picks it — but it is the courtesy,
