@@ -1,16 +1,43 @@
-"""Phase F per-provider kill switches — default off, fail-closed, read at call time."""
+"""Per-provider kill switches — default off, fail-closed, read at call time.
+
+Only the switches that actually gate something live here. Three others used to:
+`managed_email`, `whatsapp_dedicated` and `web_push` were declared, given
+accessors, listed in two operator runbook tables — and reachable from no call
+site. `ABROLIA_MANAGED_EMAIL_ENABLED=0` gated nothing at all while an operator
+reading the runbook mid-incident was told it stopped `@abrolia.com`
+provisioning.
+
+They were not replaced, because each already had a stronger live counterpart:
+
+- managed email — `ABROLIA_REAL_EMAIL_ENABLED=0` routes the managed option to
+  `fake-email` (`container.py`), so no Nerve call happens, and real provisioning
+  additionally requires a non-empty `ABROLIA_REAL_EMAIL_HOUSEHOLD_ALLOWLIST`.
+  A brake that falls back to a working synthetic path beats one that errors, and
+  the allowlist bounds it per household rather than per deployment.
+- dedicated WhatsApp and web push — `ControlPlaneConfig.validate` REFUSES TO
+  BOOT with `real_whatsapp_enabled` or `real_channel_enabled` set. There is no
+  adapter to gate yet, and a flag cannot be more fail-closed than a config that
+  will not start.
+
+`phase-DE-pilot.md` anticipated exactly this: "Alternative short form if the
+codebase consolidates: `ABROLIA_REAL_EMAIL_ENABLED` covers managed+BYO ...
+Either form is acceptable if the matrix below is covered and default-off."
+
+What remains are the two options cut from MVP, where the question is not "can
+real content arrive" but "is this on offer at all" — a question no `REAL_*` flag
+answers, because both options are refused even where they would route to a fake
+provider.
+"""
 
 from __future__ import annotations
 
 import os
 
+#: Env var -> switch name, for the switches that gate a call site.
 FLAGS = {
-    "ABROLIA_MANAGED_EMAIL_ENABLED": "managed_email",
     "ABROLIA_BYO_EMAIL_ENABLED": "byo_email",
     "ABROLIA_GMAIL_ENABLED": "gmail",
     "ABROLIA_WHATSAPP_SHARED_ENABLED": "whatsapp_shared",
-    "ABROLIA_WHATSAPP_DEDICATED_ENABLED": "whatsapp_dedicated",
-    "ABROLIA_WEB_PUSH_ENABLED": "web_push",
 }
 
 
@@ -27,12 +54,6 @@ FLAGS = {
 #: that is ALREADY queued — the case the switch exists for. Asking at the
 #: provider call alone would let a cut option stay on the onboarding screen and
 #: fail only after the user picked it. Both, or it is decorative.
-#:
-#: `abrolia_managed` / `nerve-managed` is deliberately absent. Canon has all six
-#: flags fail-closed, but wiring the managed one today would take email away
-#: from every deployment that has not set `ABROLIA_MANAGED_EMAIL_ENABLED` —
-#: including the synthetic app, which sets none of them. That is a separate step
-#: with a `fly.toml` change behind it.
 CUT_EMAIL_OPTIONS = (
     ("gmail_agent", "google-oauth", "gmail"),
     ("family_domain", "nerve-byo-domain", "byo_email"),
@@ -51,10 +72,6 @@ def _is_enabled(env_name: str) -> bool:
     return os.environ.get(env_name, "0").strip() == "1"
 
 
-def is_managed_email_enabled() -> bool:
-    return _is_enabled("ABROLIA_MANAGED_EMAIL_ENABLED")
-
-
 def is_byo_email_enabled() -> bool:
     return _is_enabled("ABROLIA_BYO_EMAIL_ENABLED")
 
@@ -64,26 +81,21 @@ def is_gmail_enabled() -> bool:
 
 
 def is_whatsapp_shared_enabled() -> bool:
+    """The shared WhatsApp relay brake, enforced in `gateway.whatsapp_router`.
+
+    Unlike the email switches this one gates an inbound relay rather than a
+    provisioning call, so it has no entry in `CUT_EMAIL_OPTIONS` and is asked
+    directly at the webhook.
+    """
     return _is_enabled("ABROLIA_WHATSAPP_SHARED_ENABLED")
-
-
-def is_whatsapp_dedicated_enabled() -> bool:
-    return _is_enabled("ABROLIA_WHATSAPP_DEDICATED_ENABLED")
-
-
-def is_web_push_enabled() -> bool:
-    return _is_enabled("ABROLIA_WEB_PUSH_ENABLED")
 
 
 def check_provider_enabled(provider: str) -> None:
     """Raise if provider is disabled — fail-closed at call time."""
     mapping = {
-        "managed_email": is_managed_email_enabled,
         "byo_email": is_byo_email_enabled,
         "gmail": is_gmail_enabled,
         "whatsapp_shared": is_whatsapp_shared_enabled,
-        "whatsapp_dedicated": is_whatsapp_dedicated_enabled,
-        "web_push": is_web_push_enabled,
     }
     checker = mapping.get(provider)
     if checker is None:

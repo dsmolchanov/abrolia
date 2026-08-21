@@ -636,14 +636,32 @@ After `codex/phase-F-release-gating` merges, every provider is independently kil
 
 **Flags (all `default off`, fail-closed):**
 
-| Flag | Controls | Default |
-|------|----------|---------|
-| `ABROLIA_MANAGED_EMAIL_ENABLED` | Nerve `@abrolia.com` provisioning | `0` |
-| `ABROLIA_BYO_EMAIL_ENABLED` | Nerve BYO domain provisioning | `0` |
-| `ABROLIA_GMAIL_ENABLED` | Gmail agent via OAuth (implies `ABROLIA_REAL_EMAIL_ENABLED` + CASA) | `0` |
-| `ABROLIA_WHATSAPP_SHARED_ENABLED` | Shared WA gateway relay | `0` |
-| `ABROLIA_WHATSAPP_DEDICATED_ENABLED` | Dedicated Evolution WA | `0` |
-| `ABROLIA_WEB_PUSH_ENABLED` | Web Push (P11) | `0` |
+| Flag | Controls | Enforced at | Default |
+|------|----------|-------------|---------|
+| `ABROLIA_REAL_EMAIL_ENABLED` | Managed `@abrolia.com` **and** BYO domain provisioning | `container.py` — `0` routes both to `fake-email`, so no Nerve call is made. Real provisioning additionally requires a non-empty `ABROLIA_REAL_EMAIL_HOUSEHOLD_ALLOWLIST`. | `0` |
+| `ABROLIA_BYO_EMAIL_ENABLED` | Whether the BYO domain option is OFFERED at all | `OnboardingService.select` and `ProvisioningWorker` (`_run_once`, `_reconcile`) | `0` |
+| `ABROLIA_GMAIL_ENABLED` | Whether the Gmail option is OFFERED at all (real Gmail additionally needs `ABROLIA_REAL_EMAIL_ENABLED` + `ABROLIA_GMAIL_REAL_ENABLED` + CASA evidence) | `OnboardingService.select` and `ProvisioningWorker` (`_run_once`, `_reconcile`) | `0` |
+| `ABROLIA_WHATSAPP_SHARED_ENABLED` | Shared WA gateway relay | `gateway.whatsapp_router.handle_webhook` — returns `flag_disabled` before persisting | `0` |
+
+Two kinds of switch, and the difference matters when choosing one under
+pressure. `ABROLIA_REAL_EMAIL_ENABLED` is an **incident brake**: off, the option
+still works, on a synthetic provider, and no external call is made. The
+per-option switches are **product gates**: off, the option is refused outright
+and disappears from onboarding. To stop talking to Nerve without breaking
+onboarding, use the first.
+
+Dedicated WhatsApp and web push have **no flag**, and need none: they have no
+adapter yet, and `ControlPlaneConfig.validate` refuses to boot at all if
+`ABROLIA_REAL_WHATSAPP_ENABLED` or `ABROLIA_REAL_CHANNEL_ENABLED` is set. A
+flag cannot be more fail-closed than a process that will not start.
+
+`ABROLIA_MANAGED_EMAIL_ENABLED`, `ABROLIA_WHATSAPP_DEDICATED_ENABLED` and
+`ABROLIA_WEB_PUSH_ENABLED` were listed here until 2026-08-22 and gated nothing —
+they were accessors with no call site. Setting them today does nothing; they are
+not read. `phase-DE-pilot.md` Step F1 sanctioned this consolidation in advance:
+"Alternative short form if the codebase consolidates: `ABROLIA_REAL_EMAIL_ENABLED`
+covers managed+BYO ... Either form is acceptable if the matrix below is covered
+and default-off."
 
 Alternative short form if the codebase consolidates: `ABROLIA_REAL_EMAIL_ENABLED` covers managed+BYO (with per-option sub-check), plus `ABROLIA_GMAIL_ENABLED` separately, plus `ABROLIA_WHATSAPP_{SHARED,DEDICATED}_ENABLED`, `ABROLIA_WEB_PUSH_ENABLED`. Either form is acceptable if the matrix below is covered and default-off.
 

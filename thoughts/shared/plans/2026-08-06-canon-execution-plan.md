@@ -203,9 +203,11 @@ OAuth / History is explicitly deferred to the start of Phase E and remains track
 `tests/control_plane/test_real_email_wiring.py`,
 `tests/control_plane/test_provisioning_jobs.py`, `control_plane/api/app.py`,
 `control_plane/email/models.py`, `control_plane/web/templates/onboarding.html`,
-`tests/control_plane/test_ui_contract.py`.
+`tests/control_plane/test_ui_contract.py`, `tests/test_feature_flags.py`,
+`gateway/whatsapp_router.py`, `docs/onboarding-runbook.md`,
+`thoughts/shared/plans/2026-08-06-phase-DE-pilot.md`.
 
-**Branches:** `codex/phase-F-email-option-kill-switches`, `codex/phase-F-hide-cut-email-cards`.
+**Branches:** `codex/phase-F-email-option-kill-switches`, `codex/phase-F-hide-cut-email-cards`, `codex/phase-F-retire-the-dead-managed-switch`.
 
 **Scope corrected 2026-08-21.** "feature-flag table" named a document rather
 than the code, and the module that implements the switches was never listed —
@@ -244,7 +246,16 @@ onboarding impossible. The page now asks the gate's own predicate
 rather than a fourth hard-coded list.
 
 **Changes:**
-1. Per-provider flags: `ABROLIA_MANAGED_EMAIL_ENABLED`, `ABROLIA_BYO_EMAIL_ENABLED`, `ABROLIA_GMAIL_ENABLED`, `ABROLIA_WHATSAPP_SHARED_ENABLED`, `ABROLIA_WHATSAPP_DEDICATED_ENABLED`, `ABROLIA_WEB_PUSH_ENABLED` — all `default off`, fail-closed; flag toggle tested in Phase C/D/E suites.
+1. Per-provider flags, `default off`, fail-closed, toggle tested. **Consolidated
+   2026-08-22** to the short form Step F1 of `phase-DE-pilot.md` already
+   sanctioned: `ABROLIA_REAL_EMAIL_ENABLED` (managed + BYO incident brake, plus
+   the household allowlist), `ABROLIA_BYO_EMAIL_ENABLED` and
+   `ABROLIA_GMAIL_ENABLED` (per-option product gates),
+   `ABROLIA_WHATSAPP_SHARED_ENABLED` (relay). `ABROLIA_MANAGED_EMAIL_ENABLED`,
+   `ABROLIA_WHATSAPP_DEDICATED_ENABLED` and `ABROLIA_WEB_PUSH_ENABLED` are
+   retired: they had no call site, and each had a stronger live counterpart —
+   the last two cannot even boot. Enforced by
+   `tests/test_feature_flags.py::test_every_declared_flag_gates_a_call_site`.
 2. Rollout order: synthetic → operator accounts → invited pilot families per provider; each transition requires `Phase A` legal + `Phase C1` receipt + `go test` + `pytest -m "not live"` + one manual live gate.
 
 **Acceptance:**

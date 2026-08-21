@@ -1,43 +1,78 @@
-"""Phase F flag matrix — default off, fail-closed, independently togglable at call time."""
+"""Phase F flag matrix — default off, fail-closed, togglable at call time.
+
+Every switch in `FLAGS` must gate a real call site. Three did not: `managed_email`,
+`whatsapp_dedicated` and `web_push` were accessors nothing called, while two
+operator tables described them as stopping provisioning. They are retired rather
+than wired, because each already had a stronger live counterpart — see the module
+docstring. `test_every_declared_flag_gates_a_call_site` is what stops another one
+appearing.
+"""
 
 from __future__ import annotations
 
+import pytest
+
 from control_plane.feature_flags import (
+    FLAGS,
+    check_provider_enabled,
     is_byo_email_enabled,
     is_gmail_enabled,
-    is_managed_email_enabled,
-    is_web_push_enabled,
-    is_whatsapp_dedicated_enabled,
     is_whatsapp_shared_enabled,
 )
 from gateway.whatsapp_router import WhatsAppGatewayRouter
 
+#: Where each declared switch is read. A switch with no entry here is the defect
+#: this module exists to catch, so the mapping is asserted to be exhaustive
+#: rather than consulted opportunistically.
+GATING_CALL_SITES = {
+    "byo_email": "control_plane.onboarding.service / provisioning.worker",
+    "gmail": "control_plane.onboarding.service / provisioning.worker",
+    "whatsapp_shared": "gateway.whatsapp_router.handle_webhook",
+}
+
+
+def test_every_declared_flag_gates_a_call_site() -> None:
+    """A switch that gates nothing is worse than no switch, because it is believed.
+
+    `ABROLIA_MANAGED_EMAIL_ENABLED=0` gated nothing while `docs/onboarding-runbook.md`
+    told an operator it stopped `@abrolia.com` provisioning — the sort of thing
+    read during an incident and acted on.
+    """
+
+    assert set(FLAGS.values()) == set(GATING_CALL_SITES)
+
 
 def test_all_flags_default_off(monkeypatch) -> None:
-    for key in [
-        "ABROLIA_MANAGED_EMAIL_ENABLED",
-        "ABROLIA_BYO_EMAIL_ENABLED",
-        "ABROLIA_GMAIL_ENABLED",
-        "ABROLIA_WHATSAPP_SHARED_ENABLED",
-        "ABROLIA_WHATSAPP_DEDICATED_ENABLED",
-        "ABROLIA_WEB_PUSH_ENABLED",
-    ]:
+    for key in FLAGS:
         monkeypatch.delenv(key, raising=False)
-    assert not is_managed_email_enabled()
     assert not is_byo_email_enabled()
     assert not is_gmail_enabled()
     assert not is_whatsapp_shared_enabled()
-    assert not is_whatsapp_dedicated_enabled()
-    assert not is_web_push_enabled()
+    for switch in FLAGS.values():
+        with pytest.raises(RuntimeError):
+            check_provider_enabled(switch)
 
 
 def test_flags_independently_togglable(monkeypatch) -> None:
-    monkeypatch.setenv("ABROLIA_MANAGED_EMAIL_ENABLED", "1")
+    monkeypatch.setenv("ABROLIA_GMAIL_ENABLED", "1")
     monkeypatch.setenv("ABROLIA_BYO_EMAIL_ENABLED", "0")
-    assert is_managed_email_enabled() is True
+    assert is_gmail_enabled() is True
     assert is_byo_email_enabled() is False
     monkeypatch.setenv("ABROLIA_BYO_EMAIL_ENABLED", "1")
     assert is_byo_email_enabled() is True
+
+
+@pytest.mark.parametrize("retired", ["managed_email", "whatsapp_dedicated", "web_push"])
+def test_a_retired_switch_is_gone_rather_than_silently_permissive(retired: str) -> None:
+    """Removing an accessor must not leave `check_provider_enabled` answering yes.
+
+    Deleting the helper but keeping the mapping entry would turn a switch that
+    gated nothing into a switch that ALLOWED everything, which is the same
+    defect with a worse failure direction.
+    """
+
+    with pytest.raises(ValueError):
+        check_provider_enabled(retired)
 
 
 def test_flag_toggle_mid_run_blocks_next_call(monkeypatch, tmp_path) -> None:
