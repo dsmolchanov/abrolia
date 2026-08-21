@@ -87,7 +87,13 @@ def test_real_email_rollout_requires_content_restriction_receipt(cp_stack) -> No
         )
 
 
-def test_real_email_rollout_does_not_route_gmail_to_nerve(cp_stack) -> None:
+def test_real_email_rollout_does_not_route_gmail_to_nerve(
+    cp_stack, monkeypatch
+) -> None:
+    # `gmail_agent` is behind a fail-closed kill switch, so a test that selects
+    # it turns it on. The routing contract below is what is under test here;
+    # the switch itself is asserted in `test_email_option_flags.py`.
+    monkeypatch.setenv("ABROLIA_GMAIL_ENABLED", "1")
     cp_stack.complete_profile()
     cp_stack.service.real_email_enabled = True
     cp_stack.service.gmail_provider = "google-oauth"

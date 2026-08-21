@@ -208,3 +208,63 @@ makes a review loop unable to terminate.
   without recording anything, which is the case an earlier version of
   `_shutdown_probe` called undiscoverable in its own docstring. It is derivable,
   and a docstring admitting a gap is not a substitute for closing it.
+
+### A precondition is enforced where the provider is CALLED, not where work is planned
+
+- **Any condition that must be able to stop external work — a consent, a kill
+  switch, an operator brake — is read on the path that reaches
+  `provider.ensure` / `provider.inspect`, at the time it reaches it, and at
+  every such entry point. A check only at the planning or selection layer does
+  not enforce it.** Enforced for the MVP email switches by
+  `tests/control_plane/test_email_option_flags.py::test_disabling_an_option_stops_work_that_is_already_queued`,
+  which enqueues with the option ON, turns it OFF, and asserts across a fresh
+  `ensure`, a user-triggered `inspect` and a reclaimed job that the recording
+  provider was never called; by
+  `test_operator_reconcile_also_stops_at_a_disabled_option`, because `reconcile`
+  is a second entry point that dispatches to the same provider methods; and by
+  `test_an_enabled_option_still_reaches_its_provider`, without which every one
+  of those passes just as well when the worker stops for an unrelated reason.
+
+  Recorded after the second instance. The Art. 9(2)(a) content restriction was
+  the first: `onboarding.provision` reported the precondition while the worker
+  was the thing that had to hold it, and the fix put the check in `_run_once`
+  and shared the predicate through `requires_current_content_restriction` so the
+  two layers ask one question. The MVP kill switches repeated it exactly —
+  `_assert_email_rollout` refused a disabled option at `select`, and every job
+  already queued kept provisioning, which is the incident the switch exists for.
+
+  Three halves, all load-bearing.
+
+  **Read at call time, not at plan time.** A value captured when the job was
+  created is the value the operator is trying to change. The queue is the whole
+  problem: between selection and the provider call there is an unbounded delay
+  during which the answer can flip, and jobs are re-inspected and reclaimed long
+  after they are planned.
+
+  **Exempt shutdown, never teardown.** A brake that also stops deprovisioning
+  strands exactly the external resources pulling it is meant to remove. Ask
+  through `_is_shutdown_action` rather than restating it; the reasoning it
+  carries for the consent precondition is the same reasoning, and a second
+  spelling is a second thing to get wrong.
+
+  **Braking is not failing.** Settling a braked job terminally is only safe
+  where it is known never to have reached a provider — a first attempt that was
+  not reclaimed. Anywhere else `failed` erases durable uncertainty AND moves the
+  job out of `outcome_unknown`, the only status `reconcile` accepts, so the
+  brake strands exactly the external org, domain or binding that turning the
+  brake off exists to clean up. An already-ambiguous job is left untouched,
+  because rewriting it replaces the reconcilable state an operator is holding
+  with the brake's own, less informative, reason. Enforced by
+  `test_a_braked_job_survives_to_be_reconciled_when_the_flag_returns`, which
+  brakes, re-enables, and asserts the provider is then actually reached — the
+  second half being what distinguishes a preserved job from a differently-broken
+  one. And the brake's error code must NOT carry `RECONCILIATION_SUFFIX`: that
+  suffix means quarantined, `_is_shutdown_action` treats quarantined as exempt,
+  and a braked job would be exempt from its own brake on the very next pass.
+
+  The selection-layer check still earns its place — it keeps a cut option off
+  the screen instead of failing after a user picks it — but it is the courtesy,
+  not the enforcement. Where both layers ask, they must ask from one table:
+  `CUT_EMAIL_OPTIONS` is keyed by selection kind and by provider name because
+  those are the two vocabularies, and two hand-written maps would drift into an
+  option cut from one and not the other.

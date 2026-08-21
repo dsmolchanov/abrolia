@@ -46,6 +46,18 @@ RESTRICTION_VERSION, RESTRICTION_SHA = consent_version_and_sha(
 HOUSEHOLD_VERSION, HOUSEHOLD_SHA = consent_version_and_sha(HOUSEHOLD_CONTENT_PURPOSE)
 
 
+@pytest.fixture(autouse=True)
+def _enable_gated_email_options(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`family_domain` and `gmail_agent` are behind fail-closed kill switches.
+
+    This suite is about Art. 9(2)(a) consent and Art. 9(4) country gating, not
+    about the switches, so it turns them on. The switches themselves are
+    asserted in `test_email_option_flags.py`.
+    """
+    monkeypatch.setenv("ABROLIA_BYO_EMAIL_ENABLED", "1")
+    monkeypatch.setenv("ABROLIA_GMAIL_ENABLED", "1")
+
+
 def real_email_selection(**overrides: object) -> dict[str, object]:
     selection: dict[str, object] = {
         "kind": "abrolia_managed",
