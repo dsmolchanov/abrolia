@@ -159,6 +159,20 @@ def test_an_unchanged_event_is_left_alone(world) -> None:
     assert backend.patches == 0, "лишний patch — лишнее уведомление всем гостям события"
 
 
+def test_google_timezone_normalization_does_not_trigger_a_patch(world) -> None:
+    pipeline, _transport, backend = world
+    event = build_calendar_event(approval_id="a-1", title="Экскурсия 3b", start=START)
+    pipeline.calendar.upsert(event)
+    stored = next(iter(backend.events.values()))
+    stored["start"]["dateTime"] = "2026-09-12T09:45:00+02:00"
+    stored["end"]["dateTime"] = "2026-09-12T10:45:00+02:00"
+
+    written = pipeline.calendar.upsert(event)
+
+    assert (written.created, written.updated) == (False, False)
+    assert backend.patches == 0
+
+
 def test_a_racing_insert_is_read_as_already_there(world) -> None:
     """Два воркера, один id: 409 от Google означает «событие уже наше»."""
     pipeline, transport, backend = world

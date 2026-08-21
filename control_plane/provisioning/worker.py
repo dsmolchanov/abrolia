@@ -25,6 +25,10 @@ from control_plane.email.repository import EmailIdentityRepository
 from control_plane.models import StepKind, StepStatus
 from control_plane.observability import StructuredLogger
 from control_plane.onboarding.state import VERIFY_RESULT, next_status
+from control_plane.privacy.consent import (
+    CURRENT_RESTRICTION_RECEIPT_SQL,
+    consent_version_and_sha,
+)
 from control_plane.providers.email.nerve_client import email_org_external_ref
 from control_plane.provisioning.contracts import (
     InspectState,
@@ -57,6 +61,22 @@ class _ProjectionCancelled(RuntimeError):
 DNS_POLL_INITIAL_SECONDS = 30.0
 DNS_POLL_MAX_SECONDS = 300.0
 DNS_POLL_MAX_JOB_ATTEMPTS = 5
+
+
+def requires_current_content_restriction(
+    kind: str, operation: str, provider: str
+) -> bool:
+    """Whether `_run_once` gates this job on the special-category receipt.
+
+    Shared with `onboarding.provision`, which reports what the worker will do
+    and therefore has to ask the worker's own question rather than restate it —
+    the same remedy `CURRENT_RESTRICTION_RECEIPT_SQL` gave the receipt lookup.
+    Restating it meant the report checked only an already-planned runtime job
+    while the gate also covers every non-fake email-identity job.
+    """
+    return (kind == "email_identity" and provider != "fake-email") or (
+        kind == "runtime" and operation != "ensure_secret_namespace"
+    )
 
 
 class ProvisioningWorker:
@@ -170,6 +190,11 @@ class ProvisioningWorker:
         request = self.jobs.request(job.id)
         if job.kind == "bootstrap_cleanup":
             return self._cleanup_bootstrap(job, request)
+        if (
+            self._requires_current_email_content_restriction(job)
+            and not self._has_current_email_content_restriction(job.household_id)
+        ):
+            return self._block_for_missing_content_restriction(job, request)
         provider = None
         result = None
         try:
@@ -192,6 +217,19 @@ class ProvisioningWorker:
             if job.kind == "email_identity":
                 namespace_ref = self._secret_namespace_ref(job.household_id)
                 if namespace_ref is None:
+                    namespace_job = self.jobs.db.query_one(
+                        "SELECT status FROM provisioning_jobs WHERE household_id = ?"
+                        " AND operation = 'ensure_secret_namespace'"
+                        " ORDER BY created_at DESC, id DESC LIMIT 1",
+                        (job.household_id,),
+                    )
+                    if namespace_job is not None and namespace_job["status"] == "failed":
+                        return self._mark_step_problem(
+                            job,
+                            request,
+                            "failed",
+                            "secret_namespace_failed",
+                        )
                     self.jobs.retry_later(
                         job.id,
                         not_before=self.clock() + 5,
@@ -312,6 +350,117 @@ class ProvisioningWorker:
             return self._mark_step_problem(
                 job, request, "outcome_unknown", "outcome_unknown"
             )
+
+    def _has_current_email_content_restriction(self, household_id: str) -> bool:
+        version, sha256 = consent_version_and_sha(
+            "special_category_content_restriction"
+        )
+        return self.jobs.db.query_one(
+            CURRENT_RESTRICTION_RECEIPT_SQL,
+            (
+                household_id,
+                "special_category_content_restriction",
+                version,
+                sha256,
+            ),
+        ) is not None
+
+    @staticmethod
+    def _requires_current_email_content_restriction(job: JobRecord) -> bool:
+        return requires_current_content_restriction(
+            job.kind, job.operation, job.provider
+        )
+
+    def _block_for_missing_content_restriction(
+        self, job: JobRecord, request: dict[str, Any]
+    ) -> WorkResult:
+        if job.kind != "runtime":
+            return self._mark_step_problem(
+                job,
+                request,
+                "failed",
+                "content_restriction_receipt_required",
+            )
+        now = self.clock()
+        with self.jobs.db.write() as connection:
+            current = connection.execute(
+                "SELECT status FROM provisioning_jobs WHERE id = ?", (job.id,)
+            ).fetchone()
+            if current is None:
+                return WorkResult(job.id, "cancelled", "job_missing")
+            if current["status"] not in {"running", "outcome_unknown"}:
+                return WorkResult(job.id, current["status"], current["status"])
+            self.jobs.settle(
+                connection,
+                job.id,
+                status="failed",
+                error_code="content_restriction_receipt_required",
+                now=now,
+            )
+            workflow_row = connection.execute(
+                "SELECT * FROM onboarding_workflows WHERE id = ? AND household_id = ?",
+                (job.workflow_id, job.household_id),
+            ).fetchone()
+            if workflow_row is None or workflow_row["state"] not in {
+                "runtime_provisioning",
+                "activating",
+            }:
+                return WorkResult(
+                    job.id, "failed", "content_restriction_receipt_required"
+                )
+            owner = connection.execute(
+                "SELECT account_id FROM household_memberships WHERE household_id = ?"
+                " AND role = 'owner' AND status = 'active' LIMIT 1",
+                (job.household_id,),
+            ).fetchone()
+            if owner is None:
+                return WorkResult(
+                    job.id, "failed", "content_restriction_receipt_required"
+                )
+            connection.execute(
+                "UPDATE config_revisions SET status = 'revoked' WHERE household_id = ?"
+                " AND status IN ('planned','issued','claimed')",
+                (job.household_id,),
+            )
+            connection.execute(
+                "UPDATE bootstrap_tokens SET revoked_at = ? WHERE household_id = ?"
+                " AND used_at IS NULL AND revoked_at IS NULL",
+                (now, job.household_id),
+            )
+            connection.execute(
+                "UPDATE households SET status = 'onboarding', updated_at = ? WHERE id = ?"
+                " AND status NOT IN ('deleting','deleted')",
+                (now, job.household_id),
+            )
+            workflow = WorkflowRecord(
+                workflow_row["id"],
+                workflow_row["household_id"],
+                workflow_row["state"],
+                workflow_row["current_step"],
+                workflow_row["version"],
+            )
+            new_version = workflow.version + 1
+            connection.execute(
+                "UPDATE onboarding_workflows SET state = 'in_progress',"
+                " current_step = ?, version = ?, updated_at = ?, completed_at = NULL"
+                " WHERE id = ?",
+                (StepKind.EMAIL.value, new_version, now, workflow.id),
+            )
+            self.onboarding.append_transition(
+                connection,
+                workflow=workflow,
+                new_version=new_version,
+                command="require_content_restriction_acknowledgement",
+                to_state="in_progress",
+                account_id=owner["account_id"],
+                session_id=None,
+                request_id=f"worker:{job.id}:content-restriction",
+                step_kind=StepKind.EMAIL.value,
+                related_job_id=job.id,
+                metadata={"reason": "current_receipt_required"},
+                now=now,
+            )
+        return WorkResult(job.id, "failed", "content_restriction_receipt_required")
 
     def _handle_email_provider_error(
         self,
@@ -554,6 +703,65 @@ class ProvisioningWorker:
                 now=self.clock(),
             )
 
+    def _email_secret_installed(
+        self, job: JobRecord, request: dict, namespace_ref: str
+    ) -> bool:
+        # Durable receipt or live sink proof that the expected binding is present.
+        binding_ref: str | None = None
+        identity_id = request.get("email_identity_id")
+        if isinstance(identity_id, str) and self.email_identities is not None:
+            identity = self.email_identities.get(identity_id)
+            if identity is not None:
+                binding_ref = identity.secret_binding_ref
+        if not isinstance(binding_ref, str) or not binding_ref:
+            raw_binding = request.get("secret_binding_ref")
+            binding_ref = raw_binding if isinstance(raw_binding, str) else None
+        if not isinstance(binding_ref, str) or not binding_ref:
+            pub = request.get("public_result")
+            public_ref = pub.get("secret_binding_ref") if isinstance(pub, dict) else None
+            if isinstance(public_ref, str):
+                binding_ref = public_ref
+        if not isinstance(binding_ref, str) or not binding_ref:  # noqa: SIM102
+            # Fall back to expected synthetic binding.
+            if job.provider == "fake-email" or job.provider == "synthetic":
+                binding_ref = SYNTHETIC_EMAIL_SECRET_BINDING
+        if not isinstance(binding_ref, str) or not binding_ref:
+            return False
+        try:
+            row = self.jobs.db.query_one(
+                "SELECT 1 FROM email_secret_installs WHERE job_id = ?",
+                (job.id,),
+            )
+            if row is not None:
+                return True
+        except Exception:
+            pass
+        try:
+            contains = getattr(self.secret_sink, "contains", None)
+            if callable(contains) and contains(namespace_ref, binding_ref):
+                # Create receipt for future reclaim without needing live inspection.
+                try:
+                    with self.jobs.db.write() as connection:
+                        connection.execute(
+                            "INSERT OR IGNORE INTO email_secret_installs"
+                            " (job_id, household_id, secret_name, namespace_ref, installed_at, created_at)"
+                            " VALUES (?, ?, ?, ?, ?, ?)",
+                            (
+                                job.id,
+                                job.household_id,
+                                binding_ref,
+                                namespace_ref,
+                                self.clock(),
+                                self.clock(),
+                            ),
+                        )
+                except Exception:
+                    pass
+                return True
+        except Exception:
+            return False
+        return False
+
     def _stage_email_secret(
         self,
         job: JobRecord,
@@ -572,10 +780,11 @@ class ProvisioningWorker:
                 return True
             provider = self.providers.get(job.provider)
             verifier = getattr(provider, "pre_staged_secret_verified", None)
-            return bool(
-                callable(verifier)
-                and verifier(request, namespace_ref, binding_ref)
-            )
+            if callable(verifier) and verifier(request, namespace_ref, binding_ref):
+                return True
+            # Empty material but sink already contains the binding from a prior crash
+            # window: treat as installed if durable receipt or live sink proves it.
+            return self._email_secret_installed(job, request, namespace_ref)  # noqa: SIM103
         material_names = [name for name, _value in result.secret_material.items()]
         if not isinstance(binding_ref, str) or material_names != [binding_ref]:
             result.secret_material.clear()
@@ -587,6 +796,26 @@ class ProvisioningWorker:
         except Exception:
             result.secret_material.clear()
             return False
+        # Record durable non-secret receipt immediately after successful sink install.
+        try:
+            with self.jobs.db.write() as connection:
+                connection.execute(
+                    "INSERT OR IGNORE INTO email_secret_installs"
+                    " (job_id, household_id, secret_name, namespace_ref, installed_at, created_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        job.id,
+                        job.household_id,
+                        binding_ref,
+                        namespace_ref,
+                        self.clock(),
+                        self.clock(),
+                    ),
+                )
+        except Exception:
+            # If the receipt write fails, the live sink still proves installation;
+            # a later reclaim will reconstruct the receipt via contains().
+            pass
         return True
 
     def _validated_email_public_result(
@@ -1150,6 +1379,11 @@ class ProvisioningWorker:
         request = self.jobs.request(job.id)
         if job.kind == "bootstrap_cleanup":
             return self._cleanup_bootstrap(job, request)
+        if (
+            self._requires_current_email_content_restriction(job)
+            and not self._has_current_email_content_restriction(job.household_id)
+        ):
+            return self._block_for_missing_content_restriction(job, request)
         provider = self.providers.get(job.provider)
         if job.kind == "cleanup":
             deferred = self._defer_runtime_cleanup(job, request)
@@ -1306,6 +1540,7 @@ class ProvisioningWorker:
                 if (
                     job.error_code == "secret_handoff_unknown"
                     and result.secret_material.is_empty
+                    and not self._email_secret_installed(job, request, namespace_ref)
                 ):
                     return WorkResult(
                         job.id, "outcome_unknown", "secret_handoff_unknown"
@@ -1345,11 +1580,15 @@ class ProvisioningWorker:
                         job.error_code == "secret_handoff_unknown"
                         and inspected.result.secret_material.is_empty
                     ):
-                        return WorkResult(
-                            job.id,
-                            "outcome_unknown",
-                            "secret_handoff_unknown",
-                        )
+                        namespace_ref_tmp = self._secret_namespace_ref(job.household_id)
+                        if namespace_ref_tmp is None or not self._email_secret_installed(
+                            job, request, namespace_ref_tmp
+                        ):
+                            return WorkResult(
+                                job.id,
+                                "outcome_unknown",
+                                "secret_handoff_unknown",
+                            )
                     namespace_ref = self._secret_namespace_ref(job.household_id)
                     if namespace_ref is None or not self._stage_email_secret(
                         job, request, inspected.result, namespace_ref

@@ -14,6 +14,7 @@ from control_plane.api.internal_bootstrap import _bootstrap_transport_allowed
 from control_plane.db import new_id
 from control_plane.models import ProfileInput, StepKind
 from control_plane.onboarding.contracts import CommandContext
+from control_plane.privacy.consent import consent_version_and_sha
 from control_plane.provisioning.bootstrap import (
     BootstrapConflict,
     BootstrapDenied,
@@ -29,7 +30,17 @@ from hermes_cloud.runtime.bootstrap import (
 )
 from hermes_cloud.runtime.service import RuntimeService
 
-EMAIL_SELECTION = {"kind": "abrolia_managed", "local_part": "bootstrap-agent"}
+_RESTRICTION_VERSION, _RESTRICTION_SHA = consent_version_and_sha(
+    "special_category_content_restriction"
+)
+EMAIL_SELECTION = {
+    "kind": "abrolia_managed",
+    "local_part": "bootstrap-agent",
+    "special_category_restriction_acknowledged": True,
+    "special_category_restriction_receipt_id": "10000000-0000-4000-8000-000000000011",
+    "special_category_restriction_text_version": _RESTRICTION_VERSION,
+    "special_category_restriction_text_sha256": _RESTRICTION_SHA,
+}
 WHATSAPP_SELECTION = {
     "kind": "shared_abrolia",
     "member_phone_test_ref": "synthetic-phone:bootstrap-owner",
@@ -195,6 +206,33 @@ def test_bootstrap_token_is_bound_to_household_runtime_and_revision(api_harness,
     assert row["claimed_at"] is None and row["used_at"] is None
 
 
+def test_activation_rechecks_content_restriction_after_runtime_issue(
+    api_harness,
+) -> None:
+    runtime = _provision_runtime(api_harness)
+    active = api_harness.container
+    binding = _binding(runtime)
+    active.bootstrap.claim(runtime.raw_token, **binding)
+    with active.database.write() as connection:
+        connection.execute(
+            "DELETE FROM consent_receipts WHERE household_id = ? AND purpose = ?",
+            (runtime.world.household.id, "special_category_content_restriction"),
+        )
+
+    with pytest.raises(BootstrapConflict, match="activation consent receipt"):
+        active.bootstrap.activate(
+            runtime.raw_token,
+            **binding,
+            activated_sha256=runtime.manifest_sha256,
+        )
+    assert active.households.get(runtime.world.household.id).status == "provisioning"
+    token = active.database.query_one(
+        "SELECT used_at FROM bootstrap_tokens WHERE household_id = ?",
+        (runtime.world.household.id,),
+    )
+    assert token["used_at"] is None
+
+
 def test_claim_and_activation_are_resumable_and_cleanup_is_durable(
     api_harness,
 ) -> None:
@@ -256,6 +294,11 @@ def test_claim_and_activation_are_resumable_and_cleanup_is_durable(
             runtime.raw_token,
             **binding,
             activated_sha256="0" * 64,
+        )
+    with active.database.write() as connection:
+        connection.execute(
+            "DELETE FROM consent_receipts WHERE household_id = ? AND purpose = ?",
+            (runtime.world.household.id, "special_category_content_restriction"),
         )
     acknowledged = active.bootstrap.activate(
         runtime.raw_token,
@@ -335,6 +378,45 @@ def test_tombstone_and_expiry_block_delayed_bootstrap_callbacks(api_harness) -> 
         )
     with pytest.raises(BootstrapGone, match="expired"):
         active.bootstrap.claim(runtime.raw_token, **_binding(runtime), now=now)
+
+
+def test_delete_retains_tombstone_rejects_old_bootstrap_and_allows_fresh_household(
+    api_harness,
+) -> None:
+    runtime = _provision_runtime(api_harness)
+    active = api_harness.container
+    deleted_household_id = runtime.world.household.id
+
+    result = active.deletion.delete(
+        runtime.world.account.id,
+        deleted_household_id,
+        idempotency_key="delete-before-bootstrap-replay",
+    )
+
+    assert result.completion_status == "complete"
+    # Complete deletion removes the token row, so the old credential is denied
+    # without revealing whether its former household existed. The tombstone is
+    # retained independently to stop delayed callbacks that still carry an ID.
+    with pytest.raises((BootstrapDenied, BootstrapGone)):
+        active.bootstrap.claim(runtime.raw_token, **_binding(runtime))
+    tombstone = active.database.query_one(
+        "SELECT household_id_hmac, completion_status FROM deletion_tombstones"
+    )
+    assert tombstone["household_id_hmac"] == active.lookup.digest(
+        deleted_household_id
+    )
+    assert tombstone["completion_status"] == "complete"
+
+    replacement_account = active.accounts.create_verified(
+        "bootstrap-owner@family.test"
+    )
+    replacement = active.households.create_for_owner(replacement_account.id)
+    assert replacement.id != deleted_household_id
+    assert active.database.query_one(
+        "SELECT household_id_hmac FROM deletion_tombstones"
+        " WHERE household_id_hmac = ?",
+        (active.lookup.digest(deleted_household_id),),
+    ) is not None
 
 
 def test_internal_bootstrap_api_maps_conflicts_replay_and_never_echoes_token(

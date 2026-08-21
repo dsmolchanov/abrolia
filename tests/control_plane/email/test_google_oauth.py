@@ -9,6 +9,7 @@ import pytest
 
 from control_plane.email.models import GMAIL_EMAIL_SCOPES, GMAIL_EMAIL_SECRET_BINDING
 from control_plane.models import StepKind
+from control_plane.privacy.consent import consent_version_and_sha
 from control_plane.providers.email.google_oauth import (
     GoogleOAuthInvalidState,
     GoogleOAuthProvisioner,
@@ -18,6 +19,18 @@ from control_plane.providers.email.google_oauth import (
 )
 from control_plane.provisioning.contracts import InspectState, ProviderRegistry, ProviderRejected
 from control_plane.provisioning.secrets import InMemorySecretSink
+
+_RESTRICTION_VERSION, _RESTRICTION_SHA = consent_version_and_sha(
+    "special_category_content_restriction"
+)
+GMAIL_SELECTION = {
+    "kind": "gmail_agent",
+    "separate_agent_account_acknowledged": True,
+    "special_category_restriction_acknowledged": True,
+    "special_category_restriction_receipt_id": "10000000-0000-4000-8000-000000000021",
+    "special_category_restriction_text_version": _RESTRICTION_VERSION,
+    "special_category_restriction_text_sha256": _RESTRICTION_SHA,
+}
 
 
 class FakeGoogleClient:
@@ -80,7 +93,7 @@ def _select_gmail(cp_stack, provider, sink):
     cp_stack.service.select(
         cp_stack.household.id,
         StepKind.EMAIL,
-        {"kind": "gmail_agent", "separate_agent_account_acknowledged": True},
+        GMAIL_SELECTION,
         context=cp_stack.context(),
     )
     registry = ProviderRegistry()

@@ -17,7 +17,7 @@ from control_plane.provisioning.contracts import (
     ProviderRateLimited,
     ProviderRejected,
 )
-from control_plane.provisioning.fly import FlyRuntimeProvisioner
+from control_plane.provisioning.fly import FlyRuntimeProvisioner, _authorization_header
 from control_plane.provisioning.manifest import (
     ActorsV1,
     ChannelBindingV1,
@@ -75,7 +75,53 @@ def _provisioner(handler) -> FlyRuntimeProvisioner:
         image_digest=IMAGE,
         bootstrap_url="https://app.example.test",
         client=httpx.Client(transport=httpx.MockTransport(handler)),
+        runner=lambda command, **_kwargs: subprocess.CompletedProcess(
+            command, 0, b"", b""
+        ),
     )
+
+
+def _synthetic_macaroon(version: str = "2") -> str:
+    """Build a non-secret Fly-shaped test value without scanner-like literals."""
+    return f"fm{version}_synthetic-macaroon"
+
+
+@pytest.mark.parametrize(
+    ("token", "expected"),
+    [
+        ("synthetic-oauth-token", "Bearer synthetic-oauth-token"),
+        ("Bearer synthetic-oauth-token", "Bearer synthetic-oauth-token"),
+        (_synthetic_macaroon(), f"FlyV1 {_synthetic_macaroon()}"),
+        ("FlyV1 fm1a_one,fm2_two", "FlyV1 fm1a_one,fm2_two"),
+        (
+            f"synthetic-oauth,{_synthetic_macaroon('1r')}",
+            f"FlyV1 {_synthetic_macaroon('1r')}",
+        ),
+    ],
+)
+def test_fly_authorization_header_matches_flaps_token_scheme(
+    token: str, expected: str
+) -> None:
+    assert _authorization_header(token) == expected
+
+
+def test_fly_request_uses_macaroon_authorization_scheme() -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers["Authorization"])
+        return httpx.Response(200, json={"status": "ok"}, request=request)
+
+    provisioner = FlyRuntimeProvisioner(
+        api_token=_synthetic_macaroon(),
+        org_slug="synthetic-org",
+        image_digest=IMAGE,
+        bootstrap_url="https://app.example.test",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    assert provisioner._request("GET", "/status") == {"status": "ok"}
+    assert seen == [f"FlyV1 {_synthetic_macaroon()}"]
 
 
 def test_config_uses_private_http_only_for_flycast(tmp_path: Path) -> None:
@@ -175,6 +221,7 @@ class StatefulFly:
         ignore_volume_update: bool = False,
     ) -> None:
         self.calls: list[tuple[str, str, dict[str, Any] | None]] = []
+        self.query_params: list[tuple[str, str, dict[str, str]]] = []
         self.app: dict[str, Any] | None = None
         self.volume: dict[str, Any] | None = None
         self.machine: dict[str, Any] | None = None
@@ -187,6 +234,7 @@ class StatefulFly:
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
+        self.query_params.append((request.method, path, dict(request.url.params)))
         body = json.loads(request.content) if request.content else None
         self.calls.append((request.method, path, body))
         if path == "/v1/apps" and request.method == "POST":
@@ -524,8 +572,7 @@ def test_deprovision_waits_for_post_delete_404_and_uses_exact_ids() -> None:
     )
 
     second = provisioner.deprovision(runtime.public_result)
-    assert second.state is InspectState.PENDING
-    assert second.error_code == "fly_delete_pending"
+    assert second.state is InspectState.ABSENT
     assert (
         "DELETE",
         f"/v1/apps/{runtime.external_ref}/volumes/vol-synthetic",
@@ -533,11 +580,86 @@ def test_deprovision_waits_for_post_delete_404_and_uses_exact_ids() -> None:
     assert ("DELETE", f"/v1/apps/{runtime.external_ref}") in [
         (method, path) for method, path, _body in fly.calls
     ]
+    assert (
+        "DELETE",
+        f"/v1/apps/{runtime.external_ref}/machines/machine-synthetic",
+        {"force": "true"},
+    ) in fly.query_params
+    assert (
+        "DELETE",
+        f"/v1/apps/{runtime.external_ref}",
+        {},
+    ) in fly.query_params
 
-    # A 2xx DELETE is only an accepted request. ABSENT is returned only after
-    # the following call's GET observes the app's authoritative 404.
+    # The pinned flyctl fallback handles staged-secret apps, but success is
+    # still established only by the authoritative GET observing 404.
     third = provisioner.deprovision(runtime.public_result)
     assert third.state is InspectState.ABSENT
+
+
+def test_deprovision_flyctl_fallback_is_shell_free_and_keeps_token_out_of_argv(
+) -> None:
+    spec = _spec()
+    fly = StatefulFly(app_delete_lag=100)
+    calls: list[tuple[list[str], dict[str, Any]]] = []
+
+    def runner(command, **kwargs):
+        calls.append((command, kwargs))
+        return subprocess.CompletedProcess(command, 0, b"", b"")
+
+    provisioner = FlyRuntimeProvisioner(
+        api_token=_synthetic_macaroon(),
+        org_slug="synthetic-org",
+        image_digest=IMAGE,
+        bootstrap_url="https://app.example.test",
+        client=httpx.Client(transport=httpx.MockTransport(fly)),
+        runner=runner,
+    )
+    runtime = provisioner.ensure(
+        {"manifest": spec.model_dump(mode="json")}, "intent"
+    )
+
+    pending = provisioner.deprovision(runtime.public_result)
+
+    assert pending.state is InspectState.PENDING
+    command, kwargs = calls[-1]
+    assert command == ["fly", "apps", "destroy", runtime.external_ref, "--yes"]
+    assert kwargs["shell"] is False
+    assert kwargs["timeout"] == 30.0
+    assert _synthetic_macaroon() not in command
+    assert kwargs["env"]["FLY_ACCESS_TOKEN"] == _synthetic_macaroon()
+
+    polled = provisioner.deprovision(runtime.public_result)
+    assert polled.state is InspectState.PENDING
+    assert len(calls) == 1
+
+
+def test_deprovision_flyctl_timeout_is_an_unknown_outcome() -> None:
+    spec = _spec()
+    fly = StatefulFly(app_delete_lag=100)
+    calls: list[tuple[list[str], dict[str, Any]]] = []
+
+    def runner(command, **kwargs):
+        calls.append((command, kwargs))
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    provisioner = FlyRuntimeProvisioner(
+        api_token=_synthetic_macaroon(),
+        org_slug="synthetic-org",
+        image_digest=IMAGE,
+        bootstrap_url="https://app.example.test",
+        client=httpx.Client(transport=httpx.MockTransport(fly)),
+        runner=runner,
+    )
+    runtime = provisioner.ensure(
+        {"manifest": spec.model_dump(mode="json")}, "intent"
+    )
+
+    result = provisioner.deprovision(runtime.public_result)
+
+    assert result.state is InspectState.UNKNOWN
+    assert result.error_code == "fly_delete_unknown"
+    assert calls[-1][1]["timeout"] == 30.0
 
 
 def test_runtime_deprovision_preserves_app_secret_namespace() -> None:

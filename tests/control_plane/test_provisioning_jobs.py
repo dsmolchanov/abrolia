@@ -4,14 +4,22 @@ import os
 import subprocess
 import sys
 from collections.abc import Callable
+from io import StringIO
 from pathlib import Path
 
 import pytest
 
+from control_plane.api.onboarding import _response
 from control_plane.crypto import SecretMaterial
 from control_plane.email.contracts import EmailFailureKind, EmailProviderError
-from control_plane.email.models import EmailIdentityStatus
+from control_plane.email.models import (
+    SYNTHETIC_EMAIL_SECRET_BINDING,
+    EmailIdentityStatus,
+)
 from control_plane.models import StepKind, StepStatus
+from control_plane.observability import StructuredLogger
+from control_plane.onboarding.contracts import CommandResult
+from control_plane.privacy.consent import consent_version_and_sha
 from control_plane.provisioning.contracts import (
     InspectResult,
     InspectState,
@@ -25,10 +33,21 @@ from control_plane.provisioning.fakes import (
     DeterministicFakeProvisioner,
     DryRunRuntimeProvisioner,
 )
+from control_plane.provisioning.manifest_toml import manifest_to_toml
 from control_plane.provisioning.secrets import InMemorySecretSink
 
 BASE_TIME = 1_800_000_000.0
-EMAIL_SELECTION = {"kind": "abrolia_managed", "local_part": "family-agent"}
+_RESTRICTION_VERSION, _RESTRICTION_SHA = consent_version_and_sha(
+    "special_category_content_restriction"
+)
+EMAIL_SELECTION = {
+    "kind": "abrolia_managed",
+    "local_part": "family-agent",
+    "special_category_restriction_acknowledged": True,
+    "special_category_restriction_receipt_id": "10000000-0000-4000-8000-000000000014",
+    "special_category_restriction_text_version": _RESTRICTION_VERSION,
+    "special_category_restriction_text_sha256": _RESTRICTION_SHA,
+}
 WHATSAPP_SELECTION = {
     "kind": "shared_abrolia",
     "member_phone_test_ref": "synthetic-phone:worker-owner",
@@ -556,6 +575,263 @@ def test_sigkill_after_one_time_secret_response_never_falsely_verifies(
     assert recovered.status == "outcome_unknown"
     assert recovered.error_code == "secret_handoff_unknown"
     assert cp_stack.jobs.get(job["id"]).status == "outcome_unknown"
+
+
+def test_secret_canary_is_confined_to_sink_across_sink_crash_and_public_surfaces(
+    cp_stack, tmp_path: Path
+) -> None:
+    """SIGKILL after sink commit; reclaim using sink proof without leaking value."""
+    canary = "-".join(("phase", "b", "secret", "canary", "value"))
+    binding = SYNTHETIC_EMAIL_SECRET_BINDING
+    sink_path = tmp_path / "durable-secret-sink"
+
+    cp_stack.complete_profile()
+    cp_stack.service.select(
+        cp_stack.household.id,
+        StepKind.EMAIL,
+        EMAIL_SELECTION,
+        context=cp_stack.context(),
+        now=BASE_TIME + 2,
+    )
+    job = cp_stack.database.query_one(
+        "SELECT id, intent_key FROM provisioning_jobs WHERE kind = 'email_identity'"
+    )
+    request = cp_stack.jobs.request(job["id"])
+    identity_id = request["email_identity_id"]
+
+    helper = Path(__file__).with_name("chaos_child.py")
+    project_root = Path(__file__).parents[2]
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            str(helper),
+            str(cp_stack.database.path),
+            "sink-commit",
+            str(sink_path),
+        ],
+        cwd=project_root,
+        env={
+            **os.environ,
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONPATH": str(project_root),
+        },
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert child.stdout is not None
+        assert child.stdout.readline().strip() == "crash-window-open"
+        child.kill()
+        _stdout, child_stderr = child.communicate(timeout=5)
+        assert child.returncode is not None and child.returncode < 0
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=5)
+
+    crashed = cp_stack.jobs.get(job["id"])
+    assert crashed.status == "running"
+    assert sink_path.read_bytes() == canary.encode()
+    assert canary not in child_stderr
+
+    class DurableFileSink(InMemorySecretSink):
+        def contains(self, runtime_ref, name):
+            if name == binding and sink_path.is_file():
+                return True
+            return super().contains(runtime_ref, name)
+
+        def get(self, runtime_ref, name):
+            if name == binding and sink_path.is_file():
+                return sink_path.read_bytes()
+            return super().get(runtime_ref, name)
+
+        def delete(self, runtime_ref, name):
+            if name == binding:
+                sink_path.unlink(missing_ok=True)
+            super().delete(runtime_ref, name)
+
+    recovered_email = DeterministicFakeProvisioner("email")
+    recovered_email.resources[job["intent_key"]] = ProvisionResult(
+        external_ref=f"synthetic-email:{identity_id}",
+        public_result={
+            "agent_inbox": "family-agent@" + "abrolia.com",
+            "provider": "synthetic",
+            "provider_refs": {"identity_id": identity_id},
+            "secret_binding_ref": binding,
+        },
+    )
+
+    providers = ProviderRegistry()
+    providers.register("fake-email", recovered_email)
+    providers.register("fake-whatsapp", DeterministicFakeProvisioner("whatsapp"))
+    providers.register("fake-channel", DeterministicFakeProvisioner("channel"))
+    providers.register("fake-cleanup", DeterministicFakeProvisioner("cleanup"))
+    providers.register("dry-run-runtime", DryRunRuntimeProvisioner())
+    sink = DurableFileSink()
+    log_stream = StringIO()
+    worker = cp_stack.make_worker(
+        providers=providers, secret_sink=sink, now=BASE_TIME + 10
+    )
+    worker.logger = StructuredLogger(log_stream)
+    recovered = worker.run_once()
+    assert recovered is not None and recovered.status == "succeeded"
+    assert recovered_email.ensure_calls == 0
+
+    for kind, selection in (
+        (StepKind.WHATSAPP, WHATSAPP_SELECTION),
+        (StepKind.PRIMARY_CHANNEL, CHANNEL_SELECTION),
+    ):
+        cp_stack.service.select(
+            cp_stack.household.id,
+            kind,
+            selection,
+            context=cp_stack.context(),
+            now=BASE_TIME + 3,
+        )
+        assert worker.run_once().status == "succeeded"
+
+    runtime = worker.run_once()
+    assert runtime is not None and runtime.status == "succeeded"
+    namespace = worker._secret_namespace_ref(cp_stack.household.id)
+    assert namespace is not None
+    assert sink.get(namespace, binding) == canary.encode()
+
+    snapshot = cp_stack.onboarding.snapshot(cp_stack.household.id)
+    api_body = _response(CommandResult(snapshot)).body
+    manifest = manifest_to_toml(cp_stack.configs.manifest(cp_stack.household.id, 1))
+    job_json = repr([
+        cp_stack.jobs.request(row["id"])
+        for row in cp_stack.database.query("SELECT id FROM provisioning_jobs")
+    ])
+    cp_stack.database.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    database_bytes = cp_stack.database.path.read_bytes()
+    wal_path = cp_stack.database.path.with_name(cp_stack.database.path.name + "-wal")
+    if wal_path.exists():
+        database_bytes += wal_path.read_bytes()
+
+    encoded = canary.encode()
+    assert encoded not in database_bytes
+    assert encoded not in api_body
+    assert canary not in manifest
+    assert canary not in job_json
+    assert canary not in log_stream.getvalue()
+
+
+def test_issued_runtime_job_rechecks_current_content_restriction_receipt(
+    cp_stack,
+) -> None:
+    _advance_to_runtime(cp_stack)
+    with cp_stack.database.write() as connection:
+        connection.execute(
+            "DELETE FROM consent_receipts WHERE household_id = ? AND purpose = ?",
+            (cp_stack.household.id, "special_category_content_restriction"),
+        )
+    runtime_provider = DryRunRuntimeProvisioner()
+    providers = ProviderRegistry()
+    providers.register("dry-run-runtime", runtime_provider)
+
+    blocked = cp_stack.make_worker(
+        providers=providers, now=BASE_TIME + 100
+    ).run_once()
+
+    assert blocked is not None and blocked.status == "failed"
+    assert blocked.error_code == "content_restriction_receipt_required"
+    assert runtime_provider.ensure_calls == 0
+    workflow = cp_stack.onboarding.workflow_for_household(cp_stack.household.id)
+    assert workflow.state == "in_progress"
+    assert workflow.current_step == StepKind.EMAIL.value
+    email_step = next(
+        step
+        for step in cp_stack.onboarding.snapshot(cp_stack.household.id).steps
+        if step.kind is StepKind.EMAIL
+    )
+    assert email_step.status is StepStatus.VERIFIED
+    assert cp_stack.configs.get(cp_stack.household.id, 1).status == "revoked"
+
+    reset = cp_stack.service.reset_from(
+        cp_stack.household.id,
+        StepKind.EMAIL,
+        context=cp_stack.context(),
+        now=BASE_TIME + 101,
+    )
+    assert reset.snapshot.current_step is StepKind.EMAIL
+    reset_email = next(
+        step for step in reset.snapshot.steps if step.kind is StepKind.EMAIL
+    )
+    assert reset_email.status is StepStatus.AVAILABLE
+
+
+def test_email_job_rechecks_current_content_restriction_before_provider(
+    cp_stack,
+) -> None:
+    cp_stack.complete_profile()
+    cp_stack.service.email_provider = "future-real-email"
+    cp_stack.service.select(
+        cp_stack.household.id,
+        StepKind.EMAIL,
+        EMAIL_SELECTION,
+        context=cp_stack.context(),
+        now=BASE_TIME + 2,
+    )
+    with cp_stack.database.write() as connection:
+        connection.execute(
+            "DELETE FROM consent_receipts WHERE household_id = ? AND purpose = ?",
+            (cp_stack.household.id, "special_category_content_restriction"),
+        )
+    email_provider = DeterministicFakeProvisioner("email")
+    providers = ProviderRegistry()
+    providers.register("future-real-email", email_provider)
+
+    blocked = cp_stack.make_worker(
+        providers=providers, now=BASE_TIME + 100
+    ).run_once()
+
+    assert blocked is not None and blocked.status == "failed"
+    assert blocked.error_code == "content_restriction_receipt_required"
+    assert email_provider.ensure_calls == 0
+
+
+def test_email_reconcile_rechecks_current_content_restriction_before_provider(
+    cp_stack,
+) -> None:
+    cp_stack.complete_profile()
+    cp_stack.service.email_provider = "future-real-email"
+    cp_stack.service.select(
+        cp_stack.household.id,
+        StepKind.EMAIL,
+        EMAIL_SELECTION,
+        context=cp_stack.context(),
+        now=BASE_TIME + 2,
+    )
+    job = cp_stack.jobs.lease("worker-before-reconcile", now=BASE_TIME + 3)
+    assert job is not None and job.kind == "email_identity"
+    with cp_stack.database.write() as connection:
+        cp_stack.jobs.settle(
+            connection,
+            job.id,
+            status="outcome_unknown",
+            error_code="email_outcome_unknown",
+            now=BASE_TIME + 4,
+        )
+        connection.execute(
+            "DELETE FROM consent_receipts WHERE household_id = ? AND purpose = ?",
+            (cp_stack.household.id, "special_category_content_restriction"),
+        )
+
+    class ProviderMustNotRun(DeterministicFakeProvisioner):
+        def inspect(self, stable_ref):
+            raise AssertionError(f"provider inspect called for {stable_ref}")
+
+    providers = ProviderRegistry()
+    providers.register("future-real-email", ProviderMustNotRun("email"))
+
+    blocked = cp_stack.make_worker(
+        providers=providers, now=BASE_TIME + 100
+    ).reconcile(job.id)
+
+    assert blocked.status == "failed"
+    assert blocked.error_code == "content_restriction_receipt_required"
 
 
 def test_provider_rejection_after_cancel_cannot_reopen_terminal_projection(cp_stack) -> None:

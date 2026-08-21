@@ -26,6 +26,10 @@ _SYNTHETIC_ACTOR_OR_CHAT = re.compile(
 _SYNTHETIC_PROVIDER_REF = re.compile(
     r"^(?:synthetic(?::|-)[a-z0-9][a-z0-9._:-]*|abrolia-hh-[a-z2-7]{26})$"
 )
+_UUID_TEXT_PATTERN = (
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-"
+    r"[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+)
 
 
 def _require_synthetic_actor_or_chat(value: str) -> str:
@@ -138,11 +142,23 @@ class ProfileInput(DurableContract):
 class ManagedEmailSelection(DurableContract):
     kind: Literal["abrolia_managed"] = "abrolia_managed"
     local_part: str = Field(pattern=r"^[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?$")
+    special_category_restriction_acknowledged: Literal[True] | None = None
+    special_category_restriction_receipt_id: str | None = Field(
+        default=None, min_length=36, max_length=36, pattern=_UUID_TEXT_PATTERN
+    )
+    special_category_restriction_text_version: str | None = None
+    special_category_restriction_text_sha256: str | None = None
 
 
 class GmailAgentSelection(DurableContract):
     kind: Literal["gmail_agent"] = "gmail_agent"
     separate_agent_account_acknowledged: Literal[True]
+    special_category_restriction_acknowledged: Literal[True] | None = None
+    special_category_restriction_receipt_id: str | None = Field(
+        default=None, min_length=36, max_length=36, pattern=_UUID_TEXT_PATTERN
+    )
+    special_category_restriction_text_version: str | None = None
+    special_category_restriction_text_sha256: str | None = None
 
 
 class FamilyDomainSelection(DurableContract):
@@ -150,6 +166,12 @@ class FamilyDomainSelection(DurableContract):
     domain: str = Field(min_length=3, max_length=253)
     local_part: str = "assistant"
     mx_change_acknowledged: bool = False
+    special_category_restriction_acknowledged: Literal[True] | None = None
+    special_category_restriction_receipt_id: str | None = Field(
+        default=None, min_length=36, max_length=36, pattern=_UUID_TEXT_PATTERN
+    )
+    special_category_restriction_text_version: str | None = None
+    special_category_restriction_text_sha256: str | None = None
 
     @field_validator("domain")
     @classmethod
@@ -278,4 +300,9 @@ TABLE_CLASSIFICATION: dict[str, TableClassification] = {
         False, True, "consumed-or-expired+24h", "ephemeral OAuth security metadata"
     ),
     "email_activation_receipts": TableClassification(True, True, "account+30d"),
+    "email_secret_installs": TableClassification(
+        False, True, "account+30d", "non-secret install receipt (name + job id only)"
+    ),
+    "channel_preferences": TableClassification(True, True, "account+30d"),
+    "channel_bindings": TableClassification(True, True, "account+30d"),
 }

@@ -14,15 +14,15 @@
 | # | Поставщик | Юрлицо / роль | Операция, в которой участвует | Данные | Локация | Ст. 28 (DPA) | Механизм передачи | TIA | Доп. меры | Уровень |
 |---|---|---|---|---|---|---|---|---|---|---|
 | P1 | **Anthropic** (Claude API, коммерческие условия) | TBD (US) — процессор | C1, C3, C5a: понимание содержимого | контент писем и сообщений в промптах, ответы | `global`/`us` | ⏳ | ⏳ SCC модуль 2 (C→P) | ⏳ | шифрование в транзите; отсутствие обучения на данных по договору; минимизация промпта | обязательный |
-| P2 | **Fly.io** | TBD (US, инстансы в NL) — процессор | dedicated runtimes; metadata-only Abrolia control plane; shared-WA gateway; volumes, Machines, secrets | runtime S1–S3/S10; encrypted S14 account/onboarding/provisioning metadata; transient S15 | `ams` (NL, EU); provider control plane — US | ⏳ | ⏳ SCC модуль 2 + оценка доступа из US к control plane | ⏳ | disk encryption; field encryption/HMAC in S14; dedicated runtime isolation; separate secret namespaces | обязательный |
+| P2 | **Fly.io** | TBD (US, инстансы в NL) — процессор | dedicated runtimes; metadata-only Abrolia control plane; shared-WA gateway; Machines, volumes, secrets; pilot backups/logs use only Fly services | runtime S1–S3/S10; encrypted S14 account/onboarding/provisioning metadata; transient S15; encrypted backups and content-free technical logs | `ams` (NL, EU) for apps/volumes; provider control plane and platform-log details require P2 evidence | ⏳ | ⏳ SCC модуль 2 + оценка доступа из US к control plane | ⏳ | disk encryption; field encryption/HMAC in S14; dedicated runtime isolation; separate secret namespaces | обязательный |
 | P3 | **Nerve** (email control plane, инстанс того же владельца) | то же юрлицо, что и оператор → **не третье лицо**, а часть систем контролёра | C1, C2, C5/C5b: `@abrolia.com` и domain-family agent inbox (email options a/c) | письма, треды, вложения, provisioning refs | Fly `iad` (US) | внутренняя запись в ст. 30, DPA не требуется, но требуется документирование трансфера | ⏳ (внутригрупповая передача в US) | ⏳ | перенос инстанса в EU — заявленный upgrade-путь | обязательный для a/c |
 | P4 | **Resend** | TBD (US) — прямой процессор для login links; субпроцессор P3 для Nerve | C2: magic-link login; доставка исходящих из Nerve-managed inbox | recovery email и одноразовая login URL; адреса, тема, тело и delivery logs для email options a/c | US (метаданные — в US независимо от sending region) | ⏳ напрямую и через P3 | ⏳ SCC | ⏳ | отдельный sending-only key; 15-minute login link; idempotency key содержит только SHA-256 URL; application errors исключают адрес, URL, ключ и provider body | обязательный для public login и a/c; Gmail option b использует Google API, не Resend |
 | P5 | **Google** (Calendar; отдельный Gmail агента option b) | Google Ireland Ltd (EU) для consumer account — самостоятельный контролёр по своим terms; API-access выдаёт семья | C2 (calendar), C5a/C5b (agent inbox) | calendar events; dedicated agent Gmail messages; OAuth grant | глобально | n/a (не наш processor) | Google's own | n/a | `gmail.readonly` + `gmail.send`, contextual OAuth disclosure, Google Limited Use, direct refresh-token handoff в household secret namespace, revoke; verification/CASA fail-closed | обязателен для calendar; Gmail b — optional/gated |
 | P6 | **Telegram** | самостоятельный оператор мессенджера | одна из primary-channel cards | сообщения и карточки | вне EU | ❌ (договора нет) | n/a | n/a | раскрытие в notice; verified binding; выбор за семьёй | опциональный, default |
 | P7a | **WhatsApp / Meta — shared Abrolia number** | вне договорных отношений | Beta quick-start family dialogue | сообщения verified взрослых; sender binding | вне EU; gateway `ams` | ❌ | n/a | n/a | отдельный channel notice; exact unique sender routing; no external school/group contour | опциональный, real adapter disabled |
 | P7b | **WhatsApp / Meta — dedicated Evolution** | вне договорных отношений | Beta full contour через linked-device отдельной SIM/eSIM | сообщения dedicated номера, session metadata | вне EU; Evolution `ams` | ❌ | n/a | n/a | отдельный informed-risk consent, per-instance key, disconnect | опциональный, real adapter disabled |
-| P8 | **Провайдер object storage для бэкапов** | **TBD — назвать до реальных данных** | C8 | зашифрованные снапшоты БД | EU (требование) | ⏳ | n/a при хранении в EU | n/a | шифрование per-household ключом до выгрузки | обязательный |
-| P9 | **Провайдер логов/алёртов** | **TBD — назвать до реальных данных** | C7 | логи без содержимого, метрики | EU (требование) | ⏳ | n/a при хранении в EU | n/a | запрет контента в логах — правило ревью | обязательный |
+| P8 | **Отдельный object-storage provider не выбран** | scoped out 2026-08-08 — pilot backups остаются на Fly EU volume по P2; новый третьесторонний P8 не привлечён. Owner decision: `/s/ Product owner (CEO), 2026-08-08` | C8 | зашифрованные снапшоты БД | `ams` (NL, EU) в контуре P2 | покрывается незакрытым P2 DPA: ⏳ | покрывается оценкой P2: ⏳ | покрывается P2 TIA: ⏳ | отдельный backup key; без внешней выгрузки в пилоте | отдельный P8 не используется |
+| P9 | **Отдельный logs/alerts provider не выбран** | scoped out 2026-08-08 — pilot logs/alerts используют только Fly по P2; новый третьесторонний P9 не привлечён. Owner decision: `/s/ Product owner (CEO), 2026-08-08` | C7 | логи без содержимого, метрики | Fly; фактическая локация/retention platform logs подлежит подтверждению в P2 evidence | покрывается незакрытым P2 DPA: ⏳ | покрывается оценкой P2: ⏳ | покрывается P2 TIA: ⏳ | запрет контента в логах — правило ревью | отдельный P9 не используется |
 | P10 | **Vertex AI EU** (Google Cloud) | Google — процессор, только в режиме `eu-strict` | C1, C3 | промпты/ответы | EU | не активирован | n/a | n/a | — | upgrade-путь |
 | P11 | **Web Push provider — TBD** | определить до включения push для real families | optional Abrolia Web notifications | endpoint/subscription metadata; уведомление без sensitive content | TBD | ⏳ | ⏳ | ⏳ | Phase 1 fake only; Web chat работает без push; fail-closed до записи в реестр | optional, disabled |
 
@@ -31,10 +31,13 @@
 
 ## 2. Что должно быть сделано до первой реальной семьи
 
-1. Назвать юрлица P1, P2, P4, P8, P9 и адреса их представителей в ЕС; назвать
+1. Назвать юрлица P1, P2, P4 и адреса их представителей в ЕС; для pilot
+   backups/logs подтвердить использование только P2. Назвать P8/P9 и выполнить
+   их отдельные pre-use gates только до привлечения таких провайдеров. Назвать
    P11 до включения real Web Push либо оставить push выключенным.
-2. Подписать DPA (ст. 28(3)) с P1, P2, P4, P8, P9 (и P11, если включён); для P3 — внутренняя запись
-   и документирование трансфера в US.
+2. Подписать DPA (ст. 28(3)) с P1, P2 и P4; DPA с P8/P9 требуется только до
+   привлечения отдельных backup/logging providers (сейчас scoped out). Для P3 —
+   внутренняя запись и документирование трансфера в US.
 3. Оформить трансферный механизм: SCC модуль 2 (контролёр → процессор) для
    P1, P2, P4; зафиксировать перечень субпроцессоров и порядок уведомления о
    их смене.

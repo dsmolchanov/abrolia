@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import socket
 import stat
 import subprocess
 import sys
@@ -34,6 +35,8 @@ def manifest_toml(
     *,
     with_email_binding: bool = False,
     email_provider: str = "nerve-managed",
+    with_content_restriction: bool = True,
+    content_restriction_sha: str = "64221529a01cff070f1f614451eecaa5c6ed28a2b7c5d6af6f56e5ef5054e509",
 ) -> str:
     body = '''\
 schema_version = 1
@@ -72,6 +75,20 @@ fallback = "owner@example.test"
 provider_kind = "{email_provider}"
 provider_binding_ref = '{binding_ref}'
 secret_binding_ref = "HERMES_EMAIL_BINDING"
+"""
+    if with_content_restriction:
+        body += f"""\
+
+[consent]
+authority = "control_plane"
+enforcement = "required"
+required_purposes = ["special_category_content_restriction"]
+
+[[consent.receipts]]
+receipt_id = "10000000-0000-4000-8000-000000000031"
+purpose = "special_category_content_restriction"
+text_version = "special-category-content-restriction-v1"
+text_sha256 = "{content_restriction_sha}"
 """
     digest = compute_config_sha256(body)
     return body.replace("schema_version = 1\n", f'schema_version = 1\nconfig_sha256 = "{digest}"\n')
@@ -238,6 +255,73 @@ def test_revision_mismatch_never_becomes_ready(tmp_path: Path) -> None:
         service.require_ready()
 
 
+def test_active_legacy_manifest_without_content_restriction_is_suspended(
+    tmp_path: Path,
+) -> None:
+    content = manifest_toml(with_content_restriction=False)
+    manifest = parse_runtime_manifest(content)
+    manifest_path = atomic_write(tmp_path / "household.toml", content.encode())
+    activation_path = tmp_path / "activation.json"
+    write_activation_state(
+        activation_path,
+        ActivationState(
+            status="active",
+            runtime_ref=RUNTIME_REF,
+            household_id=manifest.household_id,
+            config_revision=manifest.config_revision,
+            config_sha256=manifest.config_sha256,
+            updated_at=1.0,
+        ),
+    )
+
+    service = RuntimeService(
+        manifest_path=manifest_path,
+        activation_path=activation_path,
+        runtime_ref=RUNTIME_REF,
+        env={},
+    )
+
+    assert service.readyz().status_code == 503
+    assert service.readyz().payload["reason"] == "content_restriction_not_current"
+    assert service.can_start_workers is False
+    with pytest.raises(RuntimeNotReady, match="content_restriction_not_current"):
+        service.require_ready()
+
+
+def test_active_manifest_with_stale_content_restriction_is_suspended(
+    tmp_path: Path,
+) -> None:
+    content = manifest_toml(content_restriction_sha="0" * 64)
+    manifest = parse_runtime_manifest(content)
+    manifest_path = atomic_write(tmp_path / "household.toml", content.encode())
+    activation_path = tmp_path / "activation.json"
+    write_activation_state(
+        activation_path,
+        ActivationState(
+            status="active",
+            runtime_ref=RUNTIME_REF,
+            household_id=manifest.household_id,
+            config_revision=manifest.config_revision,
+            config_sha256=manifest.config_sha256,
+            updated_at=1.0,
+        ),
+    )
+
+    service = RuntimeService(
+        manifest_path=manifest_path,
+        activation_path=activation_path,
+        runtime_ref=RUNTIME_REF,
+        env={},
+    )
+
+    assert service.readyz().payload == {
+        "status": "not_ready",
+        "reason": "content_restriction_not_current",
+    }
+    with pytest.raises(RuntimeNotReady, match="content_restriction_not_current"):
+        service.require_ready()
+
+
 def test_readiness_materializes_public_email_binding_without_exposing_secrets(
     tmp_path: Path,
 ) -> None:
@@ -401,6 +485,18 @@ def test_serve_runtime_starts_probe_server_while_bootstrap_is_pending(
     assert seen["body"] == {"status": "ok"}
     assert seen["gmail_worker_started"] is True
     assert seen["closed"] is True
+
+
+def test_fly_runtime_listener_is_dual_stack() -> None:
+    host, server_class = runtime_service_module._runtime_server_binding("0.0.0.0")
+
+    assert host == "::"
+    assert server_class is runtime_service_module._DualStackWSGIServer
+    assert server_class.address_family == socket.AF_INET6
+    assert runtime_service_module._runtime_server_binding("127.0.0.1") == (
+        "127.0.0.1",
+        None,
+    )
 
 
 class FakeRuntimeGmailClient:

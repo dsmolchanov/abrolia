@@ -5,6 +5,14 @@ from __future__ import annotations
 import hashlib
 
 CONSENT_TEXTS = {
+    "special_category_content_restriction": (
+        "special-category-content-restriction-v1",
+        "Do not send or forward medical certificates, health or allergy data, "
+        "religious beliefs, or other special-category personal data about any "
+        "person to the agent inbox or channel. If such content is sent by "
+        "mistake, stop using it and request deletion at help@abrolia.com. This "
+        "acknowledgement does not transfer Abrolia's legal obligations.",
+    ),
     "whatsapp_channel_privacy": (
         "whatsapp-channel-privacy-v1",
         "Shared or dedicated WhatsApp participants may expose channel metadata "
@@ -18,6 +26,24 @@ CONSENT_TEXTS = {
 }
 
 
+#: Whether a household currently holds the special-category content
+#: restriction, as SQL taking (household_id, purpose, version, sha256).
+#:
+#: Shared, because `ProvisioningWorker._run_once` blocks a runtime job on this
+#: BEFORE dispatching any provider, and the dry-run reports what that job will
+#: do. Two spellings of one precondition is two chances to disagree — the same
+#: shape as the lease predicate, and the same remedy.
+CURRENT_RESTRICTION_RECEIPT_SQL = (
+    "SELECT 1 FROM consent_receipts WHERE household_id = ? AND purpose = ?"
+    " AND text_version = ? AND text_sha256 = ? AND revoked_at IS NULL LIMIT 1"
+)
+
+
 def consent_version_and_sha(purpose: str) -> tuple[str, str]:
     version, text = CONSENT_TEXTS[purpose]
     return version, hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def consent_version_and_text(purpose: str) -> tuple[str, str]:
+    """Return the exact versioned copy presented before a receipt is accepted."""
+    return CONSENT_TEXTS[purpose]

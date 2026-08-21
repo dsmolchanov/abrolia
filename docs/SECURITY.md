@@ -10,7 +10,7 @@
 ## Reporting a vulnerability
 
 Please report security issues privately — do not open a public issue.
-Contact: TODO: security contact address. We aim to acknowledge within 72 hours.
+Contact: `security@abrolia.com` (or via GitHub Private Security Advisory at `dsmolchanov/abrolia`). We aim to acknowledge within 72 hours.
 The service handles families' correspondence, including children's data; reports
 about data exposure are treated at the highest priority.
 

@@ -40,6 +40,7 @@ from hermes_cloud.core.runcontext import (
     Household,
     RunContext,
 )
+from hermes_cloud.core.usage import DEGRADED_MESSAGE, UsageStore, today_utc
 from hermes_cloud.execute.email_send import (
     EmailBindingChanged,
     EmailOutcomeUnknown,
@@ -228,6 +229,8 @@ class Pipeline:
         mail: EmailSender | None = None,
         whatsapp: WhatsAppSender | None = None,
         household: Household | None = None,
+        daily_cap_usd: float | None = None,
+        usage: UsageStore | None = None,
     ) -> None:
         self.approvals = approvals
         self.reminders = reminders
@@ -249,6 +252,17 @@ class Pipeline:
         self.mail = mail
         self.whatsapp = whatsapp
         self.household = household
+        # Cost caps: per-household/day soft limit, checked before model call.
+        import os as _os
+
+        cap_raw = _os.environ.get("HERMES_COST_CAP_USD_PER_DAY", "")
+        if daily_cap_usd is None:
+            try:
+                daily_cap_usd = float(cap_raw) if cap_raw.strip() else 5.0
+            except ValueError:
+                daily_cap_usd = 5.0
+        self.daily_cap_usd = daily_cap_usd
+        self.usage = usage or UsageStore(approvals.db)
         # Онтологический слой: провенанс, обязательства, память. Живёт в той же
         # базе — иначе «откуда эта сумма» пришлось бы собирать из двух мест.
         self.evidence = EvidenceStore(approvals.db)
@@ -264,8 +278,78 @@ class Pipeline:
             if context.is_known:
                 return self._handle_whatsapp_dialogue(event, context)
         parsed = parse_eml(event.raw)
+        # Cost caps: check before model call; degrade without losing the card.
+        household_id = self.household.household_id if self.household else "household"
+        day = today_utc()
+        if self.usage.is_over_budget(household_id, day, self.daily_cap_usd):
+            # Degraded mode: no model call, staged card with honest message.
+            header = DEGRADED_MESSAGE
+            snippet = (parsed.text or parsed.subject or "").strip()[:800]
+            degraded_text = f"{header}\n\n{snippet}" if snippet else header
+            # Create a minimal commitment + staged approval so the card is durable.
+
+            run = self.evidence.record_run(
+                event_id=event.id,
+                model="degraded-no-model",
+                prompt_sha=content_sha("degraded"),
+                input_tokens=0,
+                output_tokens=0,
+            )
+            ref = self.evidence.add_ref(
+                extraction_run_id=run.id,
+                event_id=event.id,
+                text=parsed.text,
+                sender=parsed.original_sender.email if parsed.original_sender else parsed.from_email,
+                message_date=parsed.date,
+                needles=[],
+            )
+            # Use info kind so no extraneous items are required.
+            fact = {"kind": "info", "title": parsed.subject or "Письмо", "summary": degraded_text[:500]}
+            commitment = self.commitments.propose(
+                kind="info",
+                payload=fact,
+                extraction_run_id=run.id,
+                confidence=0.0,
+            )
+            staged = self.approvals.stage(
+                kind=KIND_BUNDLE,
+                payload={
+                    "kind": KIND_BUNDLE,
+                    "items": [],
+                    "header": degraded_text,
+                    "commitment_id": commitment.id,
+                },
+                chat=self.chat,
+                thread=self.thread,
+                actor=self.actor,
+                context_key=event.context_key,
+                event_id=event.id,
+            )
+            card = render_bundle(
+                None, [], approval_id=staged.id, code=staged.code, header=degraded_text
+            )
+            self.transport.send_message(
+                chat=self.chat,
+                text=degraded_text,
+                thread=self.thread,
+                buttons=tuple((b.label, b.callback_data) for b in card.buttons),
+            )
+            return Handled(approval_id=staged.id, message=degraded_text)
         extraction = self.extractor.extract_email(parsed)
         result = extraction.result
+        # Record usage after successful extraction (model usage reply).
+        # Failure to record must not silently disable the cap — surface it.
+        try:
+            self.usage.record(
+                household_id,
+                day,
+                prompt_tokens=extraction.input_tokens,
+                completion_tokens=extraction.output_tokens,
+                cache_read_tokens=extraction.cache_read_tokens,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("usage record failed for %s/%s: %s", household_id, day, exc)
+            raise
 
         run = self.evidence.record_run(
             event_id=event.id,

@@ -1,0 +1,52 @@
+name: codex-review-window
+# This file is a STUB. The gate itself lives in dsmolchanov/codex-review-gate,
+# a PUBLIC repository holding the workflow and its executable tests
+# (tests/test_gate_behavior.py runs the gate's shell under a stubbed gh and
+# asserts exit codes). It must be public: a PUBLIC consumer cannot call a
+# reusable workflow from a private repository — the run fails with zero jobs
+# and no annotation. Verified by probe, not by documentation. Keeping the body here put one file in front of eight
+# independent reviewers at once and produced 21 blocking findings, no two
+# repositories agreeing and several asking for tests that exist in two of the
+# eight. A change to the gate is now reviewed once, where it can be tested.
+#
+# DO NOT paste the gate body back into this file. If you need to change the
+# gate, change it in dev-agent and move the tag below.
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+  # A review that lands after the wait window expired must re-open the gate;
+  # `pull_request` events alone never fire again for a late review.
+  pull_request_review:
+    types: [submitted]
+
+# `issue_comment` is DELIBERATELY ABSENT: a comment event runs from the default
+# branch, so its check run can never satisfy a PR's required check, and it would
+# cancel the real PR-associated run through the concurrency group below. The
+# gate posts its own anchor comment, which made an earlier revision
+# self-cancelling.
+concurrency:
+  group: codex-review-window-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  # The job key sets the check-run name branch protection matches. A reusable
+  # workflow reports as `<caller job> / <called job>`, so both are named
+  # `codex-review-window` and the required context becomes
+  # `codex-review-window / codex-review-window`. Renaming either half silently
+  # removes the gate — branch protection waits on a context that never reports.
+  codex-review-window:
+    # PINNED TO A COMMIT SHA, not to `@v1`. This caller forwards
+    # CODEX_REQUEST_TOKEN, SLACK_WEBHOOK and a write-capable workflow token to
+    # whatever that ref resolves to. A tag is mutable: retagging `v1` — by
+    # compromise or by accident — would silently change the code holding those
+    # secrets in every consumer at once, with no diff anywhere to review.
+    # The SHA below is tag v1 of dsmolchanov/codex-review-gate. To move it,
+    # read the host diff first, then change this line: the bump is the review.
+    uses: dsmolchanov/codex-review-gate/.github/workflows/codex-review-window.yml@8cafcd277cff80a4ae9b097a106afd252fea6af2  # v1
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: write
+    secrets:
+      CODEX_REQUEST_TOKEN: ${{ secrets.CODEX_REQUEST_TOKEN }}
+      SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}

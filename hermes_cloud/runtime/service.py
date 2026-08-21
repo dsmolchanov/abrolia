@@ -5,16 +5,18 @@ from __future__ import annotations
 import hmac
 import json
 import os
+import socket
 import sys
 import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from wsgiref.simple_server import WSGIRequestHandler, make_server
+from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
 import httpx
 
+from control_plane.privacy.consent import consent_version_and_sha
 from hermes_cloud.core.config import DEFAULT_DB_PATH, ENV_DB
 from hermes_cloud.core.db import open_database
 from hermes_cloud.core.dsar import export_household, is_deleted, wipe_household
@@ -82,6 +84,7 @@ ENV_NERVE_WORKER_SECONDS = "ABROLIA_NERVE_WORKER_SECONDS"
 ENV_GMAIL_WORKER_SECONDS = "ABROLIA_GMAIL_WORKER_SECONDS"
 ENV_WHATSAPP_INSTANCE = "HERMES_WHATSAPP_INSTANCE"
 ENV_WHATSAPP_RELAY_SECRET = "HERMES_WHATSAPP_RELAY_SECRET"
+REQUIRED_CONTENT_RESTRICTION_PURPOSE = "special_category_content_restriction"
 
 
 class RuntimeNotReady(RuntimeError):
@@ -139,6 +142,67 @@ class RuntimeService:
         self._gmail_database: Any | None = None
         self._gmail_binding_key: tuple[str, int] | None = None
 
+    def health(self) -> Probe:
+        """Public /health for pilot observability (E7): no content, safe for logs."""
+        try:
+            with open_database(self.database_path) as database:
+                db_ok = database.query_one("SELECT 1") is not None  # type: ignore[attr-defined]
+        except Exception:
+            db_ok = False
+        # Provider checks are best-effort and do not leak secrets.
+        nerve_key_ok = bool(
+            self.env.get("HERMES_NERVE_RUNTIME_KEY") or self.env.get("ABROLIA_NERVE_RUNTIME_KEY")
+        )
+        telegram_ok = bool(self.env.get("TELEGRAM_BOT_TOKEN"))
+        wa_ok = bool(
+            self.env.get("HERMES_WHATSAPP_INSTANCE") or self.env.get("HERMES_WHATSAPP_RELAY_SECRET")
+        )
+        google_grant_ok: bool | None = None
+        try:
+            manifest, _ = self._ready_manifest()
+            if manifest is not None:
+                # gmail grant presence check
+                google_grant_ok = self._gmail_grant_ok()
+        except Exception:
+            google_grant_ok = None
+        # backup age via control-plane marker if runtime db has backup info? pilot uses control-plane db.
+        backup_age_hours: float | None = None
+        try:
+            from control_plane.db import ControlPlaneDatabase
+            from control_plane.observability import HealthReporter
+
+            cp_db_path = self.env.get("ABROLIA_CONTROL_PLANE_DB")
+            if cp_db_path:
+                cp_db = ControlPlaneDatabase(cp_db_path)
+                reporter = HealthReporter(cp_db)
+                latest = reporter.latest_backup_completed_at()
+                if latest is not None:
+                    import time as _t
+
+                    backup_age_hours = (_t.time() - latest) / 3600.0
+        except Exception:
+            pass
+        payload: dict[str, Any] = {
+            "status": "ok" if db_ok else "degraded",
+            "nerve_key_ok": nerve_key_ok,
+            "telegram_ok": telegram_ok,
+            "wa_instance_ok": wa_ok,
+            "google_grant_ok": google_grant_ok,
+            "db_ok": db_ok,
+            "backup_age_hours": backup_age_hours,
+        }
+        if backup_age_hours is not None and backup_age_hours > 30 * 24:
+            payload["needs_attention"] = True
+        return Probe(200 if db_ok else 503, payload)
+
+    def _gmail_grant_ok(self) -> bool | None:
+        try:
+            with open_database(self.database_path) as database:
+                row = database.query_one("SELECT COUNT(*) as c FROM oauth_grants WHERE revoked_at IS NULL")
+                return bool(row and row["c"] > 0) if row else False
+        except Exception:
+            return None
+
     def healthz(self) -> Probe:
         # Liveness deliberately does not depend on bootstrap/control-plane state.
         return Probe(200, {"status": "ok"})
@@ -150,6 +214,20 @@ class RuntimeService:
             manifest = load_runtime_manifest(self.manifest_path, env=self.env)
         except ManifestError:
             return None, "manifest_missing_or_invalid"
+        restriction_version, restriction_sha = consent_version_and_sha(
+            REQUIRED_CONTENT_RESTRICTION_PURPOSE
+        )
+        if manifest.consent is None or (
+            REQUIRED_CONTENT_RESTRICTION_PURPOSE
+            not in manifest.consent.required_purposes
+            or not any(
+                receipt.purpose == REQUIRED_CONTENT_RESTRICTION_PURPOSE
+                and receipt.text_version == restriction_version
+                and hmac.compare_digest(receipt.text_sha256, restriction_sha)
+                for receipt in manifest.consent.receipts
+            )
+        ):
+            return None, "content_restriction_not_current"
         try:
             state = load_activation_state(self.activation_path)
         except BootstrapError:
@@ -465,6 +543,11 @@ class RuntimeService:
 
     def __call__(self, environ: Mapping[str, Any], start_response: Callable) -> list[bytes]:
         """Health probes plus an authenticated private DSAR boundary."""
+        import time as _t
+
+        from hermes_cloud.core.observability import RuntimeStructuredLogger
+
+        start = _t.time()
         path = str(environ.get("PATH_INFO") or "")
         method = str(environ.get("REQUEST_METHOD") or "GET").upper()
         if path == "/v1/email/nerve/webhook" and method == "POST":
@@ -475,10 +558,29 @@ class RuntimeService:
             probe = self._dsar(path, method, str(environ.get("HTTP_AUTHORIZATION") or ""))
         elif path == "/internal/v1/email/google/revoke":
             probe = self._google_revoke(method, str(environ.get("HTTP_AUTHORIZATION") or ""))
+        elif path == "/health" and method == "GET":
+            probe = self.health()
         elif method != "GET" or path not in {"/healthz", "/readyz"}:
             probe = Probe(404, {"status": "not_found"})
         else:
             probe = self.healthz() if path == "/healthz" else self.readyz()
+        # Structured observability: one JSON line per request, no content
+        try:
+            hmac_key = (
+                self.env.get("ABROLIA_HMAC_KEY") or self.env.get("HERMES_HOUSEHOLD_HMAC_KEY") or ""
+            ).encode()
+            if len(hmac_key) >= 16:
+                logger = RuntimeStructuredLogger(sys.stdout, hmac_key=hmac_key)
+                latency_ms = int((_t.time() - start) * 1000)
+                logger.emit(
+                    level="info",
+                    route=path,
+                    status=probe.status_code,
+                    latency_ms=latency_ms,
+                    request_id=environ.get("HTTP_X_REQUEST_ID"),
+                )
+        except Exception:
+            pass
         body = json.dumps(probe.payload, sort_keys=True, separators=(",", ":")).encode()
         status_text = {
             200: "200 OK",
@@ -732,6 +834,22 @@ class _QuietRequestHandler(WSGIRequestHandler):
         """Health requests are intentionally absent from application logs."""
 
 
+class _DualStackWSGIServer(WSGIServer):
+    """Accept Fly 6PN IPv6 and local IPv4 traffic on one runtime socket."""
+
+    address_family = socket.AF_INET6
+
+    def server_bind(self) -> None:
+        self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        super().server_bind()
+
+
+def _runtime_server_binding(host: str) -> tuple[str, type[WSGIServer] | None]:
+    if host in {"0.0.0.0", "::"}:
+        return "::", _DualStackWSGIServer
+    return host, None
+
+
 def serve_runtime(*, env: Mapping[str, str] | None = None) -> None:
     """Serve probes immediately and bootstrap in the background until active."""
     source = dict(os.environ if env is None else env)
@@ -744,7 +862,22 @@ def serve_runtime(*, env: Mapping[str, str] | None = None) -> None:
     if not 0 <= port <= 65535:
         raise BootstrapError(f"{ENV_RUNTIME_PORT} is outside the valid range")
     stop = threading.Event()
-    server = make_server(host, port, service, handler_class=_QuietRequestHandler)
+    server_host, server_class = _runtime_server_binding(host)
+    if server_class is None:
+        server = make_server(
+            server_host,
+            port,
+            service,
+            handler_class=_QuietRequestHandler,
+        )
+    else:
+        server = make_server(
+            server_host,
+            port,
+            service,
+            server_class=server_class,
+            handler_class=_QuietRequestHandler,
+        )
     worker = threading.Thread(
         target=_bootstrap_until_active,
         args=(service, source, stop),

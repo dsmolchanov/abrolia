@@ -287,6 +287,17 @@ fallback = "owner@example.test"
 provider_kind = "nerve-managed"
 provider_binding_ref = {json.dumps(refs)}
 secret_binding_ref = "ABROLIA_NERVE_EMAIL_CREDENTIALS"
+
+[consent]
+authority = "control_plane"
+enforcement = "required"
+required_purposes = ["special_category_content_restriction"]
+
+[[consent.receipts]]
+receipt_id = "10000000-0000-4000-8000-000000000032"
+purpose = "special_category_content_restriction"
+text_version = "special-category-content-restriction-v1"
+text_sha256 = "64221529a01cff070f1f614451eecaa5c6ed28a2b7c5d6af6f56e5ef5054e509"
 '''
     digest = compute_config_sha256(content)
     return content.replace(

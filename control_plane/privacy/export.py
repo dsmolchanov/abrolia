@@ -201,7 +201,9 @@ class HouseholdExporter:
         email_activation_receipts = self._rows(
             "email_activation_receipts",
             "SELECT email_identity_id, desired_revision, runtime_ref, provider,"
-            " inbound_check, outbound_check, checked_at, receipt_digest, status"
+            " inbound_check, outbound_check, checked_at, receipt_digest, status,"
+            " runtime_health_status, runtime_health_checked_at,"
+            " runtime_health_owns_attention, runtime_health_identity_version"
             " FROM email_activation_receipts WHERE email_identity_id IN"
             " (SELECT id FROM email_identities WHERE household_id = ?)"
             " ORDER BY desired_revision",

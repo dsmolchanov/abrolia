@@ -147,6 +147,8 @@ class SecretSink(Protocol):
 
     def delete(self, runtime_ref: str, name: str) -> None: ...
 
+    def contains(self, runtime_ref: str, name: str) -> bool: ...
+
 
 class ProviderRegistry:
     def __init__(self) -> None:

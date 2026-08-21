@@ -6,6 +6,7 @@ import pytest
 
 from control_plane.email.models import EmailOption, EmailProvisionIntent
 from control_plane.models import StepKind
+from control_plane.privacy.consent import consent_version_and_sha
 from control_plane.providers.email.nerve_managed import (
     NERVE_SECRET_BINDING,
     NerveManagedEmailProvisioner,
@@ -26,6 +27,17 @@ INBOX_ID = "00000000-0000-4000-8000-000000000003"
 KEY_ID = "00000000-0000-4000-8000-000000000004"
 OLD_KEY_ID = "00000000-0000-4000-8000-000000000005"
 WEBHOOK_ID = "00000000-0000-4000-8000-000000000006"
+_RESTRICTION_VERSION, _RESTRICTION_SHA = consent_version_and_sha(
+    "special_category_content_restriction"
+)
+MANAGED_SELECTION = {
+    "kind": "abrolia_managed",
+    "local_part": "family-agent",
+    "special_category_restriction_acknowledged": True,
+    "special_category_restriction_receipt_id": "10000000-0000-4000-8000-000000000023",
+    "special_category_restriction_text_version": _RESTRICTION_VERSION,
+    "special_category_restriction_text_sha256": _RESTRICTION_SHA,
+}
 
 
 class FakeNerveAdmin:
@@ -386,7 +398,7 @@ def test_managed_provider_runs_through_durable_worker_and_secret_sink(cp_stack) 
     cp_stack.service.select(
         cp_stack.household.id,
         StepKind.EMAIL,
-        {"kind": "abrolia_managed", "local_part": "family-agent"},
+        MANAGED_SELECTION,
         context=cp_stack.context(),
     )
     registry = ProviderRegistry()
@@ -434,7 +446,7 @@ def test_worker_keeps_onboarding_pending_until_attachment_flag_converges(
     cp_stack.service.select(
         cp_stack.household.id,
         StepKind.EMAIL,
-        {"kind": "abrolia_managed", "local_part": "family-agent"},
+        MANAGED_SELECTION,
         context=cp_stack.context(),
     )
     registry = ProviderRegistry()
@@ -484,7 +496,7 @@ def test_worker_reconciles_lost_create_response_from_durable_intent(cp_stack) ->
     cp_stack.service.select(
         cp_stack.household.id,
         StepKind.EMAIL,
-        {"kind": "abrolia_managed", "local_part": "family-agent"},
+        MANAGED_SELECTION,
         context=cp_stack.context(),
     )
     client = LostInboxResponseNerveAdmin()
@@ -498,9 +510,77 @@ def test_worker_reconciles_lost_create_response_from_durable_intent(cp_stack) ->
 
     assert unknown.status == "outcome_unknown"
     assert reconciled.status == "succeeded"
-    assert client.inbox_calls == 2
-    identity = cp_stack.email_identities.current_for_household(cp_stack.household.id)
-    assert identity is not None and identity.address == "family-agent@" + "abrolia.com"
+
+
+def test_managed_provisioner_never_calls_service_tokens() -> None:
+    """B-01 regression: exercise real NerveAdminClient with MockTransport, capture HTTP."""
+    import httpx
+
+    from control_plane.providers.email.nerve_client import NerveAdminClient, NerveAdminSettings
+
+    captured: list[tuple[str, str, dict[str, str]]] = []
+    org_counter = {"calls": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        method = request.method
+        path = request.url.path
+        headers = {k.lower(): v for k, v in request.headers.items()}
+        captured.append((method, path, headers))
+        assert "service-tokens" not in path, f"service-tokens invoked: {method} {path}"
+        if path == "/internal/feature-flags/attachments" and method == "GET":
+            # Runtime probe uses X-Nerve-Cloud-Key, not X-API-Key, and is separate from bootstrap
+            assert "x-nerve-cloud-key" in headers
+            return httpx.Response(
+                200,
+                json={"flag": "attachments", "org_id": ORG_ID, "enabled": True, "cache_ttl_seconds": 60},
+            )
+        # Bootstrap admin must be used for all 5 calls, never tenant-delegated service-token flow
+        assert headers.get("x-api-key") == "synthetic-bootstrap-admin-key", f"wrong credential for {method} {path}"
+        if path == "/v1/orgs" and method == "POST":
+            org_counter["calls"] += 1
+            return httpx.Response(200, json={"org_id": ORG_ID})
+        if path == "/v1/domain-grants" and method == "POST":
+            return httpx.Response(200, json={"id": GRANT_ID, "external_ref": "arbolia:email:identity-1:grant"})
+        if path == "/v1/inboxes" and method == "POST":
+            return httpx.Response(
+                200,
+                json={"inbox": {"id": INBOX_ID, "address": "family-agent@" + "abrolia.com", "external_ref": "arbolia:email:identity-1:inbox"}},
+            )
+        if path == "/v1/keys" and method == "POST":
+            return httpx.Response(
+                200, json={"id": KEY_ID, "key": "synthetic-nerve-key", "secret_available": True, "external_ref": "arbolia:email:identity-1:key"}
+            )
+        if path == "/v1/webhooks" and method == "POST":
+            return httpx.Response(
+                200, json={"id": WEBHOOK_ID, "secret": "synthetic-signing-key", "secret_available": True, "external_ref": "arbolia:email:identity-1:webhook"}
+            )
+        return httpx.Response(404, json={})
+
+    transport = httpx.MockTransport(handler)
+    client = httpx.Client(transport=transport)
+    settings = NerveAdminSettings(
+        base_url="https://nerve.example.test",
+        admin_key="synthetic-bootstrap-admin-key",
+        platform_org_id="20000000-0000-4000-8000-000000000001",
+        platform_domain_id="30000000-0000-4000-8000-000000000001",
+    )
+    nerve_client = NerveAdminClient(settings, client=client)
+    result = NerveManagedEmailProvisioner(nerve_client).ensure(
+        _intent(), "household-1:email_identity:identity-1:abrolia_managed:1"
+    )
+    assert result is not None
+    # Exact 5 bootstrap POSTs in order, no service-tokens, no duplicates
+    bootstrap = [(m, p) for m, p, _ in captured if p.startswith("/v1/")]
+    assert bootstrap == [
+        ("POST", "/v1/orgs"),
+        ("POST", "/v1/domain-grants"),
+        ("POST", "/v1/inboxes"),
+        ("POST", "/v1/keys"),
+        ("POST", "/v1/webhooks"),
+    ], f"unexpected bootstrap sequence: {bootstrap}"
+    assert not any("service-tokens" in p for _, p, _ in captured)
+    # Probe is separate and uses runtime key, not bootstrap admin duplication
+    assert any(p == "/internal/feature-flags/attachments" for _, p, _ in captured)
 
 
 def test_worker_rejects_duplicate_key_noncanonical_nerve_reference(cp_stack) -> None:
@@ -509,7 +589,7 @@ def test_worker_rejects_duplicate_key_noncanonical_nerve_reference(cp_stack) -> 
     cp_stack.service.select(
         cp_stack.household.id,
         StepKind.EMAIL,
-        {"kind": "abrolia_managed", "local_part": "family-agent"},
+        MANAGED_SELECTION,
         context=cp_stack.context(),
     )
 

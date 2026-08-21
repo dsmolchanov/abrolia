@@ -38,11 +38,15 @@ def local_part_suggestion(
     request: Request,
     current: Annotated[CurrentHousehold, Depends(current_household)],
 ) -> dict[str, str]:
-    return {
-        "local_part": container(request).email_identity_service.suggest(
+    try:
+        suggestion = container(request).email_identity_service.suggest(
             current.household.id
         )
-    }
+    except ValueError as error:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, "household profile is incomplete"
+        ) from error
+    return {"local_part": suggestion}
 
 
 @router.get("/api/v1/email/local-part/availability")
