@@ -4324,3 +4324,35 @@ def test_a_copied_member_takes_its_token_from_the_publication(
             assert backup_module._pause_marker(target).exists()
         else:
             assert "do not start the service" in str(raised.value), str(raised.value)
+
+
+def test_ownership_is_not_fooled_by_a_recycled_inode(tmp_path) -> None:
+    """`(st_dev, st_ino)` is reused the moment it is freed.
+
+    Measured, not assumed: this session's own tests passed on macOS and failed
+    on Linux, where unlinking a file and writing another at the same name
+    produced the SAME inode — so an ownership check comparing only the inode
+    said "still mine" and the cleanup deleted a file it had never published.
+
+    That is the invariant's "necessary and not sufficient" clause, and it was
+    applied to the reversal before it was applied to the primitives that ask
+    the same question. Driven directly here, because inode recycling cannot be
+    forced portably from a test: the entry is the published one by inode and
+    not by content, which is precisely the state a recycled inode produces.
+    """
+    destination = tmp_path / "canonical.db"
+    destination.write_bytes(b"somebody else's file")
+    inode, digest = backup_module._content_identity(destination)
+    published_digest = hashlib.sha256(b"what this call actually published").digest()
+    assert digest != published_digest
+
+    backup_module._withdraw(destination, inode, published_digest)
+
+    assert destination.read_bytes() == b"somebody else's file", (
+        "the withdrawal removed an entry that merely shares an inode with what"
+        " was published"
+    )
+
+    # And it still removes what it did publish.
+    backup_module._withdraw(destination, inode, digest)
+    assert not destination.exists()

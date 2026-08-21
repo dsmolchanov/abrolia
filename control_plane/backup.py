@@ -423,7 +423,14 @@ def _claim(
         # between, and unlinking by name would delete that replacement while
         # keeping the original at the destination — a move reported as
         # successful after destroying an unrelated entry.
-        if _inode(source) != published:
+        # CONTENT, not the inode. A filesystem hands the just-freed inode
+        # straight back — measured on Linux, not assumed — so an actor who
+        # unlinks the source and writes their own file in its place can land on
+        # the same `(st_dev, st_ino)`. Comparing only that says "still mine" and
+        # the unlink then destroys their file. This is the invariant's own
+        # "necessary and not sufficient" clause, applied where the primitive
+        # asks the question rather than only where the reversal does.
+        if _identity_or_unreadable(source) != (published, digest):
             raise RaceLostSource(source)
         source.unlink(missing_ok=True)
     except OSError:
@@ -436,7 +443,7 @@ def _claim(
         # then withdrew its pause marker over a database that was standing.
         if journal is not None:
             raise
-        _withdraw(destination, published)
+        _withdraw(destination, published, digest)
         raise
     record.source_removed = True
     return (published, digest, proven)
@@ -503,7 +510,11 @@ def _identity_before_publication(
     return (inode, digest, True)
 
 
-def _withdraw(destination: Path, published: tuple[int, int] | None) -> None:
+def _withdraw(
+    destination: Path,
+    published: tuple[int, int] | None,
+    digest: bytes | None = None,
+) -> None:
     """Take a published name away, and make the ABSENCE durable too.
 
     Only while the name still holds what was published. A cleanup that unlinks
@@ -521,8 +532,10 @@ def _withdraw(destination: Path, published: tuple[int, int] | None) -> None:
         # told the state is ambiguous — which for a restore means the worker
         # pause stays too.
         raise AmbiguousPublication(destination)
-    if _inode(destination) != published:
-        # Somebody else's now. Their file is not this failure's to clean up.
+    if _identity_or_unreadable(destination) != (published, digest):
+        # Somebody else's now — a different entry, or the same inode handed
+        # back by the filesystem holding different bytes. Their file is not
+        # this failure's to clean up.
         return
     destination.unlink(missing_ok=True)
     try:
@@ -577,7 +590,7 @@ def _publish(
         # entry another operation had put at that path in the meantime was
         # deleted by this one's cleanup, while the error reported was the
         # directory sync that failed.
-        _withdraw(destination, published)
+        _withdraw(destination, published, digest)
         raise
     return (published, digest, proven)
 
@@ -1137,7 +1150,7 @@ def _copy_install(
     database or the destruction of an unrelated file. `mkstemp` creates it with
     `O_EXCL`, so this call owns the name it is about to publish from.
     """
-    origin = _inode(source)
+    origin = _identity_or_unreadable(source)
     handle, name = tempfile.mkstemp(
         prefix=f".{destination.name}.installing.", dir=destination.parent
     )
@@ -1179,7 +1192,7 @@ def _copy_install(
         # A copy has two different inodes by construction, so the ownership
         # question is asked of the SOURCE: is this still the entry whose bytes
         # were just copied? If not, removing it destroys somebody else's file.
-        if _inode(source) != origin:
+        if _identity_or_unreadable(source) != origin:
             raise RaceLostSource(source)
         source.unlink(missing_ok=True)
     except OSError:
@@ -1190,7 +1203,7 @@ def _copy_install(
         # it just published has to go away here or stand forever.
         if journal is not None:
             raise
-        _withdraw(destination, landed_inode)
+        _withdraw(destination, landed_inode, landed_digest)
         raise
     record.source_removed = True
 
