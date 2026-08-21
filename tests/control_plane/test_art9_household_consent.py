@@ -27,6 +27,7 @@ from control_plane.config import ControlPlaneConfig
 from control_plane.container import ControlPlaneContainer
 from control_plane.models import StepKind
 from control_plane.onboarding.contracts import InvalidTransition
+from control_plane.onboarding.service import OnboardingService
 from control_plane.privacy.art9 import permitted_countries, real_content_refusal
 from control_plane.privacy.consent import (
     CONTENT_RESTRICTION_PURPOSE,
@@ -566,3 +567,125 @@ def test_the_synthetic_managed_path_is_still_ungated(cp_stack) -> None:
         {"kind": "abrolia_managed", "local_part": "family-agent"},
         context=cp_stack.context(),
     )
+
+
+#: Each real-email option with the fields its own selection model requires.
+#: `family_domain` needs a domain and the apex-MX acknowledgement;
+#: `gmail_agent` needs the separate-account one. A single shared selection
+#: validates for none of them.
+RETRY_SELECTIONS = {
+    "abrolia_managed": {"local_part": "family-agent"},
+    "family_domain": {
+        "domain": "agents.abrolia-family.com",
+        "local_part": "assistant",
+        "mx_change_acknowledged": True,
+    },
+    "gmail_agent": {"separate_agent_account_acknowledged": True},
+}
+
+
+@pytest.mark.parametrize("option", sorted(RETRY_SELECTIONS))
+def test_a_retry_asks_the_gate_the_same_question_select_asks(cp_stack, option) -> None:
+    """`select` ran `_assert_email_rollout`; `_retry_selection` did not.
+
+    A retry rebuilds the job against the CURRENT configuration, so a selection
+    made while the country was approved could be retried after the country
+    moved to one Art. 9(4) refuses — and the retry would enqueue a job bound to
+    whatever provider the deployment routes to now. The worker rechecks consent
+    receipts and knows nothing about countries or allowlists.
+
+    The assertion is agreement rather than refusal, because the right answer
+    depends on where the option routes: with real email disabled,
+    `abrolia_managed` and `family_domain` go to `fake-email` and Italy is no
+    barrier, while `gmail_agent` goes to `google-oauth` unconditionally and is
+    refused. Asserting "retry raises" would have been wrong for two of the
+    three — and asserting agreement is the property that actually matters:
+    whatever `select` would decide now, `retry` decides the same.
+    """
+    cp_stack.complete_profile()
+    # `real_email_selection` defaults to the MANAGED shape, whose `local_part`
+    # the Gmail model forbids. Each option gets its own field set rather than an
+    # override of somebody else's.
+    selection = real_email_selection(**RETRY_SELECTIONS[option])
+    selection.pop("local_part", None)
+    selection.update({"kind": option, **RETRY_SELECTIONS[option]})
+    # A service wired to REAL providers. The shared fixture leaves all three
+    # routed to `fake-email`, which the gate correctly waves through — so a
+    # test using it exercises the early return and never reaches the country
+    # check it is about.
+    service = OnboardingService(
+        cp_stack.households,
+        cp_stack.onboarding,
+        cp_stack.jobs,
+        email_identities=cp_stack.service.email_identities,
+        email_provider="nerve-managed",
+        gmail_provider="google-oauth",
+        byo_domain_provider="nerve-byo-domain",
+        allow_real_email_domains=True,
+        real_email_enabled=True,
+        real_email_household_allowlist=frozenset({cp_stack.household.id}),
+    )
+    service.select(
+        cp_stack.household.id, StepKind.EMAIL, selection, context=cp_stack.context()
+    )
+    with cp_stack.database.write() as connection:
+        connection.execute(
+            "UPDATE onboarding_steps SET status = 'failed'"
+            " WHERE workflow_id = (SELECT id FROM onboarding_workflows"
+            " WHERE household_id = ?) AND kind = 'email_identity'",
+            (cp_stack.household.id,),
+        )
+        connection.execute(
+            "UPDATE provisioning_jobs SET status = 'failed', settled_at = ?"
+            " WHERE household_id = ? AND kind = 'email_identity'",
+            (1_800_000_010.0, cp_stack.household.id),
+        )
+
+    # Italy: `misure di garanzia` unreconciled, so the gate refuses real content.
+    set_country(cp_stack, "IT")
+
+    # What the gate says NOW, asked directly.
+    refuses = None
+    try:
+        service._assert_email_rollout(
+            cp_stack.household.id,
+            service._parse_selection(StepKind.EMAIL, selection),
+        )
+    except InvalidTransition as error:
+        refuses = str(error)
+
+    before = cp_stack.database.query(
+        "SELECT id FROM provisioning_jobs WHERE household_id = ?",
+        (cp_stack.household.id,),
+    )
+    refusal = None
+    try:
+        # `retry` takes no selection: it rebuilds from the DURABLE one, which is
+        # exactly why the gate has to be re-asked here rather than trusted from
+        # whenever that selection was made.
+        service.retry(
+            cp_stack.household.id, StepKind.EMAIL, context=cp_stack.context()
+        )
+    except InvalidTransition as error:
+        refusal = str(error)
+    after = cp_stack.database.query(
+        "SELECT id FROM provisioning_jobs WHERE household_id = ?",
+        (cp_stack.household.id,),
+    )
+
+    if refuses is not None:
+        # THE GATE'S refusal, matched by its own words. Accepting any
+        # `InvalidTransition` let an unrelated refusal stand in for this one —
+        # removing the gate entirely still passed, because the retry failed for
+        # another reason and the test could not tell the two apart.
+        assert refusal == refuses, (
+            f"the gate refuses {option} with {refuses!r}; the retry gave"
+            f" {refusal!r}"
+        )
+        assert len(after) == len(before), (
+            "the retry enqueued a provider-bound job the gate refuses"
+        )
+    else:
+        assert refusal is None, (
+            f"the gate allows {option} here and the retry refused: {refusal!r}"
+        )

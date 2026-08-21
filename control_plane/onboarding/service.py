@@ -797,6 +797,15 @@ class OnboardingService:
             if replay:
                 return replay
             row = self._scoped_workflow(connection, context.account_id, household_id)
+            if kind is StepKind.EMAIL:
+                # The SAME gate `select` runs, on the CURRENT configuration. A
+                # retry rebuilds the job against whatever provider the
+                # deployment routes to now, so a selection that was synthetic
+                # when it was made can be dispatched to a real one — past an
+                # Art. 9(4) country refusal or a household allowlist that has
+                # since changed. The worker rechecks receipts and knows nothing
+                # about either, so this is the only place the question is asked.
+                self._assert_email_rollout(household_id, parsed)
             self._check_version(row, context.expected_version)
             step = connection.execute(
                 "SELECT * FROM onboarding_steps WHERE workflow_id = ? AND kind = ?",
