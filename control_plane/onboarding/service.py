@@ -10,6 +10,7 @@ from pydantic import TypeAdapter
 from control_plane.crypto import canonical_json
 from control_plane.email.models import SYNTHETIC_EMAIL_SECRET_BINDING
 from control_plane.email.service import EmailIdentityService
+from control_plane.feature_flags import check_provider_enabled
 from control_plane.models import (
     EmailSelection,
     OnboardingSnapshot,
@@ -37,6 +38,20 @@ from control_plane.repositories.jobs import JobsRepository
 from control_plane.repositories.onboarding import OnboardingRepository, WorkflowRecord
 
 IDEMPOTENCY_TTL_SECONDS = 24 * 60 * 60
+
+
+#: Email options behind a per-provider kill switch, and the flag each answers to.
+#:
+#: `abrolia_managed` is deliberately absent. Canon has all six flags fail-closed,
+#: but wiring the managed one today would take email away from every deployment
+#: that has not set `ABROLIA_MANAGED_EMAIL_ENABLED` — including the synthetic
+#: app, which sets none of them. Gating the two options MVP is cutting is the
+#: change that was asked for; the third is a separate, deliberate step with a
+#: `fly.toml` change behind it.
+GATED_EMAIL_OPTIONS = {
+    "family_domain": "byo_email",
+    "gmail_agent": "gmail",
+}
 
 
 class OnboardingService:
@@ -312,6 +327,21 @@ class OnboardingService:
         }
 
     def _assert_email_rollout(self, household_id: str, selection: dict[str, Any]) -> None:
+        # The per-provider kill switch, BEFORE anything else this method asks.
+        # `feature_flags` was written for exactly this — "default off,
+        # fail-closed, read at call time" — and had no production caller at all,
+        # so `ABROLIA_GMAIL_ENABLED=0` gated nothing while two operator tables
+        # and `canon-execution-plan.md` documented it as though it did. The
+        # switch is about which OPTION the product offers, not about whether
+        # real content can arrive, so it runs ahead of the synthetic
+        # early-return below: a disabled option stays disabled even where it
+        # would route to a fake provider.
+        gated = GATED_EMAIL_OPTIONS.get(str(selection.get("kind") or ""))
+        if gated is not None:
+            try:
+                check_provider_enabled(gated)
+            except RuntimeError as error:
+                raise InvalidTransition(str(error)) from error
         # Gate on the PROVIDER this selection routes to, not on the managed
         # rollout flag. `gmail_agent` goes to `google-oauth` unconditionally —
         # it is a real provider even when `ABROLIA_REAL_EMAIL_ENABLED=0` — so

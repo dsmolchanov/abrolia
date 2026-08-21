@@ -194,7 +194,33 @@ OAuth / History is explicitly deferred to the start of Phase E and remains track
 
 **Goal:** Independent kill switches + staged rollout.
 
-**Files:** `control_plane/config.py`, feature-flag table, `docs/onboarding-runbook.md`, `docs/privacy/processors.md` §4
+**Files:** `control_plane/config.py`, `control_plane/feature_flags.py`,
+`control_plane/onboarding/service.py`, `docs/onboarding-runbook.md`,
+`docs/privacy/processors.md` §4, `tests/control_plane/test_email_option_flags.py`,
+`tests/control_plane/email/conftest.py`,
+`tests/control_plane/test_art9_household_consent.py`,
+`tests/control_plane/test_real_email_wiring.py`.
+
+**Branches:** `codex/phase-F-email-option-kill-switches`.
+
+**Scope corrected 2026-08-21.** "feature-flag table" named a document rather
+than the code, and the module that implements the switches was never listed —
+which is part of how it came to have no caller:
+
+- `control_plane/feature_flags.py` — the switches themselves. `check_provider_enabled`
+  existed, was tested in isolation, and was imported by nothing outside its own
+  test. `ABROLIA_GMAIL_ENABLED=0` gated nothing while the runbook table and this
+  plan both described it as fail-closed.
+- `control_plane/onboarding/service.py` — the call site, in `_assert_email_rollout`,
+  which both `select` and `retry` already run.
+- the four test modules: the switch's own behaviour, and the three suites that
+  exercise gated options and therefore have to opt in.
+
+**MVP scope, 2026-08-21.** `family_domain` and `gmail_agent` are cut from MVP and
+gated. `abrolia_managed` is deliberately NOT gated yet: wiring it would take
+email away from every deployment that has not set `ABROLIA_MANAGED_EMAIL_ENABLED`,
+including the synthetic app, which sets none of them. That is a separate step
+with a `fly.toml` change behind it.
 
 **Changes:**
 1. Per-provider flags: `ABROLIA_MANAGED_EMAIL_ENABLED`, `ABROLIA_BYO_EMAIL_ENABLED`, `ABROLIA_GMAIL_ENABLED`, `ABROLIA_WHATSAPP_SHARED_ENABLED`, `ABROLIA_WHATSAPP_DEDICATED_ENABLED`, `ABROLIA_WEB_PUSH_ENABLED` — all `default off`, fail-closed; flag toggle tested in Phase C/D/E suites.
