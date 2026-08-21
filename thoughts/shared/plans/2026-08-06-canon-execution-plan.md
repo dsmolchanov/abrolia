@@ -195,11 +195,13 @@ OAuth / History is explicitly deferred to the start of Phase E and remains track
 **Goal:** Independent kill switches + staged rollout.
 
 **Files:** `control_plane/config.py`, `control_plane/feature_flags.py`,
-`control_plane/onboarding/service.py`, `docs/onboarding-runbook.md`,
+`control_plane/onboarding/service.py`, `control_plane/provisioning/worker.py`,
+`AGENTS.repo-invariants.md`, `docs/onboarding-runbook.md`,
 `docs/privacy/processors.md` §4, `tests/control_plane/test_email_option_flags.py`,
 `tests/control_plane/email/conftest.py`,
 `tests/control_plane/test_art9_household_consent.py`,
-`tests/control_plane/test_real_email_wiring.py`.
+`tests/control_plane/test_real_email_wiring.py`,
+`tests/control_plane/test_provisioning_jobs.py`.
 
 **Branches:** `codex/phase-F-email-option-kill-switches`.
 
@@ -221,6 +223,15 @@ gated. `abrolia_managed` is deliberately NOT gated yet: wiring it would take
 email away from every deployment that has not set `ABROLIA_MANAGED_EMAIL_ENABLED`,
 including the synthetic app, which sets none of them. That is a separate step
 with a `fly.toml` change behind it.
+
+**Round 2, 2026-08-21.** Codex found the switch was enforced only at selection.
+Provisioning is queued, so an operator flipping a flag off mid-incident did not
+stop the Gmail or BYO jobs already in the queue — the case the switch exists
+for. The check now also runs in `ProvisioningWorker`, at both entry points that
+reach a provider (`_run_once` and `_reconcile`), reading the flag at call time
+and exempting shutdown work so teardown is never stranded. Recorded as an
+invariant, this being the second instance of the class after the Art. 9(2)(a)
+content restriction.
 
 **Changes:**
 1. Per-provider flags: `ABROLIA_MANAGED_EMAIL_ENABLED`, `ABROLIA_BYO_EMAIL_ENABLED`, `ABROLIA_GMAIL_ENABLED`, `ABROLIA_WHATSAPP_SHARED_ENABLED`, `ABROLIA_WHATSAPP_DEDICATED_ENABLED`, `ABROLIA_WEB_PUSH_ENABLED` — all `default off`, fail-closed; flag toggle tested in Phase C/D/E suites.

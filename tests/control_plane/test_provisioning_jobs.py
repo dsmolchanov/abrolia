@@ -49,6 +49,23 @@ _RESTRICTION_VERSION, _RESTRICTION_SHA = consent_version_and_sha(
 _HOUSEHOLD_VERSION, _HOUSEHOLD_SHA = consent_version_and_sha(
     "special_category_household_content"
 )
+
+
+@pytest.fixture(autouse=True)
+def _enable_gated_email_options(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`family_domain` and `gmail_agent` are behind fail-closed kill switches.
+
+    Several cases here move a job's `provider` column to a REAL provider name as
+    a fixture device — `fake-email` is exempt from the consent gate and so would
+    exercise the gate rather than the behaviour under test. That makes those
+    jobs look like cut options to the worker's kill-switch check, which is
+    correct of the check and beside the point of these tests. The switches
+    themselves are asserted in `test_email_option_flags.py`.
+    """
+    monkeypatch.setenv("ABROLIA_BYO_EMAIL_ENABLED", "1")
+    monkeypatch.setenv("ABROLIA_GMAIL_ENABLED", "1")
+
+
 # A real provider owes the Art 9(2)(a) consent as well as the S5 restriction,
 # and an unrecognised provider counts as real by design (fail-closed). The two
 # tests below deliberately wire `future-real-email`, so they carry both.

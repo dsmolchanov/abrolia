@@ -10,7 +10,7 @@ from pydantic import TypeAdapter
 from control_plane.crypto import canonical_json
 from control_plane.email.models import SYNTHETIC_EMAIL_SECRET_BINDING
 from control_plane.email.service import EmailIdentityService
-from control_plane.feature_flags import check_provider_enabled
+from control_plane.feature_flags import GATED_EMAIL_OPTIONS, check_provider_enabled
 from control_plane.models import (
     EmailSelection,
     OnboardingSnapshot,
@@ -38,20 +38,6 @@ from control_plane.repositories.jobs import JobsRepository
 from control_plane.repositories.onboarding import OnboardingRepository, WorkflowRecord
 
 IDEMPOTENCY_TTL_SECONDS = 24 * 60 * 60
-
-
-#: Email options behind a per-provider kill switch, and the flag each answers to.
-#:
-#: `abrolia_managed` is deliberately absent. Canon has all six flags fail-closed,
-#: but wiring the managed one today would take email away from every deployment
-#: that has not set `ABROLIA_MANAGED_EMAIL_ENABLED` — including the synthetic
-#: app, which sets none of them. Gating the two options MVP is cutting is the
-#: change that was asked for; the third is a separate, deliberate step with a
-#: `fly.toml` change behind it.
-GATED_EMAIL_OPTIONS = {
-    "family_domain": "byo_email",
-    "gmail_agent": "gmail",
-}
 
 
 class OnboardingService:

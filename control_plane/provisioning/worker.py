@@ -22,6 +22,10 @@ from control_plane.email.models import (
     EmailPublicBinding,
 )
 from control_plane.email.repository import EmailIdentityRepository
+from control_plane.feature_flags import (
+    GATED_EMAIL_PROVIDERS,
+    check_provider_enabled,
+)
 from control_plane.models import StepKind, StepStatus
 from control_plane.observability import StructuredLogger
 from control_plane.onboarding.state import VERIFY_RESULT, next_status
@@ -234,6 +238,9 @@ class ProvisioningWorker:
             and self._missing_current_consent_purpose(job) is not None
         ):
             return self._block_for_missing_content_restriction(job, request)
+        disabled = self._blocked_by_email_kill_switch(job)
+        if disabled is not None:
+            return self._mark_step_problem(job, request, "failed", disabled)
         provider = None
         result = None
         try:
@@ -1411,6 +1418,34 @@ class ProvisioningWorker:
             code if requires_reconciliation(code) else "shutdown_requires_no_new_resource",
         )
 
+    def _blocked_by_email_kill_switch(self, job: JobRecord) -> str | None:
+        """The MVP kill switch, asked where the provider is actually called.
+
+        `_assert_email_rollout` asks the same question at selection. That alone
+        is not a kill switch: the provider call happens later, from a queued
+        job, so an operator flipping `1 -> 0` mid-incident would not stop the
+        Gmail or BYO work already sitting in the queue — which is the case the
+        switch exists for. Read here, at call time, `1 -> 0` stops the NEXT
+        provider call whether the job is fresh, re-inspected, or reclaimed.
+
+        Forward work only. Teardown carries `kind == "cleanup"`, and shutdown
+        work is exempt outright, for the reason `_is_shutdown_action` gives: a
+        switch that blocked teardown would strand exactly the external resources
+        turning the switch off is meant to get rid of.
+        """
+        if job.kind != "email_identity":
+            return None
+        flag = GATED_EMAIL_PROVIDERS.get(job.provider)
+        if flag is None:
+            return None
+        if self._is_shutdown_action(job):
+            return None
+        try:
+            check_provider_enabled(flag)
+        except RuntimeError:
+            return f"email_option_disabled:{flag}"
+        return None
+
     def _is_shutdown_action(self, job: JobRecord) -> bool:
         """Work that exists BECAUSE a consent went away.
 
@@ -1686,6 +1721,9 @@ class ProvisioningWorker:
             and self._missing_current_consent_purpose(job) is not None
         ):
             return self._block_for_missing_content_restriction(job, request)
+        disabled = self._blocked_by_email_kill_switch(job)
+        if disabled is not None:
+            return self._mark_step_problem(job, request, "failed", disabled)
         provider = self.providers.get(job.provider)
         if job.kind == "cleanup":
             deferred = self._defer_runtime_cleanup(job, request)
