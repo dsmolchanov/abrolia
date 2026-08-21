@@ -344,6 +344,29 @@ CREATE TABLE channel_bindings (
 - Opt-in push: Web Push subscription stored as `channel_binding` (`channel='web'`, `external_id = endpoint_hash`); push provider is `P11` — remains `TBD/disabled` for real families until `processors.md` P11 is `✅` (so Web chat works without push in Phase E; push is fake-only).
 - No vault/offline archive in Phase 5.
 
+#### Step E6a — Frontend brand rollout
+
+**Files:** `brand/logo/**`, `landing/**`, `control_plane/web/static/favicon.svg`, `control_plane/web/static/onboarding.css`, `control_plane/web/templates/base.html`, `web/**`, `tests/control_plane/test_frontend_branding.py`.
+
+**Branches:** `codex/abrolia-logo-frontends`.
+
+**Scope:**
+
+- Publish the approved handwritten `a` masters and apply the same mark to the landing page,
+  control-plane shell and Web/PWA shell, including favicon, social and app-icon variants.
+- Keep the PWA compatible with the control-plane `script-src 'self'; style-src 'self'` policy by
+  serving client CSS and JavaScript as same-origin assets rather than inline blocks.
+- Route every public “Request early access” link to the landing page's `#join` request flow;
+  `/start` remains login/reauth for invited accounts.
+
+**Acceptance:**
+
+- Shared-shell tests cover every frontend logo placement and reject the superseded arrow mark.
+- The mounted `/pwa/index.html` has no CSP-blocked inline styles, scripts or event attributes;
+  its stylesheet, controller, service worker, favicon and icons are served from `/pwa/*`.
+- Every early-access anchor targets the single public request section and the asset sanitizer,
+  Ruff and hermetic test suite pass.
+
 #### Step E7 — Observability
 
 **Files:** `control_plane/observability.py`, `hermes_cloud/core/observability.py`, `deploy/control-plane/Dockerfile` (log config), `docs/onboarding-runbook.md` (alert runbook).

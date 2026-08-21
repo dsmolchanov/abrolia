@@ -6,19 +6,9 @@
 <meta name="theme-color" content="#f7fafc">
 <link rel="manifest" href="manifest.json">
 <link rel="icon" href="static/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="static/app.css">
+<script src="static/app.js" defer></script>
 <title>Abrolia — Web chat</title>
-<style>
-:root { --ink: #18222d; --canvas: #f7fafc; --line: #d9e0e7; --signal: #2457f5; --melon: #ffb09f; }
-* { box-sizing: border-box; }
-body { margin: 0; color: var(--ink); background: var(--canvas); font: 16px/1.5 "Avenir Next", system-ui, sans-serif; }
-.app-header { padding: 1rem clamp(1rem, 4vw, 3rem); background: #fff; border-bottom: 1px solid var(--line); }
-.brand { display: inline-flex; align-items: center; gap: .6rem; color: inherit; font-size: 1.35rem; font-weight: 700; letter-spacing: -.04em; text-decoration: none; }
-.brand-mark { width: 42px; height: auto; flex: 0 0 auto; overflow: visible; fill: none; }
-.brand-stroke { stroke: var(--signal); stroke-width: 4.6; stroke-linecap: round; stroke-linejoin: round; }
-.brand-dot { fill: var(--melon); }
-#chat { width: min(720px, calc(100% - 2rem)); margin: 2.5rem auto; }
-@media (max-width: 640px) { .brand-mark { width: 38px; } }
-</style>
 </head>
 <body>
 <header class="app-header">
@@ -35,26 +25,5 @@ body { margin: 0; color: var(--ink); background: var(--canvas); font: 16px/1.5 "
 <form id="form"><input id="input" type="text" placeholder="Сообщение"><button type="submit">Отправить</button></form>
 <div id="messages"></div>
 </main>
-<script>
-const form = document.getElementById('form');
-const input = document.getElementById('input');
-const messages = document.getElementById('messages');
-form.addEventListener('submit', async (e) => {
-  e.preventDefault();
-  const text = input.value.trim();
-  if (!text) return;
-  const res = await fetch('/api/web/message', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({text})
-  });
-  const data = await res.json().catch(() => ({}));
-  const p = document.createElement('p');
-  p.textContent = data.reply || data.detail || 'ошибка';
-  messages.appendChild(p);
-  input.value = '';
-});
-if ('serviceWorker' in navigator) { navigator.serviceWorker.register('sw.js').catch(()=>{}); }
-</script>
 </body>
 </html>

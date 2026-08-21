@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 import struct
 import xml.etree.ElementTree as ElementTree
+from html.parser import HTMLParser
 from pathlib import Path
-
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 LOGO_MARKER = 'data-abrolia-logo="handwritten-a"'
@@ -18,6 +18,55 @@ OLD_ARROW_PATHS = (
 )
 
 
+class _FrontendHTMLParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.anchors: list[tuple[str, str]] = []
+        self.stylesheets: list[str] = []
+        self.scripts: list[str] = []
+        self.inline_styles = 0
+        self.inline_scripts = 0
+        self.inline_attributes: list[str] = []
+        self.join_targets = 0
+        self.pilot_form_actions: list[str] = []
+        self._anchor_href: str | None = None
+        self._anchor_text: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attributes = dict(attrs)
+        if attributes.get("id") == "join":
+            self.join_targets += 1
+        self.inline_attributes.extend(
+            name for name, _value in attrs if name == "style" or name.startswith("on")
+        )
+        if tag == "a":
+            self._anchor_href = attributes.get("href", "")
+            self._anchor_text = []
+        elif tag == "form" and "data-pilot-form" in attributes:
+            self.pilot_form_actions.append(attributes.get("action", ""))
+        elif tag == "style":
+            self.inline_styles += 1
+        elif tag == "script":
+            source = attributes.get("src")
+            if source:
+                self.scripts.append(source)
+            else:
+                self.inline_scripts += 1
+        elif tag == "link" and "stylesheet" in (attributes.get("rel") or "").split():
+            self.stylesheets.append(attributes.get("href", ""))
+
+    def handle_data(self, data: str) -> None:
+        if self._anchor_href is not None:
+            self._anchor_text.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "a" and self._anchor_href is not None:
+            label = " ".join("".join(self._anchor_text).split())
+            self.anchors.append((self._anchor_href, label))
+            self._anchor_href = None
+            self._anchor_text = []
+
+
 def _read(relative_path: str) -> str:
     return (REPOSITORY_ROOT / relative_path).read_text(encoding="utf-8")
 
@@ -26,6 +75,12 @@ def _png_dimensions(path: Path) -> tuple[int, int]:
     payload = path.read_bytes()
     assert payload[:8] == b"\x89PNG\r\n\x1a\n"
     return struct.unpack(">II", payload[16:24])
+
+
+def _parse_html(source: str) -> _FrontendHTMLParser:
+    parser = _FrontendHTMLParser()
+    parser.feed(source)
+    return parser
 
 
 def test_every_control_plane_page_renders_the_shared_logo(api_harness) -> None:
@@ -68,6 +123,21 @@ def test_all_frontend_shells_use_the_handwritten_a_and_no_old_arrow() -> None:
         assert '{% extends "base.html" %}' in template.read_text(encoding="utf-8")
 
 
+def test_every_early_access_link_targets_the_public_request_flow() -> None:
+    landing = _parse_html(_read("landing/index.html"))
+    early_access_hrefs = [
+        href for href, label in landing.anchors if label.casefold().startswith("request early access")
+    ]
+
+    assert len(early_access_hrefs) >= 2
+    assert set(early_access_hrefs) == {"#join"}
+    assert landing.join_targets == 1
+    public_email_hrefs = {href for href, _label in landing.anchors if href.startswith("mailto:")}
+    assert len(public_email_hrefs) == 1
+    assert len(landing.pilot_form_actions) == 1
+    assert set(landing.pilot_form_actions) == public_email_hrefs
+
+
 def test_logo_favicons_and_pwa_icons_are_valid_brand_assets() -> None:
     favicon_paths = (
         "landing/favicon.svg",
@@ -103,11 +173,38 @@ def test_pwa_serves_the_logo_and_relative_brand_assets(api_harness) -> None:
     assert 'href="manifest.json"' in page.text
     assert 'href="static/favicon.svg"' in page.text
 
+    content_security_policy = page.headers["content-security-policy"]
+    assert "style-src 'self'" in content_security_policy
+    assert "script-src 'self'" in content_security_policy
+    assert "'unsafe-inline'" not in content_security_policy
+    shell = _parse_html(page.text)
+    assert shell.stylesheets == ["static/app.css"]
+    assert shell.scripts == ["static/app.js"]
+    assert shell.inline_styles == 0
+    assert shell.inline_scripts == 0
+    assert shell.inline_attributes == []
+
     manifest = api_harness.client.get("/pwa/manifest.json")
     favicon = api_harness.client.get("/pwa/static/favicon.svg")
     app_icon = api_harness.client.get("/pwa/static/icon-192.png")
+    stylesheet = api_harness.client.get("/pwa/static/app.css")
+    script = api_harness.client.get("/pwa/static/app.js")
+    service_worker = api_harness.client.get("/pwa/sw.js")
+    anonymous_message = api_harness.client.post("/api/web/message", json={"text": "hello"})
     assert manifest.status_code == 200
     assert favicon.status_code == 200
     assert favicon.headers["content-type"].startswith("image/svg+xml")
     assert app_icon.status_code == 200
     assert app_icon.headers["content-type"] == "image/png"
+    assert stylesheet.status_code == 200
+    assert stylesheet.headers["content-type"].startswith("text/css")
+    assert ".brand-stroke" in stylesheet.text
+    assert script.status_code == 200
+    assert "javascript" in script.headers["content-type"]
+    assert 'form.addEventListener("submit"' in script.text
+    assert 'fetch("/api/web/message"' in script.text
+    assert 'navigator.serviceWorker.register("./sw.js")' in script.text
+    assert service_worker.status_code == 200
+    assert "javascript" in service_worker.headers["content-type"]
+    assert anonymous_message.status_code == 401
+    assert anonymous_message.headers["cache-control"] == "no-store"

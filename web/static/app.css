@@ -1,0 +1,59 @@
+:root {
+  --ink: #18222d;
+  --canvas: #f7fafc;
+  --line: #d9e0e7;
+  --signal: #2457f5;
+  --melon: #ffb09f;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  color: var(--ink);
+  background: var(--canvas);
+  font: 16px/1.5 "Avenir Next", system-ui, sans-serif;
+}
+
+.app-header {
+  padding: 1rem clamp(1rem, 4vw, 3rem);
+  background: #fff;
+  border-bottom: 1px solid var(--line);
+}
+
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: .6rem;
+  color: inherit;
+  font-size: 1.35rem;
+  font-weight: 700;
+  letter-spacing: -.04em;
+  text-decoration: none;
+}
+
+.brand-mark {
+  width: 42px;
+  height: auto;
+  flex: 0 0 auto;
+  overflow: visible;
+  fill: none;
+}
+
+.brand-stroke {
+  stroke: var(--signal);
+  stroke-width: 4.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.brand-dot { fill: var(--melon); }
+
+#chat {
+  width: min(720px, calc(100% - 2rem));
+  margin: 2.5rem auto;
+}
+
+@media (max-width: 640px) {
+  .brand-mark { width: 38px; }
+}
