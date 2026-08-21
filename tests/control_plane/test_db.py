@@ -59,7 +59,12 @@ def test_failed_migration_rolls_back_every_statement(tmp_path: Path) -> None:
         with pytest.raises(sqlite3.OperationalError):
             database.migrate(migrations)
         assert "should_rollback" not in _tables(database)
-        assert database.query("SELECT name FROM schema_migrations") == []
+        # Not merely empty — ABSENT. The ledger is created inside the batch
+        # transaction, so a failed migration on a fresh database leaves it
+        # exactly as it was. Creating it beforehand autocommitted, which made
+        # the file differ from a snapshot taken moments earlier and caused the
+        # next boot to reject that snapshot and write another.
+        assert "schema_migrations" not in _tables(database)
     finally:
         database.close()
 

@@ -376,7 +376,60 @@ CREATE TABLE channel_bindings (
 
 #### Step E9 — Release tag, migrate-on-start, restore drill
 
-**Files:** `deploy/control-plane/Dockerfile`, `control_plane/db.py`, `control_plane/migrations/*`, `docs/control-plane-restore.md`.
+**Files:** `deploy/control-plane/Dockerfile`, `control_plane/db.py`,
+`control_plane/backup.py`, `control_plane/cli.py`, `control_plane/config.py`,
+`control_plane/migrations/*`, `docs/control-plane-restore.md`,
+`tests/control_plane/test_migrate_on_start.py`,
+`tests/control_plane/test_db.py`, `AGENTS.repo-invariants.md`,
+`tests/control_plane/test_plan_inventory.py`.
+
+**Branches:** `codex/phase-E9-backup-before-migrate`.
+
+**Scope revised 2026-08-19.** The original list named only the entrypoint, the
+database module, the migrations and the restore documentation. Three more turned
+out to be load-bearing for the step's own guarantees, and the list is corrected
+rather than the changes reverted:
+
+- `control_plane/backup.py` — the pre-migrate snapshot itself lives here, along
+  with the reuse that stops a restart loop filling the volume and the
+  authentication that stops an unopenable archive satisfying the gate.
+- `control_plane/cli.py` — the `restore --no-migrate` rollback path the drill
+  depends on.
+- `control_plane/config.py` — `decode_key_material`, shared so the startup step
+  and the application cannot disagree about whether a backup key is valid. That
+  disagreement stopped the container from booting on a perfectly good key.
+
+**Scope revised again 2026-08-20.** The list named implementation modules only,
+and named no test module at all, while the step's acceptance depends on two:
+
+- `tests/control_plane/test_migrate_on_start.py` — the step's own suite,
+  referenced further down this plan but never inventoried here.
+- `tests/control_plane/test_db.py` — one assertion, tightened from "the ledger
+  is empty" to "the ledger is ABSENT". It belongs with the database module
+  rather than with the migrate-on-start suite because it is a property of
+  `migrate()` itself: creating `schema_migrations` outside the batch
+  transaction autocommitted, which made the file differ from a snapshot taken
+  moments earlier and caused the next boot to reject that snapshot and write
+  another. The migrate-on-start suite consumes that property; `test_db.py` is
+  where it is established.
+
+`tests/control_plane/test_plan_inventory.py` — **added 2026-08-21.** The scope
+check itself, whose `**Files:**` pattern matched only the first line of an
+inventory. Step E9's runs to four, so most of its declared paths were invisible
+and the check reported them all undeclared the moment this branch caught up with
+main. It failed closed, which is the right direction, and it was still wrong.
+
+**Scope revised again 2026-08-21.** `AGENTS.repo-invariants.md` — seven rounds
+reported one class of defect: an operation acting on a pathname it had validated
+at an earlier moment. `AGENTS.md` says a class that recurs is one missing rule
+rather than N findings, so the rule is recorded there and enforced by
+parameterised checks in this step's own suite.
+
+An inventory that lists only implementation files cannot detect a changed test,
+which is how this one went unlisted through several revisions. The general
+remedy — a check comparing a branch's changed paths against its plan's
+inventory — is a repository mechanism rather than a Step E9 change, and belongs
+with `AGENTS.repo-invariants.md`.
 
 **Tag:**
 
@@ -385,6 +438,31 @@ CREATE TABLE channel_bindings (
 **Migrate-on-start with backup-before-migrate:**
 
 - Container entrypoint runs `python -m control_plane.db migrate --backup-first` — creates a timestamped `/data/control-plane.db.pre-migrate-<rev>.bak` before applying any new `control_plane/migrations/*.sql`; migration failure → container exits non-zero, no partial schema.
+
+**Rollback install.** Added 2026-08-20, **revised the same day.** The drill's
+rollback was a column of `mv` commands in `docs/control-plane-restore.md`, and
+three of its steps have a failure that does not announce itself: the install is
+a cross-filesystem COPY when the restore was staged off the volume (and renaming
+the superseded database aside frees no blocks, so it still ends in `ENOSPC`); a
+superseded `-wal` left at the canonical path is replayed into the restore; and
+the worker pause is a sibling file that does not travel with the database. Prose
+cannot be executed by a test, which is why the previous check could only assert
+that `/tmp` appeared on the page while the documented procedure still failed.
+`abrolia-control-plane install-rollback` performs the sequence with those checks
+attached.
+
+It **refuses** the low-space case rather than resolving it. The first version
+archived the superseded database off-volume and deleted it to make room, which
+made a command an operator runs to move a file capable of destroying the only
+copy of every write taken after the migration — and it needed the backup key, a
+staging directory, capacity arithmetic and collision-free archive naming to do
+it. That surface produced nine review blockers over three rounds. Freeing space
+is a decision with data-loss consequences and belongs to whoever knows what else
+is on the machine, so the command checks before anything moves, reports the
+bytes needed and the bytes free, and leaves `/data` untouched. The runbook
+carries the manual procedure — archive off-volume, verify it restores, only then
+delete — and a test asserts that order, because a page documenting deletion
+before verification is worse than one documenting nothing.
 
 **Restore drill (reuse Phase B procedure):**
 
@@ -461,7 +539,7 @@ pytest tests/test_onboarding.py tests/test_google_oauth.py -q
 pytest -p no:cacheprovider -m "not live" -q
 ```
 
-- [ ] Release tag + backup-before-migrate + restore drill evidenced.
+- [ ] Release tag + backup-before-migrate + restore drill evidenced. Backup-before-migrate landed: `python -m control_plane.db migrate --backup-first` is the container entrypoint step and fails closed without the dedicated backup key (`tests/control_plane/test_migrate_on_start.py`, 5 tests). The release tag and the Phase E restore drill remain operator actions.
 
 ---
 

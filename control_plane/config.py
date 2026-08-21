@@ -13,14 +13,51 @@ class ConfigurationError(RuntimeError):
     """Configuration would weaken a locked control-plane invariant."""
 
 
+def decode_key_material(value: str) -> bytes:
+    """Decode urlsafe base64 key material, tolerating absent padding.
+
+    One spelling of the padding rule, because there was briefly more than one:
+    the startup migration step decoded the SAME environment variable without
+    restoring padding, so a valid unpadded key that the application accepted
+    turned into `b""` there — the pre-migrate backup then failed closed and the
+    container never reached `serve`. A key is either good for both readers or
+    neither.
+    """
+    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+
+
 def _decode_key(value: str, *, name: str) -> bytes:
     try:
-        decoded = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+        decoded = decode_key_material(value)
     except (ValueError, TypeError) as error:
         raise ConfigurationError(f"{name} must be urlsafe base64") from error
     if len(decoded) != 32:
         raise ConfigurationError(f"{name} must decode to exactly 32 bytes")
     return decoded
+
+
+def backup_key_from_env(env: dict[str, str] | None = None) -> bytes:
+    """The backup key alone, for commands that must work when nothing else does.
+
+    `ControlPlaneConfig.from_env` validates the WHOLE application: field
+    encryption, both HMAC keys and, under the checked-in `fly-runtime`
+    configuration, the Fly token, organization, image digest and bootstrap host.
+    Reading the backup key through it made `restore` — and the rollback install
+    that follows it — refuse to run when any unrelated secret was missing or
+    invalid, even with a perfectly good archive and a perfectly good key.
+
+    That is exactly backwards. These two commands exist for the situation where
+    the deployment is broken; making them depend on the deployment being intact
+    withdraws the recovery path at the moment it is needed. They read the
+    dedicated key, and nothing else.
+    """
+    source = dict(os.environ if env is None else env)
+    encoded = source.get("ABROLIA_CONTROL_PLANE_BACKUP_KEY", "").strip()
+    if not encoded:
+        raise ConfigurationError(
+            "ABROLIA_CONTROL_PLANE_BACKUP_KEY is required to read a backup archive"
+        )
+    return _decode_key(encoded, name="ABROLIA_CONTROL_PLANE_BACKUP_KEY")
 
 
 def _uuid_set(value: str, *, name: str) -> frozenset[str]:
