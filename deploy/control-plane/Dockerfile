@@ -6,6 +6,7 @@ WORKDIR /build
 COPY pyproject.toml requirements.txt ./
 COPY control_plane ./control_plane
 COPY hermes_cloud ./hermes_cloud
+COPY web ./web
 RUN pip wheel --wheel-dir /wheels .
 
 FROM python:3.12-slim

@@ -3,3 +3,5 @@ build>=1.2,<2
 nerve-email==0.2.0
 pytest>=8.0
 ruff>=0.6
+setuptools>=75
+wheel
