@@ -536,7 +536,12 @@ def test_the_snapshot_image_is_not_written_beside_the_database(
     assert archive is not None
     assert destinations, "no image was materialised"
     for target in destinations:
-        assert target.parent == scratch, f"{target} landed on the data volume"
+        # Inside a per-invocation PRIVATE directory under the scratch root, not
+        # directly in it: `_materialise` hands SQLite a path, so the only way to
+        # stop another writer using the moment between the image being written
+        # and this process opening it is to make that directory unreachable.
+        assert target.parent.parent == scratch, f"{target} landed on the data volume"
+        assert target.parent.name.startswith(".abrolia-image."), target.parent
     # The archive itself must still be installed beside the database.
     assert archive.parent == database.path.parent
     database.close()
@@ -4053,24 +4058,43 @@ def test_a_reversal_refuses_to_carry_back_modified_bytes(
     assert backup_module._pause_marker(target).exists()
 
 
-def test_content_identity_comes_from_the_descriptor(tmp_path, monkeypatch) -> None:
-    """One open, one `fstat`, one digest — all of the same file.
+def test_content_identity_spans_no_substitution(tmp_path, monkeypatch) -> None:
+    """The name must still refer to the descriptor, before AND after hashing.
 
-    Reading the inode by PATHNAME after opening the descriptor is the same
-    ask-twice mistake one level down: a swap in between pairs one file's digest
-    with another file's inode, and the pair is then trusted as an identity.
+    `fstat` happens in an instant and the digest read does not. An actor who
+    renames the opened file and drops a replacement at the name while the hash
+    is running leaves this returning the old descriptor's identity — while the
+    move that follows consumes the replacement. The window cannot be closed
+    without holding the name, but an identity that spans a substitution can be
+    refused, and this is that refusal.
     """
     subject = tmp_path / "member.db"
     subject.write_bytes(b"the validated bytes")
     real = subject.stat()
 
-    # If the inode came from `_inode(path)`, this sentinel would be returned.
-    monkeypatch.setattr(backup_module, "_inode", lambda _path: (-1, -1))
+    # Unmolested, the identity is the entry's own.
+    assert backup_module._content_identity(subject) == (
+        (real.st_dev, real.st_ino),
+        hashlib.sha256(b"the validated bytes").digest(),
+    )
 
-    inode, digest = backup_module._content_identity(subject)
+    real_digest = backup_module._digest_of
 
-    assert inode == (real.st_dev, real.st_ino), inode
-    assert digest == hashlib.sha256(b"the validated bytes").digest()
+    def swap_then_digest(handle):
+        # The replacement takes the NAME; the descriptor still holds the
+        # original, so the bytes hashed here are not the bytes at that path.
+        replacement = subject.with_name("a-successor")
+        replacement.write_bytes(b"an entirely different generation")
+        os.replace(replacement, subject)
+        return real_digest(handle)
+
+    monkeypatch.setattr(backup_module, "_digest_of", swap_then_digest)
+
+    with pytest.raises(OSError, match="replaced while it was being read"):
+        backup_module._content_identity(subject)
+
+    monkeypatch.undo()
+    assert subject.read_bytes() == b"an entirely different generation"
 
 
 def test_an_unreadable_member_has_no_identity(tmp_path) -> None:
@@ -4137,3 +4161,100 @@ def test_a_failed_publication_withdraws_only_what_it_published(
     )
     if sentinel == "regular":
         assert destination.read_bytes() == b"somebody else's file"
+
+
+def test_the_staging_image_is_unreachable_to_anyone_else(tmp_path, monkeypatch) -> None:
+    """`_materialise` hands SQLite a PATH; it cannot be handed a descriptor.
+
+    So there is an unavoidable moment between the image being written and this
+    process opening it, and a replacement dropped at that name in the shared
+    scratch directory was encrypted into the archive while every
+    source-identity check still passed — a different, perfectly valid
+    control-plane generation silently becoming the restore point.
+
+    The window cannot be removed. Anyone else's ability to use it can: the
+    image is staged in a per-invocation directory created 0700 with an
+    unpredictable name, so this process is the only writer to that path. The
+    guarantee is the directory, and this is what asserts it.
+    """
+    scratch = tmp_path / "ephemeral"
+    scratch.mkdir()
+    monkeypatch.setenv(SCRATCH_DIR_ENV, str(scratch))
+    seed = _database(tmp_path)
+    seed.migrate()
+    staged: list[Path] = []
+    modes: list[int] = []
+    real_materialise = backup_module._materialise
+
+    def materialise(handle, image):
+        # Read WHILE it exists. The directory is gone by the time the command
+        # returns, which is the other half of the guarantee.
+        modes.append(stat.S_IMODE(Path(image).parent.stat().st_mode))
+        staged.append(Path(image))
+        return real_materialise(handle, image)
+
+    monkeypatch.setattr(backup_module, "_materialise", materialise)
+    archive = tmp_path / "restore-point.cpb"
+    backup_module.create_backup(seed, archive, backup_key=BACKUP_KEY_BYTES)
+    seed.close()
+
+    assert staged, "no image was materialised"
+    directory = staged[0].parent
+    assert directory.parent == scratch
+    assert modes == [0o700], modes
+    # And nothing is left behind on a volume whose exhaustion this module
+    # exists to survive.
+    assert not directory.exists(), f"the staging directory outlived the backup: {directory}"
+    assert list(scratch.iterdir()) == [], list(scratch.iterdir())
+
+
+@pytest.mark.parametrize("sentinel", ["regular", "hard-link", "symlink"])
+def test_the_withdrawal_token_predates_the_publication(
+    tmp_path, monkeypatch, sentinel
+) -> None:
+    """Derived from the destination, the token describes whoever holds it.
+
+    An actor who replaces the destination between `os.link` and the read-back
+    has THEIR inode recorded as the published one — and the withdrawal that
+    follows is then authorised to unlink their file. `os.link` makes the
+    destination the source's inode by construction, so the token is taken from
+    the entry this call already owns, before the move, and nothing has to be
+    read back at all.
+    """
+    source = tmp_path / "temporary"
+    source.write_bytes(b"the generation being published")
+    destination = tmp_path / "canonical.db"
+    bystander = tmp_path / "not-yours.txt"
+    bystander.write_bytes(b"not yours to delete")
+    raw_link = os.link
+    swapped: list[Path] = []
+
+    def link(a, b, **keywords):
+        raw_link(a, b, **keywords)
+        # The window: after the link, before anything reads the name back.
+        Path(b).unlink()
+        if sentinel == "regular":
+            Path(b).write_bytes(b"somebody else's file")
+        elif sentinel == "hard-link":
+            raw_link(bystander, b)
+        else:
+            Path(b).symlink_to(bystander)
+        swapped.append(Path(b))
+
+    def refuse_sync(_directory):
+        raise OSError(errno.EIO, "the directory will not sync")
+
+    monkeypatch.setattr(backup_module.os, "link", link)
+    monkeypatch.setattr(backup_module, "_fsync_directory", refuse_sync)
+
+    with pytest.raises(OSError):
+        backup_module._publish(source, destination)
+
+    monkeypatch.undo()
+    assert swapped, "the publication window was never reached"
+    assert bystander.read_bytes() == b"not yours to delete", (
+        "the withdrawal deleted a file this publication never created"
+    )
+    assert os.path.lexists(destination), (
+        "the withdrawal removed an entry another operation had put there"
+    )

@@ -109,7 +109,14 @@ makes a review loop unable to terminate.
   file's inode. And a failure is not an identity: answering `(inode, None)` for
   a member that would not open made two transiently failing states compare
   EQUAL, so an install or a reversal could be licensed by a pair of failures.
-  Absent is an identity; unreadable is not.
+  Absent is an identity; unreadable is not. The identity of a publication is
+  taken from the entry the call already OWNS, before the move — read back from
+  the destination afterwards, it describes whoever holds that name by then, and
+  the cleanup is authorised against their file. And where a path must be handed
+  to something that cannot take a descriptor — SQLite, which is given a
+  filename — the file lives in a per-invocation directory created 0700 with an
+  unpredictable name, because the window cannot be removed but everyone else's
+  ability to use it can.
 ### A report describes the branch the worker will actually take
 
 - **Any job the dry-run report annotates with `blocked_by` and `table_writes`

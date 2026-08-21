@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import hashlib
 import hmac
@@ -191,7 +192,21 @@ def _content_identity(path: Path) -> tuple[tuple[int, int] | None, bytes | None]
         return (None, None)
     with _open_pinned(path) as handle:
         info = os.fstat(handle.fileno())
-        return ((info.st_dev, info.st_ino), _digest_of(handle))
+        entry = (info.st_dev, info.st_ino)
+        if _inode(path) != entry:
+            # The name stopped referring to this descriptor between the open
+            # and now. Whatever is hashed here would not be what the next move
+            # consumes.
+            raise _Substituted(path)
+        digest = _digest_of(handle)
+        # And AGAIN, because the digest read is the long part: a rename during
+        # it leaves this returning the old descriptor's identity while the move
+        # that follows takes the replacement. The window cannot be closed
+        # without holding the name, but an identity that spans a substitution
+        # can be refused.
+        if _inode(path) != entry:
+            raise _Substituted(path)
+        return (entry, digest)
 
 
 def _digest_file(path: Path) -> bytes:
@@ -376,13 +391,19 @@ def _claim(
     created beside its destination, and a cross-filesystem move is handled by
     `_rename_or_exdev` reporting `EXDEV` instead.
     """
+    # BEFORE the link, from the entry this call already owns. Deriving the
+    # token by reopening the DESTINATION afterwards meant that an actor who
+    # replaced it in between had their inode recorded as the published one —
+    # and the withdrawal that followed was then authorised to unlink their
+    # file. `os.link` makes the destination the source's inode by construction,
+    # so nothing has to be read back to know what was published.
+    published, digest, proven = _identity_before_publication(source)
     os.link(source, destination)
     # Journal the move BEFORE the unlink, which can fail on its own — `EIO`,
     # `EPERM`, a read-only remount. Unlinking first meant a caller could not
     # know the destination now existed, so `_undo` would not reverse it and the
     # bundle stayed half-apart. The link is the move; the unlink is tidying
     # after it, and `source_removed` is set only once that tidying succeeded.
-    published, digest, proven = _identity_after_publication(destination)
     record = _Move(
         source,
         destination,
@@ -415,6 +436,17 @@ def _claim(
         raise
     record.source_removed = True
     return published
+
+
+class _Substituted(BackupError, OSError):
+    """The pathname stopped referring to the entry that was open behind it."""
+
+    def __init__(self, path: Path) -> None:
+        super().__init__(
+            f"{path} was replaced while it was being read; no identity can be"
+            " established for it"
+        )
+        self.path = path
 
 
 class RaceLostSource(BackupError, OSError):
@@ -450,20 +482,20 @@ class AmbiguousPublication(BackupError):
         self.destination = destination
 
 
-def _identity_after_publication(
-    destination: Path,
+def _identity_before_publication(
+    source: Path,
 ) -> tuple[tuple[int, int] | None, bytes | None, bool]:
-    """Read what was just published, and say whether it could be read at all.
+    """What this call is ABOUT to publish, read from the entry it already owns.
 
-    The publication has already happened, so failing here cannot un-happen it.
-    What it can do is refuse to pretend: an unread identity is recorded as
-    UNPROVEN, and `_undo` never moves an unproven member into an authoritative
-    namespace.
+    Read before the move rather than after it, because after the move the only
+    thing available is a pathname somebody else may hold. An identity that
+    cannot be established is recorded as UNPROVEN rather than guessed at, and
+    `_undo` never moves an unproven member into an authoritative namespace.
     """
     try:
-        inode, digest = _content_identity(destination)
+        inode, digest = _content_identity(source)
     except OSError:
-        return (_inode(destination), None, False)
+        return (None, None, False)
     return (inode, digest, True)
 
 
@@ -587,6 +619,7 @@ def create_backup(
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary_archive: Path | None = None
     image: Path | None = None
+    staging: Path | None = None
     try:
         # NOT beside the database. The image and the encrypted archive are each
         # about the size of the database, and putting both on the 1 GiB data
@@ -596,10 +629,18 @@ def create_backup(
         # RAM problem this replaced must not simply become a disk problem.
         # `SCRATCH_DIR` lets an operator point this at whatever the machine has.
         scratch_root = os.environ.get(SCRATCH_DIR_ENV) or tempfile.gettempdir()
-        with tempfile.NamedTemporaryFile(
-            prefix=f".{destination.name}.image.", dir=scratch_root, delete=False
-        ) as handle:
-            image = Path(handle.name)
+        # A PRIVATE directory, not a shared one. `_materialise` hands SQLite a
+        # PATH — it cannot be given a descriptor — so there is an unavoidable
+        # moment between the image being written and this process opening it.
+        # What can be removed is anyone else's ability to use that moment:
+        # `mkdtemp` creates the directory 0700 with a name nobody can predict,
+        # so the only writer to the staging path is this process. Without it, a
+        # replacement dropped at the image's name was encrypted into the
+        # archive while every source-identity check still passed, and a
+        # different, perfectly valid control-plane generation silently became
+        # the restore point.
+        staging = Path(tempfile.mkdtemp(prefix=".abrolia-image.", dir=scratch_root))
+        image = staging / f"{destination.name}.image"
         _materialise(database, image)
         # And again AFTER. `_materialise` is where `database.connection` first
         # opens, by path, so the check before it proves nothing about the file
@@ -617,7 +658,20 @@ def create_backup(
             temporary_archive = Path(archive_file.name)
             archive_file.write(MAGIC)
             archive_file.write(nonce)
-            with open(image, "rb") as source:
+            # The staged image is UNLINKED and read from the descriptor that
+            # created it — no second open by pathname, because the scratch
+            # directory is not this process's alone and a replacement dropped
+            # at that name between `_materialise` and here would be encrypted
+            # into the archive while every source-identity check still passed.
+            # A different, perfectly valid control-plane generation would
+            # become the restore point, and the runbook then licenses deleting
+            # the current database against it.
+            #
+            # Unlinking first also makes the name unusable by anyone else and
+            # removes the cleanup the `finally` would otherwise have to do.
+            with _open_pinned(image) as source:
+                image.unlink(missing_ok=True)
+                image = None
                 for chunk in iter(lambda: source.read(CHUNK_BYTES), b""):
                     archive_file.write(encryptor.update(chunk))
             archive_file.write(encryptor.finalize())
@@ -631,6 +685,9 @@ def create_backup(
     finally:
         if image is not None:
             image.unlink(missing_ok=True)
+        if staging is not None:
+            with contextlib.suppress(OSError):
+                staging.rmdir()
         if temporary_archive is not None:
             temporary_archive.unlink(missing_ok=True)
 
@@ -1092,7 +1149,9 @@ def _copy_install(
     # source is gone — a copy whose source removal fails leaves both names
     # holding the generation, which `_undo` has to be able to tell from a move
     # that never started. See `_Move`.
-    landed_inode, landed_digest, landed_proven = _identity_after_publication(
+    # The bytes this call COPIED, taken from the temporary it owns rather than
+    # from the destination it has just let go of.
+    landed_inode, landed_digest, landed_proven = _identity_before_publication(
         destination
     )
     record = _Move(
