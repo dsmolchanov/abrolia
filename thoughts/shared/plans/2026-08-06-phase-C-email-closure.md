@@ -226,7 +226,33 @@ Each hermetic test must prove the contract without a real Nerve (fake Nerve in `
 
 ### Slice C3 — Gmail Runtime & Activation (B-06)
 
-**Files:** `hermes_cloud/ingest/gmail_api.py`, `hermes_cloud/execute/gmail_api_send.py`, `control_plane/providers/email/google_oauth.py`, `control_plane/provisioning/manifest.py`, `control_plane/migrations/0004_google_oauth.sql`, `hermes_cloud/core/migrations/0006_email_identity.sql`, `control_plane/config.py:140-164`, `control_plane/api/email.py`.
+**Files:** `hermes_cloud/ingest/gmail_api.py`,
+`hermes_cloud/execute/gmail_api_send.py`,
+`control_plane/providers/email/google_oauth.py`,
+`control_plane/provisioning/manifest.py`,
+`control_plane/migrations/0004_google_oauth.sql`,
+`hermes_cloud/core/migrations/*`, `control_plane/config.py`,
+`control_plane/api/email.py`, `hermes_cloud/core/dsar.py`,
+`hermes_cloud/email/google_client.py`, `tests/test_gmail_api_ingest.py`,
+`tests/test_db.py`, `tests/test_runtime_service.py`.
+
+**Branches:** `codex/phase-C3-gmail-v4`.
+
+**Scope corrected 2026-08-21.** The original line named the runtime and
+control-plane modules and no test module, and predated the cursor-overlap work
+it now has to describe:
+
+- `hermes_cloud/core/migrations/*` — `0009_gmail_cursor_overlap.sql`, which the
+  bounded resync needs; the line named only `0006`.
+- `hermes_cloud/core/dsar.py` — the new column's privacy classification. A
+  cursor column that no subject-access path knows about is a column that leaks.
+- `hermes_cloud/email/google_client.py` — the `history.list` query the resync
+  issues.
+- the three test modules, which an inventory listing only implementation files
+  cannot detect a change to. Steps E1 and E9 recorded the same correction.
+
+The `:140-164` line range is dropped: a line range in an inventory is a
+reference that goes stale on the next edit, and the check reads paths.
 
 #### C3.1 — Gate
 
