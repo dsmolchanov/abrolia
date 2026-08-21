@@ -27,9 +27,16 @@ def new_id() -> str:
 class ControlPlaneDatabase:
     """One serialized in-process writer over a dedicated control-plane DB."""
 
-    def __init__(self, path: Path | str, *, timeout: float = BUSY_TIMEOUT_SECONDS) -> None:
+    def __init__(
+        self,
+        path: Path | str,
+        *,
+        timeout: float = BUSY_TIMEOUT_SECONDS,
+        preserve_journal_mode: bool = False,
+    ) -> None:
         self.path = Path(path)
         self.timeout = timeout
+        self.preserve_journal_mode = preserve_journal_mode
         self._connection: sqlite3.Connection | None = None
         self._mutex = threading.RLock()
         self._process_lock_file = None
@@ -46,7 +53,14 @@ class ControlPlaneDatabase:
                     check_same_thread=False,
                 )
                 connection.row_factory = sqlite3.Row
-                connection.execute("PRAGMA journal_mode=WAL")
+                if not self.preserve_journal_mode:
+                    # PERSISTENT: this rewrites the database header when the
+                    # mode differs and creates -wal/-shm sidecars, so it is a
+                    # write. A caller that promises to mutate nothing has to be
+                    # able to decline it. `synchronous`, `foreign_keys` and
+                    # `busy_timeout` below are per-connection and change nothing
+                    # on disk.
+                    connection.execute("PRAGMA journal_mode=WAL")
                 connection.execute("PRAGMA synchronous=FULL")
                 connection.execute("PRAGMA foreign_keys=ON")
                 connection.execute(f"PRAGMA busy_timeout={int(self.timeout * 1000)}")
