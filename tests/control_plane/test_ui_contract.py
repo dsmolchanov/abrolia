@@ -672,3 +672,66 @@ def test_a_hidden_card_is_also_refused_when_submitted_anyway(
     assert allowed.headers["location"] == "/onboarding", (
         "the switch was not the reason the first post was refused"
     )
+
+
+@pytest.mark.parametrize(
+    "enabled",
+    [
+        frozenset(),
+        frozenset({"gmail_agent"}),
+        frozenset({"family_domain"}),
+        frozenset({"gmail_agent", "family_domain"}),
+    ],
+    ids=["neither", "gmail-only", "byo-only", "both"],
+)
+def test_the_art9_statement_appears_iff_a_rendered_form_asks_for_it(
+    api_harness, monkeypatch: pytest.MonkeyPatch, enabled: frozenset[str]
+) -> None:
+    """Consent copy for a path nobody can choose is worse than none.
+
+    The statement used to be keyed on whether ANY option processed real content.
+    With both switches off the only offered option is the synthetic managed one,
+    but `gmail_agent` still counts as real because it maps to `google-oauth` —
+    so the page carried explicit Art. 9(2)(a) consent language while no rendered
+    form asked for that consent and nothing on offer could produce it.
+
+    Asserted as an equivalence in both directions, because each failure mode is
+    its own harm: copy without a checkbox asks for consent to processing that
+    cannot happen, and a checkbox without copy takes consent to a statement the
+    family was never shown — which is not consent at all.
+    """
+
+    for option, env_name in CUT_CARDS.items():
+        monkeypatch.setenv(env_name, "1" if option in enabled else "0")
+    world = api_harness.create_principal(
+        f"art9-{'-'.join(sorted(enabled)) or 'none'}@family.test"
+    )
+    api_harness.authenticate(world)
+
+    html = api_harness.client.get("/onboarding").text
+    statement_shown = 'id="special-category-household-content"' in html
+    consent_asked = 'name="special_category_household_consent"' in html
+
+    assert statement_shown == consent_asked, (
+        f"statement={statement_shown} but checkbox={consent_asked}"
+    )
+
+    # An equivalence is also satisfied by neither side ever appearing, so pin
+    # which combinations must produce the copy. The asymmetry is real and is the
+    # whole reason the aggregate was wrong: `gmail_agent` maps to `google-oauth`
+    # and processes real content in ANY configuration, while `family_domain` in
+    # the synthetic circuit routes to `fake-email` and processes none. So
+    # offering Gmail must raise the statement, and offering BYO alone must not.
+    assert statement_shown == ("gmail_agent" in enabled)
+
+    _, sha256 = consent_version_and_sha("special_category_household_content")
+    if statement_shown:
+        version, text = consent_version_and_text("special_category_household_content")
+        assert version in html
+        assert text in html_module.unescape(html)
+        assert f'value="{sha256}"' in html
+    else:
+        # The binding a form would submit must be gone too, not merely the
+        # visible copy — a hidden field naming a statement the page did not
+        # show is the same defect wearing a different hat.
+        assert f'value="{sha256}"' not in html

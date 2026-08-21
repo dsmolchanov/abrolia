@@ -62,7 +62,7 @@
       <strong>{{ special_category_restriction_version }}:</strong>
       {{ special_category_restriction_text }}
     </p>
-    {%- if household_consent_required.values() | select | list %}
+    {%- if household_consent_copy_shown %}
     <p id="special-category-household-content" class="consent-copy">
       <strong>{{ special_category_household_version }}:</strong>
       {{ special_category_household_text }}

@@ -197,6 +197,24 @@ def create_app(
                     option: active_container.onboarding.email_option_offered(option)
                     for option in EMAIL_SELECTION_KINDS
                 },
+                # The Art. 9(2)(a) statement is shown if and only if some
+                # RENDERED form asks for that consent. The two dicts had to be
+                # intersected somewhere and a Jinja expression is the wrong
+                # place: with both switches off the only offered option is the
+                # synthetic managed one, but `gmail_agent` still counts as real
+                # content because it maps to `google-oauth`, so the aggregate
+                # alone put explicit-consent language on the page for a
+                # processing path nobody could choose. Kept separate from
+                # `household_consent_required`, whose per-option answer stays
+                # true for a hidden option — it is required, it is merely not
+                # on offer, and a consent question is the last place to blur
+                # that.
+                "household_consent_copy_shown": any(
+                    active_container.onboarding.email_option_offered(option)
+                    and active_container.onboarding
+                    .email_option_processes_real_content(option)
+                    for option in EMAIL_SELECTION_KINDS
+                ),
             },
         )
 
