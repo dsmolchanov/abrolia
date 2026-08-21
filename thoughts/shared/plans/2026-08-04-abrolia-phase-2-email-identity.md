@@ -762,8 +762,11 @@ flags остаются false до provider-specific gates.
 - Real Gmail quota/cursor/restart smoke remains manual and opt-in.
 - Runtime execution wiring was completed on 2026-08-06: `serve_runtime()` owns
   the Gmail History loop, the sender factory owns `GmailSendProvider`, and
-  timeout/restart reconciliation is process-tested. The immutable image deploy
-  and live Google test-user matrix remain open.
+  timeout/restart reconciliation is process-tested. PR #28 is merged and the
+  immutable runtime digest
+  `sha256:ed3794ecf26756b2b95da54d2155f5576bd4e66f88f8d0c7e4186347d095f1dd`
+  is pinned in the synthetic control plane. The live Google test-user matrix
+  remains open.
 
 #### Files
 
