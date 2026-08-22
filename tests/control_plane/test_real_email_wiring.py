@@ -466,3 +466,85 @@ def test_household_deletion_completes_with_the_brake_on(
 class _AbsentRuntime:
     def delete(self, runtime_ref: str) -> InspectState:  # noqa: ARG002
         return InspectState.ABSENT
+
+
+class _MutatingInspectNerve:
+    """An adapter whose `inspect` is a recovery path, like the real one.
+
+    `NerveManagedEmailProvisioner.inspect` reissues the API key and rotates the
+    webhook — by design, for recovery. Nothing in the `Provisioner` protocol
+    says `inspect` is read-only, so a teardown that probes with it is one
+    adapter away from handing a withdrawn household fresh live credentials.
+    """
+
+    email_public_provider = "nerve"
+
+    def __init__(self) -> None:
+        self.torn_down: list[str] = []
+        self.credentials_reissued = 0
+
+    def ensure(self, request, intent_key):  # noqa: ANN001, ANN201
+        raise AssertionError("forward work ran during teardown")
+
+    def inspect(self, stable_ref):  # noqa: ANN001, ANN201
+        self.credentials_reissued += 1
+        return InspectResult(state=InspectState.ABSENT)
+
+    def deprovision(self, external_ref):  # noqa: ANN001, ANN201
+        self.torn_down.append(external_ref)
+        return InspectResult(state=InspectState.ABSENT)
+
+
+@pytest.mark.parametrize("provider", NERVE_PROVIDERS)
+@pytest.mark.parametrize("origin", ["withdrawal", "reset"])
+def test_reconciling_a_cleanup_tears_down_instead_of_probing(
+    cp_stack, monkeypatch: pytest.MonkeyPatch, provider: str, origin: str
+) -> None:
+    """An uncertain teardown is re-run, never inspected.
+
+    The path: the first `deprovision` returns unknown, the job is quarantined,
+    an operator calls `reconcile`. That branch used to probe with `inspect` for
+    everything except runtime resources — so for `nerve-managed` it reissued the
+    key and rotated the webhook on an inbox that was supposed to be going away.
+    """
+
+    cp_stack.complete_profile()
+    _hold_both_consents(cp_stack, now=1_760_000_000.0)
+    monkeypatch.setenv("ABROLIA_REAL_EMAIL_ENABLED", "0")
+
+    now = 1_760_000_000.0
+    external_ref = "nerve:org:created-before-the-withdrawal"
+    workflow = cp_stack.onboarding.workflow_for_household(cp_stack.household.id)
+    with cp_stack.jobs.db.write() as connection:
+        job_id, _created = cp_stack.jobs.create(
+            connection,
+            household_id=cp_stack.household.id,
+            workflow_id=workflow.id,
+            kind="cleanup",
+            operation="deprovision",
+            intent_key=f"{cp_stack.household.id}:reconcile-teardown:{provider}:{origin}",
+            request={
+                "household_id": cp_stack.household.id,
+                "resource_type": "email_identity",
+                "external_ref": external_ref,
+                "stable_ref": f"{cp_stack.household.id}:inbox",
+            },
+            provider=provider,
+            now=now,
+        )
+        # The first deprovision did not answer, so the job was quarantined.
+        connection.execute(
+            "UPDATE provisioning_jobs SET status = 'outcome_unknown',"
+            " error_code = ? WHERE id = ?",
+            (f"{origin}_requires_reconciliation", job_id),
+        )
+
+    recorder = _MutatingInspectNerve()
+    registry = synthetic_provider_registry()
+    registry.register(provider, recorder)
+    cp_stack.make_worker(providers=registry, now=now + 10).reconcile(job_id)
+
+    assert recorder.credentials_reissued == 0, (
+        "teardown probed with inspect, which reissues credentials on the real adapter"
+    )
+    assert recorder.torn_down == [external_ref]

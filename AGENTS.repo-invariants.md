@@ -263,6 +263,22 @@ makes a review loop unable to terminate.
   `::test_household_deletion_completes_with_the_brake_on`, over both Nerve
   providers.
 
+  **Teardown re-runs `deprovision`; it never probes with `inspect`.** Found in
+  the same round. The reconcile branch probed with `inspect` for every resource
+  except runtime, and `inspect` is not contractually read-only:
+  `NerveManagedEmailProvisioner.inspect` is a RECOVERY path that reissues the
+  API key and rotates the webhook. Reconciling an uncertain email cleanup
+  therefore handed a withdrawn household's inbox fresh live credentials instead
+  of removing it. The runtime case had the right behaviour for a narrower
+  stated reason — that inspecting the shared app cannot distinguish an absent
+  workload from its retained secret namespace — which hid the general one, so
+  every other resource type was one adapter away from the same defect.
+  `deprovision` is the operation whose idempotence teardown already depends on;
+  the branch delegated to it anyway once `inspect` returned READY. Enforced by
+  `tests/control_plane/test_real_email_wiring.py::test_reconciling_a_cleanup_tears_down_instead_of_probing`,
+  parameterised over both Nerve providers and both cleanup origins, with a stub
+  whose `inspect` counts credential reissues.
+
   This also settles where such a brake may be read. Registration cannot carry
   it, and the worker holds no `ControlPlaneConfig`, so it is read from the
   environment at call time — a deliberate second reader of a variable the

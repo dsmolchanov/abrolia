@@ -1778,55 +1778,23 @@ class ProvisioningWorker:
                 return self._mark_step_problem(
                     job, request, "failed", "missing_external_ref"
                 )
-            if request.get("resource_type") == "runtime":
-                # Inspecting the shared app cannot distinguish an absent
-                # workload from its intentionally retained secret namespace.
-                # Re-run the exact idempotent workload cleanup instead.
-                return self._cleanup(job, request, provider)
-            inspected = provider.inspect(external_ref)
-            if inspected.state is InspectState.ABSENT:
-                email_identity_id = request.get("email_identity_id")
-                if (
-                    request.get("resource_type") == "email_identity"
-                    and not self._delete_email_cleanup_secret(
-                        job, request, email_identity_id
-                    )
-                ):
-                    return WorkResult(
-                        job.id, "outcome_unknown", "secret_cleanup_unknown"
-                    )
-                with self.jobs.db.write() as connection:
-                    self.jobs.settle(
-                        connection, job.id, status="succeeded", now=self.clock()
-                    )
-                    if request.get("resource_id"):
-                        connection.execute(
-                            "UPDATE external_resources SET status = 'deleted', updated_at = ?"
-                            " WHERE id = ?",
-                            (self.clock(), request["resource_id"]),
-                        )
-                    if (
-                        request.get("resource_type") == "email_identity"
-                        and self.email_identities is not None
-                        and isinstance(email_identity_id, str)
-                    ):
-                        self._settle_cancelled_parent(
-                            connection, request.get("parent_job_id")
-                        )
-                        self.email_identities.finish_disconnect(
-                            connection, email_identity_id, now=self.clock()
-                        )
-                return WorkResult(job.id, "succeeded")
-            if inspected.state is InspectState.READY:
-                return self._cleanup(job, request, provider)
-            if inspected.state is InspectState.FAILED:
-                return self._mark_step_problem(
-                    job,
-                    request,
-                    "failed",
-                    inspected.error_code or "cleanup_rejected",
-                )
-            return WorkResult(job.id, "outcome_unknown", "reconcile_inconclusive")
+            # Re-run the exact idempotent cleanup. Never probe with `inspect`.
+            #
+            # This was runtime-only, because inspecting the shared app cannot
+            # distinguish an absent workload from its intentionally retained
+            # secret namespace. The narrower reason hid a general one:
+            # `inspect` is not contractually read-only. `NerveManagedEmailProvisioner.inspect`
+            # is a RECOVERY path — it reissues the API key and rotates the
+            # webhook — so reconciling an uncertain email cleanup handed a
+            # withdrawn household's inbox fresh live credentials instead of
+            # tearing it down. Nothing in the `Provisioner` protocol promised
+            # otherwise, so every sibling was one adapter away from the same
+            # thing.
+            #
+            # `deprovision` is the operation whose idempotence teardown already
+            # depends on: this branch delegated here anyway once `inspect`
+            # returned READY.
+            return self._cleanup(job, request, provider)
         if job.kind == "runtime":
             if job.operation == "ensure_secret_namespace":
                 ensure_namespace = getattr(provider, "ensure_secret_namespace", None)
