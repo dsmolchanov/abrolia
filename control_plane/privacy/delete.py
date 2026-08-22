@@ -19,14 +19,6 @@ from control_plane.repositories import (
 )
 from control_plane.repositories.households import HouseholdNotFound
 
-#: What deletion marks an ambiguous job with so teardown can reach it.
-#:
-#: Carries `RECONCILIATION_SUFFIX`, which is the property `requires_reconciliation`
-#: matches and `_is_shutdown_action` treats as exempt from forward preconditions
-#: — including the real-email brake. Written ONLY here, and only for the
-#: household being erased, so a live household's braked job stays braked.
-DELETION_RECONCILIATION_CODE = "deletion_requires_reconciliation"
-
 TOMBSTONE_TTL_SECONDS = 3 * 365 * 24 * 60 * 60
 IDEMPOTENCY_TTL_SECONDS = 24 * 60 * 60
 DELETE_ROUTE = "/api/v1/onboarding/delete"
@@ -198,34 +190,6 @@ class DeletionService:
                         " updated_at = ?, lease_until = NULL, leased_by = NULL"
                         " WHERE household_id = ? AND status IN ('pending','waiting_user')",
                         (now, now, household_id),
-                    )
-                    # An AMBIGUOUS job is now shutdown work, and must be said so
-                    # durably.
-                    #
-                    # Cancelling reaches pending and waiting_user only, which is
-                    # right: an `outcome_unknown` job may have created something
-                    # upstream and has to be reconciled, not discarded. But
-                    # reconciliation re-applies every forward precondition, and a
-                    # job the kill switch settled carries `real_email_disabled`
-                    # — a code with no reconciliation suffix, so
-                    # `_is_shutdown_action` reads it as ordinary work and the
-                    # brake blocks it again. Erasure then cannot reach the
-                    # provider for exactly the resource whose creation was
-                    # uncertain: the sweep records `unknown` and the household's
-                    # inbox stays live with no path to removal.
-                    #
-                    # The remedy is NOT to give the brake's own code the
-                    # reconciliation suffix. That code is written for live
-                    # households too, and suffixing it would exempt every braked
-                    # job from its own brake. Only DELETION may reclassify, and
-                    # only its own household's jobs — which is what this
-                    # statement is scoped to.
-                    connection.execute(
-                        "UPDATE provisioning_jobs SET error_code = ?, updated_at = ?"
-                        " WHERE household_id = ? AND status = 'outcome_unknown'"
-                        " AND error_code IS NOT NULL"
-                        " AND error_code NOT LIKE '%_requires_reconciliation'",
-                        (DELETION_RECONCILIATION_CODE, now, household_id),
                     )
                     connection.execute(
                         "UPDATE bootstrap_tokens SET revoked_at = ? WHERE household_id = ?"

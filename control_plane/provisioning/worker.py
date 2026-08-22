@@ -39,7 +39,6 @@ from control_plane.privacy.consent import (
     manifest_required_purposes,
     processes_real_household_content,
 )
-from control_plane.privacy.delete import DELETION_RECONCILIATION_CODE
 from control_plane.privacy.runtime import RUNTIME_REF
 from control_plane.privacy.withdraw import REVOKE_CONSENT_OPERATION
 from control_plane.providers.email.nerve_client import (
@@ -712,11 +711,14 @@ class ProvisioningWorker:
         current = self.jobs.db.query_one(
             "SELECT status, error_code FROM provisioning_jobs WHERE id = ?", (job.id,)
         )
-        if (
-            current is None
-            or current["status"] != "outcome_unknown"
-            or not requires_reconciliation(current["error_code"])
+        if current is None or current["status"] != "outcome_unknown":
+            return None
+        if not (
+            requires_reconciliation(current["error_code"])
+            or self._owned_by_deletion(job)
         ):
+            # Erasure's own teardown reaches here without a reconciliation
+            # code, because deletion no longer rewrites one onto the job.
             return None
         with self.jobs.db.write() as connection:
             resource_id = self._external_resource(
@@ -1455,7 +1457,7 @@ class ProvisioningWorker:
         real_email = job.provider in NERVE_EMAIL_PROVIDERS
         if flag is None and not real_email:
             return None
-        if self._is_shutdown_action(job):
+        if self._is_shutdown_action(job) or self._owned_by_deletion(job):
             return None
         # The managed/BYO brake. The adapters stay registered so teardown can
         # resolve them, which means absence no longer stops forward work and
@@ -1510,18 +1512,27 @@ class ProvisioningWorker:
         return self._mark_step_problem(job, request, "outcome_unknown", code)
 
     def _owned_by_deletion(self, job: JobRecord) -> bool:
-        """Whether erasure claimed this ambiguous job as its own teardown.
+        """Whether erasure owns this job's teardown.
 
-        Read from the row, not the record: deletion rewrites the code after the
-        `JobRecord` in hand was loaded.
+        Asked of the HOUSEHOLD's durable status, not of the job's error code.
+        An earlier version had deletion stamp a code onto each ambiguous job,
+        which left two holes: a job already carrying
+        `withdrawal_requires_reconciliation` was skipped, and a `running` call
+        that timed out AFTER that statement was never stamped at all. Both then
+        reconciled down the ordinary path, hit `secret_namespace_not_ready` —
+        deletion having swept the namespace — and stayed there, with the inbox
+        live and the erasure permanently incomplete.
+
+        `status = 'deleting'` is written in the same transaction that makes the
+        deletion durable, so there is no window and nothing to re-run on resume:
+        a job that becomes ambiguous later is owned the moment it is asked. It
+        also preserves the quarantine reason an operator was given, instead of
+        overwriting it with one of deletion's own.
         """
-        current = self.jobs.db.query_one(
-            "SELECT error_code FROM provisioning_jobs WHERE id = ?", (job.id,)
+        row = self.jobs.db.query_one(
+            "SELECT status FROM households WHERE id = ?", (job.household_id,)
         )
-        return (
-            current is not None
-            and current["error_code"] == DELETION_RECONCILIATION_CODE
-        )
+        return row is not None and row["status"] in {"deleting", "deleted"}
 
     def _is_shutdown_action(self, job: JobRecord) -> bool:
         """Work that exists BECAUSE a consent went away.

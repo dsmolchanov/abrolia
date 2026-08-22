@@ -332,11 +332,22 @@ makes a review loop unable to terminate.
   deletion has already swept the namespace, it being an external resource like
   any other.
 
-  Two things this must NOT be. It must not suffix the brake's own error code:
-  that code is written for live households too, and suffixing it exempts every
-  braked job from its own brake. And it must not reclassify beyond the household
-  being erased, which would make one deletion a global release. Enforced by
+  Ownership is asked of the HOUSEHOLD's durable status, never of the job's error
+  code. Stamping a code onto each ambiguous job in one transaction — the first
+  attempt — left two holes: a job already carrying
+  `withdrawal_requires_reconciliation` was skipped by the guard against
+  overwriting an operator's quarantine reason, and a `running` call that timed
+  out AFTER that statement was never stamped at all. `status = 'deleting'` is
+  written in the same transaction that makes the deletion durable, so there is
+  no window, nothing to re-run on resume, and the job keeps the reason it had.
+
+  It must still not suffix the brake's own error code — that code is written for
+  live households too, and suffixing it would exempt every braked job from its
+  own brake — and it must not reach beyond the household being erased, which
+  would make one deletion a global release. Enforced by
   `test_deletion_can_tear_down_a_job_the_brake_settled`,
+  `test_erasure_owns_every_ambiguous_job_however_it_got_there` (braked,
+  pre-quarantined, and ambiguous-only-after-deletion),
   `test_deletion_reclassifies_only_its_own_households_jobs`, and
   `test_the_brake_code_alone_is_never_reconciliation_work`.
 

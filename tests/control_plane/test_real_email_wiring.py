@@ -15,7 +15,6 @@ from control_plane.privacy.consent import (
     consent_version_and_sha,
 )
 from control_plane.privacy.delete import (
-    DELETION_RECONCILIATION_CODE,
     DeletionService,
 )
 from control_plane.provisioning.contracts import (
@@ -900,16 +899,23 @@ def test_deletion_can_tear_down_a_job_the_brake_settled(
         now=now + 20,
     )
 
-    reclassified = cp_stack.jobs.get(job_id)
-    assert reclassified is not None
-    assert reclassified.error_code == "deletion_requires_reconciliation", (
-        "deletion left the job carrying the brake's code, so reconcile re-brakes it"
-    )
+    # The job keeps the code it had. Ownership is the HOUSEHOLD's durable
+    # status, so nothing had to be stamped onto the job and the quarantine
+    # reason an operator was given survives.
+    kept = cp_stack.jobs.get(job_id)
+    assert kept is not None
+    assert kept.error_code == "real_email_disabled"
+    assert cp_stack.database.query_one(
+        "SELECT status FROM households WHERE id = ?", (cp_stack.household.id,)
+    )["status"] in {"deleting", "deleted"}
 
-    result = cp_stack.make_worker(providers=registry, now=now + 30).reconcile(job_id)
-    assert result.error_code != "real_email_disabled", (
-        "the brake was re-applied to work erasure owns"
-    )
+    cp_stack.make_worker(providers=registry, now=now + 30).reconcile(job_id)
+
+    # The observable is the teardown, not the code. Reconciliation keeps the
+    # job's own quarantine reason — ownership is the household's status, so
+    # nothing is stamped onto the job — which means "was it braked?" cannot be
+    # read off the error code. What distinguishes braked from reconciled is
+    # whether anything was scheduled to remove the inbox.
 
     # Teardown is ARRANGED from durable state, never by asking the provider:
     # `inspect` reissues keys on the real Nerve adapter.
@@ -929,11 +935,11 @@ def test_the_brake_code_alone_is_never_reconciliation_work() -> None:
 
     Suffixing `real_email_disabled` would have been one line and would have
     exempted every braked job — live households included — from its own brake.
-    Only deletion reclassifies.
+    Ownership is asked of the household being erased instead, so the brake's own
+    code never becomes reconciliation work for anyone.
     """
 
     assert not requires_reconciliation("real_email_disabled")
-    assert requires_reconciliation(DELETION_RECONCILIATION_CODE)
 
 
 def test_the_container_authorizes_nobody_while_the_brake_is_on(tmp_path) -> None:
@@ -1016,3 +1022,109 @@ def test_deletion_reclassifies_only_its_own_households_jobs(
         "deleting one household released another household's braked job"
     )
     assert not requires_reconciliation(untouched.error_code)
+    assert cp_stack.database.query_one(
+        "SELECT status FROM households WHERE id = ?", (other.id,)
+    )["status"] not in {"deleting", "deleted"}
+
+
+@pytest.mark.parametrize("provider", NERVE_PROVIDERS)
+@pytest.mark.parametrize(
+    "prior_code",
+    ["real_email_disabled", "withdrawal_requires_reconciliation", None],
+    ids=["braked", "already-quarantined", "ambiguous-after-deletion"],
+)
+def test_erasure_owns_every_ambiguous_job_however_it_got_there(
+    cp_stack, monkeypatch: pytest.MonkeyPatch, provider: str, prior_code: str | None
+) -> None:
+    """Ownership cannot depend on when, or on what the job already said.
+
+    An earlier fix had deletion stamp a code onto each ambiguous job in one
+    transaction. That missed two ordinary siblings: a job already carrying
+    `withdrawal_requires_reconciliation` was skipped by the guard against
+    overwriting it, and a `running` provider call that timed out AFTER that
+    statement was never stamped at all. Both then reconciled down the ordinary
+    path, hit `secret_namespace_not_ready` — deletion having swept the namespace
+    — and stayed there, inbox live and erasure permanently incomplete.
+
+    `ambiguous-after-deletion` is that second sequence: the job becomes
+    ambiguous only once the household is already `deleting`.
+    """
+
+    now = 1_760_000_000.0
+    cp_stack.complete_profile()
+    _hold_both_consents(cp_stack, now=now)
+
+    external_ref = "nerve:org:created-before-the-brake"
+    workflow = cp_stack.onboarding.workflow_for_household(cp_stack.household.id)
+    with cp_stack.jobs.db.write() as connection:
+        job_id, _created = cp_stack.jobs.create(
+            connection,
+            household_id=cp_stack.household.id,
+            workflow_id=workflow.id,
+            kind="email_identity",
+            operation="ensure",
+            intent_key=f"{cp_stack.household.id}:owned:{provider}:{prior_code}",
+            request={
+                "household_id": cp_stack.household.id,
+                "stable_ref": f"{cp_stack.household.id}:inbox",
+                "external_ref": external_ref,
+            },
+            provider=provider,
+            now=now,
+        )
+        if prior_code is not None:
+            connection.execute(
+                "UPDATE provisioning_jobs SET status = 'outcome_unknown',"
+                " error_code = ? WHERE id = ?",
+                (prior_code, job_id),
+            )
+        else:
+            # Still in flight when erasure begins.
+            connection.execute(
+                "UPDATE provisioning_jobs SET status = 'running',"
+                " leased_by = 'worker', lease_until = ? WHERE id = ?",
+                (now + 600, job_id),
+            )
+
+    monkeypatch.setenv("ABROLIA_REAL_EMAIL_ENABLED", "0")
+    recorder = _ReconcilableNerve()
+    registry = synthetic_provider_registry()
+    registry.register(provider, recorder)
+
+    DeletionService(
+        cp_stack.accounts,
+        cp_stack.auth,
+        cp_stack.households,
+        cp_stack.jobs,
+        registry,
+        runtime=_AbsentRuntime(),
+    ).delete(
+        cp_stack.account.id,
+        cp_stack.household.id,
+        idempotency_key=f"owned-{provider}-{prior_code}",
+        now=now + 20,
+    )
+
+    if prior_code is None:
+        # The call times out only now — after the deletion transaction that any
+        # one-shot reclassification would already have run.
+        with cp_stack.jobs.db.write() as connection:
+            connection.execute(
+                "UPDATE provisioning_jobs SET status = 'outcome_unknown',"
+                " error_code = 'provider_outcome_unknown', lease_until = NULL"
+                " WHERE id = ?",
+                (job_id,),
+            )
+
+    cp_stack.make_worker(providers=registry, now=now + 40).reconcile(job_id)
+
+    cleanup = cp_stack.database.query_one(
+        "SELECT id FROM provisioning_jobs WHERE household_id = ?"
+        " AND kind = 'cleanup' ORDER BY created_at DESC LIMIT 1",
+        (cp_stack.household.id,),
+    )
+    assert cleanup is not None, (
+        "erasure scheduled nothing to remove the inbox for this sequence"
+    )
+    # Never by asking the provider: `inspect` reissues keys on the real adapter.
+    assert recorder.torn_down == []
