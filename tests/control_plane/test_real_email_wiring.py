@@ -1128,3 +1128,86 @@ def test_erasure_owns_every_ambiguous_job_however_it_got_there(
     )
     # Never by asking the provider: `inspect` reissues keys on the real adapter.
     assert recorder.torn_down == []
+
+
+@pytest.mark.parametrize(
+    "provider", ["nerve-managed", "nerve-byo-domain", "google-oauth"]
+)
+def test_erasure_never_lets_forward_work_past_the_brake(
+    cp_stack, monkeypatch: pytest.MonkeyPatch, provider: str
+) -> None:
+    """lease -> delete -> disable -> resume must not create anything.
+
+    Deletion deliberately leaves `running` jobs alone: they have crossed the
+    provider boundary and must be reconciled, not discarded. So a job leased
+    just before erasure began is still forward work when the worker resumes.
+    Exempting deletion-owned work inside `_blocked_by_email_kill_switch` — which
+    `_run_once` shares — let exactly that job call `ensure` with the brake off,
+    creating new upstream email state during an erasure.
+
+    The teardown route now sits above the brake in `_reconcile` instead, so the
+    exemption reaches only the path that cannot create anything. All three
+    forward email routes are covered because the predicate is shared by all of
+    them.
+    """
+
+    now = 1_760_000_000.0
+    cp_stack.complete_profile()
+    _hold_both_consents(cp_stack, now=now)
+    monkeypatch.setenv("ABROLIA_GMAIL_ENABLED", "1")
+    monkeypatch.setenv("ABROLIA_BYO_EMAIL_ENABLED", "1")
+
+    workflow = cp_stack.onboarding.workflow_for_household(cp_stack.household.id)
+    with cp_stack.jobs.db.write() as connection:
+        job_id, _created = cp_stack.jobs.create(
+            connection,
+            household_id=cp_stack.household.id,
+            workflow_id=workflow.id,
+            kind="email_identity",
+            operation="ensure",
+            intent_key=f"{cp_stack.household.id}:forward-during-erasure:{provider}",
+            request={
+                "household_id": cp_stack.household.id,
+                "stable_ref": f"{cp_stack.household.id}:inbox",
+            },
+            provider=provider,
+            now=now,
+        )
+        # Leased just before erasure begins, and therefore left alone by it.
+        connection.execute(
+            "UPDATE provisioning_jobs SET status = 'running', leased_by = 'dead-worker',"
+            " lease_until = ? WHERE id = ?",
+            (now - 1.0, job_id),
+        )
+
+    recorder = _ReconcilableNerve()
+    registry = synthetic_provider_registry()
+    registry.register(provider, recorder)
+    DeletionService(
+        cp_stack.accounts,
+        cp_stack.auth,
+        cp_stack.households,
+        cp_stack.jobs,
+        registry,
+        runtime=_AbsentRuntime(),
+    ).delete(
+        cp_stack.account.id,
+        cp_stack.household.id,
+        idempotency_key=f"forward-erasure-{provider}",
+        now=now + 20,
+    )
+
+    # The operator pulls the brake mid-erasure.
+    monkeypatch.setenv("ABROLIA_REAL_EMAIL_ENABLED", "0")
+    monkeypatch.setenv("ABROLIA_GMAIL_ENABLED", "0")
+    monkeypatch.setenv("ABROLIA_BYO_EMAIL_ENABLED", "0")
+
+    result = cp_stack.make_worker(providers=registry, now=now + 30).run_once()
+
+    # `_ReconcilableNerve.ensure` raises, so reaching it would fail loudly here
+    # rather than pass quietly.
+    assert result is None or result.job_id != job_id or result.error_code in {
+        "real_email_disabled",
+        "email_option_disabled:gmail",
+        "email_option_disabled:byo_email",
+    }, f"forward work ran during erasure with the brake on: {result}"

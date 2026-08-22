@@ -332,6 +332,17 @@ makes a review loop unable to terminate.
   deletion has already swept the namespace, it being an external resource like
   any other.
 
+  The exemption is a ROUTE, not a hole in the brake. It sits above
+  `_blocked_by_email_kill_switch` in `_reconcile`, never inside it: that
+  predicate is shared with `_run_once`, where the job may be forward work. A
+  pending job leased just before erasure began is `running`, deletion leaves
+  `running` jobs alone deliberately, and exempting deletion-owned work inside
+  the predicate let a resumed worker call `ensure` with the brake off — creating
+  new upstream email state during an erasure, on all three email routes at once.
+  Only a path that cannot create anything may pass a brake. Enforced by
+  `test_erasure_never_lets_forward_work_past_the_brake`, over
+  `nerve-managed`, `nerve-byo-domain` and `google-oauth`.
+
   Ownership is asked of the HOUSEHOLD's durable status, never of the job's error
   code. Stamping a code onto each ambiguous job in one transaction — the first
   attempt — left two holes: a job already carrying

@@ -1457,7 +1457,7 @@ class ProvisioningWorker:
         real_email = job.provider in NERVE_EMAIL_PROVIDERS
         if flag is None and not real_email:
             return None
-        if self._is_shutdown_action(job) or self._owned_by_deletion(job):
+        if self._is_shutdown_action(job):
             return None
         # The managed/BYO brake. The adapters stay registered so teardown can
         # resolve them, which means absence no longer stops forward work and
@@ -1809,9 +1809,6 @@ class ProvisioningWorker:
             and self._missing_current_consent_purpose(job) is not None
         ):
             return self._block_for_missing_content_restriction(job, request)
-        disabled = self._blocked_by_email_kill_switch(job)
-        if disabled is not None:
-            return self._brake_email_option(job, request, disabled)
         if job.kind == "email_identity" and self._owned_by_deletion(job):
             # Erasure reconciles ahead of the email branch's preconditions.
             #
@@ -1827,7 +1824,19 @@ class ProvisioningWorker:
             # (`test_late_waiting_response_after_cancel_stays_reconcilable`
             # pins one). Widening this to all shutdown work changes those and is
             # a separate question.
+            #
+            # And it sits HERE, above the brake, rather than being an exemption
+            # inside it. `_blocked_by_email_kill_switch` is shared with
+            # `_run_once`, where the job may be forward work: a pending job
+            # leased just before erasure began is `running`, deletion leaves
+            # `running` jobs alone deliberately, and exempting it there let a
+            # resumed worker call `ensure` with the brake off — creating new
+            # upstream state during an erasure. Only this path, which cannot
+            # create anything, may pass the brake.
             return self._shutdown_probe(job, request)
+        disabled = self._blocked_by_email_kill_switch(job)
+        if disabled is not None:
+            return self._brake_email_option(job, request, disabled)
         provider = self.providers.get(job.provider)
         if job.kind == "cleanup":
             deferred = self._defer_runtime_cleanup(job, request)
