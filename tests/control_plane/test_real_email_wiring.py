@@ -41,6 +41,44 @@ def test_production_container_registers_real_nerve_providers_fail_closed(
         assert container.onboarding.allow_real_email_domains
 
 
+
+def test_the_real_email_brake_leaves_no_nerve_provider_to_reach(tmp_path) -> None:
+    """What `ABROLIA_REAL_EMAIL_ENABLED=0` actually does, asserted.
+
+    `docs/onboarding-runbook.md` advertises this as the incident brake for
+    managed and BYO, so what it does needs a test rather than a paragraph. It is
+    stronger than a refusal: the Nerve adapters and their admin client are never
+    CONSTRUCTED, so there is no object holding the admin key and nothing for a
+    queued `nerve-managed` job to reach. Both options route to `fake-email`, so
+    onboarding keeps working synthetically instead of dead-ending.
+
+    It is also boot-scoped, not call-time, and that is the honest difference
+    from the per-option switches: it is a config value, and the whole config is
+    read once at startup. Flipping the variable in a running process changes
+    nothing until the process restarts — which is what `fly secrets set` does.
+    """
+
+    config = ControlPlaneConfig.for_test(tmp_path)
+    assert not config.real_email_enabled, "for_test must default to the braked state"
+
+    with ControlPlaneContainer.build(config) as container:
+        health = container.providers.health()
+        assert "nerve-managed" not in health
+        assert "nerve-byo-domain" not in health
+
+        # Not merely unregistered: unreachable. A job whose durable `provider`
+        # column still says `nerve-managed` — queued before the brake went on —
+        # cannot resolve one.
+        with pytest.raises(Exception) as resolution:
+            container.providers.get("nerve-managed")
+        assert "nerve-managed" in str(resolution.value)
+
+        # And onboarding stays usable rather than dead-ending.
+        assert container.onboarding.email_provider == "fake-email"
+        assert container.onboarding.byo_domain_provider == "fake-email"
+        assert not container.onboarding.allow_real_email_domains
+
+
 def test_real_email_rollout_rejects_non_allowlisted_household(cp_stack) -> None:
     cp_stack.complete_profile()
     cp_stack.service.real_email_enabled = True
