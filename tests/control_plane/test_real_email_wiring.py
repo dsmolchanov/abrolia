@@ -1211,3 +1211,92 @@ def test_erasure_never_lets_forward_work_past_the_brake(
         "email_option_disabled:gmail",
         "email_option_disabled:byo_email",
     }, f"forward work ran during erasure with the brake on: {result}"
+
+
+@pytest.mark.parametrize(
+    "provider", ["nerve-managed", "nerve-byo-domain", "google-oauth"]
+)
+def test_erasure_teardown_reaches_a_terminal_state(
+    cp_stack, monkeypatch: pytest.MonkeyPatch, provider: str
+) -> None:
+    """Scheduling the cleanup is not the same as finishing it.
+
+    `_shutdown_probe` schedules a cleanup; `_cleanup` deprovisions and then
+    deletes the provider secret — but only for an identity marked
+    `disconnecting`, the state the ordinary disconnect flow sets. Deletion never
+    entered that flow, so the cleanup settled
+    `outcome_unknown/secret_cleanup_unknown`, the parent job was never settled,
+    and `resume` saw unresolved work forever with the provider resource and the
+    secret namespace both already gone.
+    """
+
+    now = 1_760_000_000.0
+    cp_stack.complete_profile()
+    _hold_both_consents(cp_stack, now=now)
+
+    identity_id = "40000000-0000-4000-8000-00000000000e"
+    with cp_stack.jobs.db.write() as connection:
+        connection.execute(
+            "INSERT INTO email_identities (id, household_id, option, status,"
+            " secret_binding_ref, encryption_key_version, version, created_at, updated_at)"
+            " VALUES (?, ?, 'managed_abrolia', 'outcome_unknown', NULL, 'v1', 1, ?, ?)",
+            (identity_id, cp_stack.household.id, now, now),
+        )
+
+    class _Unresolved(_ReconcilableNerve):
+        """Teardown that does not answer, so the deletion cannot complete.
+
+        The completed path purges the household row and cascades the identity
+        away, which is the case where nothing is left to settle. The defect
+        lives in the OTHER case: deletion stays open, its scheduled cleanup has
+        to finish later, and that cleanup needs the identity in a state it can
+        act on.
+        """
+
+        def deprovision(self, external_ref):  # noqa: ANN001, ANN201
+            return InspectResult(state=InspectState.UNKNOWN)
+
+    registry = synthetic_provider_registry()
+    registry.register(provider, _Unresolved())
+    with cp_stack.jobs.db.write() as connection:
+        resource = cp_stack.jobs.encrypt_json(
+            "external_resources", "res-terminal", "external_id", "nerve:org:live"
+        )
+        connection.execute(
+            "INSERT INTO external_resources (id, household_id, provider, resource_type,"
+            " stable_name, external_id_ciphertext, encryption_key_version, status,"
+            " created_at, updated_at)"
+            " VALUES ('res-terminal', ?, ?, 'email_identity', 'inbox', ?, ?, 'ready', ?, ?)",
+            (
+                cp_stack.household.id,
+                provider,
+                resource.ciphertext,
+                resource.key_version,
+                now,
+                now,
+            ),
+        )
+
+    receipt = DeletionService(
+        cp_stack.accounts,
+        cp_stack.auth,
+        cp_stack.households,
+        cp_stack.jobs,
+        registry,
+        runtime=_AbsentRuntime(),
+    ).delete(
+        cp_stack.account.id,
+        cp_stack.household.id,
+        idempotency_key=f"terminal-{provider}",
+        now=now + 20,
+    )
+    assert receipt.completion_status != "complete", "fixture did not stay open"
+
+    identity = cp_stack.database.query_one(
+        "SELECT status FROM email_identities WHERE id = ?", (identity_id,)
+    )
+    assert identity is not None
+    assert identity["status"] == "disconnecting", (
+        "erasure never entered the disconnect lifecycle, so the cleanup it"
+        " schedules cannot delete the provider secret and never settles"
+    )

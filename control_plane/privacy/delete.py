@@ -191,6 +191,27 @@ class DeletionService:
                         " WHERE household_id = ? AND status IN ('pending','waiting_user')",
                         (now, now, household_id),
                     )
+                    # Erasure joins the identity's disconnect lifecycle rather
+                    # than working around it.
+                    #
+                    # `_delete_email_binding_secret` deletes the provider secret
+                    # only for an identity marked `disconnecting` — the state
+                    # the ordinary disconnect flow sets. Deletion never entered
+                    # that flow, so the cleanup its own teardown schedules
+                    # settled `outcome_unknown/secret_cleanup_unknown`, the
+                    # parent job was never settled, and `resume` saw unresolved
+                    # work forever even though the provider resource and the
+                    # secret namespace were both already gone.
+                    #
+                    # The same statement the disconnect path uses, so the two
+                    # cannot drift: household-scoped, version-bumping, and
+                    # idempotent via its own status guard.
+                    connection.execute(
+                        "UPDATE email_identities SET status = 'disconnecting',"
+                        " version = version + 1, updated_at = ? WHERE household_id = ?"
+                        " AND status NOT IN ('disconnecting','deleted')",
+                        (now, household_id),
+                    )
                     connection.execute(
                         "UPDATE bootstrap_tokens SET revoked_at = ? WHERE household_id = ?"
                         " AND used_at IS NULL AND revoked_at IS NULL",

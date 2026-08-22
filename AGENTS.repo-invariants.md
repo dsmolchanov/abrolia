@@ -343,6 +343,19 @@ makes a review loop unable to terminate.
   `test_erasure_never_lets_forward_work_past_the_brake`, over
   `nerve-managed`, `nerve-byo-domain` and `google-oauth`.
 
+  **Erasure joins the lifecycle it depends on.** Scheduling a cleanup is not
+  finishing one. `_delete_email_binding_secret` deletes the provider secret only
+  for an identity marked `disconnecting` — the state the ordinary disconnect
+  flow sets — and deletion never entered that flow, so its own cleanup settled
+  `outcome_unknown/secret_cleanup_unknown`, the parent job was never settled,
+  and `resume` saw unresolved work forever with the provider resource and the
+  secret namespace both already gone. Deletion now performs the same transition
+  the disconnect path uses, in the same durable transaction. This only shows up
+  when the deletion does NOT complete: the completed path drops the household
+  row and cascades the identity away, leaving nothing to settle. Enforced by
+  `test_erasure_teardown_reaches_a_terminal_state`, whose fixture deliberately
+  keeps the deletion open.
+
   Ownership is asked of the HOUSEHOLD's durable status, never of the job's error
   code. Stamping a code onto each ambiguous job in one transaction — the first
   attempt — left two holes: a job already carrying
