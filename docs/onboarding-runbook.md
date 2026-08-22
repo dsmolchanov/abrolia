@@ -448,28 +448,29 @@ call site does not belong in this table.
 
 | Flag | Controls | Enforced at | Default |
 |------|----------|-------------|---------|
-| `ABROLIA_REAL_EMAIL_ENABLED` | Managed `@abrolia.com` **and** BYO domain provisioning | `container.py`, **at startup**. Off, the Nerve adapters and their admin client are never constructed, and both options route to `fake-email`. Real provisioning additionally requires a non-empty `ABROLIA_REAL_EMAIL_HOUSEHOLD_ALLOWLIST`. **Takes effect on restart, not mid-process** — it is a config value and the config is read once at boot. `fly secrets set` restarts the machine, so the documented procedure does apply it. | `0` |
+| `ABROLIA_REAL_EMAIL_ENABLED` | Forward managed `@abrolia.com` **and** BYO domain provisioning | `ProvisioningWorker` (`_run_once`, `_reconcile`), **at call time** — `1→0` stops the next Nerve call including queued work, with no restart. New selections also route to `fake-email` from the next boot. **Teardown is exempt**: cleanup, reconciliation and household deletion still reach Nerve, or the brake would strand the inbox it stopped. Real provisioning additionally requires a non-empty `ABROLIA_REAL_EMAIL_HOUSEHOLD_ALLOWLIST`. | `0` |
 | `ABROLIA_BYO_EMAIL_ENABLED` | Whether the BYO domain option is OFFERED at all | `OnboardingService.select` and `ProvisioningWorker` (`_run_once`, `_reconcile`), **at call time**. `1→0` stops the next provider call without a restart, including work already queued. | `0` |
 | `ABROLIA_GMAIL_ENABLED` | Whether the Gmail option is OFFERED at all (real Gmail additionally needs `ABROLIA_REAL_EMAIL_ENABLED` + `ABROLIA_GMAIL_REAL_ENABLED` + CASA evidence) | `OnboardingService.select` and `ProvisioningWorker` (`_run_once`, `_reconcile`), **at call time**. `1→0` stops the next provider call without a restart, including work already queued. | `0` |
 | `ABROLIA_WHATSAPP_SHARED_ENABLED` | Shared WA gateway relay | `gateway.whatsapp_router.handle_webhook` — returns `flag_disabled` before persisting | `0` |
 
 Two kinds of switch, differing in both what they do and how fast:
 
-- `ABROLIA_REAL_EMAIL_ENABLED` is the **deploy-scoped brake**. Off, the option
-  still works — on a synthetic provider — and no external call is made, so
-  onboarding does not dead-end. It is total when it applies: with it off there
-  is no Nerve adapter object in the process at all, so a queued `nerve-managed`
-  job cannot resolve a provider to call. But it applies **on restart**.
+- `ABROLIA_REAL_EMAIL_ENABLED` is the **incident brake**. Off, no new Nerve
+  call is made — including from jobs already queued — while the option still
+  works synthetically, so onboarding does not dead-end. Teardown deliberately
+  still runs: pulling this must not leave a household unable to delete the
+  inbox it created. Until 2026-08-22 the brake worked by not registering the
+  Nerve adapters at all, which read as stronger and was not: it also removed
+  what deprovisioning needed, so erasure recorded `unknown` and never
+  completed.
 - `ABROLIA_BYO_EMAIL_ENABLED` and `ABROLIA_GMAIL_ENABLED` are **call-time
   product gates**. Off, the option is refused outright and disappears from
   onboarding, and `1→0` stops the next provider call immediately — including
   jobs already in the queue.
 
-To stop talking to Nerve without breaking onboarding, use the first, and expect
-a restart. To stop offering an option at all, use the second, and it bites at
-once. Neither is a substitute for the other, and no flag stops a Nerve call
-mid-process while leaving the managed option on offer: that combination is not
-implemented, and this table should not be read as promising it.
+To stop talking to Nerve without breaking onboarding, use the first. To stop
+offering an option at all, use the second. Both bite on the next call; neither
+is a substitute for the other, and neither stops teardown.
 
 Dedicated WhatsApp and web push have **no flag**, and need none: they have no
 adapter yet, and `ControlPlaneConfig.validate` refuses to boot at all if

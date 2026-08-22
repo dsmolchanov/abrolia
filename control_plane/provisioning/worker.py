@@ -25,6 +25,7 @@ from control_plane.email.repository import EmailIdentityRepository
 from control_plane.feature_flags import (
     GATED_EMAIL_PROVIDERS,
     check_provider_enabled,
+    is_real_email_enabled,
 )
 from control_plane.models import StepKind, StepStatus
 from control_plane.observability import StructuredLogger
@@ -1436,9 +1437,17 @@ class ProvisioningWorker:
         if job.kind != "email_identity":
             return None
         flag = GATED_EMAIL_PROVIDERS.get(job.provider)
-        if flag is None:
+        real_email = job.provider in NERVE_EMAIL_PROVIDERS
+        if flag is None and not real_email:
             return None
         if self._is_shutdown_action(job):
+            return None
+        # The managed/BYO brake. The adapters stay registered so teardown can
+        # resolve them, which means absence no longer stops forward work and
+        # this is the only thing that does.
+        if real_email and not is_real_email_enabled():
+            return "real_email_disabled"
+        if flag is None:
             return None
         try:
             check_provider_enabled(flag)

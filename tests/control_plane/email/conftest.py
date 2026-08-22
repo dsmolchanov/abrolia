@@ -20,3 +20,6 @@ import pytest
 def _enable_gated_email_options(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ABROLIA_BYO_EMAIL_ENABLED", "1")
     monkeypatch.setenv("ABROLIA_GMAIL_ENABLED", "1")
+    # The managed/BYO incident brake too: these lifecycle suites drive real
+    # Nerve adapters through the worker, which the brake stops at dispatch.
+    monkeypatch.setenv("ABROLIA_REAL_EMAIL_ENABLED", "1")

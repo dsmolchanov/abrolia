@@ -64,6 +64,10 @@ def _enable_gated_email_options(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     monkeypatch.setenv("ABROLIA_BYO_EMAIL_ENABLED", "1")
     monkeypatch.setenv("ABROLIA_GMAIL_ENABLED", "1")
+    # And the managed/BYO incident brake, for the same reason: these cases move
+    # a job's provider to a real Nerve name to reach the behaviour under test,
+    # which the brake also stops.
+    monkeypatch.setenv("ABROLIA_REAL_EMAIL_ENABLED", "1")
 
 
 # A real provider owes the Art 9(2)(a) consent as well as the S5 restriction,

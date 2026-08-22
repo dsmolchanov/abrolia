@@ -247,6 +247,28 @@ makes a review loop unable to terminate.
   carries for the consent precondition is the same reasoning, and a second
   spelling is a second thing to get wrong.
 
+  **A brake must not be implemented by removing the adapter.** The sharpest
+  instance of that half, found 2026-08-22: `container.py` registered the Nerve
+  adapters only `if config.real_email_enabled`, so turning the brake on deleted
+  the very objects teardown resolves. Teardown looks a provider up by the job's
+  durable `provider` column, so after
+  enable -> provision -> disable -> restart, every cleanup and reconcile raised
+  `ProviderRejected` and `DeletionService` swallowed it into `unknown` — an
+  erasure request that could never complete while the inbox it named stayed
+  live. Registration follows CREDENTIALS (`nerve_configured`); the brake lives
+  at forward dispatch, which is the only layer that can tell `ensure` from
+  `deprovision`. Enforced by
+  `tests/control_plane/test_real_email_wiring.py::test_teardown_still_reaches_the_provider_after_the_brake_goes_on`,
+  `::test_forward_work_is_braked_while_teardown_is_not`, and
+  `::test_household_deletion_completes_with_the_brake_on`, over both Nerve
+  providers.
+
+  This also settles where such a brake may be read. Registration cannot carry
+  it, and the worker holds no `ControlPlaneConfig`, so it is read from the
+  environment at call time — a deliberate second reader of a variable the
+  config also parses. That is the one case where the usual "one spelling" rule
+  yields, and it yields because the alternative breaks erasure.
+
   **Braking is not failing.** Settling a braked job terminally is only safe
   where it is known never to have reached a provider — a first attempt that was
   not reclaimed. Anywhere else `failed` erases durable uncertainty AND moves the

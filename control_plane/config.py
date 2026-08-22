@@ -131,6 +131,22 @@ class ControlPlaneConfig:
     google_casa_current: bool = False
     google_limited_use_disclosed: bool = False
 
+    @property
+    def nerve_configured(self) -> bool:
+        """Whether Nerve adapters can be constructed at all.
+
+        Separate from `real_email_enabled`, which says whether they may be used
+        for NEW work. The two were one question, and conflating them meant
+        turning the brake on also removed the only objects that could tear down
+        what the brake was stopping.
+        """
+        return all((
+            self.nerve_base_url,
+            self.nerve_admin_key,
+            self.nerve_platform_org_id,
+            self.nerve_platform_domain_id,
+        ))
+
     def validate(self) -> ControlPlaneConfig:
         if self.public_origin != self.public_origin.rstrip("/"):
             raise ConfigurationError("public origin must not have a trailing slash")

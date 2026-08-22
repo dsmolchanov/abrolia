@@ -204,7 +204,9 @@ OAuth / History is explicitly deferred to the start of Phase E and remains track
 `tests/control_plane/test_provisioning_jobs.py`, `control_plane/api/app.py`,
 `control_plane/email/models.py`, `control_plane/web/templates/onboarding.html`,
 `tests/control_plane/test_ui_contract.py`, `tests/test_feature_flags.py`,
-`gateway/whatsapp_router.py`, `docs/onboarding-runbook.md`,
+`gateway/whatsapp_router.py`, `control_plane/container.py`,
+`control_plane/privacy/delete.py`, `tests/control_plane/test_real_email_wiring.py`,
+`tests/control_plane/email/conftest.py`, `docs/onboarding-runbook.md`,
 `thoughts/shared/plans/2026-08-06-phase-DE-pilot.md`.
 
 **Branches:** `codex/phase-F-email-option-kill-switches`, `codex/phase-F-hide-cut-email-cards`, `codex/phase-F-retire-the-dead-managed-switch`.

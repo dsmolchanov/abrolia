@@ -90,6 +90,20 @@ def is_whatsapp_shared_enabled() -> bool:
     return _is_enabled("ABROLIA_WHATSAPP_SHARED_ENABLED")
 
 
+def is_real_email_enabled() -> bool:
+    """The managed/BYO incident brake, read at call time.
+
+    Deliberately a SECOND reader of a variable `ControlPlaneConfig` also parses,
+    which is normally the defect this module exists to remove. The exception is
+    forced: the adapters must stay registered so teardown can resolve them, so
+    registration can no longer carry the brake, and the worker holds no
+    `ControlPlaneConfig` to ask. Asking the environment here keeps the brake
+    where the provider is actually called — which is also what makes `1 -> 0`
+    stop work already queued.
+    """
+    return _is_enabled("ABROLIA_REAL_EMAIL_ENABLED")
+
+
 def check_provider_enabled(provider: str) -> None:
     """Raise if provider is disabled — fail-closed at call time."""
     mapping = {

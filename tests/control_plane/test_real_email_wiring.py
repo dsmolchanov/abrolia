@@ -6,9 +6,17 @@ import pytest
 
 from control_plane.config import ControlPlaneConfig
 from control_plane.container import ControlPlaneContainer
+from control_plane.db import new_id
 from control_plane.models import StepKind
 from control_plane.onboarding.contracts import IdempotencyConflict, InvalidTransition
-from control_plane.privacy.consent import consent_version_and_sha
+from control_plane.privacy.consent import (
+    CONTENT_RESTRICTION_PURPOSE,
+    HOUSEHOLD_CONTENT_PURPOSE,
+    consent_version_and_sha,
+)
+from control_plane.privacy.delete import DeletionService
+from control_plane.provisioning.contracts import InspectResult, InspectState
+from control_plane.provisioning.fakes import synthetic_provider_registry
 
 
 def test_production_container_registers_real_nerve_providers_fail_closed(
@@ -42,41 +50,59 @@ def test_production_container_registers_real_nerve_providers_fail_closed(
 
 
 
-def test_the_real_email_brake_leaves_no_nerve_provider_to_reach(tmp_path) -> None:
-    """What `ABROLIA_REAL_EMAIL_ENABLED=0` actually does, asserted.
+def test_the_real_email_brake_keeps_the_adapters_teardown_needs(tmp_path) -> None:
+    """The brake stops new work. It must not strand what already exists.
 
-    `docs/onboarding-runbook.md` advertises this as the incident brake for
-    managed and BYO, so what it does needs a test rather than a paragraph. It is
-    stronger than a refusal: the Nerve adapters and their admin client are never
-    CONSTRUCTED, so there is no object holding the admin key and nothing for a
-    queued `nerve-managed` job to reach. Both options route to `fake-email`, so
-    onboarding keeps working synthetically instead of dead-ending.
+    This asserted the opposite until 2026-08-22: that the brake removing both
+    Nerve adapters was the point. It is the defect. Teardown resolves a provider
+    by the job's durable `provider` column, so after
+    enable -> provision -> disable -> restart, every cleanup and reconcile hit
+    `ProviderRejected` and `DeletionService` recorded `unknown` — a household
+    deletion that could never complete, with the external inbox still live.
 
-    It is also boot-scoped, not call-time, and that is the honest difference
-    from the per-option switches: it is a config value, and the whole config is
-    read once at startup. Flipping the variable in a running process changes
-    nothing until the process restarts — which is what `fly secrets set` does.
+    So registration follows CREDENTIALS, and the brake lives at forward
+    dispatch, where shutdown work can be exempted.
+    """
+
+    household_id = "10000000-0000-4000-8000-000000000002"
+    braked = replace(
+        ControlPlaneConfig.for_test(tmp_path),
+        real_email_enabled=False,
+        real_email_household_allowlist=frozenset({household_id}),
+        nerve_base_url="https://nerve.example.test",
+        nerve_admin_key="synthetic-admin-key",
+        nerve_platform_org_id="20000000-0000-4000-8000-000000000001",
+        nerve_platform_domain_id="30000000-0000-4000-8000-000000000001",
+    )
+
+    with ControlPlaneContainer.build(braked) as container:
+        # Present, so a cleanup job queued before the brake can still resolve
+        # the provider it names and actually delete the inbox.
+        assert container.providers.get("nerve-managed") is not None
+        assert container.providers.get("nerve-byo-domain") is not None
+
+        # But NEW work still routes synthetically, so the brake means what the
+        # runbook says: no fresh Nerve provisioning.
+        assert container.onboarding.email_provider == "fake-email"
+        assert container.onboarding.byo_domain_provider == "fake-email"
+        assert not container.onboarding.allow_real_email_domains
+
+
+def test_unconfigured_nerve_registers_no_adapter(tmp_path) -> None:
+    """Credentials, not the brake, decide whether the adapters exist.
+
+    Without them there is nothing to construct — and nothing to tear down
+    either, since no job can have been provisioned through an adapter that was
+    never there.
     """
 
     config = ControlPlaneConfig.for_test(tmp_path)
-    assert not config.real_email_enabled, "for_test must default to the braked state"
+    assert not config.nerve_configured
 
     with ControlPlaneContainer.build(config) as container:
         health = container.providers.health()
         assert "nerve-managed" not in health
         assert "nerve-byo-domain" not in health
-
-        # Not merely unregistered: unreachable. A job whose durable `provider`
-        # column still says `nerve-managed` — queued before the brake went on —
-        # cannot resolve one.
-        with pytest.raises(Exception) as resolution:
-            container.providers.get("nerve-managed")
-        assert "nerve-managed" in str(resolution.value)
-
-        # And onboarding stays usable rather than dead-ending.
-        assert container.onboarding.email_provider == "fake-email"
-        assert container.onboarding.byo_domain_provider == "fake-email"
-        assert not container.onboarding.allow_real_email_domains
 
 
 def test_real_email_rollout_rejects_non_allowlisted_household(cp_stack) -> None:
@@ -216,3 +242,227 @@ def test_real_email_rollout_does_not_route_gmail_to_nerve(
                 accepted_field="special_category_restriction_acknowledged",
                 mismatch_error="restriction text version does not match",
             )
+
+
+# ---------------------------------------------------------------------------
+# enable -> provision -> disable -> tear down.
+#
+# The path the brake used to break. Each stage below is the one that failed:
+# the worker's cleanup could not resolve a provider, `reconcile` could not
+# settle an uncertain one, and the deletion sweep swallowed `ProviderRejected`
+# into `unknown` so a household deletion never completed while its inbox
+# stayed live.
+# ---------------------------------------------------------------------------
+
+def _hold_both_consents(cp_stack, *, now: float) -> None:  # noqa: ANN001
+    """Satisfy the Art. 9(2)(a) gates that run BEFORE the brake.
+
+    Without them the worker settles at `content_restriction_receipt_required`
+    and never reaches the brake, so a "braked" assertion would be measuring the
+    consent gate instead.
+    """
+
+    with cp_stack.database.write() as connection:
+        for purpose in (CONTENT_RESTRICTION_PURPOSE, HOUSEHOLD_CONTENT_PURPOSE):
+            version, sha256 = consent_version_and_sha(purpose)
+            connection.execute(
+                "INSERT INTO consent_receipts (id, household_id, account_id, purpose,"
+                " text_version, text_sha256, locale, accepted_at, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, 'en', ?, ?)",
+                (
+                    new_id(),
+                    cp_stack.household.id,
+                    cp_stack.account.id,
+                    purpose,
+                    version,
+                    sha256,
+                    now,
+                    now,
+                ),
+            )
+
+
+NERVE_PROVIDERS = ["nerve-managed", "nerve-byo-domain"]
+
+
+class _RecordingNerve:
+    """Records teardown and refuses forward work.
+
+    Forward calls raise, because if the brake ever lets one through that has to
+    be a failure and not a silently-recorded success.
+    """
+
+    email_public_provider = "nerve"
+
+    def __init__(self) -> None:
+        self.torn_down: list[str] = []
+
+    def ensure(self, request, intent_key):  # noqa: ANN001, ANN201
+        raise AssertionError("forward work ran while the brake was on")
+
+    def inspect(self, stable_ref):  # noqa: ANN001, ANN201
+        raise AssertionError("forward work ran while the brake was on")
+
+    def deprovision(self, external_ref):  # noqa: ANN001, ANN201
+        self.torn_down.append(external_ref)
+        return InspectResult(state=InspectState.ABSENT)
+
+
+@pytest.mark.parametrize("provider", NERVE_PROVIDERS)
+def test_teardown_still_reaches_the_provider_after_the_brake_goes_on(
+    cp_stack, monkeypatch: pytest.MonkeyPatch, provider: str
+) -> None:
+    """Worker cleanup, with the brake on and the resource already created."""
+
+    cp_stack.complete_profile()
+    _hold_both_consents(cp_stack, now=1_760_000_000.0)
+    monkeypatch.setenv("ABROLIA_REAL_EMAIL_ENABLED", "0")
+
+    now = 1_760_000_000.0
+    workflow = cp_stack.onboarding.workflow_for_household(cp_stack.household.id)
+    with cp_stack.jobs.db.write() as connection:
+        job_id, _created = cp_stack.jobs.create(
+            connection,
+            household_id=cp_stack.household.id,
+            workflow_id=workflow.id,
+            kind="cleanup",
+            operation="deprovision",
+            intent_key=f"{cp_stack.household.id}:brake-teardown:{provider}",
+            request={
+                "household_id": cp_stack.household.id,
+                "resource_type": "email_identity",
+                "external_ref": "nerve:org:created-before-the-brake",
+                "stable_ref": f"{cp_stack.household.id}:inbox",
+            },
+            provider=provider,
+            now=now,
+        )
+
+    recorder = _RecordingNerve()
+    registry = synthetic_provider_registry()
+    registry.register(provider, recorder)
+    result = cp_stack.make_worker(providers=registry, now=now + 10).run_once()
+
+    assert result is not None and result.job_id == job_id
+    assert result.error_code != "real_email_disabled", (
+        "the brake blocked teardown, stranding the external resource"
+    )
+    assert recorder.torn_down == ["nerve:org:created-before-the-brake"]
+
+
+@pytest.mark.parametrize("provider", NERVE_PROVIDERS)
+def test_forward_work_is_braked_while_teardown_is_not(
+    cp_stack, monkeypatch: pytest.MonkeyPatch, provider: str
+) -> None:
+    """The two halves in one place, since the fix is that they differ.
+
+    Registration cannot carry the brake any more — the adapters must stay
+    resolvable for teardown — so this is the only thing standing between a
+    queued Nerve job and a call to Nerve.
+    """
+
+    cp_stack.complete_profile()
+    _hold_both_consents(cp_stack, now=1_760_000_000.0)
+    monkeypatch.setenv("ABROLIA_REAL_EMAIL_ENABLED", "0")
+
+    now = 1_760_000_000.0
+    workflow = cp_stack.onboarding.workflow_for_household(cp_stack.household.id)
+    with cp_stack.jobs.db.write() as connection:
+        job_id, _created = cp_stack.jobs.create(
+            connection,
+            household_id=cp_stack.household.id,
+            workflow_id=workflow.id,
+            kind="email_identity",
+            operation="ensure",
+            intent_key=f"{cp_stack.household.id}:brake-forward:{provider}",
+            request={
+                "household_id": cp_stack.household.id,
+                "stable_ref": f"{cp_stack.household.id}:inbox",
+            },
+            provider=provider,
+            now=now,
+        )
+
+    recorder = _RecordingNerve()
+    registry = synthetic_provider_registry()
+    registry.register(provider, recorder)
+    result = cp_stack.make_worker(providers=registry, now=now + 10).run_once()
+
+    assert result is not None and result.job_id == job_id
+    assert result.error_code == "real_email_disabled"
+    assert recorder.torn_down == []
+
+
+@pytest.mark.parametrize("provider", NERVE_PROVIDERS)
+def test_household_deletion_completes_with_the_brake_on(
+    cp_stack, monkeypatch: pytest.MonkeyPatch, provider: str
+) -> None:
+    """The GDPR end of the same defect.
+
+    `DeletionService` resolves each external resource by its stored `provider`
+    name and wraps the call in a bare `except Exception`, so an unregistered
+    adapter did not raise — it was recorded as `unknown`, the sweep settled
+    `outcome_unknown`, and the erasure request could never complete while the
+    inbox it was supposed to remove stayed live. A silent partial failure, which
+    is the worst shape for this particular obligation.
+    """
+
+    monkeypatch.setenv("ABROLIA_REAL_EMAIL_ENABLED", "0")
+    now = 1_760_000_000.0
+    external_ref = "nerve:org:created-before-the-brake"
+
+    with cp_stack.database.write() as connection:
+        encrypted = cp_stack.jobs.encrypt_json(
+            "external_resources", "res-brake", "external_id", external_ref
+        )
+        connection.execute(
+            "INSERT INTO external_resources (id, household_id, provider, resource_type,"
+            " stable_name, external_id_ciphertext, encryption_key_version, status,"
+            " created_at, updated_at)"
+            " VALUES (?, ?, ?, 'email_identity', 'inbox', ?, ?, 'ready', ?, ?)",
+            (
+                "res-brake",
+                cp_stack.household.id,
+                provider,
+                encrypted.ciphertext,
+                encrypted.key_version,
+                now,
+                now,
+            ),
+        )
+
+    recorder = _RecordingNerve()
+    registry = synthetic_provider_registry()
+    registry.register(provider, recorder)
+
+    deletion = DeletionService(
+        cp_stack.accounts,
+        cp_stack.auth,
+        cp_stack.households,
+        cp_stack.jobs,
+        registry,
+        runtime=_AbsentRuntime(),
+    )
+    receipt = deletion.delete(
+        cp_stack.account.id,
+        cp_stack.household.id,
+        idempotency_key=f"brake-delete-{provider}",
+        now=now + 10,
+    )
+
+    assert recorder.torn_down == [external_ref], (
+        "the brake stopped erasure from reaching the provider"
+    )
+    assert receipt.completion_status == "complete", (
+        f"erasure could not complete: {receipt.completion_status} "
+        f"{receipt.provider_statuses}"
+    )
+    assert all(
+        state == InspectState.ABSENT.value
+        for state in receipt.provider_statuses.values()
+    ), receipt.provider_statuses
+
+
+class _AbsentRuntime:
+    def delete(self, runtime_ref: str) -> InspectState:  # noqa: ARG002
+        return InspectState.ABSENT
