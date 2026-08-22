@@ -25,6 +25,7 @@ from control_plane.email.repository import EmailIdentityRepository
 from control_plane.feature_flags import (
     GATED_EMAIL_PROVIDERS,
     check_provider_enabled,
+    is_real_email_enabled,
 )
 from control_plane.models import StepKind, StepStatus
 from control_plane.observability import StructuredLogger
@@ -126,6 +127,7 @@ class ProvisioningWorker:
         secret_sink: SecretSink,
         email_identities: EmailIdentityRepository | None = None,
         worker_id: str = "worker",
+        real_email_authorized: bool = False,
         runtime_provider: str = "dry-run-runtime",
         bootstrap_ttl_seconds: int = 3600,
         max_safe_attempts: int = 5,
@@ -143,6 +145,16 @@ class ProvisioningWorker:
         self.secret_sink = secret_sink
         self.email_identities = email_identities
         self.worker_id = worker_id
+        #: Whether the VALIDATED configuration authorized real email at boot.
+        #:
+        #: The live environment can only ever subtract from this. Reading
+        #: `ABROLIA_REAL_EMAIL_ENABLED` alone made `0 -> 1` an authorization:
+        #: a process booted with the brake on and an allowlist that excludes a
+        #: household would dispatch that household's durable Nerve job the
+        #: moment the variable flipped, even though the frozen configuration
+        #: this worker was built from never permitted it. The allowlist is
+        #: checked where it was validated; a brake must not be a way around it.
+        self.real_email_authorized = real_email_authorized
         self.runtime_provider = runtime_provider
         self.bootstrap_ttl_seconds = bootstrap_ttl_seconds
         self.max_safe_attempts = max_safe_attempts
@@ -1436,9 +1448,17 @@ class ProvisioningWorker:
         if job.kind != "email_identity":
             return None
         flag = GATED_EMAIL_PROVIDERS.get(job.provider)
-        if flag is None:
+        real_email = job.provider in NERVE_EMAIL_PROVIDERS
+        if flag is None and not real_email:
             return None
         if self._is_shutdown_action(job):
+            return None
+        # The managed/BYO brake. The adapters stay registered so teardown can
+        # resolve them, which means absence no longer stops forward work and
+        # this is the only thing that does.
+        if real_email and not (self.real_email_authorized and is_real_email_enabled()):
+            return "real_email_disabled"
+        if flag is None:
             return None
         try:
             check_provider_enabled(flag)
@@ -1769,55 +1789,23 @@ class ProvisioningWorker:
                 return self._mark_step_problem(
                     job, request, "failed", "missing_external_ref"
                 )
-            if request.get("resource_type") == "runtime":
-                # Inspecting the shared app cannot distinguish an absent
-                # workload from its intentionally retained secret namespace.
-                # Re-run the exact idempotent workload cleanup instead.
-                return self._cleanup(job, request, provider)
-            inspected = provider.inspect(external_ref)
-            if inspected.state is InspectState.ABSENT:
-                email_identity_id = request.get("email_identity_id")
-                if (
-                    request.get("resource_type") == "email_identity"
-                    and not self._delete_email_cleanup_secret(
-                        job, request, email_identity_id
-                    )
-                ):
-                    return WorkResult(
-                        job.id, "outcome_unknown", "secret_cleanup_unknown"
-                    )
-                with self.jobs.db.write() as connection:
-                    self.jobs.settle(
-                        connection, job.id, status="succeeded", now=self.clock()
-                    )
-                    if request.get("resource_id"):
-                        connection.execute(
-                            "UPDATE external_resources SET status = 'deleted', updated_at = ?"
-                            " WHERE id = ?",
-                            (self.clock(), request["resource_id"]),
-                        )
-                    if (
-                        request.get("resource_type") == "email_identity"
-                        and self.email_identities is not None
-                        and isinstance(email_identity_id, str)
-                    ):
-                        self._settle_cancelled_parent(
-                            connection, request.get("parent_job_id")
-                        )
-                        self.email_identities.finish_disconnect(
-                            connection, email_identity_id, now=self.clock()
-                        )
-                return WorkResult(job.id, "succeeded")
-            if inspected.state is InspectState.READY:
-                return self._cleanup(job, request, provider)
-            if inspected.state is InspectState.FAILED:
-                return self._mark_step_problem(
-                    job,
-                    request,
-                    "failed",
-                    inspected.error_code or "cleanup_rejected",
-                )
-            return WorkResult(job.id, "outcome_unknown", "reconcile_inconclusive")
+            # Re-run the exact idempotent cleanup. Never probe with `inspect`.
+            #
+            # This was runtime-only, because inspecting the shared app cannot
+            # distinguish an absent workload from its intentionally retained
+            # secret namespace. The narrower reason hid a general one:
+            # `inspect` is not contractually read-only. `NerveManagedEmailProvisioner.inspect`
+            # is a RECOVERY path — it reissues the API key and rotates the
+            # webhook — so reconciling an uncertain email cleanup handed a
+            # withdrawn household's inbox fresh live credentials instead of
+            # tearing it down. Nothing in the `Provisioner` protocol promised
+            # otherwise, so every sibling was one adapter away from the same
+            # thing.
+            #
+            # `deprovision` is the operation whose idempotence teardown already
+            # depends on: this branch delegated here anyway once `inspect`
+            # returned READY.
+            return self._cleanup(job, request, provider)
         if job.kind == "runtime":
             if job.operation == "ensure_secret_namespace":
                 ensure_namespace = getattr(provider, "ensure_secret_namespace", None)

@@ -166,7 +166,16 @@ class ControlPlaneContainer:
         )
         google_provider = GoogleOAuthProvisioner(google_oauth)
         providers.register("google-oauth", google_provider)
-        if config.real_email_enabled:
+        # Registered when CONFIGURED, not when enabled. Keying this on
+        # `real_email_enabled` meant the brake removed the adapters entirely,
+        # and teardown resolves a provider by the job's durable `provider`
+        # column: after enable -> provision -> disable -> restart, every
+        # cleanup, reconcile and deletion sweep hit `ProviderRejected`,
+        # `delete.py` recorded `unknown`, and the household's inbox stayed live
+        # with deletion unable to complete. A brake must never disable teardown
+        # — see AGENTS.repo-invariants.md. Forward dispatch is braked in
+        # `ProvisioningWorker` instead, where shutdown work can be exempted.
+        if config.nerve_configured:
             from control_plane.providers.email.nerve_byo_domain import (
                 NerveByoDomainProvisioner,
             )
@@ -219,6 +228,7 @@ class ControlPlaneContainer:
             email_identities=email_identities,
             runtime_provider=config.runtime_provider,
             bootstrap_ttl_seconds=config.bootstrap_ttl_seconds,
+            real_email_authorized=config.real_email_enabled,
             logger=StructuredLogger(sys.stderr),
         )
         bootstrap = BootstrapService(configs, onboarding_repository, jobs)

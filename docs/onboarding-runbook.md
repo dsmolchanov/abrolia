@@ -441,16 +441,49 @@ Alerts (operator-visible, not auto-page in pilot):
 
 ## Phase F — Release gating & rollout order (per-provider kill switches)
 
-All provider flags are env-driven, `default 0`, fail-closed, read at call time (not only at startup). Toggling `1→0` blocks the next call; `0→1` allows it after health check.
+Every flag below is env-driven, `default 0` and fail-closed. Each row names
+where it is read and **when it takes effect**, because those differ and the
+difference decides which one to reach for during an incident. A flag with no
+call site does not belong in this table.
 
-| Flag | Controls | Default |
-|------|----------|---------|
-| `ABROLIA_MANAGED_EMAIL_ENABLED` | Nerve `@abrolia.com` provisioning | `0` |
-| `ABROLIA_BYO_EMAIL_ENABLED` | Nerve BYO domain provisioning | `0` |
-| `ABROLIA_GMAIL_ENABLED` | Gmail agent via OAuth (implies `ABROLIA_REAL_EMAIL_ENABLED` + CASA) | `0` |
-| `ABROLIA_WHATSAPP_SHARED_ENABLED` | Shared WA gateway relay | `0` |
-| `ABROLIA_WHATSAPP_DEDICATED_ENABLED` | Dedicated Evolution WA | `0` |
-| `ABROLIA_WEB_PUSH_ENABLED` | Web Push (P11) | `0` |
+| Flag | Controls | Enforced at | Default |
+|------|----------|-------------|---------|
+| `ABROLIA_REAL_EMAIL_ENABLED` | Forward managed `@abrolia.com` **and** BYO domain provisioning | `ProvisioningWorker` (`_run_once`, `_reconcile`), **at call time** — `1→0` stops the next Nerve call including queued work, with no restart. New selections also route to `fake-email` from the next boot. **Teardown is exempt**: cleanup, reconciliation and household deletion still reach Nerve, or the brake would strand the inbox it stopped. Real provisioning additionally requires a non-empty `ABROLIA_REAL_EMAIL_HOUSEHOLD_ALLOWLIST`. | `0` |
+| `ABROLIA_BYO_EMAIL_ENABLED` | Whether the BYO domain option is OFFERED at all | `OnboardingService.select` and `ProvisioningWorker` (`_run_once`, `_reconcile`), **at call time**. `1→0` stops the next provider call without a restart, including work already queued. | `0` |
+| `ABROLIA_GMAIL_ENABLED` | Whether the Gmail option is OFFERED at all (real Gmail additionally needs `ABROLIA_REAL_EMAIL_ENABLED` + `ABROLIA_GMAIL_REAL_ENABLED` + CASA evidence) | `OnboardingService.select` and `ProvisioningWorker` (`_run_once`, `_reconcile`), **at call time**. `1→0` stops the next provider call without a restart, including work already queued. | `0` |
+| `ABROLIA_WHATSAPP_SHARED_ENABLED` | Shared WA gateway relay | `gateway.whatsapp_router.handle_webhook` — returns `flag_disabled` before persisting | `0` |
+
+Two kinds of switch, differing in both what they do and how fast:
+
+- `ABROLIA_REAL_EMAIL_ENABLED` is the **incident brake**. Off, no new Nerve
+  call is made — including from jobs already queued — while the option still
+  works synthetically, so onboarding does not dead-end. Teardown deliberately
+  still runs: pulling this must not leave a household unable to delete the
+  inbox it created. Until 2026-08-22 the brake worked by not registering the
+  Nerve adapters at all, which read as stronger and was not: it also removed
+  what deprovisioning needed, so erasure recorded `unknown` and never
+  completed.
+- `ABROLIA_BYO_EMAIL_ENABLED` and `ABROLIA_GMAIL_ENABLED` are **call-time
+  product gates**. Off, the option is refused outright and disappears from
+  onboarding, and `1→0` stops the next provider call immediately — including
+  jobs already in the queue.
+
+To stop talking to Nerve without breaking onboarding, use the first. To stop
+offering an option at all, use the second. Both bite on the next call; neither
+is a substitute for the other, and neither stops teardown.
+
+Dedicated WhatsApp and web push have **no flag**, and need none: they have no
+adapter yet, and `ControlPlaneConfig.validate` refuses to boot at all if
+`ABROLIA_REAL_WHATSAPP_ENABLED` or `ABROLIA_REAL_CHANNEL_ENABLED` is set. A
+flag cannot be more fail-closed than a process that will not start.
+
+`ABROLIA_MANAGED_EMAIL_ENABLED`, `ABROLIA_WHATSAPP_DEDICATED_ENABLED` and
+`ABROLIA_WEB_PUSH_ENABLED` were listed here until 2026-08-22 and gated nothing —
+they were accessors with no call site. Setting them today does nothing; they are
+not read. `phase-DE-pilot.md` Step F1 sanctioned this consolidation in advance:
+"Alternative short form if the codebase consolidates: `ABROLIA_REAL_EMAIL_ENABLED`
+covers managed+BYO ... Either form is acceptable if the matrix below is covered
+and default-off."
 
 Rollout order, each transition gated:
 1. **Synthetic** (`abrolia-synthetic`, `owner@abrolia.test`, fake adapters) — requires `pytest -p no:cacheprovider -m "not live" -q` + `ruff check .` + `gitleaks` + no `TODO` in notices (Phase A docs).

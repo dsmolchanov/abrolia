@@ -247,6 +247,70 @@ makes a review loop unable to terminate.
   carries for the consent precondition is the same reasoning, and a second
   spelling is a second thing to get wrong.
 
+  **A brake must not be implemented by removing the adapter.** The sharpest
+  instance of that half, found 2026-08-22: `container.py` registered the Nerve
+  adapters only `if config.real_email_enabled`, so turning the brake on deleted
+  the very objects teardown resolves. Teardown looks a provider up by the job's
+  durable `provider` column, so after
+  enable -> provision -> disable -> restart, every cleanup and reconcile raised
+  `ProviderRejected` and `DeletionService` swallowed it into `unknown` — an
+  erasure request that could never complete while the inbox it named stayed
+  live. Registration follows CREDENTIALS (`nerve_configured`); the brake lives
+  at forward dispatch, which is the only layer that can tell `ensure` from
+  `deprovision`. Enforced by
+  `tests/control_plane/test_real_email_wiring.py::test_teardown_still_reaches_the_provider_after_the_brake_goes_on`,
+  `::test_forward_work_is_braked_while_teardown_is_not`, and
+  `::test_household_deletion_completes_with_the_brake_on`, over both Nerve
+  providers.
+
+  **Teardown re-runs `deprovision`; it never probes with `inspect`.** Found in
+  the same round. The reconcile branch probed with `inspect` for every resource
+  except runtime, and `inspect` is not contractually read-only:
+  `NerveManagedEmailProvisioner.inspect` is a RECOVERY path that reissues the
+  API key and rotates the webhook. Reconciling an uncertain email cleanup
+  therefore handed a withdrawn household's inbox fresh live credentials instead
+  of removing it. The runtime case had the right behaviour for a narrower
+  stated reason — that inspecting the shared app cannot distinguish an absent
+  workload from its retained secret namespace — which hid the general one, so
+  every other resource type was one adapter away from the same defect.
+  `deprovision` is the operation whose idempotence teardown already depends on;
+  the branch delegated to it anyway once `inspect` returned READY. Enforced by
+  `tests/control_plane/test_real_email_wiring.py::test_reconciling_a_cleanup_tears_down_instead_of_probing`,
+  parameterised over both Nerve providers and both cleanup origins, with a stub
+  whose `inspect` counts credential reissues.
+
+  **Whatever `build` constructs, `validate` must already have vetted.** Widening
+  what the container builds silently widens what the config must accept.
+  Registering the Nerve adapters on `nerve_configured` rather than
+  `real_email_enabled` meant a brake-off deployment with
+  `ABROLIA_NERVE_BASE_URL=http://...` passed `validate` and then raised
+  `ValueError` inside `NerveAdminClient` — a dormant provider turned into a
+  startup outage. Structural checks (HTTPS origin, canonical UUIDs) therefore
+  bind to CONSTRUCTIBILITY and run under `nerve_configured`; enablement checks
+  (the household allowlist, completeness) stay under `real_email_enabled`.
+  Enforced by
+  `tests/control_plane/test_real_email_wiring.py::test_malformed_nerve_settings_are_refused_with_the_brake_either_way`
+  across three malformations with the brake both ways, paired with
+  `::test_a_valid_nerve_block_builds_and_keeps_both_adapters` — without which
+  the rule is satisfied by refusing every Nerve configuration, which would take
+  teardown away again.
+
+  **A brake subtracts; it never adds.** The live environment value is ANDed with
+  the boot-time authorization from the validated configuration. Reading the
+  variable alone made `0 -> 1` an authorization rather than a release: a process
+  booted with the brake on — and therefore with a household allowlist that was
+  never consulted for the household in question — would dispatch its durable
+  Nerve job the moment the variable flipped, routing around the frozen
+  configuration the worker was built from. The allowlist is enforced where it
+  was validated. Enforced by
+  `tests/control_plane/test_real_email_wiring.py::test_the_env_brake_cannot_authorize_what_the_config_refused`.
+
+  This also settles where such a brake may be read. Registration cannot carry
+  it, and the worker holds no `ControlPlaneConfig`, so it is read from the
+  environment at call time — a deliberate second reader of a variable the
+  config also parses. That is the one case where the usual "one spelling" rule
+  yields, and it yields because the alternative breaks erasure.
+
   **Braking is not failing.** Settling a braked job terminally is only safe
   where it is known never to have reached a provider — a first attempt that was
   not reclaimed. Anywhere else `failed` erases durable uncertainty AND moves the

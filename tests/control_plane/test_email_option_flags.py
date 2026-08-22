@@ -35,6 +35,19 @@ from control_plane.provisioning.contracts import (
 from control_plane.provisioning.fakes import synthetic_provider_registry
 from control_plane.repositories.jobs import requires_reconciliation
 
+
+@pytest.fixture(autouse=True)
+def _lift_the_real_email_brake(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A different axis from the switches under test.
+
+    `family_domain` routes to `nerve-byo-domain`, which the managed/BYO incident
+    brake also stops. Leaving that brake on would settle these jobs for the
+    wrong reason and every per-option assertion would pass with the per-option
+    switch deleted. The brake has its own tests in `test_real_email_wiring.py`.
+    """
+    monkeypatch.setenv("ABROLIA_REAL_EMAIL_ENABLED", "1")
+
+
 GATED = {
     "family_domain": (
         "ABROLIA_BYO_EMAIL_ENABLED",

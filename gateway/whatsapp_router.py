@@ -14,6 +14,8 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
+from control_plane.feature_flags import is_whatsapp_shared_enabled
+
 
 @dataclass(frozen=True)
 class GatewayResult:
@@ -142,10 +144,11 @@ class WhatsAppGatewayRouter:
         timestamp: str,
         signature: str,
     ) -> GatewayResult:
-        # Phase F fail-closed kill switch — read at call time, not startup
-        import os as _os
-
-        if _os.environ.get("ABROLIA_WHATSAPP_SHARED_ENABLED", "0") != "1":
+        # Phase F fail-closed kill switch — read at call time, not startup.
+        # Through the shared accessor: this used to spell the variable itself,
+        # which made two readers of one switch and no way to see from
+        # `feature_flags` that the switch was live at all.
+        if not is_whatsapp_shared_enabled():
             return GatewayResult(status="denied", code="flag_disabled", household_id=None)
         # Durable before ACK — persist first, ACK only after persist succeeds
         if not timestamp or not signature:

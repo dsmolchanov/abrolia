@@ -98,13 +98,13 @@ class ControlPlaneConfig:
     real_email_household_allowlist: frozenset[str] = field(default_factory=frozenset)
     real_whatsapp_enabled: bool = False
     real_channel_enabled: bool = False
-    # Phase F per-provider kill switches — all default off, fail-closed, read at call time
-    managed_email_enabled: bool = False
-    byo_email_enabled: bool = False
-    gmail_enabled: bool = False
-    whatsapp_shared_enabled: bool = False
-    whatsapp_dedicated_enabled: bool = False
-    web_push_enabled: bool = False
+    # The Phase F per-provider kill switches are NOT here. They were: six
+    # fields, parsed from six env vars, read by nothing. `feature_flags.py`
+    # reads those same variables directly, because a kill switch has to answer
+    # at call time and this object is built once and frozen — so a config copy
+    # could only ever be a second, staler spelling of the same value. See
+    # `AGENTS.repo-invariants.md`, "A precondition is enforced where the
+    # provider is CALLED".
     nerve_base_url: str | None = None
     nerve_admin_key: str | None = field(default=None, repr=False)
     nerve_platform_org_id: str | None = None
@@ -130,6 +130,22 @@ class ControlPlaneConfig:
     google_gmail_scope_approved: bool = False
     google_casa_current: bool = False
     google_limited_use_disclosed: bool = False
+
+    @property
+    def nerve_configured(self) -> bool:
+        """Whether Nerve adapters can be constructed at all.
+
+        Separate from `real_email_enabled`, which says whether they may be used
+        for NEW work. The two were one question, and conflating them meant
+        turning the brake on also removed the only objects that could tear down
+        what the brake was stopping.
+        """
+        return all((
+            self.nerve_base_url,
+            self.nerve_admin_key,
+            self.nerve_platform_org_id,
+            self.nerve_platform_domain_id,
+        ))
 
     def validate(self) -> ControlPlaneConfig:
         if self.public_origin != self.public_origin.rstrip("/"):
@@ -159,18 +175,32 @@ class ControlPlaneConfig:
             character in self.magic_link_from for character in "\r\n"
         ):
             raise ConfigurationError("magic-link sender contains invalid characters")
-        if self.real_email_enabled:
-            if not all((
-                self.nerve_base_url,
-                self.nerve_admin_key,
+        # Structural checks bind to CONSTRUCTIBILITY, not to enablement.
+        # `container.build` now builds the Nerve adapters whenever the settings
+        # are complete, so teardown can still reach a provider with the brake
+        # on. That made `validate` accept configurations the container then
+        # crashed on: brake off plus `ABROLIA_NERVE_BASE_URL=http://...` passed
+        # here and raised `ValueError` inside `NerveAdminClient`, turning a
+        # dormant provider into a startup outage. Whatever `build` constructs,
+        # `validate` must already have vetted.
+        if self.nerve_configured:
+            if not self.nerve_base_url.startswith("https://"):
+                raise ConfigurationError("Nerve admin origin must use HTTPS")
+            _canonical_uuid(
                 self.nerve_platform_org_id,
+                name="ABROLIA_NERVE_PLATFORM_ORG_ID",
+            )
+            _canonical_uuid(
                 self.nerve_platform_domain_id,
-            )):
+                name="ABROLIA_NERVE_PLATFORM_DOMAIN_ID",
+            )
+        if self.real_email_enabled:
+            # Completeness stays here: dormant settings may be absent, but
+            # turning real email ON without them is a misconfiguration.
+            if not self.nerve_configured:
                 raise ConfigurationError(
                     "real email requires complete Nerve admin and platform configuration"
                 )
-            if not self.nerve_base_url.startswith("https://"):
-                raise ConfigurationError("Nerve admin origin must use HTTPS")
             if not self.real_email_household_allowlist:
                 raise ConfigurationError(
                     "real email requires an explicit household allowlist"
@@ -180,14 +210,6 @@ class ControlPlaneConfig:
                     household_id,
                     name="ABROLIA_REAL_EMAIL_HOUSEHOLD_ALLOWLIST entry",
                 )
-            _canonical_uuid(
-                self.nerve_platform_org_id,
-                name="ABROLIA_NERVE_PLATFORM_ORG_ID",
-            )
-            _canonical_uuid(
-                self.nerve_platform_domain_id,
-                name="ABROLIA_NERVE_PLATFORM_DOMAIN_ID",
-            )
         google_configured = bool(
             self.google_oauth_client_id and self.google_oauth_client_secret
         )
@@ -288,12 +310,6 @@ class ControlPlaneConfig:
             ),
             real_whatsapp_enabled=source.get("ABROLIA_REAL_WHATSAPP_ENABLED", "0") == "1",
             real_channel_enabled=source.get("ABROLIA_REAL_CHANNEL_ENABLED", "0") == "1",
-            managed_email_enabled=source.get("ABROLIA_MANAGED_EMAIL_ENABLED", "0") == "1",
-            byo_email_enabled=source.get("ABROLIA_BYO_EMAIL_ENABLED", "0") == "1",
-            gmail_enabled=source.get("ABROLIA_GMAIL_ENABLED", "0") == "1",
-            whatsapp_shared_enabled=source.get("ABROLIA_WHATSAPP_SHARED_ENABLED", "0") == "1",
-            whatsapp_dedicated_enabled=source.get("ABROLIA_WHATSAPP_DEDICATED_ENABLED", "0") == "1",
-            web_push_enabled=source.get("ABROLIA_WEB_PUSH_ENABLED", "0") == "1",
             nerve_base_url=source.get("ABROLIA_NERVE_BASE_URL") or None,
             nerve_admin_key=source.get("ABROLIA_NERVE_ADMIN_KEY") or None,
             nerve_platform_org_id=source.get("ABROLIA_NERVE_PLATFORM_ORG_ID") or None,
