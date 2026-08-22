@@ -279,6 +279,22 @@ makes a review loop unable to terminate.
   parameterised over both Nerve providers and both cleanup origins, with a stub
   whose `inspect` counts credential reissues.
 
+  **Whatever `build` constructs, `validate` must already have vetted.** Widening
+  what the container builds silently widens what the config must accept.
+  Registering the Nerve adapters on `nerve_configured` rather than
+  `real_email_enabled` meant a brake-off deployment with
+  `ABROLIA_NERVE_BASE_URL=http://...` passed `validate` and then raised
+  `ValueError` inside `NerveAdminClient` — a dormant provider turned into a
+  startup outage. Structural checks (HTTPS origin, canonical UUIDs) therefore
+  bind to CONSTRUCTIBILITY and run under `nerve_configured`; enablement checks
+  (the household allowlist, completeness) stay under `real_email_enabled`.
+  Enforced by
+  `tests/control_plane/test_real_email_wiring.py::test_malformed_nerve_settings_are_refused_with_the_brake_either_way`
+  across three malformations with the brake both ways, paired with
+  `::test_a_valid_nerve_block_builds_and_keeps_both_adapters` — without which
+  the rule is satisfied by refusing every Nerve configuration, which would take
+  teardown away again.
+
   This also settles where such a brake may be read. Registration cannot carry
   it, and the worker holds no `ControlPlaneConfig`, so it is read from the
   environment at call time — a deliberate second reader of a variable the

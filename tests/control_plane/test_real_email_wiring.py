@@ -4,7 +4,7 @@ from dataclasses import replace
 
 import pytest
 
-from control_plane.config import ControlPlaneConfig
+from control_plane.config import ConfigurationError, ControlPlaneConfig
 from control_plane.container import ControlPlaneContainer
 from control_plane.db import new_id
 from control_plane.models import StepKind
@@ -548,3 +548,75 @@ def test_reconciling_a_cleanup_tears_down_instead_of_probing(
         "teardown probed with inspect, which reissues credentials on the real adapter"
     )
     assert recorder.torn_down == [external_ref]
+
+
+# ---------------------------------------------------------------------------
+# Whatever `build` constructs, `validate` must already have vetted.
+#
+# Registering the adapters on `nerve_configured` widened what the container
+# builds without widening what the config checks: brake OFF plus a complete but
+# malformed Nerve block passed validation and then raised `ValueError` inside
+# `NerveAdminClient`, turning a dormant provider into a startup outage.
+# ---------------------------------------------------------------------------
+
+MALFORMED = {
+    "plain-http-origin": {"nerve_base_url": "http://nerve.internal"},
+    "non-uuid-org": {"nerve_platform_org_id": "not-a-uuid"},
+    "non-uuid-domain": {"nerve_platform_domain_id": "not-a-uuid"},
+}
+
+
+def _nerve_block(tmp_path, **overrides):  # noqa: ANN001, ANN201
+    settings = {
+        "nerve_base_url": "https://nerve.example.test",
+        "nerve_admin_key": "synthetic-admin-key",
+        "nerve_platform_org_id": "20000000-0000-4000-8000-000000000001",
+        "nerve_platform_domain_id": "30000000-0000-4000-8000-000000000001",
+    }
+    settings.update(overrides)
+    return replace(ControlPlaneConfig.for_test(tmp_path), **settings)
+
+
+@pytest.mark.parametrize("brake_on", [True, False], ids=["brake-on", "brake-off"])
+@pytest.mark.parametrize("flaw", sorted(MALFORMED))
+def test_malformed_nerve_settings_are_refused_with_the_brake_either_way(
+    tmp_path, brake_on: bool, flaw: str
+) -> None:
+    """`brake-on` is the case that regressed, and the one worth naming.
+
+    It used to be unreachable — the adapters were not built — so the config was
+    never vetted and never needed to be. It is reachable now.
+    """
+
+    household_id = "10000000-0000-4000-8000-000000000003"
+    config = _nerve_block(
+        tmp_path,
+        real_email_enabled=not brake_on,
+        real_email_household_allowlist=frozenset({household_id}),
+        **MALFORMED[flaw],
+    )
+
+    with pytest.raises(ConfigurationError):
+        config.validate()
+
+
+@pytest.mark.parametrize("brake_on", [True, False], ids=["brake-on", "brake-off"])
+def test_a_valid_nerve_block_builds_and_keeps_both_adapters(
+    tmp_path, brake_on: bool
+) -> None:
+    """The other half: refusing malformed settings must not refuse good ones.
+
+    Without this the test above is satisfied by rejecting every Nerve
+    configuration, which would take teardown away again.
+    """
+
+    household_id = "10000000-0000-4000-8000-000000000004"
+    config = _nerve_block(
+        tmp_path,
+        real_email_enabled=not brake_on,
+        real_email_household_allowlist=frozenset({household_id}),
+    ).validate()
+
+    with ControlPlaneContainer.build(config) as container:
+        assert container.providers.get("nerve-managed") is not None
+        assert container.providers.get("nerve-byo-domain") is not None

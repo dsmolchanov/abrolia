@@ -175,18 +175,32 @@ class ControlPlaneConfig:
             character in self.magic_link_from for character in "\r\n"
         ):
             raise ConfigurationError("magic-link sender contains invalid characters")
-        if self.real_email_enabled:
-            if not all((
-                self.nerve_base_url,
-                self.nerve_admin_key,
+        # Structural checks bind to CONSTRUCTIBILITY, not to enablement.
+        # `container.build` now builds the Nerve adapters whenever the settings
+        # are complete, so teardown can still reach a provider with the brake
+        # on. That made `validate` accept configurations the container then
+        # crashed on: brake off plus `ABROLIA_NERVE_BASE_URL=http://...` passed
+        # here and raised `ValueError` inside `NerveAdminClient`, turning a
+        # dormant provider into a startup outage. Whatever `build` constructs,
+        # `validate` must already have vetted.
+        if self.nerve_configured:
+            if not self.nerve_base_url.startswith("https://"):
+                raise ConfigurationError("Nerve admin origin must use HTTPS")
+            _canonical_uuid(
                 self.nerve_platform_org_id,
+                name="ABROLIA_NERVE_PLATFORM_ORG_ID",
+            )
+            _canonical_uuid(
                 self.nerve_platform_domain_id,
-            )):
+                name="ABROLIA_NERVE_PLATFORM_DOMAIN_ID",
+            )
+        if self.real_email_enabled:
+            # Completeness stays here: dormant settings may be absent, but
+            # turning real email ON without them is a misconfiguration.
+            if not self.nerve_configured:
                 raise ConfigurationError(
                     "real email requires complete Nerve admin and platform configuration"
                 )
-            if not self.nerve_base_url.startswith("https://"):
-                raise ConfigurationError("Nerve admin origin must use HTTPS")
             if not self.real_email_household_allowlist:
                 raise ConfigurationError(
                     "real email requires an explicit household allowlist"
@@ -196,14 +210,6 @@ class ControlPlaneConfig:
                     household_id,
                     name="ABROLIA_REAL_EMAIL_HOUSEHOLD_ALLOWLIST entry",
                 )
-            _canonical_uuid(
-                self.nerve_platform_org_id,
-                name="ABROLIA_NERVE_PLATFORM_ORG_ID",
-            )
-            _canonical_uuid(
-                self.nerve_platform_domain_id,
-                name="ABROLIA_NERVE_PLATFORM_DOMAIN_ID",
-            )
         google_configured = bool(
             self.google_oauth_client_id and self.google_oauth_client_secret
         )
