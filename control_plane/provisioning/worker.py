@@ -127,6 +127,7 @@ class ProvisioningWorker:
         secret_sink: SecretSink,
         email_identities: EmailIdentityRepository | None = None,
         worker_id: str = "worker",
+        real_email_authorized: bool = False,
         runtime_provider: str = "dry-run-runtime",
         bootstrap_ttl_seconds: int = 3600,
         max_safe_attempts: int = 5,
@@ -144,6 +145,16 @@ class ProvisioningWorker:
         self.secret_sink = secret_sink
         self.email_identities = email_identities
         self.worker_id = worker_id
+        #: Whether the VALIDATED configuration authorized real email at boot.
+        #:
+        #: The live environment can only ever subtract from this. Reading
+        #: `ABROLIA_REAL_EMAIL_ENABLED` alone made `0 -> 1` an authorization:
+        #: a process booted with the brake on and an allowlist that excludes a
+        #: household would dispatch that household's durable Nerve job the
+        #: moment the variable flipped, even though the frozen configuration
+        #: this worker was built from never permitted it. The allowlist is
+        #: checked where it was validated; a brake must not be a way around it.
+        self.real_email_authorized = real_email_authorized
         self.runtime_provider = runtime_provider
         self.bootstrap_ttl_seconds = bootstrap_ttl_seconds
         self.max_safe_attempts = max_safe_attempts
@@ -1445,7 +1456,7 @@ class ProvisioningWorker:
         # The managed/BYO brake. The adapters stay registered so teardown can
         # resolve them, which means absence no longer stops forward work and
         # this is the only thing that does.
-        if real_email and not is_real_email_enabled():
+        if real_email and not (self.real_email_authorized and is_real_email_enabled()):
             return "real_email_disabled"
         if flag is None:
             return None

@@ -620,3 +620,55 @@ def test_a_valid_nerve_block_builds_and_keeps_both_adapters(
     with ControlPlaneContainer.build(config) as container:
         assert container.providers.get("nerve-managed") is not None
         assert container.providers.get("nerve-byo-domain") is not None
+
+
+@pytest.mark.parametrize("provider", NERVE_PROVIDERS)
+def test_the_env_brake_cannot_authorize_what_the_config_refused(
+    cp_stack, monkeypatch: pytest.MonkeyPatch, provider: str
+) -> None:
+    """A brake subtracts. It must never add.
+
+    The worker reads `ABROLIA_REAL_EMAIL_ENABLED` live so `1 -> 0` can stop
+    queued work without a restart. Read alone, that made `0 -> 1` an
+    AUTHORIZATION: a process booted with the brake on — and therefore with an
+    allowlist that was never consulted for this household — would dispatch a
+    durable Nerve job the moment the variable flipped, bypassing the frozen
+    configuration it was built from. The allowlist is enforced where it was
+    validated, and no environment variable may route around it.
+    """
+
+    cp_stack.complete_profile()
+    _hold_both_consents(cp_stack, now=1_760_000_000.0)
+
+    now = 1_760_000_000.0
+    workflow = cp_stack.onboarding.workflow_for_household(cp_stack.household.id)
+    with cp_stack.jobs.db.write() as connection:
+        job_id, _created = cp_stack.jobs.create(
+            connection,
+            household_id=cp_stack.household.id,
+            workflow_id=workflow.id,
+            kind="email_identity",
+            operation="ensure",
+            intent_key=f"{cp_stack.household.id}:unauthorized:{provider}",
+            request={
+                "household_id": cp_stack.household.id,
+                "stable_ref": f"{cp_stack.household.id}:inbox",
+            },
+            provider=provider,
+            now=now,
+        )
+
+    # The environment says yes. The configuration this worker was built from
+    # never did.
+    monkeypatch.setenv("ABROLIA_REAL_EMAIL_ENABLED", "1")
+    recorder = _RecordingNerve()
+    registry = synthetic_provider_registry()
+    registry.register(provider, recorder)
+    worker = cp_stack.make_worker(providers=registry, now=now + 10)
+    worker.real_email_authorized = False
+
+    result = worker.run_once()
+
+    assert result is not None and result.job_id == job_id
+    assert result.error_code == "real_email_disabled"
+    assert recorder.torn_down == []

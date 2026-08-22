@@ -228,6 +228,7 @@ class ControlPlaneContainer:
             email_identities=email_identities,
             runtime_provider=config.runtime_provider,
             bootstrap_ttl_seconds=config.bootstrap_ttl_seconds,
+            real_email_authorized=config.real_email_enabled,
             logger=StructuredLogger(sys.stderr),
         )
         bootstrap = BootstrapService(configs, onboarding_repository, jobs)

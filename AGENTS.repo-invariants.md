@@ -295,6 +295,16 @@ makes a review loop unable to terminate.
   the rule is satisfied by refusing every Nerve configuration, which would take
   teardown away again.
 
+  **A brake subtracts; it never adds.** The live environment value is ANDed with
+  the boot-time authorization from the validated configuration. Reading the
+  variable alone made `0 -> 1` an authorization rather than a release: a process
+  booted with the brake on — and therefore with a household allowlist that was
+  never consulted for the household in question — would dispatch its durable
+  Nerve job the moment the variable flipped, routing around the frozen
+  configuration the worker was built from. The allowlist is enforced where it
+  was validated. Enforced by
+  `tests/control_plane/test_real_email_wiring.py::test_the_env_brake_cannot_authorize_what_the_config_refused`.
+
   This also settles where such a brake may be read. Registration cannot carry
   it, and the worker holds no `ControlPlaneConfig`, so it is read from the
   environment at call time — a deliberate second reader of a variable the

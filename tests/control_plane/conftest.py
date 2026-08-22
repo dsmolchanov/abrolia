@@ -126,6 +126,10 @@ class ControlPlaneStack:
             secret_sink=secret_sink or InMemorySecretSink(),
             email_identities=self.email_identities,
             worker_id="synthetic-worker",
+            # The brake is subtractive: the live env can only ever turn real
+            # email OFF, never authorize it. Tests that drive Nerve adapters
+            # need the boot-time authorization as well as the env var.
+            real_email_authorized=True,
             clock=lambda: now,
         )
 
