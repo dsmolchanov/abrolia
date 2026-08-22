@@ -24,6 +24,7 @@ from control_plane.provisioning.contracts import (
     InspectState,
     OutcomeUnknown,
     ProviderRegistry,
+    ProviderRejected,
     ProviderWaiting,
     ProvisionResult,
 )
@@ -587,7 +588,17 @@ def test_provider_error_value_is_normalized_before_db_api_or_log(cp_stack) -> No
     canary = "GOCSPX-" + "provider-error-secret-canary"
 
     class CanaryProvider(FakeEmailIdentityProvisioner):
-        reconcile = None
+        # The worker no longer discovers a missing `reconcile` and falls back
+        # to probing with `inspect`; forward resume is the adapter's own
+        # method now. This stub reproduces what the deleted tail used to do,
+        # so the property under test still has a vehicle that TRIES to carry
+        # a secret-shaped provider error value toward persistence.
+
+        def reconcile(self, intent, idempotency_key):
+            found = self.inspect(idempotency_key)
+            if found.state is InspectState.FAILED:
+                raise ProviderRejected(found.error_code or "provider_rejected")
+            return self.ensure(intent, idempotency_key)
 
         def ensure(self, intent, idempotency_key):
             del intent, idempotency_key
@@ -595,10 +606,37 @@ def test_provider_error_value_is_normalized_before_db_api_or_log(cp_stack) -> No
 
         def inspect(self, stable_ref):
             del stable_ref
+            # The canary rides as an unvetted provider-supplied error code;
+            # `InspectResult` must normalize it before anything downstream
+            # can relay it.
             return InspectResult(InspectState.FAILED, error_code=canary)
 
     registry = ProviderRegistry()
     registry.register("fake-email", CanaryProvider())
+    # Forward resume re-enters the adapter only once the household's secret
+    # namespace exists; this fixture never provisioned runtime.
+    with cp_stack.jobs.db.write() as connection:
+        namespace = cp_stack.jobs.encrypt_json(
+            "external_resources",
+            "ns-canary",
+            "external_id",
+            "synthetic-namespace:canary",
+        )
+        connection.execute(
+            "INSERT INTO external_resources (id, household_id, provider,"
+            " resource_type, stable_name, external_id_ciphertext,"
+            " encryption_key_version, status, created_at, updated_at)"
+            " VALUES (?, ?, 'dry-run-runtime', 'secret_namespace',"
+            " 'secret_namespace', ?, ?, 'ready', ?, ?)",
+            (
+                "ns-canary",
+                cp_stack.household.id,
+                namespace.ciphertext,
+                namespace.key_version,
+                BASE_TIME + 2,
+                BASE_TIME + 2,
+            ),
+        )
     stream = io.StringIO()
     worker = cp_stack.make_worker(providers=registry, now=BASE_TIME + 3)
     worker.logger = StructuredLogger(stream)

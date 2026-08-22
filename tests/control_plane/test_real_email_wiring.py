@@ -20,6 +20,7 @@ from control_plane.privacy.delete import (
 from control_plane.provisioning.contracts import (
     InspectResult,
     InspectState,
+    ProviderRegistry,
 )
 from control_plane.provisioning.fakes import synthetic_provider_registry
 from control_plane.repositories.jobs import requires_reconciliation
@@ -1300,3 +1301,413 @@ def test_erasure_teardown_reaches_a_terminal_state(
         "erasure never entered the disconnect lifecycle, so the cleanup it"
         " schedules cannot delete the provider secret and never settles"
     )
+
+
+@pytest.mark.parametrize(
+    "provider", ["nerve-managed", "nerve-byo-domain", "google-oauth"]
+)
+@pytest.mark.parametrize(
+    "origin", ["braked", "pre-quarantined", "late-ambiguous"]
+)
+def test_erasure_sequence_settles_every_job_and_completes_deletion(
+    cp_stack, monkeypatch: pytest.MonkeyPatch, provider: str, origin: str
+) -> None:
+    """The whole erasure-with-brake sequence, driven to the end.
+
+    The terminal-state test above stops at the `disconnecting` transition, and
+    so did every test before it: nothing ran the scheduled cleanup, settled the
+    parent, or resumed the deletion. This drives every link in order — the
+    ambiguous job's origin (braked, pre-quarantined by withdrawal, or a
+    timeout discovered after the deletion transaction), deletion, reconcile,
+    the cleanup it schedules, and the resume that must now find nothing left.
+    """
+
+    now = 1_760_000_000.0
+    cp_stack.complete_profile()
+    _hold_both_consents(cp_stack, now=now)
+
+    identity_id = "42000000-0000-4000-8000-00000000000a"
+    workflow = cp_stack.onboarding.workflow_for_household(cp_stack.household.id)
+    with cp_stack.jobs.db.write() as connection:
+        connection.execute(
+            "INSERT INTO email_identities (id, household_id, option, status,"
+            " secret_binding_ref, encryption_key_version, version, created_at, updated_at)"
+            " VALUES (?, ?, 'managed_abrolia', 'outcome_unknown',"
+            " 'ABROLIA_EMAIL_PROVIDER_KEY', 'v1', 1, ?, ?)",
+            (identity_id, cp_stack.household.id, now, now),
+        )
+        job_id, _created = cp_stack.jobs.create(
+            connection,
+            household_id=cp_stack.household.id,
+            workflow_id=workflow.id,
+            kind="email_identity",
+            operation="ensure",
+            intent_key=f"{cp_stack.household.id}:erasure-sequence:{provider}:{origin}",
+            request={
+                "household_id": cp_stack.household.id,
+                "email_identity_id": identity_id,
+                "stable_ref": f"{cp_stack.household.id}:inbox",
+                # Deliberately NO `external_ref`: the hard case is a call that
+                # timed out without answering, which recorded nothing — so
+                # teardown has to DERIVE the reference (`nerve-org:<...>` /
+                # `google-oauth:<identity_id>`), not read it.
+                "option": "managed_abrolia",
+                "selection": {"kind": "abrolia_managed", "local_part": "family-agent"},
+            },
+            provider=provider,
+            now=now,
+        )
+        if origin == "braked":
+            # Reclaimed from a dead lease: the brake preserves ambiguity for
+            # exactly this shape, because the call may have reached Nerve.
+            connection.execute(
+                "UPDATE provisioning_jobs SET status = 'running',"
+                " leased_by = 'dead-worker', lease_until = ? WHERE id = ?",
+                (now - 1.0, job_id),
+            )
+        elif origin == "pre-quarantined":
+            cp_stack.jobs.settle(
+                connection,
+                job_id,
+                status="outcome_unknown",
+                error_code="withdrawal_requires_reconciliation",
+                now=now,
+            )
+        else:  # late-ambiguous
+            connection.execute(
+                "UPDATE provisioning_jobs SET status = 'running',"
+                " leased_by = 'dead-worker', lease_until = ? WHERE id = ?",
+                (now - 1.0, job_id),
+            )
+        resource = cp_stack.jobs.encrypt_json(
+            "external_resources", f"res-sequence-{origin}", "external_id", "nerve:org:live"
+        )
+        connection.execute(
+            "INSERT INTO external_resources (id, household_id, provider, resource_type,"
+            " stable_name, external_id_ciphertext, encryption_key_version, status,"
+            " created_at, updated_at)"
+            " VALUES (?, ?, ?, 'email_identity', 'inbox', ?, ?, 'ready', ?, ?)",
+            (
+                f"res-sequence-{origin}",
+                cp_stack.household.id,
+                provider,
+                resource.ciphertext,
+                resource.key_version,
+                now,
+                now,
+            ),
+        )
+
+    recorder = _ReconcilableNerve()
+    registry = synthetic_provider_registry()
+    registry.register(provider, recorder)
+
+    if origin == "braked":
+        monkeypatch.setenv("ABROLIA_REAL_EMAIL_ENABLED", "0")
+        monkeypatch.setenv("ABROLIA_GMAIL_ENABLED", "0")
+        monkeypatch.setenv("ABROLIA_BYO_EMAIL_ENABLED", "0")
+        braked = cp_stack.make_worker(providers=registry, now=now + 10).run_once()
+        assert braked is not None and braked.job_id == job_id
+        assert braked.status == "outcome_unknown", braked
+        assert braked.error_code in {
+            "real_email_disabled",
+            "email_option_disabled:gmail",
+            "email_option_disabled:byo_email",
+        }
+
+    deletion = DeletionService(
+        cp_stack.accounts,
+        cp_stack.auth,
+        cp_stack.households,
+        cp_stack.jobs,
+        registry,
+        runtime=_AbsentRuntime(),
+    )
+    receipt = deletion.delete(
+        cp_stack.account.id,
+        cp_stack.household.id,
+        idempotency_key=f"erasure-sequence-{provider}-{origin}",
+        now=now + 20,
+    )
+    assert receipt.completion_status != "complete", "fixture did not stay open"
+
+    if origin == "late-ambiguous":
+        # The call times out AFTER the deletion transaction: the case no
+        # one-shot reclassification can see and household ownership answers.
+        with cp_stack.jobs.db.write() as connection:
+            cp_stack.jobs.settle(
+                connection,
+                job_id,
+                status="outcome_unknown",
+                error_code="reconcile_inconclusive",
+                now=now + 25,
+            )
+
+    identity_row = cp_stack.database.query_one(
+        "SELECT status FROM email_identities WHERE id = ?", (identity_id,)
+    )
+    assert identity_row is not None
+    assert identity_row["status"] == "disconnecting", (
+        "erasure never entered the disconnect lifecycle, so the cleanup it"
+        " schedules cannot delete the provider secret and never settles"
+    )
+
+    worker = cp_stack.make_worker(providers=registry, now=now + 30)
+    worker.reconcile(job_id)
+    for _ in range(4):
+        if worker.run_once() is None:
+            break
+
+    parent = cp_stack.jobs.get(job_id)
+    assert parent is not None
+    assert (parent.status, parent.error_code) == (
+        "cancelled",
+        "cancelled_and_compensated",
+    ), f"parent never settled: {parent.status}/{parent.error_code}"
+    cleanup_row = cp_stack.database.query_one(
+        "SELECT status, error_code FROM provisioning_jobs"
+        " WHERE household_id = ? AND kind = 'cleanup'",
+        (cp_stack.household.id,),
+    )
+    assert cleanup_row is not None, "reconciliation scheduled nothing"
+    assert cleanup_row["status"] == "succeeded", (
+        f"cleanup never finished: {cleanup_row['status']}/{cleanup_row['error_code']}"
+    )
+    expected_ref = (
+        f"google-oauth:{identity_id}"
+        if provider == "google-oauth"
+        else None
+    )
+    torn = recorder.torn_down
+    if expected_ref is not None:
+        assert expected_ref in torn, f"teardown used a derived reference; got {torn}"
+    else:
+        assert any(ref.startswith("nerve-org:") for ref in torn), (
+            f"teardown used a derived org reference; got {torn}"
+        )
+
+    final = deletion.resume(cp_stack.household.id, now=now + 40)
+    assert final.completion_status == "complete", (
+        f"deletion never completed: {final.completion_status} {final.provider_statuses}"
+    )
+    assert (
+        cp_stack.database.query_one(
+            "SELECT id FROM households WHERE id = ?", (cp_stack.household.id,)
+        )
+        is None
+    ), "a complete deletion left the household row behind"
+
+
+class _NoReconcileEmail:
+    """An email adapter that never defined `reconcile`.
+
+    The shape the old tail served: the worker discovered `reconcile` with
+    `getattr` and an adapter omitting it fell through to `provider.inspect` —
+    a recovery path that reissues credentials on the real adapters. Every
+    method here raises or records, so reaching the old tail fails loudly
+    instead of passing quietly.
+    """
+
+    email_public_provider = "nerve"
+
+    def __init__(self) -> None:
+        self.inspected: list[object] = []
+        self.ensured = 0
+
+    def ensure(self, request, intent_key):  # noqa: ANN001, ANN201
+        self.ensured += 1
+        raise AssertionError("reconcile resumed provisioning")
+
+    def inspect(self, stable_ref):  # noqa: ANN001, ANN201
+        self.inspected.append(stable_ref)
+        raise AssertionError("reconcile probed with inspect")
+
+    def deprovision(self, external_ref):  # noqa: ANN001, ANN201
+        return InspectResult(state=InspectState.ABSENT)
+
+
+def _quarantine_job(
+    cp_stack, provider: str, intent_key: str, error_code: str,  # noqa: ANN001
+    *, kind: str = "email_identity",
+) -> str:
+    now = 1_760_000_000.0
+    identity_id = "43000000-0000-4000-8000-00000000000b"
+    with cp_stack.jobs.db.write() as connection:
+        if kind == "email_identity":
+            connection.execute(
+                "INSERT INTO email_identities (id, household_id, option, status,"
+                " secret_binding_ref, encryption_key_version, version, created_at, updated_at)"
+                " VALUES (?, ?, 'managed_abrolia', 'outcome_unknown', NULL, 'v1', 1, ?, ?)",
+                (identity_id, cp_stack.household.id, now, now),
+            )
+        workflow = cp_stack.onboarding.workflow_for_household(cp_stack.household.id)
+        request = {
+            "household_id": cp_stack.household.id,
+            "stable_ref": f"{cp_stack.household.id}:inbox",
+        }
+        if kind == "email_identity":
+            request.update(
+                {
+                    "email_identity_id": identity_id,
+                    "option": "managed_abrolia",
+                    "selection": {
+                        "kind": "abrolia_managed",
+                        "local_part": "family-agent",
+                    },
+                }
+            )
+        job_id, _created = cp_stack.jobs.create(
+            connection,
+            household_id=cp_stack.household.id,
+            workflow_id=workflow.id,
+            kind=kind,
+            operation="ensure",
+            intent_key=intent_key,
+            request=request,
+            provider=provider,
+            now=now,
+        )
+        cp_stack.jobs.settle(
+            connection,
+            job_id,
+            status="outcome_unknown",
+            error_code=error_code,
+            now=now,
+        )
+    return job_id
+
+
+@pytest.mark.parametrize(
+    "provider", ["nerve-managed", "nerve-byo-domain", "google-oauth", "fake-email"]
+)
+def test_a_quarantined_job_reconciles_without_the_adapters_reconcile_method(
+    cp_stack, provider: str
+) -> None:
+    """Shutdown routing is the WORKER's decision, not the adapter's shape.
+
+    The route used to live inside the branch gated on
+    `callable(getattr(provider, "reconcile"))`, so an adapter without the
+    method sent a quarantined job to a tail whose first act was
+    `provider.inspect` — a recovery path that reissues the API key and
+    rotates the webhook on Nerve, and calls `ensure` on Google OAuth. A
+    withdrawn household's inbox got fresh live credentials from the very
+    pass that was supposed to remove it.
+    """
+
+    cp_stack.complete_profile()
+    _hold_both_consents(cp_stack, now=1_760_000_000.0)
+    job_id = _quarantine_job(
+        cp_stack,
+        provider,
+        f"{cp_stack.household.id}:no-reconcile-shutdown:{provider}",
+        "withdrawal_requires_reconciliation",
+    )
+
+    adapter = _NoReconcileEmail()
+    # Exactly one provider, the shape under test: the synthetic registry
+    # already holds `fake-email`, and `register` refuses duplicates.
+    registry = ProviderRegistry()
+    registry.register(provider, adapter)
+    result = cp_stack.make_worker(
+        providers=registry, now=1_760_000_010.0
+    ).reconcile(job_id)
+
+    assert adapter.inspected == [], "reconcile probed with a mutating inspect"
+    assert adapter.ensured == 0, "reconcile resumed provisioning"
+    if provider == "fake-email":
+        # No derivable teardown contract exists for this adapter, so the
+        # worker refuses instead of scheduling a cleanup its deprovisioner
+        # would refuse — a failed job standing in for a teardown is worse
+        # than a quarantine, because the inbox is live either way.
+        assert result is not None and result.status == "outcome_unknown", result
+        assert result.error_code == "withdrawal_requires_reconciliation"
+        return
+    cleanup = cp_stack.database.query_one(
+        "SELECT request_ciphertext FROM provisioning_jobs"
+        " WHERE household_id = ? AND kind = 'cleanup'",
+        (cp_stack.household.id,),
+    )
+    assert cleanup is not None, "shutdown reconciled neither down nor out"
+
+
+@pytest.mark.parametrize(
+    "provider", ["nerve-managed", "nerve-byo-domain", "google-oauth", "fake-email"]
+)
+def test_forward_reconcile_without_the_method_fails_closed(
+    cp_stack, monkeypatch: pytest.MonkeyPatch, provider: str
+) -> None:
+    """No adapter shape buys a mutating probe for forward work either.
+
+    An ambiguous job on a LIVE household may legitimately resume — through
+    the adapter's own `reconcile`. An adapter that does not implement it is
+    refused visibly; the worker never substitutes `inspect`, which on every
+    real email adapter mutates provider state. The switches are ON here so
+    the job reaches that gate instead of stopping at the brake — this test
+    asks one question, about adapter shape, not about the brake.
+    """
+
+    monkeypatch.setenv("ABROLIA_REAL_EMAIL_ENABLED", "1")
+    monkeypatch.setenv("ABROLIA_GMAIL_ENABLED", "1")
+    monkeypatch.setenv("ABROLIA_BYO_EMAIL_ENABLED", "1")
+    cp_stack.complete_profile()
+    _hold_both_consents(cp_stack, now=1_760_000_000.0)
+    job_id = _quarantine_job(
+        cp_stack,
+        provider,
+        f"{cp_stack.household.id}:no-reconcile-forward:{provider}",
+        "reconcile_inconclusive",
+    )
+
+    adapter = _NoReconcileEmail()
+    # Exactly one provider, the shape under test: the synthetic registry
+    # already holds `fake-email`, and `register` refuses duplicates.
+    registry = ProviderRegistry()
+    registry.register(provider, adapter)
+    result = cp_stack.make_worker(
+        providers=registry, now=1_760_000_010.0
+    ).reconcile(job_id)
+
+    assert adapter.inspected == [], "reconcile probed with a mutating inspect"
+    assert adapter.ensured == 0, "reconcile resumed provisioning"
+    assert result is not None and result.status == "failed", result
+    assert result.error_code == "provider_cannot_reconcile"
+
+
+@pytest.mark.parametrize(
+    ("kind", "provider"),
+    [("whatsapp_identity", "fake-whatsapp"), ("channel_binding", "fake-channel")],
+)
+def test_a_kind_without_a_reconcile_path_is_refused_not_probed(
+    cp_stack, kind: str, provider: str
+) -> None:
+    """A schema-permitted kind must not acquire an inspect path by omission.
+
+    Phase E will create `whatsapp_identity` and `channel_binding` jobs. Under
+    the old unguarded tail they fell through every branch into
+    `provider.inspect(...)` — a call whose contract this worker does not know,
+    on adapters where it mutates. The end of `_reconcile` is now a visible
+    refusal, so introducing a kind without writing its reconcile path fails
+    loudly here instead of probing quietly in production.
+    """
+
+    cp_stack.complete_profile()
+    _hold_both_consents(cp_stack, now=1_760_000_000.0)
+    job_id = _quarantine_job(
+        cp_stack,
+        provider,
+        f"{cp_stack.household.id}:kind-gap:{kind}",
+        "reconcile_inconclusive",
+        kind=kind,
+    )
+
+    adapter = _NoReconcileEmail()  # shape is irrelevant; nothing may be called
+    registry = ProviderRegistry()
+    registry.register(provider, adapter)
+    result = cp_stack.make_worker(
+        providers=registry, now=1_760_000_010.0
+    ).reconcile(job_id)
+
+    assert adapter.inspected == [], "the kind gap fell through to inspect"
+    assert adapter.ensured == 0, "the kind gap fell through to ensure"
+    assert result is not None and result.status == "outcome_unknown", result
+    assert result.error_code == "reconcile_unsupported"

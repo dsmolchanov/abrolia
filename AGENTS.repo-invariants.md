@@ -279,6 +279,30 @@ makes a review loop unable to terminate.
   parameterised over both Nerve providers and both cleanup origins, with a stub
   whose `inspect` counts credential reissues.
 
+  **Reconcile dispatches exhaustively; adapter shape gates nothing about
+  teardown.** Found in the same round's design pass, as the residue of the
+  finding above: the shutdown route still lived INSIDE the email branch gated
+  on `callable(getattr(provider, "reconcile", None))` — an attribute the
+  `Provisioner` protocol never declared — so an adapter omitting the method
+  sent quarantined teardown work to a tail whose first act was
+  `provider.inspect`, and every schema kind without its own branch fell into
+  the same tail by omission. All adapters defining `reconcile` was a property
+  of the adapters, not a guarantee of the worker. The worker now owns the
+  whole decision: shutdown routing for email jobs sits above every
+  adapter-shaped check; forward reconcile REQUIRES `reconcile` and fails
+  closed (`provider_cannot_reconcile`) rather than substituting a probe; the
+  protocol declares the method; and the end of `_reconcile` is an explicit
+  refusal (`reconcile_unsupported`), not a tail, so a future kind cannot
+  silently acquire an inspect path. The runtime branch keeps its read-only
+  inspect deliberately — crash recovery for live households' forward work is
+  the one place the recovery-inspect contract is legitimate. Enforced by
+  `tests/control_plane/test_real_email_wiring.py::test_a_quarantined_job_reconciles_without_the_adapters_reconcile_method`,
+  `::test_forward_reconcile_without_the_method_fails_closed` (both
+  parameterised over all four adapters including the fake, against a stub
+  whose `inspect` raises), and
+  `::test_a_kind_without_a_reconcile_path_is_refused_not_probed` over the two
+  kinds Phase E has not created yet.
+
   **Whatever `build` constructs, `validate` must already have vetted.** Widening
   what the container builds silently widens what the config must accept.
   Registering the Nerve adapters on `nerve_configured` rather than

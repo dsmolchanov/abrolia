@@ -113,6 +113,20 @@ class DeterministicFakeProvisioner:
             self.resources.pop(key, None)
         return InspectResult(InspectState.ABSENT)
 
+    def reconcile(self, intent: dict[str, Any], idempotency_key: str) -> ProvisionResult:
+        """Answer what the synthetic provider already recorded, else provision.
+
+        The worker requires `reconcile` of every email adapter — an adapter
+        without it used to fall to a tail that probed with `inspect`. This
+        keeps the observable behaviour that tail had for the fake (a recorded
+        result is recovered; nothing is re-run that timed out once already)
+        while making omission of the method impossible to distinguish on.
+        """
+        found = self.inspect(idempotency_key)
+        if found.state is InspectState.READY and found.result is not None:
+            return found.result
+        return self.ensure(intent, idempotency_key)
+
 
 class DryRunRuntimeProvisioner(DeterministicFakeProvisioner):
     def __init__(self) -> None:

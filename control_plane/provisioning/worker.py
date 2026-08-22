@@ -1809,30 +1809,38 @@ class ProvisioningWorker:
             and self._missing_current_consent_purpose(job) is not None
         ):
             return self._block_for_missing_content_restriction(job, request)
-        if job.kind == "email_identity" and self._owned_by_deletion(job):
-            # Erasure reconciles ahead of the email branch's preconditions.
+        if job.kind == "email_identity" and (
+            self._owned_by_deletion(job) or self._is_shutdown_action(job)
+        ):
+            # Teardown reconciles ahead of everything adapter-shaped.
             #
-            # That branch returns `secret_namespace_not_ready` before it reaches
-            # its shutdown check, and deletion has already swept the namespace —
-            # it is an external resource like any other. So teardown for a job
-            # deletion owns could never get past that early return, and the
-            # inbox stayed live with erasure unable to complete.
+            # Erasure: the email branch below returns
+            # `secret_namespace_not_ready` before it reaches its shutdown
+            # check, and deletion has already swept the namespace — it is an
+            # external resource like any other. So teardown for a job deletion
+            # owns could never get past that early return, and the inbox
+            # stayed live with erasure unable to complete. Deliberately
+            # narrow: deletion-owned work only.
             #
-            # Deliberately narrow. Every other shutdown reason — withdrawal,
-            # cancel, reset — keeps the existing order, because those leave the
-            # namespace in place and their reconciliation is a settled contract
-            # (`test_late_waiting_response_after_cancel_stays_reconcilable`
-            # pins one). Widening this to all shutdown work changes those and is
-            # a separate question.
+            # Quarantine: withdrawal, cancel and reset settle an in-flight
+            # intent `outcome_unknown/<reason>_requires_reconciliation`. Their
+            # reconciliation always routed to `_shutdown_probe` — but from
+            # INSIDE the email branch, which was gated on the adapter defining
+            # `reconcile`. An adapter without it fell to a tail that probed
+            # with `inspect`, and on every real email adapter `inspect`
+            # mutates (Nerve reissues the API key and rotates the webhook;
+            # Google OAuth calls `ensure`). The route lives HERE, in the
+            # worker's own vocabulary, so no adapter's shape decides whether a
+            # withdrawn household's inbox gets fresh credentials.
             #
-            # And it sits HERE, above the brake, rather than being an exemption
-            # inside it. `_blocked_by_email_kill_switch` is shared with
-            # `_run_once`, where the job may be forward work: a pending job
-            # leased just before erasure began is `running`, deletion leaves
-            # `running` jobs alone deliberately, and exempting it there let a
-            # resumed worker call `ensure` with the brake off — creating new
-            # upstream state during an erasure. Only this path, which cannot
-            # create anything, may pass the brake.
+            # Both sit above the brake rather than being exemptions inside it.
+            # `_blocked_by_email_kill_switch` is shared with `_run_once`,
+            # where the job may be forward work: a pending job leased just
+            # before erasure began is `running`, deletion leaves `running`
+            # jobs alone deliberately, and exempting it there let a resumed
+            # worker call `ensure` with the brake off — creating new upstream
+            # state during an erasure. Only these paths, which cannot create
+            # anything, may pass the brake.
             return self._shutdown_probe(job, request)
         disabled = self._blocked_by_email_kill_switch(job)
         if disabled is not None:
@@ -1947,8 +1955,17 @@ class ProvisioningWorker:
                     job, request, "outcome_unknown", "reconcile_inconclusive"
                 )
             return WorkResult(job.id, "outcome_unknown", "reconcile_inconclusive")
-        reconcile_email = getattr(provider, "reconcile", None)
-        if job.kind == "email_identity" and callable(reconcile_email):
+        if job.kind == "email_identity":
+            reconcile_email = getattr(provider, "reconcile", None)
+            if not callable(reconcile_email):
+                # Fail closed into a refusal, never into an inspect. Shutdown
+                # work was routed to `_shutdown_probe` above the brake, so
+                # only FORWARD reconcile remains here — and resuming forward
+                # work is the adapter's own contract, not something the
+                # worker may substitute a mutating recovery probe for.
+                return self._mark_step_problem(
+                    job, request, "failed", "provider_cannot_reconcile"
+                )
             namespace_ref = self._secret_namespace_ref(job.household_id)
             if namespace_ref is None:
                 return WorkResult(
@@ -1961,24 +1978,6 @@ class ProvisioningWorker:
                 "selection": request["selection"],
                 "secret_namespace_ref": namespace_ref,
             }
-            if self._is_shutdown_action(job):
-                # `NerveManagedEmailProvisioner.reconcile` and its BYO-domain
-                # sibling delegate straight to `ensure`, which resumes the
-                # provisioning graph and can create an org, a domain, an inbox,
-                # a key or a webhook. So this must not call `reconcile` — but
-                # the first version of this guard simply returned, which refused
-                # the INSPECTION too and left the job permanently
-                # `outcome_unknown` with the inbox never found. Refusing to
-                # create and refusing to look are not the same refusal, and the
-                # second one abandons exactly what the quarantine exists to
-                # clean up.
-                #
-                # It asks nothing. `inspect` is NOT read-only on any email
-                # provider — this comment used to say it was, which is the
-                # belief that put a mutating call in a withdrawal path — so the
-                # shutdown acts on durable state and on references it can
-                # derive. See `_shutdown_probe`.
-                return self._shutdown_probe(job, request)
             try:
                 result = reconcile_email(
                     provider_request,
@@ -2019,52 +2018,14 @@ class ProvisioningWorker:
                 return self._mark_step_problem(job, request, "failed", error.code)
             except (OutcomeUnknown, TimeoutError, ConnectionError):
                 return WorkResult(job.id, "outcome_unknown", "reconcile_inconclusive")
-        inspected = provider.inspect(request.get("stable_ref", job.intent_key))
-        if inspected.state is InspectState.READY and inspected.result:
-            try:
-                if job.kind == "email_identity":
-                    if (
-                        job.error_code == "secret_handoff_unknown"
-                        and inspected.result.secret_material.is_empty
-                    ):
-                        namespace_ref_tmp = self._secret_namespace_ref(job.household_id)
-                        if namespace_ref_tmp is None or not self._email_secret_installed(
-                            job, request, namespace_ref_tmp
-                        ):
-                            return WorkResult(
-                                job.id,
-                                "outcome_unknown",
-                                "secret_handoff_unknown",
-                            )
-                    namespace_ref = self._secret_namespace_ref(job.household_id)
-                    if namespace_ref is None or not self._stage_email_secret(
-                        job, request, inspected.result, namespace_ref
-                    ):
-                        return self._mark_step_problem(
-                            job,
-                            request,
-                            "outcome_unknown",
-                            "secret_handoff_unknown",
-                        )
-                else:
-                    self._reject_identity_secret(inspected.result)
-                return self._finish_step(job, request, inspected.result)
-            except _ProjectionCancelled:
-                return self._cleanup_cancelled_result(
-                    job, inspected.result, self.providers.get(job.provider)
-                )
-        if inspected.state is InspectState.FAILED:
-            return self._mark_step_problem(
-                job,
-                request,
-                "failed",
-                inspected.error_code or "provider_rejected",
-            )
-        if inspected.state is InspectState.ABSENT:
-            return self._mark_step_problem(
-                job, request, "failed", "provider_absent"
-            )
-        return WorkResult(job.id, "outcome_unknown", "reconcile_inconclusive")
+        # Every kind the schema allows is handled above. Reaching this point
+        # means a kind was introduced without a reconcile path — refuse
+        # visibly instead of acquiring an inspect path by omission: `inspect`
+        # mutates on the email adapters, and nothing here knows what this
+        # adapter's contract is.
+        return self._mark_step_problem(
+            job, request, "outcome_unknown", "reconcile_unsupported"
+        )
 
     def _mark_step_problem(
         self,
