@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import json
 import pathlib
 import re
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "deploy-production.yml"
 CI_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
+VERCEL_CONFIG = ROOT / "landing" / "vercel.json"
 TEXT = WORKFLOW.read_text(encoding="utf-8")
 CI_TEXT = CI_WORKFLOW.read_text(encoding="utf-8")
+VERCEL = json.loads(VERCEL_CONFIG.read_text(encoding="utf-8"))
 
 CHECKOUT = "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
 SETUP_NODE = "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020"
@@ -42,6 +45,75 @@ EXPECTED_CONCURRENCY_GROUP = (
     "format('abrolia-nondeploy-{0}', github.run_id) }}"
 )
 
+EXPECTED_LANDING_PUBLISH_STEP = r'''        id: deploy
+        env:
+          NO_COLOR: "1"
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ vars.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ vars.VERCEL_PROJECT_ID }}
+        run: |
+          set -euo pipefail
+          : "${VERCEL_TOKEN:?production-landing VERCEL_TOKEN is not configured}"
+          : "${VERCEL_ORG_ID:?production-landing VERCEL_ORG_ID is not configured}"
+          : "${VERCEL_PROJECT_ID:?production-landing VERCEL_PROJECT_ID is not configured}"
+
+          deployment_url="$(
+            vercel deploy --prebuilt --prod --yes --cwd landing --token "$VERCEL_TOKEN"
+          )"
+          case "$deployment_url" in
+            https://*.vercel.app) ;;
+            *) echo "Vercel returned an invalid deployment URL" >&2; exit 1 ;;
+          esac
+          printf 'url=%s\n' "$deployment_url" >> "$GITHUB_OUTPUT"'''
+
+EXPECTED_LANDING_VERIFY_STEP = r'''        env:
+          DEPLOYMENT_URL: ${{ steps.deploy.outputs.url }}
+        run: |
+          set -euo pipefail
+          fetch() {
+            local url="$1"
+            local destination="$2"
+            local status
+            status="$(
+              curl --fail --silent --show-error \
+                --retry 5 --retry-all-errors --retry-delay 2 \
+                --connect-timeout 10 --max-time 30 \
+                --output "$destination" --write-out '%{http_code}' "$url"
+            )"
+            test "$status" = 200
+          }
+
+          protection_headers="$(
+            curl --silent --show-error --head \
+              --retry 5 --retry-all-errors --retry-delay 2 \
+              --connect-timeout 10 --max-time 30 \
+              "${DEPLOYMENT_URL%/}/"
+          )"
+          grep -Eq '^HTTP/[0-9.]+ 302[[:space:]]*$' <<<"$protection_headers"
+          grep -Eiq '^location: https://vercel\.com/sso-api\?url=' \
+            <<<"$protection_headers"
+
+          canonical_file="$RUNNER_TEMP/abrolia-canonical-index.html"
+          canonical_matches=false
+          for _attempt in {1..12}; do
+            if fetch https://abrolia.com/ "$canonical_file" && \
+              cmp --silent landing/index.html "$canonical_file"
+            then
+              canonical_matches=true
+              break
+            fi
+            sleep 5
+          done
+          test "$canonical_matches" = true
+          grep -F 'data-abrolia-logo="handwritten-a"' "$canonical_file"
+          grep -F 'id="join"' "$canonical_file"
+
+          expected_favicon="$(sha256sum landing/favicon.svg | cut -d ' ' -f1)"
+          canonical_favicon_file="$RUNNER_TEMP/abrolia-canonical-favicon.svg"
+          fetch https://abrolia.com/favicon.svg "$canonical_favicon_file"
+          canonical_favicon="$(sha256sum "$canonical_favicon_file" | cut -d ' ' -f1)"
+          test "$canonical_favicon" = "$expected_favicon"'''
+
 
 def _job(name: str) -> str:
     match = re.search(
@@ -55,6 +127,16 @@ def _job(name: str) -> str:
 
 def _compact(value: str) -> str:
     return " ".join(value.split())
+
+
+def _step(job: str, name: str) -> str:
+    match = re.search(
+        rf"^      - name: {re.escape(name)}\n(?P<body>.*?)(?=^      - name: |\Z)",
+        job,
+        re.MULTILINE | re.DOTALL,
+    )
+    assert match, f"missing workflow step: {name}"
+    return match.group("body").rstrip()
 
 
 def _top_level_section(name: str) -> str:
@@ -121,7 +203,7 @@ def test_permissions_dependencies_and_production_concurrency_are_immutable() -> 
     assert _compact(group.group("body")) == EXPECTED_CONCURRENCY_GROUP
     assert concurrency.count("  cancel-in-progress: false\n") == 1
     assert concurrency.count("  queue: max\n") == 1
-    for unsafe in ("continue-on-error", "|| true", "set +e", "@latest"):
+    for unsafe in ("continue-on-error", "|| true", "|| :", "set +e", "@latest"):
         assert unsafe not in TEXT
 
 
@@ -177,6 +259,25 @@ def test_vercel_builds_in_ci_then_publishes_the_prebuilt_output() -> None:
     )
     assert pull < build < recheck < deploy
     assert "https://*.vercel.app" in landing
+    assert landing.count('deployment_url="$(') == 1
+    assert landing.count("deployment_url=") == 1
+    assert (
+        'deployment_url="$(\n'
+        '            vercel deploy --prebuilt --prod --yes --cwd landing '
+        '--token "$VERCEL_TOKEN"\n'
+        '          )"'
+    ) in landing
+    assert 'printf \'url=%s\\n\' "$deployment_url" >> "$GITHUB_OUTPUT"' in landing
+    assert _step(landing, "Publish the prebuilt landing artifact") == (
+        EXPECTED_LANDING_PUBLISH_STEP
+    )
+
+
+def test_landing_routes_the_public_root_without_a_clean_url_transform() -> None:
+    assert set(VERCEL) == {"$schema", "trailingSlash", "rewrites", "headers"}
+    assert "cleanUrls" not in VERCEL
+    assert VERCEL["rewrites"] == [{"source": "/", "destination": "/index.html"}]
+    assert VERCEL["trailingSlash"] is False
 
 
 def test_fly_deploy_uses_the_root_context_and_pinned_target() -> None:
@@ -208,13 +309,41 @@ def test_live_verification_is_required_for_both_frontends() -> None:
     deploy = landing.index("vercel deploy --prebuilt")
     verify = landing.index("Verify the deployment and canonical landing domain")
     assert deploy < verify
+    assert _step(landing, "Verify the deployment and canonical landing domain") == (
+        EXPECTED_LANDING_VERIFY_STEP
+    )
     assert "${DEPLOYMENT_URL%/}/" in landing
     assert "https://abrolia.com/" in landing
-    assert 'test "$deployed_body" = "$expected_body"' in landing
-    assert '[[ "$canonical_body" == "$expected_body" ]]' in landing
-    assert "sha256sum landing/favicon.svg" in landing
+    protection = landing[
+        landing.index('protection_headers="$(') : landing.index(
+            'canonical_file="$RUNNER_TEMP/'
+        )
+    ]
+    assert "curl --silent --show-error --head" in protection
+    assert '"${DEPLOYMENT_URL%/}/"' in protection
+    assert "--location" not in protection
+    assert "HTTP/[0-9.]+ 302" in protection
+    assert r"vercel\.com/sso-api\?url=" in protection
+    assert '--output "$destination" --write-out \'%{http_code}\'' in landing
+    assert 'test "$status" = 200' in landing
+    assert "--location" not in landing
+    assert 'canonical_matches=false' in landing
+    assert 'cmp --silent landing/index.html "$canonical_file"' in landing
+    assert 'test "$canonical_matches" = true' in landing
+    assert '[[ "$canonical_body" == "$expected_body" ]]' not in landing
+    assert 'expected_favicon="$(sha256sum landing/favicon.svg' in landing
+    assert 'fetch https://abrolia.com/favicon.svg "$canonical_favicon_file"' in landing
+    assert 'canonical_favicon="$(sha256sum "$canonical_favicon_file"' in landing
+    assert 'test "$canonical_favicon" = "$expected_favicon"' in landing
     assert 'data-abrolia-logo=\"handwritten-a\"' in landing
     assert 'id=\"join\"' in landing
+    for bypass in (
+        "VERCEL_AUTOMATION_BYPASS_SECRET",
+        "x-vercel-protection-bypass",
+        "--protection-bypass",
+        "vercel curl",
+    ):
+        assert bypass.casefold() not in TEXT.casefold()
 
     fly_deploy = control_plane.index("flyctl deploy .")
     live_verify = control_plane.index(

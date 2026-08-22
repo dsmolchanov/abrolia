@@ -423,6 +423,31 @@ CREATE TABLE channel_bindings (
   run publishes the exact tested commit to both providers and verifies `abrolia.com` and
   `app.abrolia.com` before reporting success.
 
+#### Step E6d — Protected landing root deployment
+
+**Files:** `.github/workflows/deploy-production.yml`, `landing/vercel.json`,
+`landing/README.md`, `tests/test_deploy_workflow.py`.
+
+**Branches:** `codex/fix-production-landing-route`.
+
+**Scope:**
+
+- Route the public root `/` explicitly to the static `index.html` artifact without Vercel's
+  `cleanUrls` transform, which otherwise publishes the file at `/index` and leaves `/` missing.
+- Preserve Standard Deployment Protection on generated `*.vercel.app` URLs. Verify its SSO
+  challenge directly instead of creating or exposing an automation-bypass secret.
+- Keep the canonical `https://abrolia.com/` and favicon checks byte-identical to the tested source
+  so a successful workflow still proves that the tested commit reached the public brand surface.
+
+**Acceptance:**
+
+- A deterministic configuration contract requires the explicit root rewrite and rejects the
+  conflicting clean-URL transform.
+- A deterministic workflow contract requires the generated URL to remain protected, forbids
+  protection bypasses, and retains exact source comparisons on the canonical domain.
+- The post-merge release reports green with `/` serving the tested landing page publicly while its
+  generated Vercel deployment URL remains behind the provider SSO challenge.
+
 #### Step E7 — Observability
 
 **Files:** `control_plane/observability.py`, `hermes_cloud/core/observability.py`, `deploy/control-plane/Dockerfile` (log config), `docs/onboarding-runbook.md` (alert runbook).
