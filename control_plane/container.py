@@ -228,7 +228,14 @@ class ControlPlaneContainer:
             email_identities=email_identities,
             runtime_provider=config.runtime_provider,
             bootstrap_ttl_seconds=config.bootstrap_ttl_seconds,
-            real_email_authorized=config.real_email_enabled,
+            # The allowlist itself, not a boolean derived from it. Empty when
+            # the brake is on, so an unauthorized household is refused by
+            # absence rather than by a flag nobody re-checks.
+            real_email_authorized_households=(
+                config.real_email_household_allowlist
+                if config.real_email_enabled
+                else frozenset()
+            ),
             logger=StructuredLogger(sys.stderr),
         )
         bootstrap = BootstrapService(configs, onboarding_repository, jobs)

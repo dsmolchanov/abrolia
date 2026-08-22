@@ -210,7 +210,7 @@ OAuth / History is explicitly deferred to the start of Phase E and remains track
 `docs/onboarding-runbook.md`,
 `thoughts/shared/plans/2026-08-06-phase-DE-pilot.md`.
 
-**Branches:** `codex/phase-F-email-option-kill-switches`, `codex/phase-F-hide-cut-email-cards`, `codex/phase-F-retire-the-dead-managed-switch`.
+**Branches:** `codex/phase-F-email-option-kill-switches`, `codex/phase-F-hide-cut-email-cards`, `codex/phase-F-retire-the-dead-managed-switch`, `codex/phase-F-allowlist-at-dispatch`.
 
 **Scope corrected 2026-08-21.** "feature-flag table" named a document rather
 than the code, and the module that implements the switches was never listed —

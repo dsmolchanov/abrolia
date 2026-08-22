@@ -305,6 +305,47 @@ makes a review loop unable to terminate.
   was validated. Enforced by
   `tests/control_plane/test_real_email_wiring.py::test_the_env_brake_cannot_authorize_what_the_config_refused`.
 
+  **A brake carries the whole authorization, not a summary of it.** The worker
+  was given `real_email_enabled` as one boolean, which discarded
+  `real_email_household_allowlist`: a household queued while allowlisted kept
+  its authorization after the allowlist was narrowed to exclude it, because the
+  durable job carries only its own `household_id` and dispatch asked whether
+  real email was on *anywhere*. Selection checks the allowlist, but a durable
+  job outlives its selection. The worker now holds the frozen SET and asks
+  membership. Enforced by
+  `test_a_household_removed_from_the_allowlist_cannot_still_dispatch`,
+  `test_membership_is_what_the_brake_asks`, and
+  `test_the_container_authorizes_nobody_while_the_brake_is_on` — the last
+  because handing the list through with the brake on would let `0 -> 1`
+  authorize households the configuration never did.
+
+  **Erasure owns its ambiguity, and says so durably.** Deletion cancels only
+  `pending` and `waiting_user`, correctly: an `outcome_unknown` job may have
+  created something upstream and must be reconciled, not discarded. But
+  reconciliation re-applies every forward precondition, so a job the kill switch
+  settled carried `real_email_disabled` — no reconciliation suffix — and the
+  brake blocked it again forever. Erasure could not reach the provider for
+  exactly the resource whose creation was uncertain. Deletion now reclassifies
+  its OWN household's ambiguous jobs to `deletion_requires_reconciliation`, and
+  `_reconcile` routes those to `_shutdown_probe` ahead of the email branch,
+  whose `secret_namespace_not_ready` early return would otherwise stop them —
+  deletion has already swept the namespace, it being an external resource like
+  any other.
+
+  Two things this must NOT be. It must not suffix the brake's own error code:
+  that code is written for live households too, and suffixing it exempts every
+  braked job from its own brake. And it must not reclassify beyond the household
+  being erased, which would make one deletion a global release. Enforced by
+  `test_deletion_can_tear_down_a_job_the_brake_settled`,
+  `test_deletion_reclassifies_only_its_own_households_jobs`, and
+  `test_the_brake_code_alone_is_never_reconciliation_work`.
+
+  The route is deliberately narrow — deletion-owned work only. Withdrawal,
+  cancel and reset leave the namespace in place and their reconciliation is a
+  settled contract; widening it to all shutdown work breaks
+  `test_late_waiting_response_after_cancel_stays_reconcilable` and is a separate
+  question.
+
   This also settles where such a brake may be read. Registration cannot carry
   it, and the worker holds no `ControlPlaneConfig`, so it is read from the
   environment at call time — a deliberate second reader of a variable the

@@ -39,6 +39,7 @@ from control_plane.privacy.consent import (
     manifest_required_purposes,
     processes_real_household_content,
 )
+from control_plane.privacy.delete import DELETION_RECONCILIATION_CODE
 from control_plane.privacy.runtime import RUNTIME_REF
 from control_plane.privacy.withdraw import REVOKE_CONSENT_OPERATION
 from control_plane.providers.email.nerve_client import (
@@ -127,7 +128,7 @@ class ProvisioningWorker:
         secret_sink: SecretSink,
         email_identities: EmailIdentityRepository | None = None,
         worker_id: str = "worker",
-        real_email_authorized: bool = False,
+        real_email_authorized_households: frozenset[str] = frozenset(),
         runtime_provider: str = "dry-run-runtime",
         bootstrap_ttl_seconds: int = 3600,
         max_safe_attempts: int = 5,
@@ -145,16 +146,19 @@ class ProvisioningWorker:
         self.secret_sink = secret_sink
         self.email_identities = email_identities
         self.worker_id = worker_id
-        #: Whether the VALIDATED configuration authorized real email at boot.
+        #: The households the VALIDATED configuration authorized for real email
+        #: at boot — empty when the brake was on, so absence is fail-closed.
         #:
-        #: The live environment can only ever subtract from this. Reading
-        #: `ABROLIA_REAL_EMAIL_ENABLED` alone made `0 -> 1` an authorization:
-        #: a process booted with the brake on and an allowlist that excludes a
-        #: household would dispatch that household's durable Nerve job the
-        #: moment the variable flipped, even though the frozen configuration
-        #: this worker was built from never permitted it. The allowlist is
-        #: checked where it was validated; a brake must not be a way around it.
-        self.real_email_authorized = real_email_authorized
+        #: A SET, not a boolean. Reducing it to "real email is on somewhere"
+        #: discarded `real_email_household_allowlist` at dispatch: a household
+        #: queued while allowlisted kept its authorization after the allowlist
+        #: was narrowed to exclude it, because its job carries only its own
+        #: `household_id` and nothing re-asked. Selection checks the allowlist,
+        #: but a durable job outlives its selection.
+        #:
+        #: The live environment is ANDed with membership and can only subtract:
+        #: `0 -> 1` must never authorize a household this frozen set omits.
+        self.real_email_authorized_households = real_email_authorized_households
         self.runtime_provider = runtime_provider
         self.bootstrap_ttl_seconds = bootstrap_ttl_seconds
         self.max_safe_attempts = max_safe_attempts
@@ -1456,7 +1460,11 @@ class ProvisioningWorker:
         # The managed/BYO brake. The adapters stay registered so teardown can
         # resolve them, which means absence no longer stops forward work and
         # this is the only thing that does.
-        if real_email and not (self.real_email_authorized and is_real_email_enabled()):
+        authorized = (
+            job.household_id in self.real_email_authorized_households
+            and is_real_email_enabled()
+        )
+        if real_email and not authorized:
             return "real_email_disabled"
         if flag is None:
             return None
@@ -1500,6 +1508,20 @@ class ProvisioningWorker:
             # the brake's own, less informative, reason.
             return WorkResult(job.id, "outcome_unknown", job.error_code)
         return self._mark_step_problem(job, request, "outcome_unknown", code)
+
+    def _owned_by_deletion(self, job: JobRecord) -> bool:
+        """Whether erasure claimed this ambiguous job as its own teardown.
+
+        Read from the row, not the record: deletion rewrites the code after the
+        `JobRecord` in hand was loaded.
+        """
+        current = self.jobs.db.query_one(
+            "SELECT error_code FROM provisioning_jobs WHERE id = ?", (job.id,)
+        )
+        return (
+            current is not None
+            and current["error_code"] == DELETION_RECONCILIATION_CODE
+        )
 
     def _is_shutdown_action(self, job: JobRecord) -> bool:
         """Work that exists BECAUSE a consent went away.
@@ -1779,6 +1801,22 @@ class ProvisioningWorker:
         disabled = self._blocked_by_email_kill_switch(job)
         if disabled is not None:
             return self._brake_email_option(job, request, disabled)
+        if job.kind == "email_identity" and self._owned_by_deletion(job):
+            # Erasure reconciles ahead of the email branch's preconditions.
+            #
+            # That branch returns `secret_namespace_not_ready` before it reaches
+            # its shutdown check, and deletion has already swept the namespace —
+            # it is an external resource like any other. So teardown for a job
+            # deletion owns could never get past that early return, and the
+            # inbox stayed live with erasure unable to complete.
+            #
+            # Deliberately narrow. Every other shutdown reason — withdrawal,
+            # cancel, reset — keeps the existing order, because those leave the
+            # namespace in place and their reconciliation is a settled contract
+            # (`test_late_waiting_response_after_cancel_stays_reconcilable`
+            # pins one). Widening this to all shutdown work changes those and is
+            # a separate question.
+            return self._shutdown_probe(job, request)
         provider = self.providers.get(job.provider)
         if job.kind == "cleanup":
             deferred = self._defer_runtime_cleanup(job, request)

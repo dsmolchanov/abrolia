@@ -14,9 +14,16 @@ from control_plane.privacy.consent import (
     HOUSEHOLD_CONTENT_PURPOSE,
     consent_version_and_sha,
 )
-from control_plane.privacy.delete import DeletionService
-from control_plane.provisioning.contracts import InspectResult, InspectState
+from control_plane.privacy.delete import (
+    DELETION_RECONCILIATION_CODE,
+    DeletionService,
+)
+from control_plane.provisioning.contracts import (
+    InspectResult,
+    InspectState,
+)
 from control_plane.provisioning.fakes import synthetic_provider_registry
+from control_plane.repositories.jobs import requires_reconciliation
 
 
 def test_production_container_registers_real_nerve_providers_fail_closed(
@@ -665,10 +672,347 @@ def test_the_env_brake_cannot_authorize_what_the_config_refused(
     registry = synthetic_provider_registry()
     registry.register(provider, recorder)
     worker = cp_stack.make_worker(providers=registry, now=now + 10)
-    worker.real_email_authorized = False
+    worker.real_email_authorized_households = frozenset()
 
     result = worker.run_once()
 
     assert result is not None and result.job_id == job_id
     assert result.error_code == "real_email_disabled"
     assert recorder.torn_down == []
+
+
+# ---------------------------------------------------------------------------
+# Composition cases. Each focused piece below already passed on its own; these
+# are the sequences that cross them.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("provider", NERVE_PROVIDERS)
+def test_a_household_removed_from_the_allowlist_cannot_still_dispatch(
+    cp_stack, monkeypatch: pytest.MonkeyPatch, provider: str
+) -> None:
+    """Queued while allowlisted, narrowed afterwards.
+
+    Selection checks `real_email_household_allowlist`, but a durable job
+    outlives its selection: it carries a provider name and a household id, and
+    nothing re-asked. Reducing the boot-time authorization to one global boolean
+    meant H1 kept its authorization once the allowlist was narrowed to H2 —
+    real email is still enabled *somewhere*, and that was the whole question
+    dispatch asked.
+    """
+
+    cp_stack.complete_profile()
+    _hold_both_consents(cp_stack, now=1_760_000_000.0)
+    monkeypatch.setenv("ABROLIA_REAL_EMAIL_ENABLED", "1")
+
+    now = 1_760_000_000.0
+    workflow = cp_stack.onboarding.workflow_for_household(cp_stack.household.id)
+    with cp_stack.jobs.db.write() as connection:
+        job_id, _created = cp_stack.jobs.create(
+            connection,
+            household_id=cp_stack.household.id,
+            workflow_id=workflow.id,
+            kind="email_identity",
+            operation="ensure",
+            intent_key=f"{cp_stack.household.id}:narrowed:{provider}",
+            request={
+                "household_id": cp_stack.household.id,
+                "stable_ref": f"{cp_stack.household.id}:inbox",
+            },
+            provider=provider,
+            now=now,
+        )
+
+    recorder = _RecordingNerve()
+    registry = synthetic_provider_registry()
+    registry.register(provider, recorder)
+    worker = cp_stack.make_worker(providers=registry, now=now + 10)
+    # Restarted with real email still on, but the allowlist now names a
+    # different household.
+    worker.real_email_authorized_households = frozenset(
+        {"20000000-0000-4000-8000-0000000000ff"}
+    )
+
+    result = worker.run_once()
+
+    assert result is not None and result.job_id == job_id
+    assert result.error_code == "real_email_disabled"
+
+
+@pytest.mark.parametrize("provider", NERVE_PROVIDERS)
+def test_membership_is_what_the_brake_asks(
+    cp_stack, monkeypatch: pytest.MonkeyPatch, provider: str
+) -> None:
+    """The control, asked of the predicate rather than of a whole dispatch.
+
+    Driving `run_once` proves the negative well — a braked job stops before any
+    provider call whatever its shape. It is a poor control: the two Nerve
+    providers need different request fields, so "no provider call" is satisfied
+    by any unrelated early return, and the test would pass with the allowlist
+    check deleted. The predicate is the thing the finding is about, so ask it.
+    """
+
+    cp_stack.complete_profile()
+    _hold_both_consents(cp_stack, now=1_760_000_000.0)
+    monkeypatch.setenv("ABROLIA_REAL_EMAIL_ENABLED", "1")
+    # `nerve-byo-domain` answers to the per-option switch as well, and that one
+    # is checked first. This test is about the allowlist, so the other gate is
+    # opened rather than measured.
+    monkeypatch.setenv("ABROLIA_BYO_EMAIL_ENABLED", "1")
+
+    now = 1_760_000_000.0
+    workflow = cp_stack.onboarding.workflow_for_household(cp_stack.household.id)
+    with cp_stack.jobs.db.write() as connection:
+        job_id, _created = cp_stack.jobs.create(
+            connection,
+            household_id=cp_stack.household.id,
+            workflow_id=workflow.id,
+            kind="email_identity",
+            operation="ensure",
+            intent_key=f"{cp_stack.household.id}:membership:{provider}",
+            request={"household_id": cp_stack.household.id},
+            provider=provider,
+            now=now,
+        )
+    job = cp_stack.jobs.get(job_id)
+    worker = cp_stack.make_worker(now=now + 10)
+
+    worker.real_email_authorized_households = frozenset({cp_stack.household.id})
+    assert worker._blocked_by_email_kill_switch(job) is None
+
+    worker.real_email_authorized_households = frozenset(
+        {"20000000-0000-4000-8000-0000000000ff"}
+    )
+    assert worker._blocked_by_email_kill_switch(job) == "real_email_disabled"
+
+    # And the environment still subtracts from membership rather than adding.
+    worker.real_email_authorized_households = frozenset({cp_stack.household.id})
+    monkeypatch.setenv("ABROLIA_REAL_EMAIL_ENABLED", "0")
+    assert worker._blocked_by_email_kill_switch(job) == "real_email_disabled"
+
+
+class _ReconcilableNerve(_RecordingNerve):
+    """Has `reconcile`, as all three real email adapters do.
+
+    A stub without it falls past the shutdown guard to a tail that inspects, so
+    omitting it would test a path production never takes.
+    """
+
+    def reconcile(self, request, idempotency_key):  # noqa: ANN001, ANN201
+        raise AssertionError("shutdown work must never resume provisioning")
+
+
+@pytest.mark.parametrize("provider", NERVE_PROVIDERS)
+def test_deletion_can_tear_down_a_job_the_brake_settled(
+    cp_stack, monkeypatch: pytest.MonkeyPatch, provider: str
+) -> None:
+    """Brake -> erase -> reconcile must reach teardown.
+
+    The kill switch settles a reclaimed job `outcome_unknown/real_email_disabled`
+    to keep it reconcilable. Deletion cancels only `pending` and `waiting_user`
+    — correctly, since an ambiguous job may have created something upstream —
+    so that job survived, and `reconcile` re-applied the brake to it forever.
+    Erasure could never reach the provider for exactly the resource whose
+    creation was uncertain: the sweep recorded `unknown` and the inbox stayed
+    live with no path to removal.
+
+    The fix is NOT to give the brake's own error code the reconciliation
+    suffix — that code is written for live households too, and suffixing it
+    would exempt every braked job from its own brake. Deletion reclassifies,
+    and only its own household's jobs.
+    """
+
+    cp_stack.complete_profile()
+    _hold_both_consents(cp_stack, now=1_760_000_000.0)
+
+    now = 1_760_000_000.0
+    external_ref = "nerve:org:created-before-the-brake"
+    workflow = cp_stack.onboarding.workflow_for_household(cp_stack.household.id)
+    with cp_stack.jobs.db.write() as connection:
+        job_id, _created = cp_stack.jobs.create(
+            connection,
+            household_id=cp_stack.household.id,
+            workflow_id=workflow.id,
+            kind="email_identity",
+            operation="ensure",
+            intent_key=f"{cp_stack.household.id}:erase-braked:{provider}",
+            request={
+                "household_id": cp_stack.household.id,
+                "stable_ref": f"{cp_stack.household.id}:inbox",
+                "external_ref": external_ref,
+                "email_identity_id": "40000000-0000-4000-8000-000000000001",
+                "option": "managed_abrolia",
+                "selection": {"kind": "abrolia_managed", "local_part": "family-agent"},
+            },
+            provider=provider,
+            now=now,
+        )
+        # Reclaimed from a dead lease: it may have reached the provider.
+        connection.execute(
+            "UPDATE provisioning_jobs SET status = 'running', leased_by = 'dead-worker',"
+            " lease_until = ? WHERE id = ?",
+            (now - 1.0, job_id),
+        )
+
+        # A ready secret namespace, as any job that reached a provider would
+        # have. Without it the email reconcile path returns
+        # `secret_namespace_not_ready` before the shutdown check, and the test
+        # would exercise a state production does not reach.
+        namespace = cp_stack.jobs.encrypt_json(
+            "external_resources", "ns-erase", "external_id", "synthetic-namespace"
+        )
+        connection.execute(
+            "INSERT INTO external_resources (id, household_id, provider, resource_type,"
+            " stable_name, external_id_ciphertext, encryption_key_version, status,"
+            " created_at, updated_at)"
+            " VALUES ('ns-erase', ?, 'dry-run-runtime', 'secret_namespace', 'ns', ?, ?,"
+            " 'ready', ?, ?)",
+            (
+                cp_stack.household.id,
+                namespace.ciphertext,
+                namespace.key_version,
+                now,
+                now,
+            ),
+        )
+
+    monkeypatch.setenv("ABROLIA_REAL_EMAIL_ENABLED", "0")
+    recorder = _ReconcilableNerve()
+    registry = synthetic_provider_registry()
+    registry.register(provider, recorder)
+
+    braked = cp_stack.make_worker(providers=registry, now=now + 10).run_once()
+    assert braked.status == "outcome_unknown"
+    assert braked.error_code == "real_email_disabled"
+
+    deletion = DeletionService(
+        cp_stack.accounts,
+        cp_stack.auth,
+        cp_stack.households,
+        cp_stack.jobs,
+        registry,
+        runtime=_AbsentRuntime(),
+    )
+    deletion.delete(
+        cp_stack.account.id,
+        cp_stack.household.id,
+        idempotency_key=f"erase-braked-{provider}",
+        now=now + 20,
+    )
+
+    reclassified = cp_stack.jobs.get(job_id)
+    assert reclassified is not None
+    assert reclassified.error_code == "deletion_requires_reconciliation", (
+        "deletion left the job carrying the brake's code, so reconcile re-brakes it"
+    )
+
+    result = cp_stack.make_worker(providers=registry, now=now + 30).reconcile(job_id)
+    assert result.error_code != "real_email_disabled", (
+        "the brake was re-applied to work erasure owns"
+    )
+
+    # Teardown is ARRANGED from durable state, never by asking the provider:
+    # `inspect` reissues keys on the real Nerve adapter.
+    # `_RecordingNerve.ensure`/`inspect` raise, so reaching either would have
+    # surfaced as a failure above rather than silently here.
+    assert recorder.torn_down == []
+    cleanup = cp_stack.database.query_one(
+        "SELECT id FROM provisioning_jobs WHERE household_id = ?"
+        " AND kind = 'cleanup' ORDER BY created_at DESC LIMIT 1",
+        (cp_stack.household.id,),
+    )
+    assert cleanup is not None, "erasure scheduled nothing to remove the inbox"
+
+
+def test_the_brake_code_alone_is_never_reconciliation_work() -> None:
+    """The trap the fix had to avoid.
+
+    Suffixing `real_email_disabled` would have been one line and would have
+    exempted every braked job — live households included — from its own brake.
+    Only deletion reclassifies.
+    """
+
+    assert not requires_reconciliation("real_email_disabled")
+    assert requires_reconciliation(DELETION_RECONCILIATION_CODE)
+
+
+def test_the_container_authorizes_nobody_while_the_brake_is_on(tmp_path) -> None:
+    """The allowlist is only an authorization when real email is enabled.
+
+    Nothing forbids a configuration that carries an allowlist with the brake on
+    — `validate` requires a non-empty one only when real email is enabled. If
+    the container handed that list through regardless, the live environment
+    going `0 -> 1` would authorize those households against a configuration that
+    never did, which is the brake adding rather than subtracting.
+    """
+
+    household_id = "10000000-0000-4000-8000-000000000005"
+    braked = _nerve_block(
+        tmp_path,
+        real_email_enabled=False,
+        real_email_household_allowlist=frozenset({household_id}),
+    ).validate()
+
+    with ControlPlaneContainer.build(braked) as container:
+        assert container.worker.real_email_authorized_households == frozenset()
+
+
+def test_deletion_reclassifies_only_its_own_households_jobs(
+    cp_stack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The trap named in review, asserted.
+
+    Marking ambiguity as shutdown work is what lets erasure reach teardown past
+    the brake. Doing it for every braked job — rather than only for the
+    household being erased — would exempt live households from their own brake,
+    turning one household's deletion into a global release.
+    """
+
+    now = 1_760_000_000.0
+    cp_stack.complete_profile()
+    _hold_both_consents(cp_stack, now=now)
+
+    # A second household with its own braked, ambiguous job.
+    other_account = cp_stack.accounts.create_verified("other@family.test", now=now)
+    other = cp_stack.households.create_for_owner(other_account.id, now=now)
+    other_workflow = cp_stack.onboarding.workflow_for_household(other.id)
+    with cp_stack.jobs.db.write() as connection:
+        other_job, _created = cp_stack.jobs.create(
+            connection,
+            household_id=other.id,
+            workflow_id=other_workflow.id,
+            kind="email_identity",
+            operation="ensure",
+            intent_key=f"{other.id}:live-braked",
+            request={"household_id": other.id},
+            provider="nerve-managed",
+            now=now,
+        )
+        connection.execute(
+            "UPDATE provisioning_jobs SET status = 'outcome_unknown',"
+            " error_code = 'real_email_disabled' WHERE id = ?",
+            (other_job,),
+        )
+
+    registry = synthetic_provider_registry()
+    registry.register("nerve-managed", _ReconcilableNerve())
+    DeletionService(
+        cp_stack.accounts,
+        cp_stack.auth,
+        cp_stack.households,
+        cp_stack.jobs,
+        registry,
+        runtime=_AbsentRuntime(),
+    ).delete(
+        cp_stack.account.id,
+        cp_stack.household.id,
+        idempotency_key="scoped-delete",
+        now=now + 20,
+    )
+
+    untouched = cp_stack.jobs.get(other_job)
+    assert untouched is not None
+    assert untouched.error_code == "real_email_disabled", (
+        "deleting one household released another household's braked job"
+    )
+    assert not requires_reconciliation(untouched.error_code)
