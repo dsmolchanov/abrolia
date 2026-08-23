@@ -208,7 +208,11 @@ OAuth / History is explicitly deferred to the start of Phase E and remains track
 `control_plane/privacy/delete.py`, `tests/control_plane/test_real_email_wiring.py`,
 `tests/control_plane/email/conftest.py`, `tests/control_plane/conftest.py`,
 `docs/onboarding-runbook.md`,
-`thoughts/shared/plans/2026-08-06-phase-DE-pilot.md`.
+`thoughts/shared/plans/2026-08-06-phase-DE-pilot.md`,
+`.phase-f-mutations.py`, `control_plane/provisioning/contracts.py`,
+`control_plane/provisioning/fakes.py`,
+`tests/control_plane/email/test_identity.py`,
+`tests/control_plane/test_consent_withdrawal.py`.
 
 **Branches:** `codex/phase-F-email-option-kill-switches`, `codex/phase-F-hide-cut-email-cards`, `codex/phase-F-retire-the-dead-managed-switch`, `codex/phase-F-allowlist-at-dispatch`.
 
@@ -247,6 +251,20 @@ that already diverged once over the Art. 9(2)(a) consent and made browser
 onboarding impossible. The page now asks the gate's own predicate
 (`email_option_offered`), and enumerates options from `EMAIL_SELECTION_KINDS`
 rather than a fourth hard-coded list.
+
+**Round 4, 2026-08-23.** The closure design pass
+(`thoughts/shared/plans/2026-08-22-phase-F-closure-design-pass.md`) hoisted the
+reconcile contract onto the worker instead of the adapters' good manners: the
+`Provisioner` protocol now declares `reconcile`
+(`control_plane/provisioning/contracts.py`), and the deterministic fake
+implements it (`control_plane/provisioning/fakes.py`). Two suites whose stub
+adapters silently depended on the deleted inspect tail were renegotiated onto
+the contract rather than left asserting its old semantics
+(`tests/control_plane/email/test_identity.py`,
+`tests/control_plane/test_consent_withdrawal.py`). `.phase-f-mutations.py`
+is the mutation harness that proves the new erasure sequence test kills its
+defects; it is committed because an uncommitted proof proves nothing to the
+next reader.
 
 **Changes:**
 1. Per-provider flags, `default off`, fail-closed, toggle tested. **Consolidated
