@@ -97,6 +97,51 @@ a refusal.
 - Mutations M1–M4 re-proved KILLED at this head; M5 (derivation disabled)
   added and KILLED. Full non-live suite green, ruff clean.
 
+## Round twelve (2026-08-23) — the late ProviderWaiting
+
+The eleventh generation's verdict found one more member of the family, and
+this one was a race no existing test held: a call still IN FLIGHT when the
+deletion transaction commits is reached by nothing delete() runs — the sweep
+cancels only `pending`/`waiting_user`, deliberately leaving running work to
+prove its outcome — and if that answer comes back as `ProviderWaiting`,
+`_schedule_cancelled_waiting_cleanup` refused the `running` row (its guard
+accepted only `outcome_unknown`). The handler then settled `waiting_user`,
+which nothing in erasure reads: not the sweep that already ran, not
+`resume`'s unresolved scan (`running`/`outcome_unknown` only). A live
+org/inbox/key behind an erasure that completes anyway.
+
+- Fix shape, per the reviewer's prescription: deletion ownership is asked
+  BEFORE the status restriction. A `running` row of a household whose status
+  is `deleting`/`deleted` is admitted; the SAME transaction settles it
+  `outcome_unknown`, records the external resource under the answer's own
+  reference, and schedules the cleanup (`jobs.create` is intent-idempotent
+  and `_external_resource` upserts by stable name, so the later probe pass
+  through reconcile re-enters harmlessly). A returned WorkResult is only
+  telemetry — handlers settle themselves — so the transition lives in the
+  write, which is also what makes it atomic.
+- Reference-less waiting shapes go through the handler's ownership branch:
+  BYO DNS legitimately names no resource yet, and the synthetic validator
+  REFUSES a reference on any waiting answer outright. For them there is no
+  scheduled cleanup from the answer — the job lands unresolved where
+  reconcile routes it to the shutdown probe, which derives what Round five's
+  machinery established (or refuses with a named reason).
+- `test_a_waiting_answer_arriving_after_erasure_begins_is_still_torn_down`
+  parameterizes all four provider contracts over their REAL waiting shapes:
+  google-oauth (`google-oauth:<id>`), nerve-managed (canonical-JSON
+  reference with typed attachment readiness), nerve-byo-domain (DNS wait,
+  no reference), fake-email (no reference, contract-forbidden). Each parks
+  its adapter on a gate inside `ensure`, leases, begins erasure while the
+  call is parked, releases the answer, and drives reconcile → cleanup →
+  parent `cancelled_and_compensated` → identity deleted → reservation
+  released → resume complete → household row gone. The with-ref arms pin
+  that the teardown was scheduled by the answering worker itself, before
+  any reconcile.
+- Mutations M6 (a running row is never admitted) and M7 (erasure never owns
+  the reference-less answer) both KILLED; M1–M5 re-proved at this head.
+- `.check-fixtures-allow`: one exact-value entry — the managed contract's
+  `<local_part>@abrolia.com` is production by definition, so the regression
+  cannot use a documentation-domain placeholder.
+
 # Phase F Closure — Erasure Sequence Guarantee and the Reconcile Contract Hoist
 
 ## Overview

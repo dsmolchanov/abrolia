@@ -97,6 +97,45 @@ MUTATIONS = [
             f"{WIRING}::test_an_ambiguous_synthetic_job_tears_down_the_reference_it_can_derive",
         ],
     },
+    {
+        "name": "M6 a running row is never admitted to the late-waiting cleanup",
+        "why": (
+            "Round twelve: a ProviderWaiting arriving after the deletion"
+            " transaction must schedule its teardown while its worker still"
+            " holds the answer, not settle waiting_user where nothing looks"
+        ),
+        "file": "control_plane/provisioning/worker.py",
+        "old": """            if not self._owned_by_deletion(job):
+                return None
+        elif current["status"] != "outcome_unknown":
+""",
+        "new": """            return None  # MUTATION M6: a running row is never admitted
+        elif current["status"] != "outcome_unknown":
+""",
+        "tests": [
+            f"{WIRING}::test_a_waiting_answer_arriving_after_erasure_begins_is_still_torn_down[google-oauth]",
+            f"{WIRING}::test_a_waiting_answer_arriving_after_erasure_begins_is_still_torn_down[nerve-managed]",
+        ],
+    },
+    {
+        "name": "M7 erasure never owns the reference-less waiting answer",
+        "why": (
+            "Round twelve: contracts whose waiting shape carries no reference"
+            " (BYO DNS, synthetic) must land unresolved where reconcile can"
+            " derive their teardown, not stranded as waiting_user"
+        ),
+        "file": "control_plane/provisioning/worker.py",
+        "old": """        if self._owned_by_deletion(job):
+            # A waiting answer that arrives after the deletion transaction has
+""",
+        "new": """        if False:  # MUTATION M7: erasure never owns this answer
+            # A waiting answer that arrives after the deletion transaction has
+""",
+        "tests": [
+            f"{WIRING}::test_a_waiting_answer_arriving_after_erasure_begins_is_still_torn_down[nerve-byo-domain]",
+            f"{WIRING}::test_a_waiting_answer_arriving_after_erasure_begins_is_still_torn_down[fake-email]",
+        ],
+    },
 ]
 
 

@@ -1,12 +1,20 @@
 from __future__ import annotations
 
+import json
+import threading
 from dataclasses import replace
 
 import pytest
 
 from control_plane.config import ConfigurationError, ControlPlaneConfig
 from control_plane.container import ControlPlaneContainer
+from control_plane.crypto import normalize_email
 from control_plane.db import new_id
+from control_plane.email.models import (
+    EmailDnsPublicStatus,
+    EmailGoogleOAuthPublicStatus,
+    EmailNerveAttachmentPublicStatus,
+)
 from control_plane.models import StepKind
 from control_plane.onboarding.contracts import IdempotencyConflict, InvalidTransition
 from control_plane.privacy.consent import (
@@ -17,10 +25,15 @@ from control_plane.privacy.consent import (
 from control_plane.privacy.delete import (
     DeletionService,
 )
+from control_plane.providers.email.nerve_client import (
+    email_org_external_ref,
+    org_teardown_ref,
+)
 from control_plane.provisioning.contracts import (
     InspectResult,
     InspectState,
     ProviderRegistry,
+    ProviderWaiting,
 )
 from control_plane.provisioning.fakes import (
     DeterministicFakeProvisioner,
@@ -1729,6 +1742,379 @@ def test_an_ambiguous_synthetic_job_tears_down_the_reference_it_can_derive(
             "the local part stayed held after the inbox finished disconnecting:"
             f" {reservation['status']}"
         )
+
+
+class _InFlightEmailCall:
+    """An adapter parked inside `ensure` until the test releases its gate.
+
+    The run under test: the call leases, erasure begins while it is in
+    flight, and only then does the provider answer — the one shape no
+    statement of delete() can reach, because the job was `running` when the
+    deletion transaction committed. Whatever the contract's waiting shape is —
+    a durable reference, a DNS wait that carries none, or a synthetic answer
+    forbidden to carry one — erasure must own what comes back.
+    """
+
+    def __init__(
+        self,
+        *,
+        public_provider: str,
+        entered: threading.Event,
+        release: threading.Event,
+        public_result: dict,
+        waiting_ref: str | None,
+    ) -> None:
+        self.email_public_provider = public_provider
+        self.torn_down: list[str] = []
+        self._entered = entered
+        self._release = release
+        self._public_result = public_result
+        self._waiting_ref = waiting_ref
+
+    def ensure(self, request, intent_key):  # noqa: ANN001, ANN201
+        self._entered.set()
+        if not self._release.wait(timeout=30.0):
+            raise AssertionError("the test never released the in-flight call")
+        raise ProviderWaiting(
+            "provider waits for user action",
+            public_result=self._public_result,
+            external_ref=self._waiting_ref,
+        )
+
+    def deprovision(self, external_ref):  # noqa: ANN001, ANN201
+        self.torn_down.append(external_ref)
+        return InspectResult(state=InspectState.ABSENT)
+
+
+def _late_waiting_contract(
+    provider: str, *, household_id: str, identity_id: str
+) -> dict:
+    """Each provider contract's real waiting shape, and what teardown must use.
+
+    Google OAuth and managed Nerve answer `ProviderWaiting` with a durable
+    reference (Nerve's being canonical JSON). A BYO-DNS wait carries no
+    reference — no org has been named yet. The synthetic validator refuses a
+    reference on a waiting answer outright, so its teardown can only ever be
+    derived.
+    """
+    if provider == "google-oauth":
+        public = EmailGoogleOAuthPublicStatus(
+            state="oauth_required",
+            disclosure=(
+                "Abrolia reads and sends mail only for this dedicated agent"
+                " mailbox; Google data is not used to train a general model."
+            ),
+        ).model_dump(mode="json", exclude_none=True)
+        return {
+            "option": "gmail",
+            "selection": {"kind": "gmail"},
+            "declares": "gmail",
+            "public_result": public,
+            "waiting_ref": f"google-oauth:{identity_id}",
+            "torn_down": f"google-oauth:{identity_id}",
+        }
+    if provider == "nerve-managed":
+        org_id = "46000000-0000-4000-8000-000000000001"
+        reference = {
+            "household_id": household_id,
+            "stable_ref": f"{household_id}:inbox",
+            "org_id": org_id,
+            "grant_id": "46000000-0000-4000-8000-000000000002",
+            "inbox_id": "46000000-0000-4000-8000-000000000003",
+            "key_id": "46000000-0000-4000-8000-000000000004",
+            "webhook_id": "46000000-0000-4000-8000-000000000005",
+            "address": normalize_email("family-agent@abrolia.com"),
+            "org_external_ref": email_org_external_ref(household_id, identity_id),
+        }
+        waiting_ref = json.dumps(reference, sort_keys=True, separators=(",", ":"))
+        public = EmailNerveAttachmentPublicStatus.model_validate(
+            {
+                "nerve_org_id": org_id,
+                "operator_action": {
+                    "arguments": [
+                        "set",
+                        "attachments",
+                        "--org",
+                        org_id,
+                        "--enabled=true",
+                    ]
+                },
+            }
+        ).model_dump(mode="json", exclude_none=True)
+        return {
+            "option": "managed_abrolia",
+            "selection": {"kind": "abrolia_managed", "local_part": "family-agent"},
+            "declares": "nerve",
+            "public_result": public,
+            "waiting_ref": waiting_ref,
+            "torn_down": waiting_ref,
+        }
+    if provider == "nerve-byo-domain":
+        public = EmailDnsPublicStatus.model_validate(
+            {
+                "domain": "family.test",
+                "dns_records": [
+                    {
+                        "type": "TXT",
+                        "host": "_arbolia.family.test",
+                        "value": "ownership-token",
+                    }
+                ],
+            }
+        ).model_dump(mode="json", exclude_none=True)
+        return {
+            "option": "own_domain",
+            "selection": {"kind": "own_domain", "domain": "family.test"},
+            "declares": "nerve",
+            "public_result": public,
+            "waiting_ref": None,
+            # Nothing recorded, so the probe derives the org contract.
+            "torn_down": org_teardown_ref(household_id, identity_id),
+        }
+    assert provider == "fake-email"
+    return {
+        "option": "managed_abrolia",
+        "selection": {"kind": "abrolia_managed", "local_part": "family-agent"},
+        "declares": "synthetic",
+        "public_result": {},
+        "waiting_ref": None,
+        "torn_down": f"synthetic-email:{identity_id}",
+    }
+
+
+@pytest.mark.parametrize(
+    "provider",
+    ["google-oauth", "nerve-managed", "nerve-byo-domain", "fake-email"],
+)
+def test_a_waiting_answer_arriving_after_erasure_begins_is_still_torn_down(
+    cp_stack, monkeypatch: pytest.MonkeyPatch, provider: str
+) -> None:
+    """The late `ProviderWaiting` race, across every provider contract.
+
+    A call in flight when the deletion transaction commits is invisible to
+    every statement delete() runs: the sweep cancels only
+    `pending`/`waiting_user`, and `resume` reads only
+    `running`/`outcome_unknown`. If the answer that arrives afterwards is a
+    `ProviderWaiting`, settling it `waiting_user` strands a live resource
+    outside an erasure that then completes. Each contract parks its call on a
+    gate until erasure has begun, answers, and the sequence must still end in
+    the resource torn down, the parent compensated, and the household gone.
+    """
+
+    # The call has to REACH the provider, so the incident brake is lifted for
+    # the forward leg (the household itself is allowlisted by the fixture);
+    # teardown was never braked anyway.
+    monkeypatch.setenv("ABROLIA_REAL_EMAIL_ENABLED", "1")
+    monkeypatch.setenv("ABROLIA_GMAIL_ENABLED", "1")
+    monkeypatch.setenv("ABROLIA_BYO_EMAIL_ENABLED", "1")
+
+    now = 1_760_000_000.0
+    cp_stack.complete_profile()
+    _hold_both_consents(cp_stack, now=now)
+
+    identity_id = "45000000-0000-4000-8000-00000000000d"
+    workflow = cp_stack.onboarding.workflow_for_household(cp_stack.household.id)
+    contract = _late_waiting_contract(
+        provider, household_id=cp_stack.household.id, identity_id=identity_id
+    )
+    with cp_stack.jobs.db.write() as connection:
+        # An own-domain identity carries its verified domain's lookup HMAC;
+        # every other option leaves it NULL.
+        domain_hmac = (
+            cp_stack.lookup.digest("email-domain:family.test")
+            if provider == "nerve-byo-domain"
+            else None
+        )
+        connection.execute(
+            "INSERT INTO email_identities (id, household_id, option, status,"
+            " secret_binding_ref, encryption_key_version, version, created_at,"
+            " updated_at, domain_lookup_hmac)"
+            " VALUES (?, ?, ?, 'active', 'ABROLIA_EMAIL_PROVIDER_KEY', 'v1', 1, ?, ?, ?)",
+            (
+                identity_id,
+                cp_stack.household.id,
+                contract["option"],
+                now,
+                now,
+                domain_hmac,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO email_address_reservations (id, normalized_domain,"
+            " normalized_local_part, household_id, email_identity_id, status,"
+            " expires_at, created_at)"
+            " VALUES (?, 'abrolia.com', 'family-agent', ?, ?, 'held', ?, ?)",
+            (
+                f"res-late-waiting-{provider}",
+                cp_stack.household.id,
+                identity_id,
+                now + 3_600.0,
+                now,
+            ),
+        )
+        # Erasure awaits an outstanding email resource (the sequence test
+        # keeps one for the same reason); its reference is the contract's own,
+        # so resume's direct deprovision reaches this very adapter.
+        resource = cp_stack.jobs.encrypt_json(
+            "external_resources",
+            f"res-late-waiting-row-{provider}",
+            "external_id",
+            contract["torn_down"],
+        )
+        connection.execute(
+            "INSERT INTO external_resources (id, household_id, provider,"
+            " resource_type, stable_name, external_id_ciphertext,"
+            " encryption_key_version, status, created_at, updated_at)"
+            " VALUES (?, ?, ?, 'email_identity', 'inbox', ?, ?, 'ready', ?, ?)",
+            (
+                f"res-late-waiting-row-{provider}",
+                cp_stack.household.id,
+                provider,
+                resource.ciphertext,
+                resource.key_version,
+                now,
+                now,
+            ),
+        )
+        job_id, _created = cp_stack.jobs.create(
+            connection,
+            household_id=cp_stack.household.id,
+            workflow_id=workflow.id,
+            kind="email_identity",
+            operation="ensure",
+            intent_key=f"{cp_stack.household.id}:late-waiting:{provider}",
+            request={
+                "household_id": cp_stack.household.id,
+                "email_identity_id": identity_id,
+                "stable_ref": f"{cp_stack.household.id}:inbox",
+                "option": contract["option"],
+                "selection": contract["selection"],
+            },
+            provider=provider,
+            now=now,
+        )
+
+    entered, release = threading.Event(), threading.Event()
+    adapter = _InFlightEmailCall(
+        public_provider=contract["declares"],
+        entered=entered,
+        release=release,
+        public_result=contract["public_result"],
+        waiting_ref=contract["waiting_ref"],
+    )
+    base = synthetic_provider_registry()
+    registry = ProviderRegistry()
+    registry.register(provider, adapter)
+    for name in ("fake-whatsapp", "fake-channel", "fake-cleanup", "dry-run-runtime"):
+        registry.register(name, base.get(name))
+
+    worker = cp_stack.make_worker(providers=registry, now=now + 10)
+
+    outcomes = []
+
+    def call():  # noqa: ANN001, ANN201
+        outcomes.append(worker.run_once())
+
+    in_flight = threading.Thread(target=call, daemon=True)
+    in_flight.start()
+    assert entered.wait(timeout=30.0), "the adapter was never reached"
+
+    deletion = DeletionService(
+        cp_stack.accounts,
+        cp_stack.auth,
+        cp_stack.households,
+        cp_stack.jobs,
+        registry,
+        runtime=_AbsentRuntime(),
+    )
+    receipt = deletion.delete(
+        cp_stack.account.id,
+        cp_stack.household.id,
+        idempotency_key=f"late-waiting-{provider}",
+        now=now + 20,
+    )
+    assert receipt.completion_status != "complete", "fixture did not stay open"
+
+    # The answer arrives now — after the deletion transaction committed.
+    release.set()
+    in_flight.join(timeout=30.0)
+    assert not in_flight.is_alive(), "the in-flight call never finished"
+    late = outcomes[0]
+    assert late is not None and late.job_id == job_id
+    # The whole point: NOT `waiting_user` — that state is invisible to an
+    # erasure whose cancellation sweep already ran.
+    assert late.status == "outcome_unknown", late
+    if contract["waiting_ref"] is not None:
+        # A contract that ANSWERED with its reference has its teardown
+        # scheduled by the very worker that received it — not deferred to a
+        # later reconciliation that would have to re-derive what it was told.
+        scheduled = cp_stack.database.query_one(
+            "SELECT status FROM provisioning_jobs"
+            " WHERE household_id = ? AND kind = 'cleanup'",
+            (cp_stack.household.id,),
+        )
+        assert scheduled is not None, (
+            "the answering worker never scheduled the teardown it owed"
+        )
+
+    worker.reconcile(job_id)
+    for _ in range(6):
+        if worker.run_once() is None:
+            break
+
+    parent = cp_stack.jobs.get(job_id)
+    assert parent is not None
+    assert (parent.status, parent.error_code) == (
+        "cancelled",
+        "cancelled_and_compensated",
+    ), f"parent never settled: {parent.status}/{parent.error_code}"
+    cleanup_row = cp_stack.database.query_one(
+        "SELECT status, error_code FROM provisioning_jobs"
+        " WHERE household_id = ? AND kind = 'cleanup'",
+        (cp_stack.household.id,),
+    )
+    assert cleanup_row is not None, "nothing scheduled the teardown"
+    assert cleanup_row["status"] == "succeeded", (
+        f"cleanup never finished: {cleanup_row['status']}/{cleanup_row['error_code']}"
+    )
+    recorded = cp_stack.database.query_one(
+        "SELECT status FROM external_resources WHERE stable_name = ?",
+        (f"{cp_stack.household.id}:late-waiting:{provider}",),
+    )
+    assert recorded is not None, "the late reference was never recorded"
+    assert recorded["status"] == "deleted", (
+        f"the recorded resource never finished deleting: {recorded['status']}"
+    )
+    assert contract["torn_down"] in adapter.torn_down, (
+        f"teardown did not use the contract's reference; got {adapter.torn_down}"
+    )
+    identity_row = cp_stack.database.query_one(
+        "SELECT status FROM email_identities WHERE id = ?", (identity_id,)
+    )
+    assert identity_row is not None, "the disconnect lost the identity row"
+    assert identity_row["status"] == "deleted", (
+        f"the identity never finished disconnecting: {identity_row['status']}"
+    )
+    reservation = cp_stack.database.query_one(
+        "SELECT status FROM email_address_reservations WHERE email_identity_id = ?",
+        (identity_id,),
+    )
+    assert reservation is not None, "the reservation row vanished instead of releasing"
+    assert reservation["status"] == "released", (
+        f"the local part stayed held: {reservation['status']}"
+    )
+
+    final = deletion.resume(cp_stack.household.id, now=now + 40)
+    assert final.completion_status == "complete", (
+        f"deletion never completed: {final.completion_status}"
+        f" {final.provider_statuses}"
+    )
+    assert (
+        cp_stack.database.query_one(
+            "SELECT id FROM households WHERE id = ?", (cp_stack.household.id,)
+        )
+        is None
+    ), "a complete deletion left the household row behind"
 
 
 class _NoReconcileEmail:

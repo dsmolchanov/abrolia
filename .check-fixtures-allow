@@ -65,3 +65,11 @@ README.md | email | help@abrolia.com
 docs/onboarding-runbook.md | email | help@abrolia.com
 thoughts/shared/handoffs/general/*.md | email | help@abrolia.com
 .check-fixtures-allow | email | help@abrolia.com
+
+# Managed-inbox address in the late-ProviderWaiting erasure regression. The
+# abrolia.com domain is part of the managed-option CONTRACT here — the
+# worker's own validator compares the waiting reference against
+# `<local_part>@abrolia.com` — so a placeholder documentation domain would
+# fail the validation the test exists to exercise. Local part is fictional.
+tests/control_plane/test_real_email_wiring.py | email | family-agent@abrolia.com
+.check-fixtures-allow | email | family-agent@abrolia.com

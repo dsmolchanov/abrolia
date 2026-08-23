@@ -704,6 +704,26 @@ class ProvisioningWorker:
             )
             if cleanup is not None:
                 return cleanup
+        if self._owned_by_deletion(job):
+            # A waiting answer that arrives after the deletion transaction has
+            # nowhere else to go: no statement of delete() can see this job
+            # any more, and `resume` reads only `running`/`outcome_unknown`.
+            # Settling `waiting_user` would strand the resource outside an
+            # erasure that then completes. The job stays unresolved instead —
+            # reconcile routes a deletion-owned job to the shutdown probe,
+            # which tears down what is recorded or derivable and refuses with
+            # a named reason otherwise. This is also the only arm the
+            # synthetic contract can take: its validator refuses a reference
+            # on a waiting answer outright, so for it there is no scheduled
+            # cleanup above — only this state and the probe's arithmetic.
+            return self._mark_step_problem(
+                job,
+                request,
+                "outcome_unknown",
+                error.code,
+                public_result=public_result,
+                external_ref=external_ref,
+            )
         return self._mark_step_problem(
             job,
             request,
@@ -719,7 +739,23 @@ class ProvisioningWorker:
         current = self.jobs.db.query_one(
             "SELECT status, error_code FROM provisioning_jobs WHERE id = ?", (job.id,)
         )
-        if current is None or current["status"] != "outcome_unknown":
+        if current is None:
+            return None
+        if current["status"] == "running":
+            # The call was still in flight when the deletion transaction
+            # committed: nothing delete() did can reach this row, and its
+            # answer is arriving only now — after the sweep that cancels
+            # pending work, and outside any stamping deletion no longer
+            # performs. Ownership is asked of the household's durable status,
+            # so erasure owns it the moment anyone looks; refusing here would
+            # leave a provider-held resource with an answer nobody keeps.
+            # Admitting it schedules the teardown in the same worker that
+            # holds the answer — and the SAME transaction moves the running
+            # row into the unresolved state `resume` reads, because a returned
+            # result is only telemetry; nothing else applies it.
+            if not self._owned_by_deletion(job):
+                return None
+        elif current["status"] != "outcome_unknown":
             return None
         if not (
             requires_reconciliation(current["error_code"])
@@ -729,6 +765,16 @@ class ProvisioningWorker:
             # code, because deletion no longer rewrites one onto the job.
             return None
         with self.jobs.db.write() as connection:
+            if current["status"] == "running":
+                # Lease-consistent: this worker holds the lease it is settling
+                # under, and the guard makes re-entry a no-op.
+                self.jobs.settle(
+                    connection,
+                    job.id,
+                    status="outcome_unknown",
+                    error_code=current["error_code"],
+                    now=self.clock(),
+                )
             resource_id = self._external_resource(
                 connection,
                 job,

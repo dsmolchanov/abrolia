@@ -212,7 +212,8 @@ OAuth / History is explicitly deferred to the start of Phase E and remains track
 `.phase-f-mutations.py`, `control_plane/provisioning/contracts.py`,
 `control_plane/provisioning/fakes.py`,
 `tests/control_plane/email/test_identity.py`,
-`tests/control_plane/test_consent_withdrawal.py`.
+`tests/control_plane/test_consent_withdrawal.py`,
+`.check-fixtures-allow`.
 
 **Branches:** `codex/phase-F-email-option-kill-switches`, `codex/phase-F-hide-cut-email-cards`, `codex/phase-F-retire-the-dead-managed-switch`, `codex/phase-F-allowlist-at-dispatch`.
 
@@ -277,6 +278,31 @@ exactly that at settle time — so the worker now derives it whenever the job's
 own adapter declares the synthetic public identity; adapters that declare
 no contract still refuse, whichever registry name they sit under. A
 four-origin regression lands with the fix, and mutation M5 kills the revert.
+
+**Round 6, 2026-08-23.** Codex's twelfth round found the race the ownership
+doctrine implied but no test held: a call still IN FLIGHT when the deletion
+transaction commits is touched by nothing delete() runs (the sweep cancels
+only `pending`/`waiting_user`; `resume` reads only
+`running`/`outcome_unknown`) — and when that call's answer arrives as
+`ProviderWaiting`, `_schedule_cancelled_waiting_cleanup` refused the
+`running` row outright, so the parent settled `waiting_user`, a state
+nothing in erasure ever reads again, with a live org/inbox/key behind it.
+The remedy asks deletion ownership BEFORE the status restriction:
+a `running` row of a deletion-owned household is admitted, its parent
+settled unresolved and its external resource recorded in the SAME
+transaction that schedules the cleanup from the answer's own reference.
+The reference-less waiting shapes (BYO DNS legitimately names no resource;
+the synthetic validator forbids a reference outright) land unresolved via
+the handler's ownership branch, where reconcile derives their teardown as
+Round 5 established. The four-contract regression parks each adapter on a
+gate mid-`ensure`, begins erasure, releases the answer, and drives cleanup,
+compensation, disconnect and resume to the household row's removal;
+mutations M6 (running never admitted) and M7 (erasure never owns the
+reference-less answer) kill the reverts. `.check-fixtures-allow` gains one
+exact-value entry: the managed contract's inbox domain is production by
+definition (`<local_part>@abrolia.com` is what the validator compares
+against), so the synthetic regression cannot use a documentation-domain
+placeholder.
 
 **Changes:**
 1. Per-provider flags, `default off`, fail-closed, toggle tested. **Consolidated
