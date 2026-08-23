@@ -29,6 +29,7 @@ from hermes_cloud.core.events import Event
 from hermes_cloud.core.evidence import EvidenceStore, content_sha
 from hermes_cloud.core.matching import find_match
 from hermes_cloud.core.memory import MemoryStore
+from hermes_cloud.core.observability import emit_alert
 from hermes_cloud.core.runcontext import (
     DATA_DELETE,
     DATA_EXPORT,
@@ -440,7 +441,30 @@ class Pipeline:
         parsed = parse_eml(event.raw)
         if self.loop is None or not parsed.text.strip():
             return Handled()
+        # Cost caps: the same contract as email extraction — check before the
+        # model call, record after it. A dialogue turn spends the same budget.
+        day = today_utc()
+        if self.usage.is_over_budget(context.household_id, day, self.daily_cap_usd):
+            emit_alert(logger, "budget_exceeded", household_id=context.household_id, day=day)
+            self.transport.send_message(
+                chat=self.chat,
+                text=DEGRADED_MESSAGE,
+                thread=self.thread,
+            )
+            return Handled(message=DEGRADED_MESSAGE)
         answer = self.loop.run(context, parsed.text)
+        try:
+            self.usage.record(
+                context.household_id,
+                day,
+                # getattr keeps lightweight test stubs without token counts
+                # green; the real ToolLoop always reports both.
+                prompt_tokens=getattr(answer, "input_tokens", 0),
+                completion_tokens=getattr(answer, "output_tokens", 0),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("usage record failed for %s/%s: %s", context.household_id, day, exc)
+            raise
         payload = bundle_payload(
             [Item(payload={"kind": KIND_WHATSAPP, "to": context.actor_id, "text": answer.text})],
             header=f"Ответ в WhatsApp для {context.actor_id}",
@@ -561,9 +585,29 @@ class Pipeline:
             return Handled(message=TEXT_UNKNOWN_ACTOR)
         if self.loop is None or not parsed.text.strip():
             return None
+        # Cost caps: the same contract as email extraction and WhatsApp
+        # dialogue — check before the model call, record after it.
+        hid = parsed.context.household_id
+        day = today_utc()
+        if self.usage.is_over_budget(hid, day, self.daily_cap_usd):
+            emit_alert(logger, "budget_exceeded", household_id=hid, day=day)
+            self.transport.send_message(
+                chat=parsed.context.chat_id, text=DEGRADED_MESSAGE, thread=parsed.context.thread_id
+            )
+            return Handled(message=DEGRADED_MESSAGE)
         # Ход диалога. Права уже собраны на входе: `run` получает их готовыми и
         # сам ничего не расширяет.
         answer = self.loop.run(parsed.context, parsed.text)
+        try:
+            self.usage.record(
+                hid,
+                day,
+                prompt_tokens=getattr(answer, "input_tokens", 0),
+                completion_tokens=getattr(answer, "output_tokens", 0),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("usage record failed for %s/%s: %s", hid, day, exc)
+            raise
         self.transport.send_message(
             chat=parsed.context.chat_id, text=answer.text, thread=parsed.context.thread_id
         )

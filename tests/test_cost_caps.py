@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from hermes_cloud.channels.telegram import FakeTransport
+from hermes_cloud.channels.web import WebChannelMessage, handle_web_message
 from hermes_cloud.core.approvals import ApprovalStore
 from hermes_cloud.core.db import open_database
 from hermes_cloud.core.events import EventStore
-from hermes_cloud.core.runcontext import Household
+from hermes_cloud.core.runcontext import ROLE_FAMILY, ROLE_OWNER, Household, RunContext
 from hermes_cloud.core.usage import DEGRADED_MESSAGE, UsageStore, estimate_usd, today_utc
 from hermes_cloud.execute.reminder import ReminderStore
 from hermes_cloud.ingest.inject import ingest_file
@@ -139,3 +142,167 @@ def test_cost_cap_env_override(tmp_path: Path, monkeypatch) -> None:
         chat="-100990000101",
     )
     assert pipeline.daily_cap_usd == pytest.approx(1.5)
+
+
+class CountingLoop:
+    """Dialogue-model stub: counts calls, reports the tokens it spent."""
+
+    def __init__(self, tokens=(2000, 800)) -> None:
+        self.calls = 0
+        self.tokens = tokens
+
+    def run(self, context, text):
+        self.calls += 1
+        pt, ct = self.tokens
+        return SimpleNamespace(
+            text="готово", input_tokens=pt, output_tokens=ct,
+            iterations=1, tokens=pt + ct, stopped="completed",
+        )
+
+
+def _prefill_over_budget(store: UsageStore, household_id: str) -> None:
+    store.record(household_id, today_utc(), prompt_tokens=100000, completion_tokens=50000)
+
+
+def test_whatsapp_dialogue_degrades_when_over_budget(tmp_path: Path) -> None:
+    db = open_database(tmp_path / "h.db")
+    context = RunContext(
+        household_id="hh-wa",
+        actor_id="+999123456",
+        chat_id="999123456@s.whatsapp.invalid",
+        thread_id=None,
+        role=ROLE_FAMILY,
+        scope="dialogue",
+    )
+    # The staged reply carries a real event FK, so append the event first.
+    events = EventStore(db)
+    accepted = events.append(
+        source="whatsapp",
+        external_id="ext-1",
+        raw=b"Subject: q\nContent-Type: text/plain; charset=utf-8\n\nprivet",
+    )
+    event = accepted.event
+
+    def build(loop, cap):
+        return Pipeline(
+            approvals=ApprovalStore(db),
+            reminders=ReminderStore(db),
+            transport=FakeTransport(),
+            extractor=None,
+            chat="telegram-control",
+            loop=loop,
+            daily_cap_usd=cap,
+        )
+
+    capped_loop = CountingLoop()
+    capped = build(capped_loop, cap=0.01)
+    _prefill_over_budget(capped.usage, "hh-wa")
+
+    before = len(capped.approvals.db.query("SELECT id FROM approvals"))
+    handled = capped._handle_whatsapp_dialogue(event, context)
+
+    assert handled.message == DEGRADED_MESSAGE
+    assert capped_loop.calls == 0, "over-budget dialogue must not reach the model"
+    assert DEGRADED_MESSAGE in capped.transport.messages[-1].text
+    after = len(capped.approvals.db.query("SELECT id FROM approvals"))
+    assert after == before, "degraded dialogue stages nothing for approval"
+
+    # Under a raised cap the same turn reaches the model; its spend joins the
+    # prefilled day row (100000 + 2000).
+    free_loop = CountingLoop()
+    free = build(free_loop, cap=1_000_000.0)
+    handled2 = free._handle_whatsapp_dialogue(event, context)
+    assert free_loop.calls == 1
+    assert handled2.approval_id is not None
+    row = free.usage.get("hh-wa", today_utc())
+    assert row is not None
+    assert row.prompt_tokens == 102000 and row.completion_tokens == 50800
+
+
+def test_web_channel_cap_guards_the_model_path(tmp_path: Path) -> None:
+    store = UsageStore(open_database(tmp_path / "h.db"))
+    loop = CountingLoop()
+    context = RunContext(
+        household_id="hh-web",
+        actor_id="owner",
+        chat_id="web-chat",
+        thread_id=None,
+        role=ROLE_OWNER,
+        scope="chat",
+    )
+    message = WebChannelMessage(actor_id="owner", text="собери повестку")
+
+    _prefill_over_budget(store, "hh-web")
+    assert (
+        handle_web_message(message, context=context, loop=loop, usage=store, daily_cap_usd=0.01)
+        == DEGRADED_MESSAGE
+    )
+    assert loop.calls == 0, "over-budget web chat must not reach the model"
+
+    under_cap = handle_web_message(
+        message, context=context, loop=loop, usage=store, daily_cap_usd=1_000_000.0
+    )
+    assert under_cap == "готово"
+    assert loop.calls == 1
+    row = store.get("hh-web", today_utc())
+    assert row is not None and row.prompt_tokens >= 2000
+
+
+
+def test_telegram_dialogue_degrades_when_over_budget_and_records_when_under(
+    tmp_path: Path, caplog
+) -> None:
+    db = open_database(tmp_path / "h.db")
+    actor, chat = 990000001, -100990000101
+
+    def telegram_update() -> dict:
+        return {
+            "update_id": 1,
+            "message": {
+                "message_id": 1,
+                "chat": {"id": chat},
+                "from": {"id": actor},
+                "text": "перепиши короче",
+            },
+        }
+    household = Household(
+        household_id="hh-tg",
+        owner=str(actor),
+        family=frozenset({str(actor)}),
+        allowed_chats=frozenset({str(chat)}),
+    )
+
+    def build(loop, cap):
+        return Pipeline(
+            approvals=ApprovalStore(db),
+            reminders=ReminderStore(db),
+            transport=FakeTransport(),
+            extractor=None,
+            chat=str(chat),
+            loop=loop,
+            household=household,
+            daily_cap_usd=cap,
+        )
+
+    # Over budget: no model call, honest degraded reply, alert emitted.
+    capped_loop = CountingLoop()
+    capped = build(capped_loop, cap=0.01)
+    _prefill_over_budget(capped.usage, "hh-tg")
+    with caplog.at_level(logging.WARNING, logger="hermes_cloud.runner.pipeline"):
+        handled = capped.handle_update(telegram_update(), household)
+    assert handled is not None and handled.message == DEGRADED_MESSAGE
+    assert capped_loop.calls == 0, "over-budget dialogue must not reach the model"
+    assert DEGRADED_MESSAGE in capped.transport.messages[-1].text
+    assert "budget_exceeded" in caplog.text
+
+    # Under budget: model runs and its spend accumulates on the day's row —
+    # the next capped path (any channel) will see it.
+    free_loop = CountingLoop()
+    free = build(free_loop, cap=100.0)
+    handled2 = free.handle_update(telegram_update(), household)
+    assert handled2.message == "готово"
+    assert free_loop.calls == 1
+    row = free.usage.get("hh-tg", today_utc())
+    assert row is not None
+    assert row.prompt_tokens == 102000 and row.completion_tokens == 50800
+

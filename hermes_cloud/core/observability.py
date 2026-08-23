@@ -105,3 +105,16 @@ ALERTS = {
     "backup_stale": "backup stale — backup_age_hours > 26h",
     "budget_exceeded": "budget exceeded — per-household/day cost cap hit",
 }
+
+
+def emit_alert(logger_: Any, name: str, **fields: str) -> None:
+    """Log a defined alert through the given logger.
+
+    An alert that exists only as a dictionary entry is documentation, not an
+    alert. Unknown names raise: a typo must be loud at the call site, not a
+    silently skipped warning.
+    """
+    if name not in ALERTS:
+        raise KeyError(f"unknown alert {name!r}")
+    suffix = "".join(f" {key}={value}" for key, value in sorted(fields.items()))
+    logger_.warning("ALERT %s — %s%s", name, ALERTS[name], suffix)
