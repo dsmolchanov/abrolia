@@ -3,15 +3,15 @@
 from __future__ import annotations
 
 import uuid
-from typing import Any
+from typing import Annotated, Any
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi import status as http_status
 from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, ValidationError
 
 from control_plane.api.auth import issue_requested_link
-from control_plane.api.dependencies import container
+from control_plane.api.dependencies import Principal, container, require_private_mutation
 from control_plane.auth.rate_limit import RateLimitExceeded
 from control_plane.db import new_id
 from control_plane.models import ProfileInput, StepKind
@@ -259,53 +259,52 @@ class WebMessageInput(BaseModel):
 
 
 @router.post("/api/web/message")
-async def web_message(request: Request, payload: WebMessageInput) -> JSONResponse:
-    """Authenticated Web chat — same pipeline as other channels, server-verified context."""
+async def web_message(
+    request: Request,
+    principal: Annotated[Principal, Depends(require_private_mutation)],
+    payload: WebMessageInput,
+) -> JSONResponse:
+    """Authenticated Web chat, proxied to the household's dedicated runtime.
+
+    Same-origin, session and CSRF are enforced by ``require_private_mutation``,
+    exactly as on every other mutating endpoint — a bare session cookie must
+    never be enough to spend a model call. The control plane stays
+    metadata-only: it verifies membership, then forwards the turn over the
+    private network; the model call and its cost cap live inside the runtime,
+    where the budget state actually resides.
+    """
     active = container(request)
-    raw_session = request.cookies.get(active.config.session_cookie_name, "")
-    try:
-        session = active.sessions.authenticate(raw_session)
-        household_rec = active.households.current_for_account(session.account_id)
-    except (InvalidCredential, HouseholdNotFound) as error:
-        raise HTTPException(http_status.HTTP_401_UNAUTHORIZED, "authentication required") from error
     text = payload.text.strip()
     if not text:
         raise HTTPException(http_status.HTTP_400_BAD_REQUEST, "text required")
     if len(text) > 2000:
         raise HTTPException(http_status.HTTP_400_BAD_REQUEST, "text too long")
-    # Server-verified RunContext: use real household id, verify membership via DB
-    from hermes_cloud.channels.web import WebChannelMessage, handle_web_message
-    from hermes_cloud.core.runcontext import Household, build_run_context
-
-    # Build Household view from actual membership — owner is account, family = active members
+    household_rec = active.households.current_for_account(principal.account_id)
     try:
         rows = active.database.query(
             "SELECT account_id, role FROM household_memberships WHERE household_id = ? AND status='active'",
             (household_rec.id,),
         )
-        members = {r["account_id"]: r["role"] for r in rows}
-        owner = next((aid for aid, role in members.items() if role == "owner"), session.account_id)
-        family = frozenset(aid for aid, role in members.items() if role in ("owner", "adult"))
+        roles = {r["account_id"]: r["role"] for r in rows}
     except Exception:
-        owner = session.account_id
-        family = frozenset({session.account_id})
-    hh = Household(
-        household_id=household_rec.id,
-        owner=owner,
-        family=family,
-        allowed_chats=frozenset({"web-chat"}),
-    )
-    context = build_run_context(household=hh, actor_id=session.account_id, chat_id="web-chat")
-    if not context.is_known:
-        raise HTTPException(http_status.HTTP_403_FORBIDDEN, "unknown actor for this household")
-    # Route through shared pipeline if available, otherwise fallback is still capability-checked
-    # For pilot, handle_web_message will delegate to loop when wired; fallback echo is not staged
-    reply = handle_web_message(
-        WebChannelMessage(actor_id=session.account_id, text=text),
-        context=context,
-        loop=getattr(active, "web_loop", None),
-        pipeline=getattr(active, "web_pipeline", None),
-    )
-    # If handler returned fallback echo, surface as staged only when context known and text accepted
-    status = "staged" if context.is_known and reply else "rejected"
-    return JSONResponse({"reply": reply, "status": status})
+        roles = {}
+    role = roles.get(principal.account_id, "owner")
+    if not household_rec.runtime_ref:
+        raise HTTPException(
+            http_status.HTTP_503_SERVICE_UNAVAILABLE,
+            "assistant runtime is not provisioned",
+        )
+    from control_plane.privacy.runtime import RuntimeBoundaryError
+
+    try:
+        answer = active.web_chat.send(
+            household_rec.runtime_ref,
+            actor_id=principal.account_id,
+            role=role,
+            text=text,
+        )
+    except RuntimeBoundaryError as error:
+        raise HTTPException(
+            http_status.HTTP_503_SERVICE_UNAVAILABLE, "assistant is unavailable"
+        ) from error
+    return JSONResponse({"reply": answer["reply"], "status": "staged"})
