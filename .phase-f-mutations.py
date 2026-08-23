@@ -79,6 +79,24 @@ MUTATIONS = [
             "tests/control_plane/test_provisioning_jobs.py::test_reconcile_recovers_accepted_unknown_without_duplicate_resource",
         ],
     },
+    {
+        "name": "M5 the synthetic teardown reference stops being derivable",
+        "why": (
+            "Round eleven: an adapter that declares the synthetic contract"
+            " must get its derived reference, or ambiguous synthetic jobs"
+            " quarantine forever"
+        ),
+        "file": "control_plane/provisioning/worker.py",
+        "old": """        if declared == SYNTHETIC_PUBLIC_EMAIL:
+            return f"synthetic-email:{identity_id}"
+""",
+        "new": """        if declared == "MUTATION M5: the declaration derives nothing":
+            return f"synthetic-email:{identity_id}"
+""",
+        "tests": [
+            f"{WIRING}::test_an_ambiguous_synthetic_job_tears_down_the_reference_it_can_derive",
+        ],
+    },
 ]
 
 

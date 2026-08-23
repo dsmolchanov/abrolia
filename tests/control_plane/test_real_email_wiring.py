@@ -22,7 +22,10 @@ from control_plane.provisioning.contracts import (
     InspectState,
     ProviderRegistry,
 )
-from control_plane.provisioning.fakes import synthetic_provider_registry
+from control_plane.provisioning.fakes import (
+    DeterministicFakeProvisioner,
+    synthetic_provider_registry,
+)
 from control_plane.repositories.jobs import requires_reconciliation
 
 
@@ -1498,6 +1501,236 @@ def test_erasure_sequence_settles_every_job_and_completes_deletion(
     ), "a complete deletion left the household row behind"
 
 
+class _SpySyntheticEmail(DeterministicFakeProvisioner):
+    """The real synthetic email provisioner, with its calls counted.
+
+    Shutdown may neither ask the provider what it holds (`inspect`) nor resume
+    provisioning (`ensure`): teardown comes from the derived reference alone,
+    and the counts prove it.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("email")
+        self.inspected: list[str] = []
+        self.torn_down: list[str] = []
+
+    def inspect(self, stable_ref: str) -> InspectResult:
+        self.inspected.append(stable_ref)
+        return super().inspect(stable_ref)
+
+    def deprovision(self, external_ref: str) -> InspectResult:
+        self.torn_down.append(external_ref)
+        return super().deprovision(external_ref)
+
+
+@pytest.mark.parametrize("origin", ["cancel", "reset", "withdrawal", "deletion"])
+def test_an_ambiguous_synthetic_job_tears_down_the_reference_it_can_derive(
+    cp_stack, origin: str
+) -> None:
+    """The synthetic contract IS derivable arithmetic — so derive it.
+
+    Every quarantined email job routes to `_shutdown_probe`, but the derived
+    reference knew only Google's and Nerve's contracts. The synthetic
+    provisioner names its resource `synthetic-email:<identity_id>` — the very
+    string `_validate_email_external_ref` enforces at settle time — yet an
+    ambiguous synthetic job with nothing recorded repeated its reconciliation
+    error forever while the identity stayed held, because derivation refused a
+    reference the worker's own validator treats as arithmetic. This drives all
+    four shutdown origins through reconcile, the derived-reference cleanup and
+    the disconnect lifecycle to terminal states, with the provider never asked.
+    """
+
+    now = 1_760_000_000.0
+    cp_stack.complete_profile()
+    _hold_both_consents(cp_stack, now=now)
+
+    identity_id = "43000000-0000-4000-8000-00000000000c"
+    workflow = cp_stack.onboarding.workflow_for_household(cp_stack.household.id)
+    quarantine_code = {
+        "cancel": "cancel_requires_reconciliation",
+        "reset": "reset_requires_reconciliation",
+        "withdrawal": "withdrawal_requires_reconciliation",
+    }.get(origin)
+    with cp_stack.jobs.db.write() as connection:
+        connection.execute(
+            "INSERT INTO email_identities (id, household_id, option, status,"
+            " secret_binding_ref, encryption_key_version, version, created_at, updated_at)"
+            " VALUES (?, ?, 'managed_abrolia', 'outcome_unknown', NULL, 'v1', 1, ?, ?)",
+            (identity_id, cp_stack.household.id, now, now),
+        )
+        connection.execute(
+            "INSERT INTO email_address_reservations (id, normalized_domain,"
+            " normalized_local_part, household_id, email_identity_id, status,"
+            " expires_at, created_at)"
+            " VALUES (?, 'abrolia.com', 'family-agent', ?, ?, 'held', ?, ?)",
+            (f"res-synthetic-{origin}", cp_stack.household.id, identity_id,
+             now + 3_600.0, now),
+        )
+        # No `external_resources` row for the three command origins: the case
+        # under test is a call that was accepted and then timed out without
+        # answering, which recorded NOTHING durable — that is why teardown has
+        # to derive. Erasure is the exception: deletion awaits an outstanding
+        # email resource, so it keeps one (the sequence test does the same).
+        if origin == "deletion":
+            resource = cp_stack.jobs.encrypt_json(
+                "external_resources",
+                f"res-synthetic-job-{origin}",
+                "external_id",
+                f"synthetic-email:{identity_id}",
+            )
+            connection.execute(
+                "INSERT INTO external_resources (id, household_id, provider,"
+                " resource_type, stable_name, external_id_ciphertext,"
+                " encryption_key_version, status, created_at, updated_at)"
+                " VALUES (?, ?, 'fake-email', 'email_identity', 'inbox', ?, ?,"
+                " 'ready', ?, ?)",
+                (
+                    f"res-synthetic-job-{origin}",
+                    cp_stack.household.id,
+                    resource.ciphertext,
+                    resource.key_version,
+                    now,
+                    now,
+                ),
+            )
+        job_id, _created = cp_stack.jobs.create(
+            connection,
+            household_id=cp_stack.household.id,
+            workflow_id=workflow.id,
+            kind="email_identity",
+            operation="ensure",
+            intent_key=f"{cp_stack.household.id}:synthetic-teardown:{origin}",
+            request={
+                "household_id": cp_stack.household.id,
+                "email_identity_id": identity_id,
+                "stable_ref": f"{cp_stack.household.id}:inbox",
+                # Deliberately NO `external_ref`: the call timed out without
+                # answering, which recorded nothing — teardown has to DERIVE
+                # the reference, not read it.
+                "option": "managed_abrolia",
+                "selection": {"kind": "abrolia_managed", "local_part": "family-agent"},
+            },
+            provider="fake-email",
+            now=now,
+        )
+        if quarantine_code is not None:
+            # What the real producers do around the quarantine:
+            # `_supersede_unsettled_jobs` stamps the reason, and cancel, reset
+            # and withdrawal each begin the disconnect this cleanup finishes.
+            connection.execute(
+                "UPDATE provisioning_jobs SET status = 'outcome_unknown',"
+                " settled_at = ?, updated_at = ?, error_code = ? WHERE id = ?",
+                (now, now, quarantine_code, job_id),
+            )
+            connection.execute(
+                "UPDATE email_identities SET status = 'disconnecting',"
+                " version = version + 1, updated_at = ? WHERE id = ?",
+                (now, identity_id),
+            )
+        else:  # deletion: ambiguity discovered only after that transaction
+            connection.execute(
+                "UPDATE provisioning_jobs SET status = 'running',"
+                " leased_by = 'dead-worker', lease_until = ? WHERE id = ?",
+                (now - 1.0, job_id),
+            )
+
+    fake = _SpySyntheticEmail()
+    # The whole synthetic registry with the spy standing in for `fake-email`:
+    # erasure drives the runtime and cleanup adapters too, so a bare
+    # single-name registry leaves their provider statuses unresolved and the
+    # deletion never completes.
+    base = synthetic_provider_registry()
+    registry = ProviderRegistry()
+    registry.register("fake-email", fake)
+    for name in ("fake-whatsapp", "fake-channel", "fake-cleanup", "dry-run-runtime"):
+        registry.register(name, base.get(name))
+
+    if origin == "deletion":
+        deletion = DeletionService(
+            cp_stack.accounts,
+            cp_stack.auth,
+            cp_stack.households,
+            cp_stack.jobs,
+            registry,
+            runtime=_AbsentRuntime(),
+        )
+        receipt = deletion.delete(
+            cp_stack.account.id,
+            cp_stack.household.id,
+            idempotency_key=f"synthetic-teardown-{origin}",
+            now=now + 20,
+        )
+        assert receipt.completion_status != "complete", "fixture did not stay open"
+        with cp_stack.jobs.db.write() as connection:
+            cp_stack.jobs.settle(
+                connection,
+                job_id,
+                status="outcome_unknown",
+                error_code="reconcile_inconclusive",
+                now=now + 25,
+            )
+
+    worker = cp_stack.make_worker(providers=registry, now=now + 30)
+    worker.reconcile(job_id)
+
+    assert fake.inspected == [], "shutdown asked the provider what it holds"
+    assert fake.ensure_calls == 0, "shutdown resumed provisioning"
+
+    for _ in range(6):
+        if worker.run_once() is None:
+            break
+
+    parent = cp_stack.jobs.get(job_id)
+    assert parent is not None
+    assert (parent.status, parent.error_code) == (
+        "cancelled",
+        "cancelled_and_compensated",
+    ), f"parent never settled: {parent.status}/{parent.error_code}"
+    cleanup_row = cp_stack.database.query_one(
+        "SELECT status, error_code FROM provisioning_jobs"
+        " WHERE household_id = ? AND kind = 'cleanup'",
+        (cp_stack.household.id,),
+    )
+    assert cleanup_row is not None, "reconciliation scheduled nothing"
+    assert cleanup_row["status"] == "succeeded", (
+        f"cleanup never finished: {cleanup_row['status']}/{cleanup_row['error_code']}"
+    )
+    assert f"synthetic-email:{identity_id}" in fake.torn_down, (
+        f"teardown did not use the derived reference; got {fake.torn_down}"
+    )
+
+    if origin == "deletion":
+        final = deletion.resume(cp_stack.household.id, now=now + 40)
+        assert final.completion_status == "complete", (
+            f"deletion never completed: {final.completion_status}"
+            f" {final.provider_statuses}"
+        )
+        assert (
+            cp_stack.database.query_one(
+                "SELECT id FROM households WHERE id = ?", (cp_stack.household.id,)
+            )
+            is None
+        ), "a complete deletion left the household row behind"
+    else:
+        identity_row = cp_stack.database.query_one(
+            "SELECT status FROM email_identities WHERE id = ?", (identity_id,)
+        )
+        assert identity_row is not None, "the disconnect lost the identity row"
+        assert identity_row["status"] == "deleted", (
+            "the disconnect never finished after the derived-reference teardown:"
+            f" {identity_row['status']}"
+        )
+        reservation = cp_stack.database.query_one(
+            "SELECT status FROM email_address_reservations WHERE email_identity_id = ?",
+            (identity_id,),
+        )
+        assert reservation is not None, "the reservation row vanished instead of releasing"
+        assert reservation["status"] == "released", (
+            "the local part stayed held after the inbox finished disconnecting:"
+            f" {reservation['status']}"
+        )
+
+
 class _NoReconcileEmail:
     """An email adapter that never defined `reconcile`.
 
@@ -1615,10 +1848,17 @@ def test_a_quarantined_job_reconciles_without_the_adapters_reconcile_method(
     assert adapter.inspected == [], "reconcile probed with a mutating inspect"
     assert adapter.ensured == 0, "reconcile resumed provisioning"
     if provider == "fake-email":
-        # No derivable teardown contract exists for this adapter, so the
-        # worker refuses instead of scheduling a cleanup its deprovisioner
-        # would refuse — a failed job standing in for a teardown is worse
-        # than a quarantine, because the inbox is live either way.
+        # This STUB declares no derivable teardown contract: its
+        # `email_public_provider` says "nerve", whose references are not this
+        # adapter's to accept by arithmetic — and deriving from the registry
+        # NAME would schedule cleanups against deprovisioners that never
+        # accepted such references. The real synthetic provisioner declares
+        # "synthetic" and IS derived for
+        # (`test_an_ambiguous_synthetic_job_tears_down_the_reference_it_can_derive`).
+        # Refusing an adapter that declares no contract beats scheduling a
+        # cleanup its deprovisioner would refuse — a failed job standing in
+        # for a teardown is worse than a quarantine, because the inbox is
+        # live either way.
         assert result is not None and result.status == "outcome_unknown", result
         assert result.error_code == "withdrawal_requires_reconciliation"
         return

@@ -266,6 +266,18 @@ is the mutation harness that proves the new erasure sequence test kills its
 defects; it is committed because an uncommitted proof proves nothing to the
 next reader.
 
+**Round 5, 2026-08-23.** Codex's eleventh round found the hoisted route
+half-honest: shutdown routing no longer asked the adapter's shape, but the
+derived teardown reference still knew only Google's and Nerve's contracts —
+so an ambiguous synthetic email job (cancel, reset, withdrawal or erasure
+origin, nothing durably recorded) repeated its reconciliation error forever
+with the identity held. The synthetic provisioner names its resource
+`synthetic-email:<identity_id>` — `_validate_email_external_ref` enforces
+exactly that at settle time — so the worker now derives it whenever the job's
+own adapter declares the synthetic public identity; adapters that declare
+no contract still refuse, whichever registry name they sit under. A
+four-origin regression lands with the fix, and mutation M5 kills the revert.
+
 **Changes:**
 1. Per-provider flags, `default off`, fail-closed, toggle tested. **Consolidated
    2026-08-22** to the short form Step F1 of `phase-DE-pilot.md` already

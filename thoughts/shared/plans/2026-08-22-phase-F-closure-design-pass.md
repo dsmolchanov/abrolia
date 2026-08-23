@@ -68,6 +68,35 @@ switches to `1` explicitly).
 Validation still owed: full non-live suite after rewrites (in flight);
 mutation checks from both items above.
 
+## Round eleven (2026-08-23) — the synthetic derivation
+
+Codex's verdict on `6591143` itself came back clean, but the CI run exposed a
+plan-scope deviation first (five paths the canon Phase F step never declared;
+fixed docs-only in the commit before this one), and the eleventh generation
+then found one real blocker: `_derived_teardown_ref` knew Google's and Nerve's
+contracts but refused the synthetic one — while `_validate_email_external_ref`
+has always enforced `external_ref == synthetic-email:<identity_id>` on every
+synthetic result. The finding was correct, and it convicted us with our own
+invariant: a computable-before-call reference left quarantined forever behind
+a refusal.
+
+- Fix shape: derivation keys on the ADAPTER'S OWN DECLARATION
+  (`email_public_provider == "synthetic"`), not on a registry-name list —
+  the queued `synthetic` alias is then covered by construction, and a stub
+  that declares no contract still refuses whichever name it sits under.
+  That preserved the hoist pin's refusal case (`_NoReconcileEmail` declares
+  `"nerve"`); only its rationale changed.
+- `test_an_ambiguous_synthetic_job_tears_down_the_reference_it_can_derive`:
+  four origins (cancel, reset, withdrawal, deletion) drive an external_ref-less
+  synthetic job through reconcile → derived-ref cleanup → disconnect
+  lifecycle; no inspect, no ensure; parent `cancelled_and_compensated`;
+  identity `deleted`; reservation `released`; household gone on erasure.
+  Fixture note: no `external_resources` row on the three command origins —
+  ambiguity means nothing durable was recorded — while erasure keeps one,
+  deletion awaiting an outstanding resource being the exception.
+- Mutations M1–M4 re-proved KILLED at this head; M5 (derivation disabled)
+  added and KILLED. Full non-live suite green, ruff clean.
+
 # Phase F Closure — Erasure Sequence Guarantee and the Reconcile Contract Hoist
 
 ## Overview

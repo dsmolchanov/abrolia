@@ -97,6 +97,14 @@ GOOGLE_OAUTH_PROVIDER = "google-oauth"
 #: The Nerve email routes, whose teardown reference is the computed org ref.
 NERVE_EMAIL_PROVIDERS = frozenset({"nerve-managed", "nerve-byo-domain"})
 
+#: The public provider identity whose email resource reference is pure
+#: arithmetic: `synthetic-email:<identity_id>` — the exact string
+#: `_validate_email_external_ref` enforces at settle time and the declaring
+#: adapter's `deprovision` accepts. Keyed on the ADAPTER's declaration
+#: (`email_public_provider`), not on a registry name: a stub registered under
+#: a synthetic name without declaring the contract still refuses.
+SYNTHETIC_PUBLIC_EMAIL = "synthetic"
+
 
 def requires_current_content_restriction(
     kind: str, operation: str, provider: str
@@ -1369,6 +1377,18 @@ class ProvisioningWorker:
         Read-only discovery, tolerant deletes, idempotent: no key is issued and
         no webhook rotated, which is what made `inspect` unusable here.
 
+        The synthetic adapters declare their contract the same way they declare
+        their public identity: `email_public_provider == "synthetic"` is the
+        adapter stating that its references are `synthetic-email:<identity_id>`
+        — the exact string `_validate_email_external_ref` enforces on every
+        result it settles, and one its `deprovision` accepts. A call that was
+        accepted and then timed out left its resource under precisely that
+        name, recorded nowhere; refusing to compute it quarantined the teardown
+        forever behind an ambiguity only the provider could resolve — and
+        asking the provider is what a shutdown may not do. An adapter that does
+        not declare this contract derives nothing here, whichever registry
+        name it sits under.
+
         What remains beyond these is state under a reference nobody can
         reconstruct, and there the job stays quarantined with the error code
         naming the reconcile an operator has to run.
@@ -1404,6 +1424,10 @@ class ProvisioningWorker:
         then timed out is still tearable down. Nerve's is a `_Refs` object of
         provider-assigned ids, so nothing here can construct it; returning a
         lookup key instead would schedule a cleanup its deprovisioner refuses.
+        The synthetic adapters' is `synthetic-email:<identity_id>`, declared by
+        the adapter itself through `email_public_provider` (see
+        `SYNTHETIC_PUBLIC_EMAIL`); an adapter that declares no derivable
+        contract still refuses, whichever registry name it sits under.
         """
         if job.kind != "email_identity":
             return None
@@ -1414,6 +1438,16 @@ class ProvisioningWorker:
             return f"{GOOGLE_OAUTH_PROVIDER}:{identity_id}"
         if job.provider in NERVE_EMAIL_PROVIDERS:
             return org_teardown_ref(job.household_id, identity_id)
+        try:
+            declared = getattr(
+                self.providers.get(job.provider), "email_public_provider", None
+            )
+        except ProviderRejected:
+            # An unregistered provider has no contract to derive against; the
+            # refusal below names the reconcile an operator must run.
+            return None
+        if declared == SYNTHETIC_PUBLIC_EMAIL:
+            return f"synthetic-email:{identity_id}"
         return None
 
     def _shutdown_refusal(self, job: JobRecord, request: dict[str, Any]) -> WorkResult:
