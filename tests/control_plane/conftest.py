@@ -128,8 +128,10 @@ class ControlPlaneStack:
             worker_id="synthetic-worker",
             # The brake is subtractive: the live env can only ever turn real
             # email OFF, never authorize it. Tests that drive Nerve adapters
-            # need the boot-time authorization as well as the env var.
-            real_email_authorized=True,
+            # need this household in the boot-time allowlist as well as the env
+            # var, because dispatch asks about THIS household and not about
+            # real email in general.
+            real_email_authorized_households=frozenset({self.household.id}),
             clock=lambda: now,
         )
 

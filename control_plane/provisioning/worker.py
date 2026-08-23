@@ -97,6 +97,14 @@ GOOGLE_OAUTH_PROVIDER = "google-oauth"
 #: The Nerve email routes, whose teardown reference is the computed org ref.
 NERVE_EMAIL_PROVIDERS = frozenset({"nerve-managed", "nerve-byo-domain"})
 
+#: The public provider identity whose email resource reference is pure
+#: arithmetic: `synthetic-email:<identity_id>` — the exact string
+#: `_validate_email_external_ref` enforces at settle time and the declaring
+#: adapter's `deprovision` accepts. Keyed on the ADAPTER's declaration
+#: (`email_public_provider`), not on a registry name: a stub registered under
+#: a synthetic name without declaring the contract still refuses.
+SYNTHETIC_PUBLIC_EMAIL = "synthetic"
+
 
 def requires_current_content_restriction(
     kind: str, operation: str, provider: str
@@ -127,7 +135,7 @@ class ProvisioningWorker:
         secret_sink: SecretSink,
         email_identities: EmailIdentityRepository | None = None,
         worker_id: str = "worker",
-        real_email_authorized: bool = False,
+        real_email_authorized_households: frozenset[str] = frozenset(),
         runtime_provider: str = "dry-run-runtime",
         bootstrap_ttl_seconds: int = 3600,
         max_safe_attempts: int = 5,
@@ -145,16 +153,19 @@ class ProvisioningWorker:
         self.secret_sink = secret_sink
         self.email_identities = email_identities
         self.worker_id = worker_id
-        #: Whether the VALIDATED configuration authorized real email at boot.
+        #: The households the VALIDATED configuration authorized for real email
+        #: at boot — empty when the brake was on, so absence is fail-closed.
         #:
-        #: The live environment can only ever subtract from this. Reading
-        #: `ABROLIA_REAL_EMAIL_ENABLED` alone made `0 -> 1` an authorization:
-        #: a process booted with the brake on and an allowlist that excludes a
-        #: household would dispatch that household's durable Nerve job the
-        #: moment the variable flipped, even though the frozen configuration
-        #: this worker was built from never permitted it. The allowlist is
-        #: checked where it was validated; a brake must not be a way around it.
-        self.real_email_authorized = real_email_authorized
+        #: A SET, not a boolean. Reducing it to "real email is on somewhere"
+        #: discarded `real_email_household_allowlist` at dispatch: a household
+        #: queued while allowlisted kept its authorization after the allowlist
+        #: was narrowed to exclude it, because its job carries only its own
+        #: `household_id` and nothing re-asked. Selection checks the allowlist,
+        #: but a durable job outlives its selection.
+        #:
+        #: The live environment is ANDed with membership and can only subtract:
+        #: `0 -> 1` must never authorize a household this frozen set omits.
+        self.real_email_authorized_households = real_email_authorized_households
         self.runtime_provider = runtime_provider
         self.bootstrap_ttl_seconds = bootstrap_ttl_seconds
         self.max_safe_attempts = max_safe_attempts
@@ -693,6 +704,26 @@ class ProvisioningWorker:
             )
             if cleanup is not None:
                 return cleanup
+        if self._owned_by_deletion(job):
+            # A waiting answer that arrives after the deletion transaction has
+            # nowhere else to go: no statement of delete() can see this job
+            # any more, and `resume` reads only `running`/`outcome_unknown`.
+            # Settling `waiting_user` would strand the resource outside an
+            # erasure that then completes. The job stays unresolved instead —
+            # reconcile routes a deletion-owned job to the shutdown probe,
+            # which tears down what is recorded or derivable and refuses with
+            # a named reason otherwise. This is also the only arm the
+            # synthetic contract can take: its validator refuses a reference
+            # on a waiting answer outright, so for it there is no scheduled
+            # cleanup above — only this state and the probe's arithmetic.
+            return self._mark_step_problem(
+                job,
+                request,
+                "outcome_unknown",
+                error.code,
+                public_result=public_result,
+                external_ref=external_ref,
+            )
         return self._mark_step_problem(
             job,
             request,
@@ -708,13 +739,42 @@ class ProvisioningWorker:
         current = self.jobs.db.query_one(
             "SELECT status, error_code FROM provisioning_jobs WHERE id = ?", (job.id,)
         )
-        if (
-            current is None
-            or current["status"] != "outcome_unknown"
-            or not requires_reconciliation(current["error_code"])
+        if current is None:
+            return None
+        if current["status"] == "running":
+            # The call was still in flight when the deletion transaction
+            # committed: nothing delete() did can reach this row, and its
+            # answer is arriving only now — after the sweep that cancels
+            # pending work, and outside any stamping deletion no longer
+            # performs. Ownership is asked of the household's durable status,
+            # so erasure owns it the moment anyone looks; refusing here would
+            # leave a provider-held resource with an answer nobody keeps.
+            # Admitting it schedules the teardown in the same worker that
+            # holds the answer — and the SAME transaction moves the running
+            # row into the unresolved state `resume` reads, because a returned
+            # result is only telemetry; nothing else applies it.
+            if not self._owned_by_deletion(job):
+                return None
+        elif current["status"] != "outcome_unknown":
+            return None
+        if not (
+            requires_reconciliation(current["error_code"])
+            or self._owned_by_deletion(job)
         ):
+            # Erasure's own teardown reaches here without a reconciliation
+            # code, because deletion no longer rewrites one onto the job.
             return None
         with self.jobs.db.write() as connection:
+            if current["status"] == "running":
+                # Lease-consistent: this worker holds the lease it is settling
+                # under, and the guard makes re-entry a no-op.
+                self.jobs.settle(
+                    connection,
+                    job.id,
+                    status="outcome_unknown",
+                    error_code=current["error_code"],
+                    now=self.clock(),
+                )
             resource_id = self._external_resource(
                 connection,
                 job,
@@ -1363,6 +1423,18 @@ class ProvisioningWorker:
         Read-only discovery, tolerant deletes, idempotent: no key is issued and
         no webhook rotated, which is what made `inspect` unusable here.
 
+        The synthetic adapters declare their contract the same way they declare
+        their public identity: `email_public_provider == "synthetic"` is the
+        adapter stating that its references are `synthetic-email:<identity_id>`
+        — the exact string `_validate_email_external_ref` enforces on every
+        result it settles, and one its `deprovision` accepts. A call that was
+        accepted and then timed out left its resource under precisely that
+        name, recorded nowhere; refusing to compute it quarantined the teardown
+        forever behind an ambiguity only the provider could resolve — and
+        asking the provider is what a shutdown may not do. An adapter that does
+        not declare this contract derives nothing here, whichever registry
+        name it sits under.
+
         What remains beyond these is state under a reference nobody can
         reconstruct, and there the job stays quarantined with the error code
         naming the reconcile an operator has to run.
@@ -1398,6 +1470,10 @@ class ProvisioningWorker:
         then timed out is still tearable down. Nerve's is a `_Refs` object of
         provider-assigned ids, so nothing here can construct it; returning a
         lookup key instead would schedule a cleanup its deprovisioner refuses.
+        The synthetic adapters' is `synthetic-email:<identity_id>`, declared by
+        the adapter itself through `email_public_provider` (see
+        `SYNTHETIC_PUBLIC_EMAIL`); an adapter that declares no derivable
+        contract still refuses, whichever registry name it sits under.
         """
         if job.kind != "email_identity":
             return None
@@ -1408,6 +1484,16 @@ class ProvisioningWorker:
             return f"{GOOGLE_OAUTH_PROVIDER}:{identity_id}"
         if job.provider in NERVE_EMAIL_PROVIDERS:
             return org_teardown_ref(job.household_id, identity_id)
+        try:
+            declared = getattr(
+                self.providers.get(job.provider), "email_public_provider", None
+            )
+        except ProviderRejected:
+            # An unregistered provider has no contract to derive against; the
+            # refusal below names the reconcile an operator must run.
+            return None
+        if declared == SYNTHETIC_PUBLIC_EMAIL:
+            return f"synthetic-email:{identity_id}"
         return None
 
     def _shutdown_refusal(self, job: JobRecord, request: dict[str, Any]) -> WorkResult:
@@ -1456,7 +1542,11 @@ class ProvisioningWorker:
         # The managed/BYO brake. The adapters stay registered so teardown can
         # resolve them, which means absence no longer stops forward work and
         # this is the only thing that does.
-        if real_email and not (self.real_email_authorized and is_real_email_enabled()):
+        authorized = (
+            job.household_id in self.real_email_authorized_households
+            and is_real_email_enabled()
+        )
+        if real_email and not authorized:
             return "real_email_disabled"
         if flag is None:
             return None
@@ -1500,6 +1590,29 @@ class ProvisioningWorker:
             # the brake's own, less informative, reason.
             return WorkResult(job.id, "outcome_unknown", job.error_code)
         return self._mark_step_problem(job, request, "outcome_unknown", code)
+
+    def _owned_by_deletion(self, job: JobRecord) -> bool:
+        """Whether erasure owns this job's teardown.
+
+        Asked of the HOUSEHOLD's durable status, not of the job's error code.
+        An earlier version had deletion stamp a code onto each ambiguous job,
+        which left two holes: a job already carrying
+        `withdrawal_requires_reconciliation` was skipped, and a `running` call
+        that timed out AFTER that statement was never stamped at all. Both then
+        reconciled down the ordinary path, hit `secret_namespace_not_ready` —
+        deletion having swept the namespace — and stayed there, with the inbox
+        live and the erasure permanently incomplete.
+
+        `status = 'deleting'` is written in the same transaction that makes the
+        deletion durable, so there is no window and nothing to re-run on resume:
+        a job that becomes ambiguous later is owned the moment it is asked. It
+        also preserves the quarantine reason an operator was given, instead of
+        overwriting it with one of deletion's own.
+        """
+        row = self.jobs.db.query_one(
+            "SELECT status FROM households WHERE id = ?", (job.household_id,)
+        )
+        return row is not None and row["status"] in {"deleting", "deleted"}
 
     def _is_shutdown_action(self, job: JobRecord) -> bool:
         """Work that exists BECAUSE a consent went away.
@@ -1776,6 +1889,39 @@ class ProvisioningWorker:
             and self._missing_current_consent_purpose(job) is not None
         ):
             return self._block_for_missing_content_restriction(job, request)
+        if job.kind == "email_identity" and (
+            self._owned_by_deletion(job) or self._is_shutdown_action(job)
+        ):
+            # Teardown reconciles ahead of everything adapter-shaped.
+            #
+            # Erasure: the email branch below returns
+            # `secret_namespace_not_ready` before it reaches its shutdown
+            # check, and deletion has already swept the namespace — it is an
+            # external resource like any other. So teardown for a job deletion
+            # owns could never get past that early return, and the inbox
+            # stayed live with erasure unable to complete. Deliberately
+            # narrow: deletion-owned work only.
+            #
+            # Quarantine: withdrawal, cancel and reset settle an in-flight
+            # intent `outcome_unknown/<reason>_requires_reconciliation`. Their
+            # reconciliation always routed to `_shutdown_probe` — but from
+            # INSIDE the email branch, which was gated on the adapter defining
+            # `reconcile`. An adapter without it fell to a tail that probed
+            # with `inspect`, and on every real email adapter `inspect`
+            # mutates (Nerve reissues the API key and rotates the webhook;
+            # Google OAuth calls `ensure`). The route lives HERE, in the
+            # worker's own vocabulary, so no adapter's shape decides whether a
+            # withdrawn household's inbox gets fresh credentials.
+            #
+            # Both sit above the brake rather than being exemptions inside it.
+            # `_blocked_by_email_kill_switch` is shared with `_run_once`,
+            # where the job may be forward work: a pending job leased just
+            # before erasure began is `running`, deletion leaves `running`
+            # jobs alone deliberately, and exempting it there let a resumed
+            # worker call `ensure` with the brake off — creating new upstream
+            # state during an erasure. Only these paths, which cannot create
+            # anything, may pass the brake.
+            return self._shutdown_probe(job, request)
         disabled = self._blocked_by_email_kill_switch(job)
         if disabled is not None:
             return self._brake_email_option(job, request, disabled)
@@ -1889,8 +2035,17 @@ class ProvisioningWorker:
                     job, request, "outcome_unknown", "reconcile_inconclusive"
                 )
             return WorkResult(job.id, "outcome_unknown", "reconcile_inconclusive")
-        reconcile_email = getattr(provider, "reconcile", None)
-        if job.kind == "email_identity" and callable(reconcile_email):
+        if job.kind == "email_identity":
+            reconcile_email = getattr(provider, "reconcile", None)
+            if not callable(reconcile_email):
+                # Fail closed into a refusal, never into an inspect. Shutdown
+                # work was routed to `_shutdown_probe` above the brake, so
+                # only FORWARD reconcile remains here — and resuming forward
+                # work is the adapter's own contract, not something the
+                # worker may substitute a mutating recovery probe for.
+                return self._mark_step_problem(
+                    job, request, "failed", "provider_cannot_reconcile"
+                )
             namespace_ref = self._secret_namespace_ref(job.household_id)
             if namespace_ref is None:
                 return WorkResult(
@@ -1903,24 +2058,6 @@ class ProvisioningWorker:
                 "selection": request["selection"],
                 "secret_namespace_ref": namespace_ref,
             }
-            if self._is_shutdown_action(job):
-                # `NerveManagedEmailProvisioner.reconcile` and its BYO-domain
-                # sibling delegate straight to `ensure`, which resumes the
-                # provisioning graph and can create an org, a domain, an inbox,
-                # a key or a webhook. So this must not call `reconcile` — but
-                # the first version of this guard simply returned, which refused
-                # the INSPECTION too and left the job permanently
-                # `outcome_unknown` with the inbox never found. Refusing to
-                # create and refusing to look are not the same refusal, and the
-                # second one abandons exactly what the quarantine exists to
-                # clean up.
-                #
-                # It asks nothing. `inspect` is NOT read-only on any email
-                # provider — this comment used to say it was, which is the
-                # belief that put a mutating call in a withdrawal path — so the
-                # shutdown acts on durable state and on references it can
-                # derive. See `_shutdown_probe`.
-                return self._shutdown_probe(job, request)
             try:
                 result = reconcile_email(
                     provider_request,
@@ -1961,52 +2098,14 @@ class ProvisioningWorker:
                 return self._mark_step_problem(job, request, "failed", error.code)
             except (OutcomeUnknown, TimeoutError, ConnectionError):
                 return WorkResult(job.id, "outcome_unknown", "reconcile_inconclusive")
-        inspected = provider.inspect(request.get("stable_ref", job.intent_key))
-        if inspected.state is InspectState.READY and inspected.result:
-            try:
-                if job.kind == "email_identity":
-                    if (
-                        job.error_code == "secret_handoff_unknown"
-                        and inspected.result.secret_material.is_empty
-                    ):
-                        namespace_ref_tmp = self._secret_namespace_ref(job.household_id)
-                        if namespace_ref_tmp is None or not self._email_secret_installed(
-                            job, request, namespace_ref_tmp
-                        ):
-                            return WorkResult(
-                                job.id,
-                                "outcome_unknown",
-                                "secret_handoff_unknown",
-                            )
-                    namespace_ref = self._secret_namespace_ref(job.household_id)
-                    if namespace_ref is None or not self._stage_email_secret(
-                        job, request, inspected.result, namespace_ref
-                    ):
-                        return self._mark_step_problem(
-                            job,
-                            request,
-                            "outcome_unknown",
-                            "secret_handoff_unknown",
-                        )
-                else:
-                    self._reject_identity_secret(inspected.result)
-                return self._finish_step(job, request, inspected.result)
-            except _ProjectionCancelled:
-                return self._cleanup_cancelled_result(
-                    job, inspected.result, self.providers.get(job.provider)
-                )
-        if inspected.state is InspectState.FAILED:
-            return self._mark_step_problem(
-                job,
-                request,
-                "failed",
-                inspected.error_code or "provider_rejected",
-            )
-        if inspected.state is InspectState.ABSENT:
-            return self._mark_step_problem(
-                job, request, "failed", "provider_absent"
-            )
-        return WorkResult(job.id, "outcome_unknown", "reconcile_inconclusive")
+        # Every kind the schema allows is handled above. Reaching this point
+        # means a kind was introduced without a reconcile path — refuse
+        # visibly instead of acquiring an inspect path by omission: `inspect`
+        # mutates on the email adapters, and nothing here knows what this
+        # adapter's contract is.
+        return self._mark_step_problem(
+            job, request, "outcome_unknown", "reconcile_unsupported"
+        )
 
     def _mark_step_problem(
         self,

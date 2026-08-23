@@ -118,6 +118,17 @@ class Provisioner(Protocol):
 
     def inspect(self, stable_ref: str) -> InspectResult: ...
 
+    def reconcile(self, intent: dict[str, Any], idempotency_key: str) -> ProvisionResult:
+        """Resume an uncertain provision. The worker's only forward re-entry.
+
+        Declared because `reconcile` is a CONTRACT, not an optional attribute
+        the worker discovers with `getattr`: an adapter that omits it used to
+        fall to a reconcile tail whose first act was `inspect` — and on the
+        email adapters `inspect` is a recovery path that mutates provider
+        state (Nerve reissues the API key and rotates the webhook; Google
+        OAuth calls `ensure`). Shutdown work must never reach it.
+        """
+
     def deprovision(self, external_ref: str) -> InspectResult: ...
 
 

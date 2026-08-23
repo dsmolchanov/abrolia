@@ -35,7 +35,10 @@ from control_plane.provisioning.contracts import (
     ProviderRegistry,
     ProviderWaiting,
 )
-from control_plane.provisioning.fakes import DeterministicFakeProvisioner
+from control_plane.provisioning.fakes import (
+    DeterministicFakeProvisioner,
+    synthetic_provider_registry,
+)
 from control_plane.provisioning.planner import DesiredSpecPlanner
 from control_plane.provisioning.worker import COMPENSATED_STEP_KINDS
 
@@ -1129,11 +1132,14 @@ def test_a_quarantined_email_job_reconciles_past_the_consent_check(cp_stack) -> 
     """The teardown must not require the consent whose loss demands it.
 
     Withdrawal settles an ambiguous provider call `outcome_unknown` so an
-    operator can reconcile it, and reconciling means finding and tearing down
-    whatever the provider may have created. `_reconcile` checked for a current
-    content-restriction consent BEFORE inspecting — and withdrawal necessarily
-    revoked it — so the job settled `failed` at the precondition and the inbox
-    that may exist was never inspected, never recorded, never deleted.
+    operator can reconcile it, and reconciling means tearing down whatever
+    the provider may have created. `_reconcile` checked for a current
+    content-restriction consent BEFORE tearing down — and withdrawal
+    necessarily revoked it — so the job settled `failed` at the precondition
+    and the inbox that may exist was never removed. Reconciling no longer
+    inspects anything: it derives the teardown reference from durable state
+    and schedules a deprovision, so what must survive the missing consent is
+    the whole teardown, not merely a look.
     """
     complete_onboarding(cp_stack)
     drain(cp_stack)
@@ -1163,24 +1169,44 @@ def test_a_quarantined_email_job_reconciles_past_the_consent_check(cp_stack) -> 
 
     class RecordingEmail(DeterministicFakeProvisioner):
         inspected = 0
+        torn_down: list[str] = []
 
         def inspect(self, intent, idempotency_key=None):
             type(self).inspected += 1
             return InspectResult(InspectState.ABSENT)
 
-    provider = RecordingEmail("email")
-    registry = ProviderRegistry()
-    registry.register("nerve-managed", provider)
-    cp_stack.make_worker(providers=registry, now=BASE_TIME + 50).reconcile(email_job)
+        def deprovision(self, external_ref):
+            type(self).torn_down.append(external_ref)
+            return InspectResult(InspectState.ABSENT)
 
-    # The property, asserted positively: the provider was ASKED. Asserting that
-    # some error code did not appear is weaker than it looks — the precondition
-    # settles with a code of its own choosing, and a test that names one string
-    # passes when the code changes. What matters is that the inspection the
-    # teardown depends on actually happened.
-    assert type(provider).inspected > 0, (
+    provider = RecordingEmail("email")
+    # The full synthetic set underneath: withdrawal's own supersession left
+    # cleanups for this household's other resources, and a worker that cannot
+    # resolve their providers would fail them before reaching ours.
+    registry = synthetic_provider_registry()
+    registry.register("nerve-managed", provider)
+    worker = cp_stack.make_worker(providers=registry, now=BASE_TIME + 50)
+    reconciled = worker.reconcile(email_job)
+    assert reconciled.status == "outcome_unknown"
+    # Withdrawal itself scheduled cleanups alongside this one; drain until
+    # the queue is quiet so the pass that performs THIS teardown is certain
+    # to have run.
+    for _ in range(10):
+        if worker.run_once() is None:
+            break
+
+    # The property, asserted positively: the teardown happened without the
+    # consent that was withdrawn. Asserting that some error code did not
+    # appear is weaker than it looks — the precondition settles with a code
+    # of its own choosing, and a test that names one string passes when the
+    # code changes. What matters is that the provider resource was actually
+    # deprovisioned, and that none of it went through a mutating inspect.
+    assert type(provider).torn_down, (
         "the teardown was refused for want of the consent that was withdrawn,"
-        " so the inbox that may exist was never inspected"
+        " so the inbox that may exist was never removed"
+    )
+    assert type(provider).inspected == 0, (
+        "reconcile reached the adapter through a mutating inspect"
     )
 
 

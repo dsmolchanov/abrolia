@@ -279,6 +279,30 @@ makes a review loop unable to terminate.
   parameterised over both Nerve providers and both cleanup origins, with a stub
   whose `inspect` counts credential reissues.
 
+  **Reconcile dispatches exhaustively; adapter shape gates nothing about
+  teardown.** Found in the same round's design pass, as the residue of the
+  finding above: the shutdown route still lived INSIDE the email branch gated
+  on `callable(getattr(provider, "reconcile", None))` — an attribute the
+  `Provisioner` protocol never declared — so an adapter omitting the method
+  sent quarantined teardown work to a tail whose first act was
+  `provider.inspect`, and every schema kind without its own branch fell into
+  the same tail by omission. All adapters defining `reconcile` was a property
+  of the adapters, not a guarantee of the worker. The worker now owns the
+  whole decision: shutdown routing for email jobs sits above every
+  adapter-shaped check; forward reconcile REQUIRES `reconcile` and fails
+  closed (`provider_cannot_reconcile`) rather than substituting a probe; the
+  protocol declares the method; and the end of `_reconcile` is an explicit
+  refusal (`reconcile_unsupported`), not a tail, so a future kind cannot
+  silently acquire an inspect path. The runtime branch keeps its read-only
+  inspect deliberately — crash recovery for live households' forward work is
+  the one place the recovery-inspect contract is legitimate. Enforced by
+  `tests/control_plane/test_real_email_wiring.py::test_a_quarantined_job_reconciles_without_the_adapters_reconcile_method`,
+  `::test_forward_reconcile_without_the_method_fails_closed` (both
+  parameterised over all four adapters including the fake, against a stub
+  whose `inspect` raises), and
+  `::test_a_kind_without_a_reconcile_path_is_refused_not_probed` over the two
+  kinds Phase E has not created yet.
+
   **Whatever `build` constructs, `validate` must already have vetted.** Widening
   what the container builds silently widens what the config must accept.
   Registering the Nerve adapters on `nerve_configured` rather than
@@ -304,6 +328,82 @@ makes a review loop unable to terminate.
   configuration the worker was built from. The allowlist is enforced where it
   was validated. Enforced by
   `tests/control_plane/test_real_email_wiring.py::test_the_env_brake_cannot_authorize_what_the_config_refused`.
+
+  **A brake carries the whole authorization, not a summary of it.** The worker
+  was given `real_email_enabled` as one boolean, which discarded
+  `real_email_household_allowlist`: a household queued while allowlisted kept
+  its authorization after the allowlist was narrowed to exclude it, because the
+  durable job carries only its own `household_id` and dispatch asked whether
+  real email was on *anywhere*. Selection checks the allowlist, but a durable
+  job outlives its selection. The worker now holds the frozen SET and asks
+  membership. Enforced by
+  `test_a_household_removed_from_the_allowlist_cannot_still_dispatch`,
+  `test_membership_is_what_the_brake_asks`, and
+  `test_the_container_authorizes_nobody_while_the_brake_is_on` — the last
+  because handing the list through with the brake on would let `0 -> 1`
+  authorize households the configuration never did.
+
+  **Erasure owns its ambiguity, and says so durably.** Deletion cancels only
+  `pending` and `waiting_user`, correctly: an `outcome_unknown` job may have
+  created something upstream and must be reconciled, not discarded. But
+  reconciliation re-applies every forward precondition, so a job the kill switch
+  settled carried `real_email_disabled` — no reconciliation suffix — and the
+  brake blocked it again forever. Erasure could not reach the provider for
+  exactly the resource whose creation was uncertain. Deletion now reclassifies
+  its OWN household's ambiguous jobs to `deletion_requires_reconciliation`, and
+  `_reconcile` routes those to `_shutdown_probe` ahead of the email branch,
+  whose `secret_namespace_not_ready` early return would otherwise stop them —
+  deletion has already swept the namespace, it being an external resource like
+  any other.
+
+  The exemption is a ROUTE, not a hole in the brake. It sits above
+  `_blocked_by_email_kill_switch` in `_reconcile`, never inside it: that
+  predicate is shared with `_run_once`, where the job may be forward work. A
+  pending job leased just before erasure began is `running`, deletion leaves
+  `running` jobs alone deliberately, and exempting deletion-owned work inside
+  the predicate let a resumed worker call `ensure` with the brake off — creating
+  new upstream email state during an erasure, on all three email routes at once.
+  Only a path that cannot create anything may pass a brake. Enforced by
+  `test_erasure_never_lets_forward_work_past_the_brake`, over
+  `nerve-managed`, `nerve-byo-domain` and `google-oauth`.
+
+  **Erasure joins the lifecycle it depends on.** Scheduling a cleanup is not
+  finishing one. `_delete_email_binding_secret` deletes the provider secret only
+  for an identity marked `disconnecting` — the state the ordinary disconnect
+  flow sets — and deletion never entered that flow, so its own cleanup settled
+  `outcome_unknown/secret_cleanup_unknown`, the parent job was never settled,
+  and `resume` saw unresolved work forever with the provider resource and the
+  secret namespace both already gone. Deletion now performs the same transition
+  the disconnect path uses, in the same durable transaction. This only shows up
+  when the deletion does NOT complete: the completed path drops the household
+  row and cascades the identity away, leaving nothing to settle. Enforced by
+  `test_erasure_teardown_reaches_a_terminal_state`, whose fixture deliberately
+  keeps the deletion open.
+
+  Ownership is asked of the HOUSEHOLD's durable status, never of the job's error
+  code. Stamping a code onto each ambiguous job in one transaction — the first
+  attempt — left two holes: a job already carrying
+  `withdrawal_requires_reconciliation` was skipped by the guard against
+  overwriting an operator's quarantine reason, and a `running` call that timed
+  out AFTER that statement was never stamped at all. `status = 'deleting'` is
+  written in the same transaction that makes the deletion durable, so there is
+  no window, nothing to re-run on resume, and the job keeps the reason it had.
+
+  It must still not suffix the brake's own error code — that code is written for
+  live households too, and suffixing it would exempt every braked job from its
+  own brake — and it must not reach beyond the household being erased, which
+  would make one deletion a global release. Enforced by
+  `test_deletion_can_tear_down_a_job_the_brake_settled`,
+  `test_erasure_owns_every_ambiguous_job_however_it_got_there` (braked,
+  pre-quarantined, and ambiguous-only-after-deletion),
+  `test_deletion_reclassifies_only_its_own_households_jobs`, and
+  `test_the_brake_code_alone_is_never_reconciliation_work`.
+
+  The route is deliberately narrow — deletion-owned work only. Withdrawal,
+  cancel and reset leave the namespace in place and their reconciliation is a
+  settled contract; widening it to all shutdown work breaks
+  `test_late_waiting_response_after_cancel_stays_reconcilable` and is a separate
+  question.
 
   This also settles where such a brake may be read. Registration cannot carry
   it, and the worker holds no `ControlPlaneConfig`, so it is read from the

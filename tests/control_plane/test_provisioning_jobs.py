@@ -405,15 +405,27 @@ def test_reconcile_recovers_accepted_unknown_without_duplicate_resource(cp_stack
     assert email.status is StepStatus.VERIFIED
 
 
-def test_reconcile_marks_definitively_absent_unknown_as_failed(cp_stack) -> None:
+def test_reconcile_of_an_absent_unknown_resumes_through_the_adapter(cp_stack) -> None:
+    """Absence is the adapter's finding now, not the worker's.
+
+    The deleted reconcile tail probed with `inspect` and settled a
+    definitively absent unknown `failed/provider_absent` itself. Forward
+    resume goes through the adapter's `reconcile` — which for this fake, like
+    Nerve's (`return self.ensure(...)`), re-runs the idempotent provision
+    under the same key. "Unknown" is still all anyone knows, so the job stays
+    exactly as reconcilable as it was; what must NOT happen is the worker
+    deciding absence on its own authority ever again.
+    """
+
     fake, worker = _selected_email_with_provider(cp_stack, "unknown")
     unknown = worker.run_once()
+    assert fake.ensure_calls == 1
     fake.resources.clear()
 
     reconciled = worker.reconcile(unknown.job_id)
-    assert reconciled.status == "failed"
-    assert reconciled.error_code == "provider_absent"
-    assert cp_stack.jobs.get(unknown.job_id).status == "failed"
+    assert fake.ensure_calls == 2
+    assert reconciled.status == "outcome_unknown"
+    assert cp_stack.jobs.get(unknown.job_id).status == "outcome_unknown"
 
 
 def test_provider_call_runs_without_an_open_control_plane_transaction(cp_stack) -> None:
@@ -940,13 +952,23 @@ def test_late_waiting_response_after_cancel_stays_reconcilable(cp_stack) -> None
     assert late.status == "outcome_unknown"
     assert late.error_code == "cancel_requires_reconciliation"
     assert cp_stack.jobs.get(late.job_id).status == "outcome_unknown"
+    # Reconciling a quarantined job is teardown-first now: it routes to the
+    # shutdown probe, never to a recovery inspect. This adapter exposes no
+    # derivable teardown reference, so the probe refuses rather than guess —
+    # and the refusal keeps the quarantine exactly as an operator found it.
     assert worker.reconcile(late.job_id).status == "outcome_unknown"
 
     fake.pending.clear()
-    resolved = worker.reconcile(late.job_id)
-    assert resolved.status == "failed"
-    assert resolved.error_code == "provider_absent"
-    assert cp_stack.jobs.get(late.job_id).status == "failed"
+    still = worker.reconcile(late.job_id)
+    assert still.status == "outcome_unknown"
+    assert still.error_code == "cancel_requires_reconciliation", (
+        "the reconcile of a quarantined job must not overwrite the reason "
+        "an operator is holding"
+    )
+    assert cp_stack.jobs.get(late.job_id).status == "outcome_unknown", (
+        "a late waiting response after cancel left the job somewhere "
+        "reconcile can never reach again"
+    )
     assert cp_stack.onboarding.workflow_for_household(
         cp_stack.household.id
     ).state == "cancelled"
@@ -954,12 +976,18 @@ def test_late_waiting_response_after_cancel_stays_reconcilable(cp_stack) -> None
         "SELECT id, status FROM email_identities WHERE household_id = ?",
         (cp_stack.household.id,),
     )
-    assert identity["status"] == EmailIdentityStatus.DELETED.value
-    reservation = cp_stack.database.query_one(
-        "SELECT status FROM email_address_reservations WHERE email_identity_id = ?",
-        (identity["id"],),
-    )
-    assert reservation["status"] == "released"
+    assert identity["status"] not in {
+        EmailIdentityStatus.VERIFIED.value,
+        EmailIdentityStatus.ACTIVE.value,
+    }, "an identity whose workflow was cancelled ended up activated"
+
+    # Over the three real adapters the same cancel derives a teardown
+    # reference, and the cleanup it schedules settles this parent to
+    # `cancelled_and_compensated` and deletes the identity — covered by
+    # test_real_email_wiring.py. The synthetic provider deliberately has no
+    # teardown contract; refusing beats scheduling a cleanup its
+    # deprovisioner would refuse, because the resource is live either way
+    # and only one of the two says it was handled.
 
 
 @pytest.mark.parametrize(

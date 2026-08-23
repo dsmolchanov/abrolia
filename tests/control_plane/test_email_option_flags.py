@@ -225,6 +225,12 @@ class RecordingProvisioner:
         self.calls.append("inspect")
         return InspectResult(state=InspectState.ABSENT)
 
+    def reconcile(self, intent, idempotency_key):  # noqa: ANN001, ANN201
+        # Declared on `Provisioner` now: forward resume is the adapter's own
+        # method, not something the worker substitutes a mutating probe for.
+        self.calls.append("reconcile")
+        return self.ensure(intent, idempotency_key)
+
     def deprovision(self, external_ref):  # noqa: ANN001, ANN201
         self.calls.append("deprovision")
         return InspectResult(state=InspectState.ABSENT)
@@ -269,6 +275,7 @@ def _queue_email_job(
     operation: str,
     kind: str = "email_identity",
     now: float,
+    extra_request: dict | None = None,
 ) -> str:
     """Enqueue the job the way the queue holds it, with the option still ON."""
 
@@ -286,6 +293,7 @@ def _queue_email_job(
                 "stable_ref": f"{cp_stack.household.id}:inbox",
                 "resource_type": "email_identity",
                 "external_ref": "already-created-at-the-provider",
+                **(extra_request or {}),
             },
             provider=provider,
             now=now,
@@ -504,10 +512,26 @@ def test_a_quarantined_job_is_not_blocked_by_a_disabled_option(
     cp_stack.complete_profile()
     _hold_the_content_restriction(cp_stack, now=1_760_000_000.0)
 
-    monkeypatch.setenv(env_name, "1")
+    identity_id = "44000000-0000-4000-8000-00000000000c"
     now = 1_760_000_000.0
+    # The teardown's last act deletes the identity's provider secret, which it
+    # only does for an identity inside the disconnect lifecycle.
+    with cp_stack.database.write() as connection:
+        connection.execute(
+            "INSERT INTO email_identities (id, household_id, option, status,"
+            " secret_binding_ref, encryption_key_version, version, created_at,"
+            " updated_at)"
+            " VALUES (?, ?, 'managed_abrolia', 'disconnecting', NULL, 'v1', 1, ?, ?)",
+            (identity_id, cp_stack.household.id, now, now),
+        )
+
+    monkeypatch.setenv(env_name, "1")
     job_id = _queue_email_job(
-        cp_stack, provider=provider_name, operation="inspect", now=now
+        cp_stack,
+        provider=provider_name,
+        operation="inspect",
+        now=now,
+        extra_request={"email_identity_id": identity_id},
     )
     with cp_stack.jobs.db.write() as connection:
         connection.execute(
@@ -520,10 +544,25 @@ def test_a_quarantined_job_is_not_blocked_by_a_disabled_option(
     recorder = RecordingProvisioner()
     registry = synthetic_provider_registry()
     registry.register(provider_name, recorder)
-    result = cp_stack.make_worker(providers=registry, now=now + 10).reconcile(job_id)
+    worker = cp_stack.make_worker(providers=registry, now=now + 10)
+    result = worker.reconcile(job_id)
 
     assert result.error_code != f"email_option_disabled:{flag}"
-    assert recorder.calls != [], "the switch blocked shutdown work"
+    assert result.error_code == "withdrawal_requires_reconciliation"
+    cleanup_row = cp_stack.database.query_one(
+        "SELECT id FROM provisioning_jobs WHERE household_id = ? AND kind = 'cleanup'",
+        (cp_stack.household.id,),
+    )
+    assert cleanup_row is not None, (
+        "the switch blocked the teardown the quarantined job exists for"
+    )
+
+    # The teardown is scheduled by reconcile and performed by the next pass —
+    # through deprovision, never a mutating inspect — so drive that pass and
+    # require the provider to actually be reached.
+    done = worker.run_once()
+    assert done is not None and done.status == "succeeded", done
+    assert recorder.calls == ["deprovision"], recorder.calls
 
 
 @pytest.mark.parametrize("option", sorted(PROVIDER_CASES))
@@ -547,7 +586,17 @@ def test_a_braked_job_survives_to_be_reconciled_when_the_flag_returns(
     monkeypatch.setenv(env_name, "1")
     now = 1_760_000_000.0
     job_id = _queue_email_job(
-        cp_stack, provider=provider_name, operation="inspect", now=now
+        cp_stack,
+        provider=provider_name,
+        operation="inspect",
+        now=now,
+        extra_request={
+            # Forward resume re-enters the adapter with the original intent,
+            # which the email branch reads from the request.
+            "email_identity_id": "44000000-0000-4000-8000-00000000000d",
+            "option": "managed_abrolia",
+            "selection": {"kind": "abrolia_managed", "local_part": "family-agent"},
+        },
     )
     if braked_by == "reclaimed_run_once":
         _expire_the_lease(cp_stack, job_id, now=now)
@@ -580,6 +629,30 @@ def test_a_braked_job_survives_to_be_reconciled_when_the_flag_returns(
     # provider must actually be reached — this is the half that proves the brake
     # preserved a usable job rather than merely a differently-broken one.
     monkeypatch.setenv(env_name, "1")
+    # Forward resume re-enters the adapter only once the household's secret
+    # namespace exists; these brake fixtures never provisioned runtime.
+    with cp_stack.jobs.db.write() as connection:
+        namespace = cp_stack.jobs.encrypt_json(
+            "external_resources",
+            f"ns-brake-return-{job_id}",
+            "external_id",
+            "synthetic-namespace:brake-return",
+        )
+        connection.execute(
+            "INSERT INTO external_resources (id, household_id, provider,"
+            " resource_type, stable_name, external_id_ciphertext,"
+            " encryption_key_version, status, created_at, updated_at)"
+            " VALUES (?, ?, 'dry-run-runtime', 'secret_namespace',"
+            " 'secret_namespace', ?, ?, 'ready', ?, ?)",
+            (
+                f"ns-brake-return-{job_id}",
+                cp_stack.household.id,
+                namespace.ciphertext,
+                namespace.key_version,
+                now + 15,
+                now + 15,
+            ),
+        )
     after = RecordingProvisioner()
     registry_after = synthetic_provider_registry()
     registry_after.register(provider_name, after)
