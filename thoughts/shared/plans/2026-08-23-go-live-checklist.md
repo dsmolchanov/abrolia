@@ -150,6 +150,25 @@ Prerequisite: O1 ticked. Order is not negotiable per runbook and canon.
 
 ## Execution log
 
+- 2026-08-24: **PR #71 opened; the archived Anthropic DPA lost its CMS payload,
+  not its text.** CI's `check_fixtures` runs with a PRIVATE deny file
+  (`HERMES_EXTRA_DENY_FILE`) that does not exist locally, so Gate -1 was red in
+  CI while clean here: one private pattern matched a substring inside the
+  serialized Next.js/Sanity navigation payload of the archived page — website
+  scaffolding a "save page" snapshot dragged along, not a word of the DPA. The
+  `custom` rule refuses allowlisting by design (`check_fixtures.py:412` raises
+  on a `custom` exception line), and that is right: suppressing it would put the
+  protected token in the repository as a rule. So the 37 `<script>` elements
+  (138 324 bytes) were deleted instead. The deletion is span-exact — the
+  remaining bytes are identical to the original, proven against blob `9b989cf`
+  — and the file now opens with a comment recording what was removed, the
+  original's SHA-256, and the commit to audit it against; the registry row
+  carries the same note. Scripts never render, so the visible DPA is unchanged:
+  SCC Module Two ×5, Standard Contractual Clauses ×12, every Annex. **The first
+  attempt at that comment quoted the matched token verbatim and tripped the
+  same gate**, which is the rule working exactly as intended and worth
+  remembering: the explanation of a redaction is inside its blast radius.
+
 - 2026-08-24: **branch pushed; the plan-scope gate was red and is now closed.**
   `codex/go-live-c1-c2` reached `origin` at `2c99080` (the push the previous
   session could not complete). The full non-live suite then came back **1483
