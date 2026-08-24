@@ -36,6 +36,7 @@ def test_migrations_are_ordered_and_idempotent(tmp_path: Path) -> None:
             "0006_channel_preferences.sql",
             "0007_channel_bindings.sql",
             "0008_runtime_health_ownership.sql",
+            "0009_channel_binding_challenges.sql",
         ]
         assert database.migrate() == []
         assert database.pragma() == {

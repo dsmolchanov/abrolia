@@ -81,6 +81,15 @@ class RetentionService:
                 "DELETE FROM bootstrap_tokens WHERE COALESCE(used_at, revoked_at, expires_at) < ?",
                 (now - 90 * DAY,),
             ).rowcount
+            # An unanswered challenge is a live invitation to join a
+            # household. Its `expires_at` stops it being redeemable; this stops
+            # it being STORED — the target's channel ID sits in the row, and a
+            # code nobody used is the one most worth not keeping.
+            deleted["channel_binding_challenges"] = connection.execute(
+                "DELETE FROM channel_binding_challenges"
+                " WHERE COALESCE(consumed_at, expires_at) < ?",
+                (now - DAY,),
+            ).rowcount
             deleted["consent_receipts"] = connection.execute(
                 "DELETE FROM consent_receipts WHERE revoked_at IS NOT NULL AND revoked_at < ?"
                 " AND household_id IS NULL AND account_id IS NULL",

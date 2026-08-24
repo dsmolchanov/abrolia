@@ -146,6 +146,41 @@ Track C's later slices get their own inventory sections and their own
 `**Branches:**` lines. C3 must not be added to this one — a step that
 accumulates branches stops bounding any of them.
 
+#### Inventory — C3 binding lifecycle and the second adult
+
+**Files:** `control_plane/repositories/bindings.py`,
+`control_plane/migrations/0009_channel_binding_challenges.sql`,
+`control_plane/api/bindings.py`, `control_plane/api/app.py`,
+`control_plane/provisioning/planner.py`, `control_plane/container.py`,
+`control_plane/repositories/__init__.py`, `control_plane/models.py`,
+`control_plane/privacy/retention.py`, `tests/control_plane/conftest.py`,
+`tests/control_plane/test_channel_bindings.py`,
+`tests/control_plane/test_binding_api.py`, `tests/control_plane/test_db.py`,
+`tests/control_plane/test_manifest.py`,
+`tests/control_plane/test_consent_withdrawal.py`.
+
+**Branches:** `codex/go-live-c3-bindings`.
+
+Four of these are consequences rather than choices, named so they are not read
+as scope creep:
+
+- `control_plane/models.py` and `control_plane/privacy/retention.py` — a new
+  table must declare a privacy classification and be retired by the sweep.
+  Three separate gates fail otherwise, which is the schema contract working.
+- `tests/control_plane/conftest.py`, `test_manifest.py`,
+  `test_consent_withdrawal.py`, `test_db.py` — `DesiredSpecPlanner` gained a
+  repository argument, so every construction of it moved, and the migration
+  list is asserted explicitly.
+
+**This step's `**Branches:**` line cannot make the gate pass while the branch
+is stacked.** `codex/go-live-c3-bindings` sits on `codex/go-live-c1-c2`, which
+is unmerged, so `git diff main...HEAD` returns the union of both slices and the
+C1+C2 paths read as undeclared by THIS step. Adding them here, or adding this
+branch to the C1+C2 step, would each defeat the bounding the gate exists for.
+The scope becomes well-defined the moment #71 merges and this branch rebases
+onto main — which is the honest reading: a stacked branch does not have a
+scope of its own until its base has one.
+
 ## Track R — Staged rollout (fixed order; runbook §Rollout)
 
 Prerequisite: O1 ticked. Order is not negotiable per runbook and canon.
@@ -263,6 +298,47 @@ Prerequisite: O1 ticked. Order is not negotiable per runbook and canon.
   have, which is the scope signal `CLAUDE.md` describes — a read-only web tool
   registry and a threaded runtime server are each their own change. Suite 1492
   green, ruff and sanitizer clean.
+
+- 2026-08-24: **C3 landed — `channel_bindings` finally has a writer, and the
+  manifest became a projection of it.** The table arrived in 0007 carrying
+  `verified_at`/`verified_by_actor_id` and nothing in production ever wrote a
+  row: `gateway/whatsapp_router.py:114` read it to route senders, and only
+  tests ever gave it something to find, while the planner built the owner's
+  binding inline. Two records of one fact, and nothing keeping them in step.
+  Now `ChannelBindingsRepository` (challenge → verify → write, migration 0009)
+  is the only writer, the planner SEEDS the owner's row from verified
+  onboarding and PROJECTS the manifest from the table, and
+  `actors.family` stops being the hardcoded `(owner,)` that made a second
+  adult impossible. A verified binding issues a config revision in the same
+  transaction as the row, so neither half is ever observable alone — the
+  runtime reads `RunContext` from the manifest, so a row without a revision
+  would be a member the runtime refuses. Owner-only, behind
+  `require_private_mutation`, in `control_plane/api/bindings.py`. On the rebased
+  tree the full suite is 1520 green — the 1502 that merged as `e2f82de` plus
+  12 lifecycle and 6 endpoint cases — with the scope gate among them, ruff and
+  sanitizer clean.
+
+  **Two limits are pinned by tests rather than left to be discovered.**
+  `external_id_hmac` stays NULL, because the digest the gateway compares in
+  strict mode is keyed with a relay key the control plane does not hold and
+  has no path to (`provisioning/secrets.py` is C5's, absent) — every binding
+  written here is invisible to a strict-mode gateway until C5 lands, and
+  `test_hmac_column_stays_null_until_c5_provisions_the_key` is what should
+  start failing then. And "verified" is narrower than the column name: this
+  side has no SENDER for telegram or WhatsApp, so it cannot put a code into
+  the channel it is binding. The code goes to the owner to deliver, which
+  proves whoever answers holds it and leaves "this ID is that person's" as the
+  owner's attestation. B-07 keeps every external ID synthetic meanwhile, so
+  nobody real can be attested for. Both belong to the design, not to a patch.
+
+  **The scope gate could not pass while this branch was stacked**, and that
+  was not a defect: `git diff main...HEAD` returned the union of both slices
+  while `codex/go-live-c1-c2` was unmerged, so C1+C2's paths read as
+  undeclared by C3's step. Resolved by the event it was waiting for — #71
+  merged as `e2f82de` and this branch was rebased onto it with
+  `--onto origin/main db93ccc`, replaying only the C3 commit rather than the
+  seven already squashed into main. The diff is now C3's own, which is what
+  makes the step's inventory the branch's actual scope.
 
 - 2026-08-24: **PR #71 opened; the archived Anthropic DPA lost its CMS payload,
   not its text.** CI's `check_fixtures` runs with a PRIVATE deny file
