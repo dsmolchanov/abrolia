@@ -102,6 +102,37 @@ Ordered slices:
   `hermes_cloud/core/migrations/0008`), so the acceptance commands name tests
   that exist. Stale boxes mislead exactly like the retired flags did.
 
+#### Inventory — C1 + C2, with the O1 evidence they shipped beside
+
+**Files:** `hermes_cloud/runner/pipeline.py`, `hermes_cloud/channels/web.py`,
+`hermes_cloud/core/observability.py`, `hermes_cloud/runtime/service.py`,
+`control_plane/api/web.py`, `control_plane/container.py`,
+`control_plane/runtimes/*`, `web/static/app.js`, `tests/test_cost_caps.py`,
+`tests/test_runtime_web_chat.py`, `tests/control_plane/test_web_chat_api.py`,
+`tests/control_plane/test_frontend_branding.py`, `docs/privacy/processors.md`,
+`docs/privacy/vendor-dpas/*`, `.check-fixtures-allow`.
+
+**Branches:** `codex/go-live-c1-c2`.
+
+Three of these are not obvious from the slice titles, so they are named with
+their reason rather than left to be inferred:
+
+- `tests/control_plane/test_frontend_branding.py` — putting `/api/web/message`
+  behind `require_private_mutation` changed the refusal ORDER on that endpoint
+  (403 before auth). The branding test asserted the old order, so it is a
+  consequence of C2, not an unrelated edit.
+- `.check-fixtures-allow` — the archived vendor DPAs are third-party legal
+  prose carrying vendor org contacts, which the fixture sanitizer reads as
+  live contact data. Allowlisted under the landing-page org-contact precedent.
+- `docs/privacy/*` — O1 is a Track O item, not Track C. Its evidence rode this
+  branch because the DPA verification happened in the same sitting; the step
+  declares it here so the path is not undeclared, and O1 itself stays open on
+  P2, the TIAs and the Art 27 mandate.
+
+Track C's later slices get their own inventory sections and their own
+`**Branches:**` lines. C3 must not be added to this one — a step that
+accumulates branches stops bounding any of them.
+
 ## Track R — Staged rollout (fixed order; runbook §Rollout)
 
 Prerequisite: O1 ticked. Order is not negotiable per runbook and canon.
@@ -118,6 +149,21 @@ Prerequisite: O1 ticked. Order is not negotiable per runbook and canon.
   open). Shared-WA relay last, after C5.
 
 ## Execution log
+
+- 2026-08-24: **branch pushed; the plan-scope gate was red and is now closed.**
+  `codex/go-live-c1-c2` reached `origin` at `2c99080` (the push the previous
+  session could not complete). The full non-live suite then came back **1483
+  passed, 1 failed** — not the 1484/exit-0 the C2b handoff recorded:
+  `test_every_changed_path_is_declared_by_this_branch_s_plan_step` failed with
+  "0 plan steps claim the branch". The earlier green is explainable rather than
+  imaginary — the gate reads the CURRENT branch name, and the tree was
+  tree-identical to `codex/phase-F-allowlist-at-dispatch`, which
+  `canon-execution-plan.md:218` does claim; run under that name it passes, under
+  this one it never could. CI resolves the name from `GITHUB_HEAD_REF`, so the
+  PR would have opened red. Closed by giving Track C its first inventory
+  section above — no code changed. The lesson is the gate's own: a scope check
+  is only as good as the name it is run under, and "the suite was green on the
+  other branch" is not evidence about this one.
 
 - 2026-08-24: **C2b landed — the runtime serves `/internal/v1/web/chat` and
   builds its first ToolLoop.** The route joined `INTERNAL_ROUTES`, so the
