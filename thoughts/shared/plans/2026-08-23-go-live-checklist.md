@@ -116,7 +116,8 @@ Ordered slices:
 `tests/control_plane/conftest.py`,
 `tests/control_plane/test_provisioning_jobs.py`, `tests/test_whatsapp.py`,
 `docs/onboarding-runbook.md`, `tests/control_plane/test_config.py`,
-`tests/control_plane/test_export_delete.py`.
+`tests/control_plane/test_export_delete.py`,
+`hermes_cloud/runtime/service.py`.
 
 **Branches:** `codex/go-live-c1-c2`.
 
@@ -161,6 +162,34 @@ Prerequisite: O1 ticked. Order is not negotiable per runbook and canon.
   open). Shared-WA relay last, after C5.
 
 ## Execution log
+
+- 2026-08-25: **Review round 3 — two fail-open defects in C1's own work.**
+  Both were verified before changing anything and both were real.
+
+  **`emit_alert` printed raw tenant IDs.** `RuntimeStructuredLogger`, sixty
+  lines above it in the same module, refuses to start without an HMAC key so
+  that identifiers reach the log as `household_id_hash` — and the alert C1
+  added wrote `household_id=` verbatim to the same Fly-hosted stream from all
+  three channels. Redaction now happens at the alert boundary, not at the call
+  sites: a rule enforced in three places is a rule with three chances to be
+  forgotten, and the fourth caller would be the leak. Without a key the
+  identifier is dropped rather than printed, which is the trade the request
+  logger already makes by emitting nothing at all.
+
+  **`nan` disabled the spending brake.** Both parse sites used bare `float()`,
+  and every comparison against `nan` or `inf` is False — so
+  `HERMES_COST_CAP_USD_PER_DAY=nan` parsed cleanly and switched the cap OFF at
+  every provider call. `parse_daily_cap_usd` is now shared by the pipeline and
+  the runtime, refuses non-finite and non-positive values loudly at startup,
+  and treats unset as the default rather than an error. The pipeline also
+  stopped swallowing a bad value into $5: a cap the operator got wrong is a cap
+  they believe they set.
+
+  Suite 1502 green. Merged to main by admin with three findings open — the web
+  approval lifecycle, the runtime's single-threaded server, and fail-closed
+  behaviour when usage accounting cannot commit — each needing a design
+  decision rather than a patch, and each recorded here rather than lost with
+  the branch.
 
 - 2026-08-25: **Review round 2 — the credential fix did not fix production,
   and the finding was right.** One new blocker on `3f5e9b1`: the key had been

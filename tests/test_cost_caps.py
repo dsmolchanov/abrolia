@@ -464,3 +464,68 @@ def test_a_retry_is_also_a_paid_call_and_is_capped(tmp_path: Path) -> None:
     # One attempt happened; the retry was refused by the cap rather than made.
     assert len(client.calls) == 1
     assert result.stopped == STOP_COST_CAP
+
+
+# --- what the alert may print, and what the cap may be --------------------
+
+
+def test_an_alert_never_prints_a_raw_tenant_identifier(caplog, monkeypatch) -> None:
+    """`RuntimeStructuredLogger` in this same module refuses to start without an
+    HMAC key so that identifiers reach the log as `household_id_hash`. An alert
+    writing the raw value to the same Fly-hosted stream walks around that."""
+    from hermes_cloud.core.observability import (
+        UNKEYED_IDENTIFIER,
+        emit_alert,
+        household_id_hash,
+    )
+
+    key = b"k" * 32
+    logger_ = logging.getLogger("alert-redaction")
+    with caplog.at_level(logging.WARNING):
+        emit_alert(
+            logger_,
+            "budget_exceeded",
+            env={"ABROLIA_HMAC_KEY": key.decode()},
+            household_id="hh-secret-tenant",
+            day="2026-08-25",
+        )
+    assert "hh-secret-tenant" not in caplog.text
+    assert household_id_hash("hh-secret-tenant", key) in caplog.text
+    # The alert still fires, and the non-identifier field survives intact.
+    assert "budget_exceeded" in caplog.text
+    assert "day=2026-08-25" in caplog.text
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        emit_alert(logger_, "budget_exceeded", env={}, household_id="hh-secret-tenant")
+    # No key: the identifier is dropped rather than printed, exactly as the
+    # request logger emits nothing at all without one.
+    assert "hh-secret-tenant" not in caplog.text
+    assert UNKEYED_IDENTIFIER in caplog.text
+
+
+@pytest.mark.parametrize("raw", ["nan", "inf", "-inf", "0", "-1", "abc"])
+def test_a_cap_that_cannot_brake_is_refused(raw: str) -> None:
+    """`float()` accepts `nan` and `inf`, and every comparison against either is
+    False — so the check never fires and the brake is silently off."""
+    from hermes_cloud.core.usage import CostCapError, parse_daily_cap_usd
+
+    with pytest.raises(CostCapError):
+        parse_daily_cap_usd(raw)
+
+
+def test_an_unset_cap_is_the_default_not_an_error() -> None:
+    from hermes_cloud.core.usage import DEFAULT_DAILY_USD_CAP, parse_daily_cap_usd
+
+    assert parse_daily_cap_usd(None) == DEFAULT_DAILY_USD_CAP
+    assert parse_daily_cap_usd("   ") == DEFAULT_DAILY_USD_CAP
+    assert parse_daily_cap_usd("12.5") == 12.5
+
+
+def test_the_runtime_refuses_a_non_finite_cap_rather_than_serving_uncapped() -> None:
+    """The value reaches `DailyCostGuard` through `web_chat_turn`; a cap of
+    `nan` there means every web turn is unlimited."""
+    from hermes_cloud.core.usage import CostCapError, parse_daily_cap_usd
+
+    with pytest.raises(CostCapError, match="finite"):
+        parse_daily_cap_usd("nan")

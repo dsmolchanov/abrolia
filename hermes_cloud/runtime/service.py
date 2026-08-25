@@ -36,7 +36,10 @@ from hermes_cloud.core.runtime_manifest import (
     RuntimeManifest,
     load_runtime_manifest,
 )
-from hermes_cloud.core.usage import DEFAULT_DAILY_USD_CAP, UsageStore
+from hermes_cloud.core.usage import (
+    UsageStore,
+    parse_daily_cap_usd,
+)
 from hermes_cloud.email.contracts import EmailBinding
 from hermes_cloud.email.google_client import (
     GmailConfigurationError,
@@ -690,8 +693,7 @@ class RuntimeService:
             actor_id=manifest.actors.owner,
             chat_id="web-chat",
         )
-        cap_raw = (self.env.get(ENV_COST_CAP_USD_PER_DAY) or "").strip()
-        daily_cap_usd = float(cap_raw) if cap_raw else DEFAULT_DAILY_USD_CAP
+        daily_cap_usd = parse_daily_cap_usd(self.env.get(ENV_COST_CAP_USD_PER_DAY))
         with open_database(self.database_path) as database:
             return handle_web_message(
                 WebChannelMessage(actor_id=manifest.actors.owner, text=text),

@@ -7,6 +7,7 @@ degrades to extraction-only staged card with honest message, no model call.
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -31,6 +32,42 @@ def estimate_usd(*, prompt_tokens: int, completion_tokens: int, cache_read_token
         + cache_read_tokens * PRICE_CACHE_READ_PER_1K / 1000.0
         + completion_tokens * PRICE_COMPLETION_PER_1K / 1000.0
     )
+
+
+class CostCapError(ValueError):
+    """The configured daily cap is not a usable brake."""
+
+
+def parse_daily_cap_usd(
+    raw: str | None, *, default: float = DEFAULT_DAILY_USD_CAP
+) -> float:
+    """Read `HERMES_COST_CAP_USD_PER_DAY` into a cap that can actually stop work.
+
+    `float()` alone accepts `nan` and `inf`, and every comparison against
+    either is False — so `usd_estimate >= cap` never fires and a syntactically
+    valid environment value silently switches the spending brake OFF. That is
+    the worst direction for this particular setting to fail in, so a value that
+    cannot brake is refused loudly at startup instead of quietly at every
+    provider call. Zero and negatives are refused for the opposite reason: they
+    would stop all work, which is a brake nobody meant to set.
+
+    An empty or unset value is not a misconfiguration — it is the default.
+    """
+    if raw is None or not raw.strip():
+        return default
+    try:
+        cap = float(raw)
+    except ValueError as error:
+        raise CostCapError(
+            "HERMES_COST_CAP_USD_PER_DAY must be a number"
+        ) from error
+    if not math.isfinite(cap):
+        raise CostCapError(
+            "HERMES_COST_CAP_USD_PER_DAY must be finite — nan and inf disable the cap"
+        )
+    if cap <= 0:
+        raise CostCapError("HERMES_COST_CAP_USD_PER_DAY must be greater than zero")
+    return cap
 
 
 def today_utc() -> str:

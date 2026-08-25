@@ -41,7 +41,13 @@ from hermes_cloud.core.runcontext import (
     Household,
     RunContext,
 )
-from hermes_cloud.core.usage import DEGRADED_MESSAGE, DailyCostGuard, UsageStore, today_utc
+from hermes_cloud.core.usage import (
+    DEGRADED_MESSAGE,
+    DailyCostGuard,
+    UsageStore,
+    parse_daily_cap_usd,
+    today_utc,
+)
 from hermes_cloud.execute.email_send import (
     EmailBindingChanged,
     EmailOutcomeUnknown,
@@ -256,12 +262,14 @@ class Pipeline:
         # Cost caps: per-household/day soft limit, checked before model call.
         import os as _os
 
-        cap_raw = _os.environ.get("HERMES_COST_CAP_USD_PER_DAY", "")
         if daily_cap_usd is None:
-            try:
-                daily_cap_usd = float(cap_raw) if cap_raw.strip() else 5.0
-            except ValueError:
-                daily_cap_usd = 5.0
+            # Shared with the runtime's web-chat path, and no longer swallowing
+            # a bad value into the default: a cap the operator got wrong is a
+            # cap they think they set, and `nan`/`inf` parse fine while
+            # disabling the brake entirely.
+            daily_cap_usd = parse_daily_cap_usd(
+                _os.environ.get("HERMES_COST_CAP_USD_PER_DAY")
+            )
         self.daily_cap_usd = daily_cap_usd
         self.usage = usage or UsageStore(approvals.db)
         # Онтологический слой: провенанс, обязательства, память. Живёт в той же
