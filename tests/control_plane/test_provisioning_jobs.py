@@ -1769,3 +1769,25 @@ def test_a_deployment_without_a_model_key_installs_none(cp_stack) -> None:
     sink, runtime_ref = _install_runtime(cp_stack, model_api_key=None)
     assert sink.get(runtime_ref, "ANTHROPIC_API_KEY") is None
     assert sink.get(runtime_ref, "HERMES_BOOTSTRAP_TOKEN") is not None
+
+
+def test_redeploying_with_the_key_does_not_reach_an_existing_runtime(cp_stack) -> None:
+    """Why the runbook carries a manual backfill instead of code.
+
+    `_finish_runtime` installs runtime secrets once and returns early for a
+    runtime whose job already succeeded. So setting
+    `ABROLIA_RUNTIME_MODEL_API_KEY` and redeploying the control plane fixes
+    every FUTURE runtime and no existing one — the operator has to import the
+    secret into each existing app, which is the same `fly secrets import
+    --stage` the sink itself runs.
+    """
+    sink, runtime_ref = _install_runtime(cp_stack, model_api_key=None)
+    assert sink.get(runtime_ref, "ANTHROPIC_API_KEY") is None
+
+    # The redeploy: same household, same runtime, now configured with a key.
+    again = cp_stack.make_worker(
+        secret_sink=sink, model_api_key="synthetic-model-key", now=BASE_TIME + 60
+    ).run_once()
+
+    assert again is None or again.status == "succeeded"
+    assert sink.get(runtime_ref, "ANTHROPIC_API_KEY") is None

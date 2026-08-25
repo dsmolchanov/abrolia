@@ -114,7 +114,9 @@ Ordered slices:
 `hermes_cloud/runner/model.py`, `hermes_cloud/core/usage.py`,
 `control_plane/config.py`, `control_plane/provisioning/worker.py`,
 `tests/control_plane/conftest.py`,
-`tests/control_plane/test_provisioning_jobs.py`, `tests/test_whatsapp.py`.
+`tests/control_plane/test_provisioning_jobs.py`, `tests/test_whatsapp.py`,
+`docs/onboarding-runbook.md`, `tests/control_plane/test_config.py`,
+`tests/control_plane/test_export_delete.py`.
 
 **Branches:** `codex/go-live-c1-c2`.
 
@@ -159,6 +161,31 @@ Prerequisite: O1 ticked. Order is not negotiable per runbook and canon.
   open). Shared-WA relay last, after C5.
 
 ## Execution log
+
+- 2026-08-25: **Review round 2 — the credential fix did not fix production,
+  and the finding was right.** One new blocker on `3f5e9b1`: the key had been
+  added as an OPTIONAL setting, installed only when present. `fly.toml:11`
+  selects `fly-runtime`, nothing named `ABROLIA_RUNTIME_MODEL_API_KEY`
+  anywhere, and `_finish_runtime` omitted it silently — so following the
+  repository's own deploy path still produced runtimes whose every chat turn
+  answered 503. All three of the finding's claims were checked and held.
+
+  The key now joins the four inputs `validate()` already requires for
+  `fly-runtime`, which is where it belonged: a runtime that cannot answer the
+  surface it serves is a misconfiguration, and it fails at boot where an
+  operator sees it rather than per-turn where a family does. The config test
+  now omits each pinned input in turn instead of only the whole set, and
+  asserts the key is not printable by a config that logs itself.
+
+  **The backfill is an operator step, not code, and that is a finding in
+  itself.** `_finish_runtime` returns early for a runtime whose job already
+  succeeded, so setting the value and redeploying fixes every future runtime
+  and no existing one — pinned by
+  `test_redeploying_with_the_key_does_not_reach_an_existing_runtime`. No new
+  provisioning code is needed because `FlySecretSink.install` IS `fly secrets
+  import --stage`; the runbook now documents the operator running that same
+  command by hand, over stdin so the value never reaches argv or shell
+  history. Suite 1492 green.
 
 - 2026-08-25: **Review round 1 on #71 — five of seven blockers fixed, two
   handed back.** Codex raised seven P1s across two generations. Four were

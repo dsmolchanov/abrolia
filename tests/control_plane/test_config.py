@@ -156,18 +156,33 @@ def test_fly_runtime_requires_all_private_pinned_inputs() -> None:
         ControlPlaneConfig.from_env(
             _production_env(ABROLIA_RUNTIME_PROVIDER="fly-runtime")
         )
-    config = ControlPlaneConfig.from_env(
-        _production_env(
-            ABROLIA_RUNTIME_PROVIDER="fly-runtime",
-            FLY_API_TOKEN="synthetic-fly-token",
-            ABROLIA_FLY_ORG="synthetic-org",
-            ABROLIA_RUNTIME_IMAGE="registry.example.test/runtime@sha256:" + "a" * 64,
-            ABROLIA_INTERNAL_BOOTSTRAP_HOST="control-plane.internal",
-        )
+    complete = dict(
+        ABROLIA_RUNTIME_PROVIDER="fly-runtime",
+        FLY_API_TOKEN="synthetic-fly-token",
+        ABROLIA_FLY_ORG="synthetic-org",
+        ABROLIA_RUNTIME_IMAGE="registry.example.test/runtime@sha256:" + "a" * 64,
+        ABROLIA_INTERNAL_BOOTSTRAP_HOST="control-plane.internal",
+        ABROLIA_RUNTIME_MODEL_API_KEY="synthetic-model-key",
     )
+    # EVERY pinned input is required, one at a time — a Fly deployment missing
+    # any single one is a misconfiguration and must not boot. The model key
+    # joined this list because installing it "when present" left the production
+    # path exactly as broken as before: `fly.toml` selects `fly-runtime`,
+    # nothing named the variable, and every runtime got a chat route that
+    # answers 503 on its first turn.
+    for omitted in complete:
+        if omitted == "ABROLIA_RUNTIME_PROVIDER":
+            continue
+        partial = {name: value for name, value in complete.items() if name != omitted}
+        with pytest.raises(ConfigurationError, match="Fly synthetic runtime requires"):
+            ControlPlaneConfig.from_env(_production_env(**partial))
+
+    config = ControlPlaneConfig.from_env(_production_env(**complete))
     assert config.runtime_provider == "fly-runtime"
     assert config.runtime_region == "ams"
     assert config.runtime_volume_mount == "/data"
+    # A secret must not be printable by a config that logs itself.
+    assert "synthetic-model-key" not in repr(config)
 
 
 def test_configuration_rejects_shared_keys_and_insecure_origin() -> None:

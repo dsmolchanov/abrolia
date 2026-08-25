@@ -259,9 +259,19 @@ class ControlPlaneConfig:
             or not self.fly_org_slug
             or not self.runtime_image_digest
             or not self.internal_bootstrap_host
+            # The model credential belongs in this list, not beside it. Adding
+            # it as an OPTIONAL setting installed only when present left the
+            # production path exactly as broken as before: `fly.toml` selects
+            # `fly-runtime`, nothing named the new variable, `_finish_runtime`
+            # omitted it silently, and every provisioned runtime got a chat
+            # route whose first turn answers 503. A runtime that cannot answer
+            # the surface it serves is a misconfiguration, so it fails at boot
+            # where an operator sees it — not per-turn where a family does.
+            or not self.runtime_model_api_key
         ):
             raise ConfigurationError(
-                "Fly synthetic runtime requires token, org, image digest and private bootstrap host"
+                "Fly synthetic runtime requires token, org, image digest,"
+                " private bootstrap host and a model API key"
             )
         if self.internal_bootstrap_host and any(
             marker in self.internal_bootstrap_host for marker in ("/", ":", " ")
