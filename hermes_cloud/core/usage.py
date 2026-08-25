@@ -10,6 +10,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Any
 
 from hermes_cloud.core.db import Database
 
@@ -112,3 +113,44 @@ class UsageStore:
         row = self.get(household_id, day)
         assert row is not None
         return row
+
+
+class DailyCostGuard:
+    """Дневной потолок одной пары «домохозяйство + сутки», для `ToolLoop`.
+
+    Существует потому, что канальная проверка удерживала не то: она стояла
+    ОДИН раз перед ходом, а ход делает до `MAX_ITERATIONS` вызовов плюс
+    повтор. Ход, перешедший потолок на первом вызове, оплачивал остальные.
+    Здесь `is_over_budget` спрашивается перед каждым обращением, а `record`
+    записывает ответ немедленно — поэтому следующая проверка уже видит то,
+    что только что потрачено.
+
+    Канальная проверка при этом остаётся: она отвечает семье, не построив
+    цикл вовсе. Это представление, а не защита.
+    """
+
+    def __init__(
+        self,
+        store: UsageStore,
+        household_id: str,
+        *,
+        day: str | None = None,
+        cap_usd: float = DEFAULT_DAILY_USD_CAP,
+    ) -> None:
+        self.store = store
+        self.household_id = household_id
+        self.day = day or today_utc()
+        self.cap_usd = cap_usd
+
+    def is_over_budget(self) -> bool:
+        return self.store.is_over_budget(self.household_id, self.day, self.cap_usd)
+
+    def record(self, response: Any) -> None:
+        usage = getattr(response, "usage", None)
+        self.store.record(
+            self.household_id,
+            self.day,
+            prompt_tokens=getattr(usage, "input_tokens", 0) or 0,
+            completion_tokens=getattr(usage, "output_tokens", 0) or 0,
+            cache_read_tokens=getattr(usage, "cache_read_input_tokens", 0) or 0,
+        )

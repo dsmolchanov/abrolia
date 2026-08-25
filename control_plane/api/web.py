@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import uuid
+from functools import partial
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi import status as http_status
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, ValidationError
 
@@ -20,6 +22,16 @@ from control_plane.repositories.auth import InvalidCredential
 from control_plane.repositories.households import HouseholdNotFound
 
 router = APIRouter()
+
+#: Exactly the roles `household_memberships.role` may hold
+#: (`0001_control_plane.sql:46` CHECKs `owner`/`adult`). Anything else —
+#: including the absence of a membership row — is refused rather than
+#: interpreted. Spelled out here rather than imported because the control
+#: plane deliberately does not import `hermes_cloud`; the runtime's own
+#: vocabulary is a different set, and it independently refuses every role but
+#: `owner` on this route and derives real capabilities from the manifest, so
+#: neither side trusts this string on its own.
+KNOWN_ROLES = frozenset({"owner", "adult"})
 
 _CONSENT_RECEIPT_NAMESPACE = uuid.UUID("84b94abc-d057-48c4-a1ee-2fabf19f5139")
 
@@ -258,11 +270,54 @@ class WebMessageInput(BaseModel):
     text: str
 
 
+#: The turn is capped at 2 000 characters, so nothing legitimate approaches
+#: this. It exists to bound what is READ, not what is accepted: the character
+#: check below runs after FastAPI has already materialised the whole body.
+MAX_WEB_MESSAGE_BYTES = 64 * 1024
+
+
+async def _bounded_web_message(request: Request) -> WebMessageInput:
+    """Read at most `MAX_WEB_MESSAGE_BYTES`, then parse.
+
+    Declaring the body as a Pydantic parameter let FastAPI materialise an
+    unbounded JSON document before any size check could run, so an
+    authenticated caller could spend the process's memory without ever
+    reaching the model. `Content-Length` is checked when offered and the
+    stream is bounded regardless, because a chunked request offers none.
+    """
+    declared = request.headers.get("content-length")
+    if declared is not None:
+        try:
+            if int(declared) > MAX_WEB_MESSAGE_BYTES:
+                raise HTTPException(
+                    http_status.HTTP_413_CONTENT_TOO_LARGE, "body too large"
+                )
+        except ValueError as error:
+            raise HTTPException(
+                http_status.HTTP_400_BAD_REQUEST, "invalid content-length"
+            ) from error
+
+    body = bytearray()
+    async for chunk in request.stream():
+        body.extend(chunk)
+        # A lying or absent Content-Length is caught here, while reading.
+        if len(body) > MAX_WEB_MESSAGE_BYTES:
+            raise HTTPException(
+                http_status.HTTP_413_CONTENT_TOO_LARGE, "body too large"
+            )
+    try:
+        return WebMessageInput.model_validate_json(bytes(body))
+    except ValidationError as error:
+        raise HTTPException(
+            http_status.HTTP_422_UNPROCESSABLE_CONTENT, "invalid request body"
+        ) from error
+
+
 @router.post("/api/web/message")
 async def web_message(
     request: Request,
     principal: Annotated[Principal, Depends(require_private_mutation)],
-    payload: WebMessageInput,
+    payload: Annotated[WebMessageInput, Depends(_bounded_web_message)],
 ) -> JSONResponse:
     """Authenticated Web chat, proxied to the household's dedicated runtime.
 
@@ -280,15 +335,24 @@ async def web_message(
     if len(text) > 2000:
         raise HTTPException(http_status.HTTP_400_BAD_REQUEST, "text too long")
     household_rec = active.households.current_for_account(principal.account_id)
-    try:
-        rows = active.database.query(
-            "SELECT account_id, role FROM household_memberships WHERE household_id = ? AND status='active'",
-            (household_rec.id,),
+    # Authorization FAILS CLOSED. This defaulted to "owner" — so a database
+    # error, or a membership row removed between the household lookup and this
+    # one, handed the caller the owner role. The runtime maps that role onto
+    # `manifest.actors.owner`, whose tools include data export and deletion, so
+    # the default granted the most power at exactly the moment authorization
+    # could not be established. An unavailable answer is not an affirmative one.
+    rows = active.database.query(
+        "SELECT account_id, role FROM household_memberships"
+        " WHERE household_id = ? AND status='active'",
+        (household_rec.id,),
+    )
+    roles = {r["account_id"]: r["role"] for r in rows}
+    role = roles.get(principal.account_id)
+    if role not in KNOWN_ROLES:
+        raise HTTPException(
+            http_status.HTTP_403_FORBIDDEN,
+            "household membership is required",
         )
-        roles = {r["account_id"]: r["role"] for r in rows}
-    except Exception:
-        roles = {}
-    role = roles.get(principal.account_id, "owner")
     if not household_rec.runtime_ref:
         raise HTTPException(
             http_status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -297,11 +361,18 @@ async def web_message(
     from control_plane.privacy.runtime import RuntimeBoundaryError
 
     try:
-        answer = active.web_chat.send(
-            household_rec.runtime_ref,
-            actor_id=principal.account_id,
-            role=role,
-            text=text,
+        # OFF THE EVENT LOOP. `web_chat.send` is synchronous and waits out a
+        # whole model turn behind a 120-second timeout, while `_serve` runs
+        # Uvicorn with one worker — so awaiting it inline stalled every other
+        # household's request, and `/healthz` with them, for the duration.
+        answer = await run_in_threadpool(
+            partial(
+                active.web_chat.send,
+                household_rec.runtime_ref,
+                actor_id=principal.account_id,
+                role=role,
+                text=text,
+            )
         )
     except RuntimeBoundaryError as error:
         raise HTTPException(

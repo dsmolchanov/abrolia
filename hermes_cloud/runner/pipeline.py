@@ -41,7 +41,7 @@ from hermes_cloud.core.runcontext import (
     Household,
     RunContext,
 )
-from hermes_cloud.core.usage import DEGRADED_MESSAGE, UsageStore, today_utc
+from hermes_cloud.core.usage import DEGRADED_MESSAGE, DailyCostGuard, UsageStore, today_utc
 from hermes_cloud.execute.email_send import (
     EmailBindingChanged,
     EmailOutcomeUnknown,
@@ -452,19 +452,18 @@ class Pipeline:
                 thread=self.thread,
             )
             return Handled(message=DEGRADED_MESSAGE)
-        answer = self.loop.run(context, parsed.text)
-        try:
-            self.usage.record(
-                context.household_id,
-                day,
-                # getattr keeps lightweight test stubs without token counts
-                # green; the real ToolLoop always reports both.
-                prompt_tokens=getattr(answer, "input_tokens", 0),
-                completion_tokens=getattr(answer, "output_tokens", 0),
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("usage record failed for %s/%s: %s", context.household_id, day, exc)
-            raise
+        # The check above is PRESENTATION — it answers without building a turn.
+        # Enforcement lives in the guard, which is consulted before every
+        # provider call inside the loop and records each response as it
+        # arrives. One turn makes up to MAX_ITERATIONS calls plus a retry, so a
+        # single check per turn held nothing after the first one.
+        answer = self.loop.run(
+            context,
+            parsed.text,
+            cost_guard=DailyCostGuard(
+                self.usage, context.household_id, day=day, cap_usd=self.daily_cap_usd
+            ),
+        )
         payload = bundle_payload(
             [Item(payload={"kind": KIND_WHATSAPP, "to": context.actor_id, "text": answer.text})],
             header=f"Ответ в WhatsApp для {context.actor_id}",
@@ -597,17 +596,13 @@ class Pipeline:
             return Handled(message=DEGRADED_MESSAGE)
         # Ход диалога. Права уже собраны на входе: `run` получает их готовыми и
         # сам ничего не расширяет.
-        answer = self.loop.run(parsed.context, parsed.text)
-        try:
-            self.usage.record(
-                hid,
-                day,
-                prompt_tokens=getattr(answer, "input_tokens", 0),
-                completion_tokens=getattr(answer, "output_tokens", 0),
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("usage record failed for %s/%s: %s", hid, day, exc)
-            raise
+        answer = self.loop.run(
+            parsed.context,
+            parsed.text,
+            cost_guard=DailyCostGuard(
+                self.usage, hid, day=day, cap_usd=self.daily_cap_usd
+            ),
+        )
         self.transport.send_message(
             chat=parsed.context.chat_id, text=answer.text, thread=parsed.context.thread_id
         )

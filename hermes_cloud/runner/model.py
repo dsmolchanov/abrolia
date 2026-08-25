@@ -26,7 +26,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Protocol
 
 from hermes_cloud.core.effects import EffectInFlight, EffectJournal
 from hermes_cloud.core.runcontext import CapabilityDenied, RunContext
@@ -55,6 +55,8 @@ STOP_COMPLETED = "completed"
 STOP_ITERATIONS = "max_iterations"
 STOP_TIMEOUT = "timeout"
 STOP_BUDGET = "token_budget"
+#: Дневной денежный потолок домохозяйства, в отличие от токенного бюджета хода.
+STOP_COST_CAP = "cost_cap"
 STOP_INTERRUPTED = "interrupted"
 STOP_REFUSED = "refused"
 STOP_NO_TOOLS = "no_tools"
@@ -108,6 +110,27 @@ class LoopResult:
         return self.input_tokens + self.output_tokens
 
 
+class CostGuard(Protocol):
+    """Дневной потолок в той точке, где вызывается провайдер.
+
+    До этого проверка стояла в трёх местах канала — перед `ToolLoop.run`. Но
+    один ход делает до `MAX_ITERATIONS` вызовов плюс повтор, поэтому ход,
+    перешедший потолок на первом вызове, продолжал платить за остальные семь.
+    Инвариант репозитория (`AGENTS.repo-invariants.md`) требует предусловие
+    там, ГДЕ вызывается провайдер, — то есть здесь, а не у канала.
+    """
+
+    def is_over_budget(self) -> bool:
+        ...
+
+    def record(self, response: Any) -> None:
+        ...
+
+
+class _CapReached(Exception):
+    """Потолок достигнут до вызова: ход останавливается без обращения к API."""
+
+
 class ToolLoop:
     def __init__(
         self,
@@ -123,6 +146,7 @@ class ToolLoop:
         max_iterations: int = MAX_ITERATIONS,
         max_seconds: float = MAX_SECONDS,
         token_budget: int = TOKEN_BUDGET,
+        cost_guard: CostGuard | None = None,
         clock=time.monotonic,
     ) -> None:
         self.journal = journal
@@ -136,6 +160,7 @@ class ToolLoop:
         self.max_iterations = max_iterations
         self.max_seconds = max_seconds
         self.token_budget = token_budget
+        self.cost_guard = cost_guard
         self.clock = clock
 
     @property
@@ -157,8 +182,16 @@ class ToolLoop:
         user_text: str,
         *,
         history: list[dict[str, Any]] | None = None,
+        cost_guard: CostGuard | None = None,
     ) -> LoopResult:
-        """Один ход диалога: сообщение человека → ответ, возможно через tools."""
+        """Один ход диалога: сообщение человека → ответ, возможно через tools.
+
+        `cost_guard` задаётся на ход, потому что потолок принадлежит паре
+        «домохозяйство + сутки», а не циклу: в runtime цикл строится под ход и
+        получает страж в конструкторе, а в Pipeline он живёт долго и страж
+        приходит сюда.
+        """
+        guard = cost_guard if cost_guard is not None else self.cost_guard
         if not context.has_tools:
             # Неизвестному актору не отвечает даже модель: платить за чужой
             # промпт незачем, а «поговорить» — уже доступ.
@@ -181,7 +214,11 @@ class ToolLoop:
                 return self._stop(result, STOP_BUDGET)
 
             try:
-                response = self._call(context, messages, tools)
+                response = self._call(context, messages, tools, guard)
+            except _CapReached:
+                # Ни одного вызова на этой итерации не было — ход обрывается
+                # честно, с тем же текстом, что и у канала.
+                return self._stop(result, STOP_COST_CAP)
             except _CallFailed as failure:
                 return self._interrupted(context, result, failure)
             result.iterations += 1
@@ -209,7 +246,11 @@ class ToolLoop:
     # --- вызов модели -------------------------------------------------------
 
     def _call(
-        self, context: RunContext, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+        self,
+        context: RunContext,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        guard: CostGuard | None = None,
     ) -> Any:
         """Вызов API с единственным разрешённым повтором — пока ход пуст."""
         options: dict[str, Any] = {}
@@ -218,8 +259,13 @@ class ToolLoop:
         attempts = 0
         while True:
             attempts += 1
+            # Перед КАЖДЫМ обращением, включая повтор: повтор — это тоже
+            # оплаченный вызов, и потолок, проверенный лишь раз за ход, его
+            # не удерживает.
+            if guard is not None and guard.is_over_budget():
+                raise _CapReached()
             try:
-                return self.client.messages.create(
+                response = self.client.messages.create(
                     model=self.model,
                     max_tokens=self.max_tokens,
                     system=[
@@ -243,6 +289,13 @@ class ToolLoop:
                 if attempts > 1:
                     raise _CallFailed(error) from error
                 logger.warning("повтор вызова модели после %s", type(error).__name__)
+            else:
+                # Учитываем СРАЗУ, до возврата: следующая итерация должна
+                # видеть уже потраченное, иначе потолок отстаёт ровно на один
+                # оплаченный вызов — а именно тот, который его перешёл.
+                if guard is not None:
+                    guard.record(response)
+                return response
 
     def _account(self, result: LoopResult, response: Any) -> None:
         usage = getattr(response, "usage", None)
@@ -302,7 +355,13 @@ class ToolLoop:
 
     def _stop(self, result: LoopResult, reason: str) -> LoopResult:
         result.stopped = reason
-        if reason in {STOP_ITERATIONS, STOP_TIMEOUT, STOP_BUDGET} and not result.text:
+        if reason == STOP_COST_CAP and not result.text:
+            # Тот же текст, что отдаёт канал, — семья не должна по
+            # формулировке угадывать, на каком слое сработал потолок.
+            from hermes_cloud.core.usage import DEGRADED_MESSAGE
+
+            result.text = DEGRADED_MESSAGE
+        elif reason in {STOP_ITERATIONS, STOP_TIMEOUT, STOP_BUDGET} and not result.text:
             result.text = TEXT_LIMIT
         return result
 

@@ -110,7 +110,11 @@ Ordered slices:
 `control_plane/runtimes/*`, `web/static/app.js`, `tests/test_cost_caps.py`,
 `tests/test_runtime_web_chat.py`, `tests/control_plane/test_web_chat_api.py`,
 `tests/control_plane/test_frontend_branding.py`, `docs/privacy/processors.md`,
-`docs/privacy/vendor-dpas/*`, `.check-fixtures-allow`.
+`docs/privacy/vendor-dpas/*`, `.check-fixtures-allow`,
+`hermes_cloud/runner/model.py`, `hermes_cloud/core/usage.py`,
+`control_plane/config.py`, `control_plane/provisioning/worker.py`,
+`tests/control_plane/conftest.py`,
+`tests/control_plane/test_provisioning_jobs.py`, `tests/test_whatsapp.py`.
 
 **Branches:** `codex/go-live-c1-c2`.
 
@@ -128,6 +132,12 @@ their reason rather than left to be inferred:
   branch because the DPA verification happened in the same sitting; the step
   declares it here so the path is not undeclared, and O1 itself stays open on
   P2, the TIAs and the Art 27 mandate.
+
+The last seven arrived with the review round below and are consequences of
+fixing C1's cap where the provider is actually called: `model.py` and
+`usage.py` hold the guard, `config.py` and `worker.py` install the model
+credential C2 needed and never had, and the three test files are the stubs
+whose signatures the moved contract changed.
 
 Track C's later slices get their own inventory sections and their own
 `**Branches:**` lines. C3 must not be added to this one — a step that
@@ -149,6 +159,54 @@ Prerequisite: O1 ticked. Order is not negotiable per runbook and canon.
   open). Shared-WA relay last, after C5.
 
 ## Execution log
+
+- 2026-08-25: **Review round 1 on #71 — five of seven blockers fixed, two
+  handed back.** Codex raised seven P1s across two generations. Four were
+  verified against the code before anything was changed.
+
+  **The cap was in the wrong place, and that was C1's mistake.** `is_over_budget`
+  guarded each channel once per turn, but `ToolLoop.run` makes up to
+  `MAX_ITERATIONS = 8` provider calls plus a retry — so a turn that crossed the
+  cap on its first call paid for every call after it, on all three channels.
+  The repo's own invariant says the precondition lives where the provider is
+  CALLED, which is `ToolLoop._call`, not the channel. A `CostGuard` is now asked
+  before EVERY call including the retry, and records each response as it
+  arrives so the next check sees what was just spent. The channel check stays,
+  demoted to what it always was — presentation, answering without building a
+  turn. One fix, three consumers, per "fix the invariant, not the instance".
+
+  **`/api/web/message` failed OPEN on authorization.** `except Exception: roles
+  = {}` then `.get(account_id, "owner")` meant a database error, or a
+  membership row removed between the household lookup and the role lookup,
+  granted the owner role — which the runtime maps onto `manifest.actors.owner`,
+  whose tools include export and deletion. The most power was handed out at
+  precisely the moment authorization could not be established. Now the query
+  propagates and an unknown or absent role is refused.
+
+  **C2 could never have worked in production.** Provisioning installs the
+  bootstrap and DSAR tokens and nothing else; `ANTHROPIC_API_KEY` appears
+  nowhere outside a test skip guard. So the first real turn failed constructing
+  the model client, `_web_chat` reported `chat_unavailable`, and the endpoint
+  answered 503 forever. The route was right and the credential to serve it was
+  never installed. It now travels the same sink path as the other runtime
+  secrets, and its absence stays honest rather than fatal.
+
+  Also fixed: the request body is bounded before it is parsed rather than after
+  (the 2 000-character check ran once FastAPI had already materialised the
+  document), and the synchronous 120-second runtime call moved off the event
+  loop, which a single-worker Uvicorn shared with every other household.
+
+  **Handed back, with reasons rather than patches:** web-chat turns can stage
+  approvals through `propose_reminder`/`memory_append`/`propose_email`/
+  `propose_whatsapp` that the web UI offers no way to confirm — telegram
+  callbacks cannot recover them because `ApprovalStore.claim_by_id` requires
+  the originating chat — so the assistant can promise a confirmation step that
+  does not exist. And `wsgiref.simple_server` is single-threaded, so a chat turn
+  blocks that household's `/healthz`, DSAR and consent-revocation routes for
+  its duration. Both need a lifecycle or a concurrency model this PR does not
+  have, which is the scope signal `CLAUDE.md` describes — a read-only web tool
+  registry and a threaded runtime server are each their own change. Suite 1492
+  green, ruff and sanitizer clean.
 
 - 2026-08-24: **PR #71 opened; the archived Anthropic DPA lost its CMS payload,
   not its text.** CI's `check_fixtures` runs with a PRIVATE deny file

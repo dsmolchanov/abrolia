@@ -230,7 +230,7 @@ def test_known_family_dialogue_runs_under_context_and_stages_the_reply(tmp_path:
     seen = {}
 
     class FakeLoop:
-        def run(self, context, text):
+        def run(self, context, text, *, history=None, cost_guard=None):
             seen.update(context=context, text=text)
             return SimpleNamespace(text="Ja, ich habe den neuen Termin notiert.")
 

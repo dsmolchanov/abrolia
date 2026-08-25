@@ -145,15 +145,24 @@ def test_cost_cap_env_override(tmp_path: Path, monkeypatch) -> None:
 
 
 class CountingLoop:
-    """Dialogue-model stub: counts calls, reports the tokens it spent."""
+    """Dialogue-model stub: counts turns and honours the cost guard.
+
+    It records through the guard exactly as the real `ToolLoop._call` does,
+    because the contract under test is now "the guard is what accounts", not
+    "the channel records after the run".
+    """
 
     def __init__(self, tokens=(2000, 800)) -> None:
         self.calls = 0
         self.tokens = tokens
 
-    def run(self, context, text):
+    def run(self, context, text, *, history=None, cost_guard=None):
         self.calls += 1
         pt, ct = self.tokens
+        if cost_guard is not None:
+            cost_guard.record(
+                SimpleNamespace(usage=SimpleNamespace(input_tokens=pt, output_tokens=ct))
+            )
         return SimpleNamespace(
             text="готово", input_tokens=pt, output_tokens=ct,
             iterations=1, tokens=pt + ct, stopped="completed",
@@ -306,3 +315,152 @@ def test_telegram_dialogue_degrades_when_over_budget_and_records_when_under(
     assert row is not None
     assert row.prompt_tokens == 102000 and row.completion_tokens == 50800
 
+
+
+# --- the cap at the provider-call boundary ---------------------------------
+#
+# The channel check runs ONCE per turn. A turn makes up to MAX_ITERATIONS
+# provider calls plus a retry, so a turn that crossed the cap on its first call
+# used to pay for every call after it. These cases drive a REAL ToolLoop, not a
+# stub, because the defect lived between the check and the calls.
+
+from hermes_cloud.core.approvals import ApprovalStore as _ApprovalStore  # noqa: E402
+from hermes_cloud.core.effects import EffectJournal  # noqa: E402
+from hermes_cloud.core.usage import DailyCostGuard  # noqa: E402
+from hermes_cloud.runner.model import STOP_COST_CAP, ToolLoop  # noqa: E402
+from hermes_cloud.runner.tools import Services  # noqa: E402
+from tests.test_model import (  # noqa: E402
+    CHAT,
+    HOUSEHOLD,
+    PARENT,
+    ScriptedClient,
+    asks,
+    build_run_context,
+    says,
+)
+
+#: `HOUSEHOLD` in test_model is the Household object; usage is keyed by its id.
+HID = HOUSEHOLD.household_id
+
+#: One response's worth of spend. Kept well under `model.TOKEN_BUDGET`
+#: (120_000) so the loop stops on the COST cap under test rather than on its
+#: own per-turn token budget — the cap under test is measured in dollars, so
+#: the test moves the dollar threshold instead of the token count.
+_HEAVY = 5_000
+#: $0.003/1k prompt + $0.015/1k completion → one response above this.
+_TINY_CAP = 0.05
+
+
+def _heavy(response):
+    response.usage.input_tokens = _HEAVY
+    response.usage.output_tokens = _HEAVY
+    return response
+
+
+def _loop_with_cap(tmp_path, script, store, *, cap_usd):
+    database = open_database(tmp_path / "hermes.db")
+    services = Services(
+        approvals=_ApprovalStore(database), reminders=ReminderStore(database)
+    )
+    client = ScriptedClient(script=list(script))
+    loop = ToolLoop(
+        journal=EffectJournal(database), services=services, client=client
+    )
+    guard = DailyCostGuard(store, HID, cap_usd=cap_usd)
+    return loop, client, guard
+
+
+def test_a_turn_that_crosses_the_cap_makes_no_further_provider_call(
+    tmp_path: Path,
+) -> None:
+    """The defect, stated exactly.
+
+    The first response asks for a tool AND spends past the cap. Before the
+    guard moved to the call boundary, the loop would answer the tool and call
+    the provider again — up to seven more times — because the only check had
+    already happened before the turn began.
+    """
+    database = open_database(tmp_path / "usage.db")
+    store = UsageStore(database)
+    script = [
+        _heavy(asks("propose_reminder", {"text": "молоко", "when": "завтра"})),
+        says("этого вызова быть не должно"),
+    ]
+    loop, client, guard = _loop_with_cap(tmp_path, script, store, cap_usd=_TINY_CAP)
+
+    result = loop.run(
+        build_run_context(household=HOUSEHOLD, actor_id=PARENT, chat_id=CHAT),
+        "напомни про молоко",
+        cost_guard=guard,
+    )
+
+    assert len(client.calls) == 1
+    assert result.stopped == STOP_COST_CAP
+    assert result.text == DEGRADED_MESSAGE
+    # The spend that crossed the cap was recorded as it happened, not after
+    # the turn — which is what lets the next check see it.
+    assert store.is_over_budget(HID, today_utc(), _TINY_CAP)
+
+
+def test_an_already_over_budget_turn_never_reaches_the_provider(
+    tmp_path: Path,
+) -> None:
+    database = open_database(tmp_path / "usage.db")
+    store = UsageStore(database)
+    store.record(HID, today_utc(), prompt_tokens=_HEAVY, completion_tokens=_HEAVY)
+    loop, client, guard = _loop_with_cap(
+        tmp_path, [says("не должно быть вызвано")], store, cap_usd=_TINY_CAP
+    )
+
+    result = loop.run(
+        build_run_context(household=HOUSEHOLD, actor_id=PARENT, chat_id=CHAT),
+        "привет",
+        cost_guard=guard,
+    )
+
+    assert client.calls == []
+    assert result.stopped == STOP_COST_CAP
+    assert result.text == DEGRADED_MESSAGE
+
+
+def test_a_retry_is_also_a_paid_call_and_is_capped(tmp_path: Path) -> None:
+    """`_call` retries once while the turn is still empty. That retry reaches
+    the provider, so the cap has to be asked again before it — not once per
+    turn."""
+    database = open_database(tmp_path / "usage.db")
+    store = UsageStore(database)
+    # First attempt fails, so the loop would retry; the cap is crossed in
+    # between by another path recording spend for the same household+day.
+    class _FailThenNotice:
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+
+        @property
+        def messages(self):
+            return self
+
+        def create(self, **kwargs):
+            self.calls.append(kwargs)
+            store.record(
+                HID, today_utc(), prompt_tokens=_HEAVY, completion_tokens=_HEAVY
+            )
+            raise RuntimeError("сеть подвела")
+
+    database2 = open_database(tmp_path / "hermes.db")
+    services = Services(
+        approvals=_ApprovalStore(database2), reminders=ReminderStore(database2)
+    )
+    client = _FailThenNotice()
+    loop = ToolLoop(
+        journal=EffectJournal(database2), services=services, client=client
+    )
+
+    result = loop.run(
+        build_run_context(household=HOUSEHOLD, actor_id=PARENT, chat_id=CHAT),
+        "привет",
+        cost_guard=DailyCostGuard(store, HID, cap_usd=_TINY_CAP),
+    )
+
+    # One attempt happened; the retry was refused by the cap rather than made.
+    assert len(client.calls) == 1
+    assert result.stopped == STOP_COST_CAP

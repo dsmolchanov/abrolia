@@ -115,6 +115,10 @@ class ControlPlaneConfig:
     runtime_region: str = "ams"
     runtime_volume_mount: str = "/data"
     runtime_provider: str = "dry-run-runtime"
+    # The model credential each runtime needs to answer a chat turn.
+    # `repr=False` for the same reason as the two above: a config that
+    # printed itself would put it in a log.
+    runtime_model_api_key: str | None = field(default=None, repr=False)
     internal_bootstrap_host: str | None = None
     session_cookie_name: str = "__Host-abrolia_session"
     csrf_cookie_name: str = "__Host-abrolia_csrf"
@@ -320,6 +324,7 @@ class ControlPlaneConfig:
             fly_org_slug=source.get("ABROLIA_FLY_ORG") or None,
             runtime_image_digest=source.get("ABROLIA_RUNTIME_IMAGE") or None,
             runtime_provider=source.get("ABROLIA_RUNTIME_PROVIDER", "dry-run-runtime"),
+            runtime_model_api_key=source.get("ABROLIA_RUNTIME_MODEL_API_KEY") or None,
             internal_bootstrap_host=source.get("ABROLIA_INTERNAL_BOOTSTRAP_HOST") or None,
             magic_link_delivery_enabled=(
                 source.get("ABROLIA_MAGIC_LINK_DELIVERY_ENABLED", "0") == "1"

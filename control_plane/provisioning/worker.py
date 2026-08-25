@@ -122,6 +122,11 @@ def requires_current_content_restriction(
     )
 
 
+#: Name the runtime reads its model credential under. The runtime's own
+#: client library looks for exactly this variable.
+RUNTIME_MODEL_SECRET = "ANTHROPIC_API_KEY"
+
+
 class ProvisioningWorker:
     def __init__(
         self,
@@ -137,6 +142,7 @@ class ProvisioningWorker:
         worker_id: str = "worker",
         real_email_authorized_households: frozenset[str] = frozenset(),
         runtime_provider: str = "dry-run-runtime",
+        model_api_key: str | None = None,
         bootstrap_ttl_seconds: int = 3600,
         max_safe_attempts: int = 5,
         logger: StructuredLogger | None = None,
@@ -167,6 +173,7 @@ class ProvisioningWorker:
         #: `0 -> 1` must never authorize a household this frozen set omits.
         self.real_email_authorized_households = real_email_authorized_households
         self.runtime_provider = runtime_provider
+        self.model_api_key = model_api_key
         self.bootstrap_ttl_seconds = bootstrap_ttl_seconds
         self.max_safe_attempts = max_safe_attempts
         self.logger = logger
@@ -2779,6 +2786,19 @@ class ProvisioningWorker:
             ),
             "ascii",
         )
+        # Without this the runtime serves `/internal/v1/web/chat`, builds its
+        # ToolLoop, and fails constructing the model client on the first real
+        # turn — which `_web_chat` reports as `chat_unavailable`, so the public
+        # endpoint answered 503 forever. The route was right and the credential
+        # to serve it was never installed.
+        #
+        # It travels the same path as every other runtime secret: through the
+        # sink, into the runtime's own namespace, never through argv, the
+        # manifest or a log. Absent in configurations that do not run chat, and
+        # absent is not a failure — it is a runtime that cannot answer chat,
+        # which `_web_chat` already reports honestly.
+        if self.model_api_key:
+            merged[RUNTIME_MODEL_SECRET] = bytearray(self.model_api_key, "ascii")
         install_failed = False
         try:
             self.secret_sink.install(

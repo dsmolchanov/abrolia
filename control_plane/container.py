@@ -229,6 +229,7 @@ class ControlPlaneContainer:
             secret_sink=secret_sink,
             email_identities=email_identities,
             runtime_provider=config.runtime_provider,
+            model_api_key=config.runtime_model_api_key,
             bootstrap_ttl_seconds=config.bootstrap_ttl_seconds,
             # The allowlist itself, not a boolean derived from it. Empty when
             # the brake is on, so an unauthorized household is refused by

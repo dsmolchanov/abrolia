@@ -82,8 +82,15 @@ class StubLoop:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, str, str]] = []
 
-    def run(self, context, text):
+    def run(self, context, text, *, history=None, cost_guard=None):
         self.calls.append((context.role, context.actor_id, context.chat_id, text))
+        # The guard is what accounts now — the channel no longer records after
+        # the run, because a turn makes many provider calls and only the guard
+        # sees each one.
+        if cost_guard is not None:
+            cost_guard.record(
+                SimpleNamespace(usage=SimpleNamespace(input_tokens=11, output_tokens=7))
+            )
         return SimpleNamespace(text="готово", input_tokens=11, output_tokens=7)
 
 

@@ -13,7 +13,12 @@ from typing import Any
 
 from hermes_cloud.core.observability import emit_alert
 from hermes_cloud.core.runcontext import RunContext
-from hermes_cloud.core.usage import DEFAULT_DAILY_USD_CAP, DEGRADED_MESSAGE, today_utc
+from hermes_cloud.core.usage import (
+    DEFAULT_DAILY_USD_CAP,
+    DEGRADED_MESSAGE,
+    DailyCostGuard,
+    today_utc,
+)
 
 
 def endpoint_hash(endpoint: str) -> str:
@@ -56,21 +61,22 @@ def handle_web_message(
         ):
             emit_alert(logger_, "budget_exceeded", household_id=context.household_id, day=day)
             return DEGRADED_MESSAGE
-        # Delegate to runner/model.ToolLoop — same as Telegram/WhatsApp dialogue
-        answer = loop.run(context, message.text)
-        if usage is not None:
-            try:
-                # getattr keeps lightweight test stubs without token counts
-                # green; the real ToolLoop always reports both.
-                usage.record(
-                    context.household_id,
-                    day,
-                    prompt_tokens=getattr(answer, "input_tokens", 0),
-                    completion_tokens=getattr(answer, "output_tokens", 0),
+        # The check above is PRESENTATION — it answers without building a turn.
+        # Enforcement is the guard: consulted before every provider call inside
+        # the loop, recording each response as it arrives. A turn makes up to
+        # MAX_ITERATIONS calls plus a retry, so one check per turn held nothing
+        # after the first.
+        answer = loop.run(
+            context,
+            message.text,
+            cost_guard=(
+                None
+                if usage is None
+                else DailyCostGuard(
+                    usage, context.household_id, day=day, cap_usd=daily_cap_usd
                 )
-            except Exception as exc:  # noqa: BLE001
-                logger_.warning("usage record failed for %s/%s: %s", context.household_id, day, exc)
-                raise
+            ),
+        )
         return answer.text if hasattr(answer, "text") else str(answer)
     if pipeline is not None and hasattr(pipeline, "handle_web_event"):
         handled = pipeline.handle_web_event(message, context)
