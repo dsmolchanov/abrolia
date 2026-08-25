@@ -115,6 +115,10 @@ class ControlPlaneConfig:
     runtime_region: str = "ams"
     runtime_volume_mount: str = "/data"
     runtime_provider: str = "dry-run-runtime"
+    # The model credential each runtime needs to answer a chat turn.
+    # `repr=False` for the same reason as the two above: a config that
+    # printed itself would put it in a log.
+    runtime_model_api_key: str | None = field(default=None, repr=False)
     internal_bootstrap_host: str | None = None
     session_cookie_name: str = "__Host-abrolia_session"
     csrf_cookie_name: str = "__Host-abrolia_csrf"
@@ -255,9 +259,19 @@ class ControlPlaneConfig:
             or not self.fly_org_slug
             or not self.runtime_image_digest
             or not self.internal_bootstrap_host
+            # The model credential belongs in this list, not beside it. Adding
+            # it as an OPTIONAL setting installed only when present left the
+            # production path exactly as broken as before: `fly.toml` selects
+            # `fly-runtime`, nothing named the new variable, `_finish_runtime`
+            # omitted it silently, and every provisioned runtime got a chat
+            # route whose first turn answers 503. A runtime that cannot answer
+            # the surface it serves is a misconfiguration, so it fails at boot
+            # where an operator sees it — not per-turn where a family does.
+            or not self.runtime_model_api_key
         ):
             raise ConfigurationError(
-                "Fly synthetic runtime requires token, org, image digest and private bootstrap host"
+                "Fly synthetic runtime requires token, org, image digest,"
+                " private bootstrap host and a model API key"
             )
         if self.internal_bootstrap_host and any(
             marker in self.internal_bootstrap_host for marker in ("/", ":", " ")
@@ -320,6 +334,7 @@ class ControlPlaneConfig:
             fly_org_slug=source.get("ABROLIA_FLY_ORG") or None,
             runtime_image_digest=source.get("ABROLIA_RUNTIME_IMAGE") or None,
             runtime_provider=source.get("ABROLIA_RUNTIME_PROVIDER", "dry-run-runtime"),
+            runtime_model_api_key=source.get("ABROLIA_RUNTIME_MODEL_API_KEY") or None,
             internal_bootstrap_host=source.get("ABROLIA_INTERNAL_BOOTSTRAP_HOST") or None,
             magic_link_delivery_enabled=(
                 source.get("ABROLIA_MAGIC_LINK_DELIVERY_ENABLED", "0") == "1"

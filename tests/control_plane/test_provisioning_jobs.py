@@ -1733,3 +1733,61 @@ def test_a_shutdown_tears_down_what_it_can_name_without_asking_the_provider(
         assert f"google-oauth:{identity['id']}" in refs, refs
     else:
         assert org_teardown_ref(cp_stack.household.id, identity["id"]) in refs, refs
+
+
+def _install_runtime(cp_stack, *, model_api_key: str | None):
+    _advance_to_runtime(cp_stack)
+    sink = InMemorySecretSink()
+    result = cp_stack.make_worker(
+        secret_sink=sink, model_api_key=model_api_key, now=BASE_TIME + 30
+    ).run_once()
+    assert result is not None and result.status == "succeeded"
+    return sink, f"synthetic-runtime:{cp_stack.household.id}"
+
+
+def test_a_runtime_is_provisioned_with_the_credential_its_chat_needs(cp_stack) -> None:
+    """C2 shipped a chat route with no credential to serve it.
+
+    `_web_chat_loop` builds the model client lazily, provisioning installed only
+    the bootstrap and DSAR tokens, and the machine environment carried no model
+    key — so the first real turn failed inside the client constructor, which
+    `_web_chat` reports as `chat_unavailable`, and the public endpoint answered
+    503 permanently. The route was right; the secret was never installed.
+    """
+    sink, runtime_ref = _install_runtime(cp_stack, model_api_key="synthetic-model-key")
+
+    assert sink.get(runtime_ref, "ANTHROPIC_API_KEY") == b"synthetic-model-key"
+    # It travels with the others, into the runtime's own namespace — never
+    # through argv, the manifest, or a log.
+    assert sink.get(runtime_ref, "HERMES_BOOTSTRAP_TOKEN") is not None
+    assert sink.get(runtime_ref, "HERMES_RUNTIME_DSAR_TOKEN") is not None
+
+
+def test_a_deployment_without_a_model_key_installs_none(cp_stack) -> None:
+    """Absent is not a failure: it is a runtime that cannot answer chat, which
+    `_web_chat` already reports honestly rather than pretending."""
+    sink, runtime_ref = _install_runtime(cp_stack, model_api_key=None)
+    assert sink.get(runtime_ref, "ANTHROPIC_API_KEY") is None
+    assert sink.get(runtime_ref, "HERMES_BOOTSTRAP_TOKEN") is not None
+
+
+def test_redeploying_with_the_key_does_not_reach_an_existing_runtime(cp_stack) -> None:
+    """Why the runbook carries a manual backfill instead of code.
+
+    `_finish_runtime` installs runtime secrets once and returns early for a
+    runtime whose job already succeeded. So setting
+    `ABROLIA_RUNTIME_MODEL_API_KEY` and redeploying the control plane fixes
+    every FUTURE runtime and no existing one — the operator has to import the
+    secret into each existing app, which is the same `fly secrets import
+    --stage` the sink itself runs.
+    """
+    sink, runtime_ref = _install_runtime(cp_stack, model_api_key=None)
+    assert sink.get(runtime_ref, "ANTHROPIC_API_KEY") is None
+
+    # The redeploy: same household, same runtime, now configured with a key.
+    again = cp_stack.make_worker(
+        secret_sink=sink, model_api_key="synthetic-model-key", now=BASE_TIME + 60
+    ).run_once()
+
+    assert again is None or again.status == "succeeded"
+    assert sink.get(runtime_ref, "ANTHROPIC_API_KEY") is None

@@ -37,10 +37,35 @@ arguments: `ABROLIA_ENCRYPTION_KEY`, `ABROLIA_LOOKUP_HMAC_KEY`,
 `ABROLIA_CONTROL_PLANE_BACKUP_KEY`. `ABROLIA_RESEND_API_KEY` is the dedicated,
 sending-only key for public magic-link delivery; do not reuse Nerve's Resend
 key. `ABROLIA_NERVE_ADMIN_KEY` is also a Fly
-secret whenever the Nerve gate is configured. The three application keys are independent
+secret whenever the Nerve gate is configured. `ABROLIA_RUNTIME_MODEL_API_KEY`
+is the model credential the control plane installs into each household
+runtime's own namespace; with `ABROLIA_RUNTIME_PROVIDER=fly-runtime` the
+control plane refuses to boot without it, because a runtime provisioned
+without one serves a web-chat route whose every turn answers 503. The three
+application keys are independent
 32-byte urlsafe-base64 values. Record the active encryption version in
 `ABROLIA_ENCRYPTION_KEY_VERSION`; retain an old field key until its rows have
 been re-encrypted.
+
+### Backfilling the model key into runtimes provisioned before it existed
+
+`_finish_runtime` installs runtime secrets once and returns early for a runtime
+whose job already succeeded, so a runtime provisioned before
+`ABROLIA_RUNTIME_MODEL_API_KEY` existed never receives it from a redeploy of
+the control plane. Setting the config value fixes every FUTURE runtime and no
+existing one.
+
+For each existing runtime app, install it the same way the control plane does —
+over stdin, so the value never reaches argv or shell history:
+
+```text
+printf 'ANTHROPIC_API_KEY=%s\n' "$KEY" | fly secrets import --stage --app <runtime-app>
+```
+
+This needs no new provisioning code because `FlySecretSink.install` is that
+command; the operator is running the same step by hand for a machine the
+worker will not revisit. Verify by opening the web chat for that household:
+before the key it answers 503 (`chat_unavailable`), after it answers normally.
 
 ### Public magic-link delivery gate
 

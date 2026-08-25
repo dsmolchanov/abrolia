@@ -7,10 +7,18 @@ server-verified RunContext (channel_bindings) and staged approval.
 from __future__ import annotations
 
 import hashlib
+import logging
 from dataclasses import dataclass
 from typing import Any
 
+from hermes_cloud.core.observability import emit_alert
 from hermes_cloud.core.runcontext import RunContext
+from hermes_cloud.core.usage import (
+    DEFAULT_DAILY_USD_CAP,
+    DEGRADED_MESSAGE,
+    DailyCostGuard,
+    today_utc,
+)
 
 
 def endpoint_hash(endpoint: str) -> str:
@@ -30,18 +38,45 @@ def handle_web_message(
     context: RunContext,
     loop: Any | None = None,
     pipeline: Any | None = None,
+    usage: Any | None = None,
+    daily_cap_usd: float = DEFAULT_DAILY_USD_CAP,
 ) -> str:
     """Route authenticated Web message through shared pipeline.
 
     Caller must have built RunContext from verified channel_bindings — never trust
     client payload for household/role. If a ToolLoop/pipeline is supplied, delegate
     to it; otherwise fallback to capability-checked echo for tests.
+
+    When `usage` is supplied the cost cap applies here exactly as on every other
+    model path — check before the call, record after it. The web channel is a
+    tenant surface; an uncapped chat would spend outside the budget.
     """
     if not context.is_known:
         return "Я вас не знаю и поэтому ничего не подтверждаю."
     if loop is not None:
-        # Delegate to runner/model.ToolLoop — same as Telegram/WhatsApp dialogue
-        answer = loop.run(context, message.text)
+        logger_ = logging.getLogger(__name__)
+        day = today_utc()
+        if usage is not None and usage.is_over_budget(
+            context.household_id, day, daily_cap_usd
+        ):
+            emit_alert(logger_, "budget_exceeded", household_id=context.household_id, day=day)
+            return DEGRADED_MESSAGE
+        # The check above is PRESENTATION — it answers without building a turn.
+        # Enforcement is the guard: consulted before every provider call inside
+        # the loop, recording each response as it arrives. A turn makes up to
+        # MAX_ITERATIONS calls plus a retry, so one check per turn held nothing
+        # after the first.
+        answer = loop.run(
+            context,
+            message.text,
+            cost_guard=(
+                None
+                if usage is None
+                else DailyCostGuard(
+                    usage, context.household_id, day=day, cap_usd=daily_cap_usd
+                )
+            ),
+        )
         return answer.text if hasattr(answer, "text") else str(answer)
     if pipeline is not None and hasattr(pipeline, "handle_web_event"):
         handled = pipeline.handle_web_event(message, context)

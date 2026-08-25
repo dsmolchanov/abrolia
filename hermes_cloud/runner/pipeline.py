@@ -29,6 +29,7 @@ from hermes_cloud.core.events import Event
 from hermes_cloud.core.evidence import EvidenceStore, content_sha
 from hermes_cloud.core.matching import find_match
 from hermes_cloud.core.memory import MemoryStore
+from hermes_cloud.core.observability import emit_alert
 from hermes_cloud.core.runcontext import (
     DATA_DELETE,
     DATA_EXPORT,
@@ -40,7 +41,13 @@ from hermes_cloud.core.runcontext import (
     Household,
     RunContext,
 )
-from hermes_cloud.core.usage import DEGRADED_MESSAGE, UsageStore, today_utc
+from hermes_cloud.core.usage import (
+    DEGRADED_MESSAGE,
+    DailyCostGuard,
+    UsageStore,
+    parse_daily_cap_usd,
+    today_utc,
+)
 from hermes_cloud.execute.email_send import (
     EmailBindingChanged,
     EmailOutcomeUnknown,
@@ -255,12 +262,14 @@ class Pipeline:
         # Cost caps: per-household/day soft limit, checked before model call.
         import os as _os
 
-        cap_raw = _os.environ.get("HERMES_COST_CAP_USD_PER_DAY", "")
         if daily_cap_usd is None:
-            try:
-                daily_cap_usd = float(cap_raw) if cap_raw.strip() else 5.0
-            except ValueError:
-                daily_cap_usd = 5.0
+            # Shared with the runtime's web-chat path, and no longer swallowing
+            # a bad value into the default: a cap the operator got wrong is a
+            # cap they think they set, and `nan`/`inf` parse fine while
+            # disabling the brake entirely.
+            daily_cap_usd = parse_daily_cap_usd(
+                _os.environ.get("HERMES_COST_CAP_USD_PER_DAY")
+            )
         self.daily_cap_usd = daily_cap_usd
         self.usage = usage or UsageStore(approvals.db)
         # Онтологический слой: провенанс, обязательства, память. Живёт в той же
@@ -440,7 +449,29 @@ class Pipeline:
         parsed = parse_eml(event.raw)
         if self.loop is None or not parsed.text.strip():
             return Handled()
-        answer = self.loop.run(context, parsed.text)
+        # Cost caps: the same contract as email extraction — check before the
+        # model call, record after it. A dialogue turn spends the same budget.
+        day = today_utc()
+        if self.usage.is_over_budget(context.household_id, day, self.daily_cap_usd):
+            emit_alert(logger, "budget_exceeded", household_id=context.household_id, day=day)
+            self.transport.send_message(
+                chat=self.chat,
+                text=DEGRADED_MESSAGE,
+                thread=self.thread,
+            )
+            return Handled(message=DEGRADED_MESSAGE)
+        # The check above is PRESENTATION — it answers without building a turn.
+        # Enforcement lives in the guard, which is consulted before every
+        # provider call inside the loop and records each response as it
+        # arrives. One turn makes up to MAX_ITERATIONS calls plus a retry, so a
+        # single check per turn held nothing after the first one.
+        answer = self.loop.run(
+            context,
+            parsed.text,
+            cost_guard=DailyCostGuard(
+                self.usage, context.household_id, day=day, cap_usd=self.daily_cap_usd
+            ),
+        )
         payload = bundle_payload(
             [Item(payload={"kind": KIND_WHATSAPP, "to": context.actor_id, "text": answer.text})],
             header=f"Ответ в WhatsApp для {context.actor_id}",
@@ -561,9 +592,25 @@ class Pipeline:
             return Handled(message=TEXT_UNKNOWN_ACTOR)
         if self.loop is None or not parsed.text.strip():
             return None
+        # Cost caps: the same contract as email extraction and WhatsApp
+        # dialogue — check before the model call, record after it.
+        hid = parsed.context.household_id
+        day = today_utc()
+        if self.usage.is_over_budget(hid, day, self.daily_cap_usd):
+            emit_alert(logger, "budget_exceeded", household_id=hid, day=day)
+            self.transport.send_message(
+                chat=parsed.context.chat_id, text=DEGRADED_MESSAGE, thread=parsed.context.thread_id
+            )
+            return Handled(message=DEGRADED_MESSAGE)
         # Ход диалога. Права уже собраны на входе: `run` получает их готовыми и
         # сам ничего не расширяет.
-        answer = self.loop.run(parsed.context, parsed.text)
+        answer = self.loop.run(
+            parsed.context,
+            parsed.text,
+            cost_guard=DailyCostGuard(
+                self.usage, hid, day=day, cap_usd=self.daily_cap_usd
+            ),
+        )
         self.transport.send_message(
             chat=parsed.context.chat_id, text=answer.text, thread=parsed.context.thread_id
         )

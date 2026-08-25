@@ -21,10 +21,13 @@ from control_plane.privacy.consent import (
     consent_version_and_sha,
     processes_real_household_content,
 )
-from hermes_cloud.core.config import DEFAULT_DB_PATH, ENV_DB
+from hermes_cloud.channels.web import WebChannelMessage, handle_web_message
+from hermes_cloud.core.config import DEFAULT_DB_PATH, ENV_DB, load_config
 from hermes_cloud.core.db import open_database
 from hermes_cloud.core.dsar import export_household, is_deleted, wipe_household
+from hermes_cloud.core.effects import EffectJournal
 from hermes_cloud.core.events import EventStore
+from hermes_cloud.core.runcontext import Household, build_run_context
 from hermes_cloud.core.runtime_manifest import (
     ENV_CONFIG_REVISION,
     ENV_HOUSEHOLD_FILE,
@@ -32,6 +35,10 @@ from hermes_cloud.core.runtime_manifest import (
     ManifestError,
     RuntimeManifest,
     load_runtime_manifest,
+)
+from hermes_cloud.core.usage import (
+    UsageStore,
+    parse_daily_cap_usd,
 )
 from hermes_cloud.email.contracts import EmailBinding
 from hermes_cloud.email.google_client import (
@@ -62,6 +69,8 @@ from hermes_cloud.ingest.whatsapp_webhook import (
     WhatsAppWebhookReceiver,
     WhatsAppWebhookRejected,
 )
+from hermes_cloud.runner.model import ToolLoop
+from hermes_cloud.runner.tools import Services
 from hermes_cloud.runtime.bootstrap import (
     DEFAULT_ACTIVATION_STATE,
     DEFAULT_MANIFEST_PATH,
@@ -89,6 +98,7 @@ ENV_NERVE_WORKER_SECONDS = "ABROLIA_NERVE_WORKER_SECONDS"
 ENV_GMAIL_WORKER_SECONDS = "ABROLIA_GMAIL_WORKER_SECONDS"
 ENV_WHATSAPP_INSTANCE = "HERMES_WHATSAPP_INSTANCE"
 ENV_WHATSAPP_RELAY_SECRET = "HERMES_WHATSAPP_RELAY_SECRET"
+ENV_COST_CAP_USD_PER_DAY = "HERMES_COST_CAP_USD_PER_DAY"
 REQUIRED_CONTENT_RESTRICTION_PURPOSE = "special_category_content_restriction"
 
 
@@ -626,6 +636,83 @@ class RuntimeService:
                 instance=config.instance,
             ).receive(payload, signature)
 
+    def _web_chat(self, method: str, body: bytes) -> Probe:
+        """One authenticated chat turn; the hoisted bearer gate already ran."""
+        try:
+            request = json.loads(body.decode("utf-8")) if body else None
+        except ValueError:
+            return Probe(400, {"status": "invalid_request"})
+        if not isinstance(request, dict):
+            return Probe(400, {"status": "invalid_request"})
+        text = str(request.get("text") or "").strip()
+        role = str(request.get("role") or "")
+        if not text:
+            return Probe(400, {"status": "text_required"})
+        if len(text) > 2000:
+            return Probe(400, {"status": "text_too_long"})
+        # Until C3 gives web a real channel-binding lifecycle there is no
+        # account→actor mapping to trust, so only owners get chat and effects
+        # attribute to the manifest's own owner actor. Fail closed for every
+        # other role rather than guessing an identity.
+        if role != "owner":
+            return Probe(403, {"status": "owner_role_required"})
+        try:
+            reply = self.web_chat_turn(text)
+        except RuntimeNotReady:
+            return Probe(503, {"status": "runtime_not_ready"})
+        except Exception:
+            return Probe(503, {"status": "chat_unavailable"})
+        return Probe(200, {"reply": reply})
+
+    def web_chat_turn(self, text: str) -> str:
+        """Route one web-chat turn through the shared dialogue loop.
+
+        The loop lives here, not in the control plane: this process owns the
+        household's budget counter, so the cap is enforced at the call site
+        exactly as on every other channel. `EffectJournal` binds to an open
+        database connection, so loop and usage store are rebuilt per turn.
+        """
+        manifest = self.require_ready()
+        # Explicit path, not env discovery: this process serves exactly one
+        # manifest, so language/model must come from it even if the env var
+        # wiring drifts.
+        config = load_config(env=self.env, manifest_path=self.manifest_path)
+        # The bearer gate on /internal/v1/* IS the transport verification here:
+        # only the control plane can reach this process, and it authenticated
+        # the human before proxying. The manifest's verified pairs cover
+        # telegram today, so carrying them verbatim would deny web entirely —
+        # C3 moves web into the manifest when bindings get a lifecycle.
+        household = Household(
+            household_id=manifest.household_id,
+            owner=manifest.actors.owner,
+            family=frozenset(manifest.actors.family),
+            allowed_chats=frozenset({"web-chat"}),
+        )
+        context = build_run_context(
+            household=household,
+            actor_id=manifest.actors.owner,
+            chat_id="web-chat",
+        )
+        daily_cap_usd = parse_daily_cap_usd(self.env.get(ENV_COST_CAP_USD_PER_DAY))
+        with open_database(self.database_path) as database:
+            return handle_web_message(
+                WebChannelMessage(actor_id=manifest.actors.owner, text=text),
+                context=context,
+                loop=self._web_chat_loop(database, config),
+                usage=UsageStore(database),
+                daily_cap_usd=daily_cap_usd,
+            )
+
+    def _web_chat_loop(self, database, config) -> ToolLoop:
+        """The dialogue loop against this turn's database connection."""
+        return ToolLoop(
+            journal=EffectJournal(database),
+            services=Services.on(database),
+            model=config.model,
+            effort=config.effort,
+            family_language=config.language,
+        )
+
     def __call__(self, environ: Mapping[str, Any], start_response: Callable) -> list[bytes]:
         """Health probes plus an authenticated private DSAR boundary."""
         import time as _t
@@ -660,6 +747,8 @@ class RuntimeService:
             probe = self._dsar(path, method, str(environ.get("HTTP_AUTHORIZATION") or ""))
         elif path == "/internal/v1/email/google/revoke":
             probe = self._google_revoke(method, str(environ.get("HTTP_AUTHORIZATION") or ""))
+        elif path == "/internal/v1/web/chat":
+            probe = self._web_chat(method, self._request_body(environ))
         elif path == "/health" and method == "GET":
             probe = self.health()
         elif method != "GET" or path not in {"/healthz", "/readyz"}:
@@ -777,6 +866,7 @@ class RuntimeService:
         "/internal/v1/dsar/export",
         "/internal/v1/dsar/delete",
         "/internal/v1/email/google/revoke",
+        "/internal/v1/web/chat",
     })
 
     def _authenticate_internal(self, method: str, authorization: str) -> Probe | None:

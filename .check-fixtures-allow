@@ -28,6 +28,18 @@ docs/privacy/*.md | email | schule@example.de
 # production domain remains blocked.
 landing/*.html | email | hello@abrolia.com
 landing/*.js | email | hello@abrolia.com
+
+# Публичные организационные контакты САМИХ процессоров: адрес поддержки Fly.io
+# из их privacy policy (маршрут запроса DPA записан в реестре и плане) и
+# privacy-адрес Resend внутри дословного архивного снимка их опубликованного
+# DPA. Это контакты организаций, а не данные семей или доноров; любые другие
+# адреса в этих файлах остаются под правилом.
+docs/privacy/vendor-dpas/*.md | email | privacy@resend.com
+docs/privacy/*.md | email | support@fly.io
+thoughts/shared/plans/*.md | email | support@fly.io
+# Файл исключений содержит значения, которые исключает, — включая себя же.
+.check-fixtures-allow | email | privacy@resend.com
+.check-fixtures-allow | email | support@fly.io
 .check-fixtures-allow | email | hello@abrolia.com
 
 # Illustrative managed-inbox address in the implementation plan. The concrete

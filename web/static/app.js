@@ -7,9 +7,18 @@ form.addEventListener("submit", async (event) => {
   const text = input.value.trim();
   if (!text) return;
 
+  // Double-submit CSRF: echo the session's csrf cookie back in a header,
+  // as every other mutating endpoint requires.
+  const csrfEntry = document.cookie
+    .split("; ")
+    .find((entry) => entry.split("=")[0].endsWith("csrf"));
+  const csrfToken = csrfEntry
+    ? decodeURIComponent(csrfEntry.split("=").slice(1).join("="))
+    : "";
+
   const response = await fetch("/api/web/message", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", "X-CSRF-Token": csrfToken },
     body: JSON.stringify({ text }),
   });
   const data = await response.json().catch(() => ({}));

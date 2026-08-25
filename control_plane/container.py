@@ -49,6 +49,7 @@ from control_plane.repositories import (
     JobsRepository,
     OnboardingRepository,
 )
+from control_plane.runtimes.chat_client import PrivateRuntimeWebChatClient
 from control_plane.services.accounts import AccountService
 from control_plane.services.households import HouseholdService
 
@@ -85,6 +86,7 @@ class ControlPlaneContainer:
     withdrawal: ConsentWithdrawalService
     retention: RetentionService
     runtime_health: RuntimeReadinessMonitor
+    web_chat: PrivateRuntimeWebChatClient
 
     @classmethod
     def build(
@@ -227,6 +229,7 @@ class ControlPlaneContainer:
             secret_sink=secret_sink,
             email_identities=email_identities,
             runtime_provider=config.runtime_provider,
+            model_api_key=config.runtime_model_api_key,
             bootstrap_ttl_seconds=config.bootstrap_ttl_seconds,
             # The allowlist itself, not a boolean derived from it. Empty when
             # the brake is on, so an unauthorized household is refused by
@@ -278,6 +281,10 @@ class ControlPlaneContainer:
         )
         retention = RetentionService(accounts)
         runtime_health = RuntimeReadinessMonitor(database)
+        # Unconditional: the client holds no state, validates the ref against
+        # the managed namespace, and a synthetic household's ref fails that
+        # check closed — so dry-run deploys need no special case here.
+        web_chat = PrivateRuntimeWebChatClient(token_hasher)
         return cls(
             config,
             database,
@@ -309,6 +316,7 @@ class ControlPlaneContainer:
             withdrawal,
             retention,
             runtime_health,
+            web_chat,
         )
 
     def close(self) -> None:

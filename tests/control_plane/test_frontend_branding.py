@@ -191,6 +191,9 @@ def test_pwa_serves_the_logo_and_relative_brand_assets(api_harness) -> None:
     script = api_harness.client.get("/pwa/static/app.js")
     service_worker = api_harness.client.get("/pwa/sw.js")
     anonymous_message = api_harness.client.post("/api/web/message", json={"text": "hello"})
+    # Same-origin gate fires before authentication (house order), so a bare
+    # anonymous post is refused with 403, not 401.
+    assert anonymous_message.status_code == 403
     assert manifest.status_code == 200
     assert favicon.status_code == 200
     assert favicon.headers["content-type"].startswith("image/svg+xml")
@@ -206,5 +209,4 @@ def test_pwa_serves_the_logo_and_relative_brand_assets(api_harness) -> None:
     assert 'navigator.serviceWorker.register("./sw.js")' in script.text
     assert service_worker.status_code == 200
     assert "javascript" in service_worker.headers["content-type"]
-    assert anonymous_message.status_code == 401
     assert anonymous_message.headers["cache-control"] == "no-store"

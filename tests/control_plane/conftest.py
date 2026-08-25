@@ -108,6 +108,7 @@ class ControlPlaneStack:
         *,
         providers: ProviderRegistry | None = None,
         secret_sink: InMemorySecretSink | None = None,
+        model_api_key: str | None = None,
         now: float = BASE_TIME + 100,
     ) -> ProvisioningWorker:
         planner = DesiredSpecPlanner(
@@ -132,6 +133,7 @@ class ControlPlaneStack:
             # var, because dispatch asks about THIS household and not about
             # real email in general.
             real_email_authorized_households=frozenset({self.household.id}),
+            model_api_key=model_api_key,
             clock=lambda: now,
         )
 

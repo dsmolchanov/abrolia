@@ -133,6 +133,7 @@ def test_fly_wiring_never_defaults_to_synthetic_runtime_dsar_boundaries(tmp_path
         fly_api_token="synthetic-fly-token",
         fly_org_slug="synthetic-org",
         runtime_image_digest="registry.example.test/runtime@sha256:" + "a" * 64,
+        runtime_model_api_key="synthetic-model-key",
     ).validate()
     with ControlPlaneContainer.build(config) as active:
         assert isinstance(active.exporter.runtime, PrivateRuntimeDsarClient)
