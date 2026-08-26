@@ -515,3 +515,152 @@ def test_reprovisioning_drops_outstanding_challenges_and_dependent_adults(
     assert [(r.channel, r.external_id, r.role) for r in rows] == [
         ("whatsapp", "+999511230000", "owner")
     ]
+
+
+# --- review follow-ups: four findings that arrived after the last fix ------
+
+
+def test_one_actor_with_several_bindings_is_one_family_member(cp_stack) -> None:
+    """`family` was built per BINDING, not per actor.
+
+    `verify_challenge` lets one actor hold several bindings — an adult
+    reachable on WhatsApp and on web is two rows and one person — so the
+    projection emitted `family=(owner, adult, adult)`, which the runtime
+    rejects as `actors.family: duplicate actor`. Another revision that cannot
+    start, reached by a different route than the primary-channel one.
+    """
+    _provisioned(cp_stack)
+    with cp_stack.database.write() as connection:
+        for channel, external_id in (
+            ("whatsapp", "+999511234567"),
+            ("web", "synthetic-web-seat"),
+        ):
+            issued = cp_stack.bindings.issue_challenge(
+                connection,
+                household_id=cp_stack.household.id,
+                channel=channel,
+                external_id=external_id,
+                actor_id=ADULT,
+                role="adult",
+                issued_by_actor_id=CHANNEL_SELECTION["actor_id"],
+                now=BASE_TIME + 100,
+            )
+            cp_stack.bindings.verify_challenge(
+                connection,
+                code=issued.code,
+                household_id=cp_stack.household.id,
+                owner_actor_id=CHANNEL_SELECTION["actor_id"],
+                now=BASE_TIME + 200,
+            )
+        cp_stack.make_worker().planner.issue(
+            connection, household_id=cp_stack.household.id
+        )
+
+    spec = DesiredHouseholdSpecV1.model_validate(
+        cp_stack.configs.manifest(cp_stack.household.id, 2)
+    )
+    assert spec.actors.family == (CHANNEL_SELECTION["actor_id"], ADULT)
+    # Two bindings, one member — and the runtime accepts it.
+    assert len(spec.channel_bindings) == 3
+    parse_runtime_manifest(manifest_to_toml(spec))
+
+
+def test_seeding_reconciles_role_and_actor_not_just_the_tuple(cp_stack) -> None:
+    """The early return matched `(channel, external_id)` whatever the row WAS.
+
+    Reproduced twice: re-onboarding onto a tuple an ADULT holds wrote no owner
+    binding at all while the stale owner row survived on the channel the
+    household had just left; and an owner whose ACTOR changed during reset
+    never became authoritative.
+    """
+    hid = cp_stack.household.id
+    with cp_stack.database.write() as connection:
+        cp_stack.bindings.ensure_owner_binding(
+            connection, household_id=hid, channel="telegram",
+            external_id="synthetic-chat-one", actor_id=OWNER, now=BASE_TIME,
+        )
+        issued = cp_stack.bindings.issue_challenge(
+            connection, household_id=hid, channel="whatsapp", external_id=PHONE,
+            actor_id=ADULT, role="adult", issued_by_actor_id=OWNER, now=BASE_TIME,
+        )
+        cp_stack.bindings.verify_challenge(
+            connection, code=issued.code, household_id=hid,
+            owner_actor_id=OWNER, now=BASE_TIME + 1,
+        )
+        # 1. The owner re-onboards onto the tuple the adult holds.
+        cp_stack.bindings.ensure_owner_binding(
+            connection, household_id=hid, channel="whatsapp",
+            external_id=PHONE, actor_id=OWNER, now=BASE_TIME + 10,
+        )
+        rows = cp_stack.bindings.verified(connection, household_id=hid)
+
+    assert [(r.channel, r.external_id, r.actor_id, r.role) for r in rows] == [
+        ("whatsapp", PHONE, OWNER, "owner")
+    ]
+
+    # 2. The actor changes while the chat stays the same.
+    with cp_stack.database.write() as connection:
+        cp_stack.bindings.ensure_owner_binding(
+            connection, household_id=hid, channel="whatsapp",
+            external_id=PHONE, actor_id="synthetic-owner-renamed", now=BASE_TIME + 20,
+        )
+        rows = cp_stack.bindings.verified(connection, household_id=hid)
+
+    assert [(r.actor_id, r.role) for r in rows] == [
+        ("synthetic-owner-renamed", "owner")
+    ]
+
+
+def test_a_household_cannot_grow_challenges_or_bindings_without_end(
+    cp_stack,
+) -> None:
+    """Every issued challenge is a stored row and every verified binding
+    becomes a manifest entry and a config revision, so an authenticated owner
+    looping over unique IDs grows a shared volume and the manifest with it."""
+    from control_plane.repositories.bindings import (
+        MAX_BINDINGS,
+        MAX_OPEN_CHALLENGES,
+    )
+
+    hid = cp_stack.household.id
+    with cp_stack.database.write() as connection:
+        cp_stack.bindings.ensure_owner_binding(
+            connection, household_id=hid, channel="telegram",
+            external_id="synthetic-chat", actor_id=OWNER, now=BASE_TIME,
+        )
+        for index in range(MAX_OPEN_CHALLENGES):
+            cp_stack.bindings.issue_challenge(
+                connection, household_id=hid, channel="whatsapp",
+                external_id=f"+99951100{index:04d}", actor_id=f"synthetic-a{index}",
+                role="adult", issued_by_actor_id=OWNER, now=BASE_TIME,
+            )
+        with pytest.raises(BindingError, match="outstanding challenges"):
+            cp_stack.bindings.issue_challenge(
+                connection, household_id=hid, channel="whatsapp",
+                external_id="+999511009999", actor_id="synthetic-one-too-many",
+                role="adult", issued_by_actor_id=OWNER, now=BASE_TIME,
+            )
+
+        # Bindings are capped where rows are created, so the limit holds
+        # however the row was reached.
+        connection.execute("DELETE FROM channel_binding_challenges")
+        for index in range(MAX_BINDINGS - 1):
+            issued = cp_stack.bindings.issue_challenge(
+                connection, household_id=hid, channel="whatsapp",
+                external_id=f"+99951199{index:04d}", actor_id=f"synthetic-b{index}",
+                role="adult", issued_by_actor_id=OWNER, now=BASE_TIME,
+            )
+            cp_stack.bindings.verify_challenge(
+                connection, code=issued.code, household_id=hid,
+                owner_actor_id=OWNER, now=BASE_TIME + 1,
+            )
+        over = cp_stack.bindings.issue_challenge(
+            connection, household_id=hid, channel="whatsapp",
+            external_id="+999511998888", actor_id="synthetic-last",
+            role="adult", issued_by_actor_id=OWNER, now=BASE_TIME,
+        )
+        with pytest.raises(BindingError, match="as many bindings"):
+            cp_stack.bindings.verify_challenge(
+                connection, code=over.code, household_id=hid,
+                owner_actor_id=OWNER, now=BASE_TIME + 1,
+            )

@@ -210,6 +210,24 @@ The scope becomes well-defined the moment #71 merges and this branch rebases
 onto main — which is the honest reading: a stacked branch does not have a
 scope of its own until its base has one.
 
+#### Inventory — C3 review follow-ups
+
+**Files:** `control_plane/repositories/bindings.py`,
+`control_plane/provisioning/planner.py`, `control_plane/privacy/export.py`,
+`tests/control_plane/test_channel_bindings.py`,
+`tests/control_plane/test_export_delete.py`.
+
+**Branches:** `codex/c3-review-followups`.
+
+Four findings that arrived on #72 after its last fix and merged untriaged.
+All four were reproduced before anything changed. They are one step because
+they share a cause: C3 gave `channel_bindings` its first writer, and every
+consumer that had been correct only because the table was always empty stopped
+being correct at that moment — the exporter that never read it, the projection
+that assumed one binding per actor, the seeding that matched a tuple without
+looking at whose row it was.
+
+
 ## Track R — Staged rollout (fixed order; runbook §Rollout)
 
 Prerequisite: O1 ticked. Order is not negotiable per runbook and canon.
@@ -226,6 +244,42 @@ Prerequisite: O1 ticked. Order is not negotiable per runbook and canon.
   open). Shared-WA relay last, after C5.
 
 ## Execution log
+
+- 2026-08-26: **The four findings that merged untriaged on #72 are fixed.**
+  All reproduced first; all four turned out to share one cause. C3 gave
+  `channel_bindings` its first production writer, and three consumers that had
+  been correct only because the table was always empty stopped being correct
+  the moment it filled.
+
+  **The DSAR export omitted it.** `TABLE_CLASSIFICATION` marks the table
+  exportable and `docs/privacy/data-map.md:53` promises it with a ✔, and
+  `HouseholdExporter.export` never read it — costless while every household's
+  binding list was empty, and a genuinely incomplete subject access request
+  now that it holds channel identities, actors, roles and verification
+  metadata. Exported without `external_id_hmac`, which is a keyed digest of
+  the column beside it and so publishes a lookup token for no reader benefit;
+  challenges stay out entirely by their own classification.
+
+  **One actor with two bindings became two family members.** The projection
+  appended per BINDING, so an adult reachable on WhatsApp and on web produced
+  `family=(owner, adult, adult)` — rejected by `parse_runtime_manifest` as
+  `actors.family: duplicate actor`. The same unstartable-revision class as the
+  primary-channel case, reached by a different route, which is what made it
+  worth fixing at the projection rather than at either symptom.
+
+  **Seeding matched a tuple without asking whose row it was.**
+  `ensure_owner_binding` returned early on `(channel, external_id)` alone, so
+  re-onboarding the owner onto a tuple an ADULT held wrote no owner binding at
+  all while the stale owner row survived on the channel the household had just
+  left; and an owner whose ACTOR changed during reset never became
+  authoritative. Reconciliation now compares role, actor and tuple together,
+  and anything else is a reset that retires what it replaces.
+
+  **Nothing bounded the collections.** An authenticated owner could loop
+  unique IDs, each one a stored challenge row or a binding that becomes both a
+  manifest entry and a config revision. Capped per household at both ends.
+
+  Suite 1530 green, ruff and sanitizer clean.
 
 - 2026-08-26: **C3 review round 2 — two more authorization defects, both
   reproduced, both fixed.** This is the third generation on this branch and the

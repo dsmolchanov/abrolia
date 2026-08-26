@@ -150,10 +150,17 @@ class DesiredSpecPlanner:
         # — an unstable projection would move `config_sha256` between two runs
         # that bound nothing new, and a changed hash is how this system says
         # "something changed".
-        family = (actor_id,) + tuple(
-            binding.actor_id
-            for binding in bound
-            if binding.actor_id != actor_id
+        # One entry per ACTOR, not per binding. `verify_challenge` lets one
+        # actor hold several bindings — an adult reachable on WhatsApp and on
+        # web is two rows and one person — and appending per row produced
+        # `family=(owner, adult, adult)`, which `parse_runtime_manifest`
+        # rejects as `actors.family: duplicate actor`. A revision that cannot
+        # start. First-verification order is preserved because `verified()` is
+        # ordered and `dict.fromkeys` keeps first appearance.
+        family = tuple(
+            dict.fromkeys(
+                (actor_id, *(binding.actor_id for binding in bound))
+            )
         )
         spec = DesiredHouseholdSpecV1(
             household_id=household_id,
