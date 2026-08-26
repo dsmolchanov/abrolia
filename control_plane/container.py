@@ -44,6 +44,7 @@ from control_plane.provisioning.worker import ProvisioningWorker
 from control_plane.repositories import (
     AccountsRepository,
     AuthRepository,
+    ChannelBindingsRepository,
     ConfigRepository,
     HouseholdsRepository,
     JobsRepository,
@@ -67,6 +68,7 @@ class ControlPlaneContainer:
     onboarding_repository: OnboardingRepository
     jobs: JobsRepository
     configs: ConfigRepository
+    bindings: ChannelBindingsRepository
     email_identities: EmailIdentityRepository
     email_identity_service: EmailIdentityService
     google_oauth: GoogleOAuthService
@@ -121,6 +123,7 @@ class ControlPlaneContainer:
         onboarding_repository = OnboardingRepository(database, cipher, lookup)
         jobs = JobsRepository(database, cipher, lookup)
         configs = ConfigRepository(database, cipher, lookup, token_hasher)
+        bindings = ChannelBindingsRepository(database, cipher, lookup, token_hasher)
         email_identities = EmailIdentityRepository(database, cipher, lookup)
         email_identity_service = EmailIdentityService(email_identities)
         sessions = SessionService(auth)
@@ -218,7 +221,9 @@ class ControlPlaneContainer:
             real_email_household_allowlist=config.real_email_household_allowlist,
             email_identities=email_identity_service,
         )
-        planner = DesiredSpecPlanner(accounts, households, onboarding_repository, configs)
+        planner = DesiredSpecPlanner(
+            accounts, households, onboarding_repository, configs, bindings
+        )
         worker = ProvisioningWorker(
             jobs=jobs,
             onboarding=onboarding_repository,
@@ -297,6 +302,7 @@ class ControlPlaneContainer:
             onboarding_repository,
             jobs,
             configs,
+            bindings,
             email_identities,
             email_identity_service,
             google_oauth,

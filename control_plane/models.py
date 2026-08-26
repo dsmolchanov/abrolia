@@ -309,4 +309,10 @@ TABLE_CLASSIFICATION: dict[str, TableClassification] = {
     ),
     "channel_preferences": TableClassification(True, True, "account+30d"),
     "channel_bindings": TableClassification(True, True, "account+30d"),
+    "channel_binding_challenges": TableClassification(
+        False,
+        True,
+        "consumed-or-expired+24h",
+        "ephemeral join credential; its durable outcome is channel_bindings",
+    ),
 }

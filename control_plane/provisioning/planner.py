@@ -19,6 +19,7 @@ from control_plane.provisioning.manifest import (
     manifest_sha256,
 )
 from control_plane.repositories.accounts import AccountsRepository
+from control_plane.repositories.bindings import ChannelBindingsRepository
 from control_plane.repositories.configs import ConfigRepository, ConfigRevisionRecord
 from control_plane.repositories.households import HouseholdsRepository
 from control_plane.repositories.onboarding import OnboardingRepository
@@ -37,11 +38,13 @@ class DesiredSpecPlanner:
         households: HouseholdsRepository,
         onboarding: OnboardingRepository,
         configs: ConfigRepository,
+        bindings: ChannelBindingsRepository,
     ) -> None:
         self.accounts = accounts
         self.households = households
         self.onboarding = onboarding
         self.configs = configs
+        self.bindings = bindings
 
     def issue(
         self,
@@ -127,6 +130,31 @@ class DesiredSpecPlanner:
         primary = channel_public["channel"]
         actor_id = str(channel_public["actor_id"])
         chat_id = str(channel_public["chat_id"])
+        # The manifest is a PROJECTION of `channel_bindings`, not a second
+        # record of the same fact. Before C3 this method built the owner's
+        # binding inline and the table stayed empty, so the gateway — whose
+        # only source is that table — could not route to a household the
+        # manifest considered fully bound. Seeding the owner's row here from
+        # the onboarding step that already proved the channel makes the two
+        # agree by construction: everything below reads the table.
+        self.bindings.ensure_owner_binding(
+            connection,
+            household_id=household_id,
+            channel=primary,
+            external_id=chat_id,
+            actor_id=actor_id,
+        )
+        bound = self.bindings.verified(connection, household_id=household_id)
+        # Order carries meaning: the owner leads `family`, then adults in the
+        # order they were verified. `verified()` is ordered for the same reason
+        # — an unstable projection would move `config_sha256` between two runs
+        # that bound nothing new, and a changed hash is how this system says
+        # "something changed".
+        family = (actor_id,) + tuple(
+            binding.actor_id
+            for binding in bound
+            if binding.actor_id != actor_id
+        )
         spec = DesiredHouseholdSpecV1(
             household_id=household_id,
             config_revision=next_revision,
@@ -134,15 +162,25 @@ class DesiredSpecPlanner:
             timezone=profile["timezone"],
             country_code=profile["country_code"],
             residency_mode=profile["residency_mode"],
-            actors=ActorsV1(owner=actor_id, family=(actor_id,)),
+            actors=ActorsV1(owner=actor_id, family=family),
             channels=ChannelsV1(primary=primary),
-            channel_bindings=(
+            channel_bindings=tuple(
                 ChannelBindingV1(
-                    channel=primary,
-                    actor_id=actor_id,
-                    chat_id=chat_id,
-                    external_ref=channel_result["external_ref"],
-                ),
+                    channel=binding.channel,
+                    actor_id=binding.actor_id,
+                    chat_id=binding.external_id,
+                    # Only the owner's binding came from a provider result, so
+                    # only it carries that provider's reference. An adult
+                    # verified by challenge has no provider row to point at,
+                    # and inventing one would put a reference in the manifest
+                    # that resolves to nothing.
+                    external_ref=(
+                        channel_result["external_ref"]
+                        if binding.role == "owner" and binding.channel == primary
+                        else None
+                    ),
+                )
+                for binding in bound
             ),
             email=EmailV1(
                 agent_inbox=email_public["agent_inbox"],

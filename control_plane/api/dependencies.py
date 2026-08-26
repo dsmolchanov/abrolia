@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any, NamedTuple
 
 from fastapi import Header, HTTPException, Request, status
+from pydantic import ValidationError
 
 from control_plane.container import ControlPlaneContainer
 from control_plane.db import new_id
@@ -103,6 +104,38 @@ def current_household_mutation(
     return CurrentHousehold(principal, household)
 
 
+def current_household_owner_mutation(
+    request: Request,
+    x_csrf_token: str | None = Header(default=None, alias="X-CSRF-Token"),
+) -> CurrentHousehold:
+    """A mutation only the household's OWNER may perform.
+
+    `current_household_mutation` resolves the household through
+    `households.for_account`, which accepts any ACTIVE membership regardless of
+    role — `household_memberships.role` CHECKs `owner`/`adult`, and nothing
+    above this line ever looked at it. For most household mutations that is
+    right. For attesting a new binding it is not: an adult could issue a code,
+    redeem it, and have the binding recorded against the owner's actor, adding
+    a member to the household's durable routing state without the owner ever
+    being asked.
+
+    The role is read from the membership row rather than inferred from the
+    binding table, because it is the ACCOUNT's authority that is in question
+    here, not which actor a channel maps to.
+    """
+    current = current_household_mutation(request, x_csrf_token)
+    row = container(request).database.query_one(
+        "SELECT role FROM household_memberships WHERE household_id = ?"
+        " AND account_id = ? AND status = 'active'",
+        (current.household.id, current.principal.account_id),
+    )
+    if row is None or row["role"] != "owner":
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN, "household owner role required"
+        )
+    return current
+
+
 def current_household_fresh_mutation(
     request: Request,
     x_csrf_token: str | None = Header(default=None, alias="X-CSRF-Token"),
@@ -198,3 +231,40 @@ def browser_session(request: Request) -> BrowserSession:
     except (PermissionError, HouseholdNotFound) as error:
         raise SeeOther("/start") from error
     return BrowserSession(household, account)
+
+
+#: Bodies are bounded before they are PARSED, not after. A Pydantic body
+#: parameter lets FastAPI materialise the whole document first, so the field
+#: limits on a model bound what is accepted and never what is read — an
+#: authenticated caller could spend the process's memory without reaching any
+#: handler. `Content-Length` is checked when offered, and the stream is bounded
+#: regardless, because a chunked request offers none.
+MAX_JSON_BODY_BYTES = 64 * 1024
+
+
+async def read_bounded_json(
+    request: Request, model: type[Any], *, limit: int = MAX_JSON_BODY_BYTES
+) -> Any:
+    declared = request.headers.get("content-length")
+    if declared is not None:
+        try:
+            if int(declared) > limit:
+                raise HTTPException(
+                    status.HTTP_413_CONTENT_TOO_LARGE, "body too large"
+                )
+        except ValueError as error:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST, "invalid content-length"
+            ) from error
+    body = bytearray()
+    async for chunk in request.stream():
+        body.extend(chunk)
+        # Catches a request that declares nothing, or lies about it.
+        if len(body) > limit:
+            raise HTTPException(status.HTTP_413_CONTENT_TOO_LARGE, "body too large")
+    try:
+        return model.model_validate_json(bytes(body))
+    except ValidationError as error:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT, "invalid request body"
+        ) from error

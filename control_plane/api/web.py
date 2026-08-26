@@ -13,7 +13,12 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, ValidationError
 
 from control_plane.api.auth import issue_requested_link
-from control_plane.api.dependencies import Principal, container, require_private_mutation
+from control_plane.api.dependencies import (
+    Principal,
+    container,
+    read_bounded_json,
+    require_private_mutation,
+)
 from control_plane.auth.rate_limit import RateLimitExceeded
 from control_plane.db import new_id
 from control_plane.models import ProfileInput, StepKind
@@ -270,47 +275,15 @@ class WebMessageInput(BaseModel):
     text: str
 
 
-#: The turn is capped at 2 000 characters, so nothing legitimate approaches
-#: this. It exists to bound what is READ, not what is accepted: the character
-#: check below runs after FastAPI has already materialised the whole body.
-MAX_WEB_MESSAGE_BYTES = 64 * 1024
-
-
 async def _bounded_web_message(request: Request) -> WebMessageInput:
-    """Read at most `MAX_WEB_MESSAGE_BYTES`, then parse.
+    """The same bounded read every JSON endpoint uses.
 
-    Declaring the body as a Pydantic parameter let FastAPI materialise an
-    unbounded JSON document before any size check could run, so an
-    authenticated caller could spend the process's memory without ever
-    reaching the model. `Content-Length` is checked when offered and the
-    stream is bounded regardless, because a chunked request offers none.
+    This began as a private helper here and was then not applied to the two
+    binding endpoints written in the same session — the instance fixed, the
+    invariant missed. It lives in `dependencies` now so the next JSON route
+    inherits it instead of re-deciding.
     """
-    declared = request.headers.get("content-length")
-    if declared is not None:
-        try:
-            if int(declared) > MAX_WEB_MESSAGE_BYTES:
-                raise HTTPException(
-                    http_status.HTTP_413_CONTENT_TOO_LARGE, "body too large"
-                )
-        except ValueError as error:
-            raise HTTPException(
-                http_status.HTTP_400_BAD_REQUEST, "invalid content-length"
-            ) from error
-
-    body = bytearray()
-    async for chunk in request.stream():
-        body.extend(chunk)
-        # A lying or absent Content-Length is caught here, while reading.
-        if len(body) > MAX_WEB_MESSAGE_BYTES:
-            raise HTTPException(
-                http_status.HTTP_413_CONTENT_TOO_LARGE, "body too large"
-            )
-    try:
-        return WebMessageInput.model_validate_json(bytes(body))
-    except ValidationError as error:
-        raise HTTPException(
-            http_status.HTTP_422_UNPROCESSABLE_CONTENT, "invalid request body"
-        ) from error
+    return await read_bounded_json(request, WebMessageInput)
 
 
 @router.post("/api/web/message")

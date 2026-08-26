@@ -12,7 +12,16 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from control_plane.api import auth, email, households, internal_bootstrap, onboarding, privacy, web
+from control_plane.api import (
+    auth,
+    bindings,
+    email,
+    households,
+    internal_bootstrap,
+    onboarding,
+    privacy,
+    web,
+)
 from control_plane.api.dependencies import BrowserSession, SeeOther, browser_session
 from control_plane.config import ControlPlaneConfig
 from control_plane.container import ControlPlaneContainer
@@ -313,6 +322,7 @@ def create_app(
 
     app.include_router(auth.router)
     app.include_router(households.router)
+    app.include_router(bindings.router)
     app.include_router(onboarding.router)
     app.include_router(email.router)
     app.include_router(privacy.router)

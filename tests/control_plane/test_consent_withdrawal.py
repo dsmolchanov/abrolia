@@ -329,7 +329,11 @@ def test_no_new_revision_can_be_issued_after_withdrawal(cp_stack) -> None:
     )
 
     planner = DesiredSpecPlanner(
-        cp_stack.accounts, cp_stack.households, cp_stack.onboarding, cp_stack.configs
+        cp_stack.accounts,
+        cp_stack.households,
+        cp_stack.onboarding,
+        cp_stack.configs,
+        cp_stack.bindings,
     )
     with (
         cp_stack.database.write() as connection,

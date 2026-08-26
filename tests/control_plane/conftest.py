@@ -28,6 +28,7 @@ from control_plane.provisioning.secrets import InMemorySecretSink
 from control_plane.provisioning.worker import ProvisioningWorker
 from control_plane.repositories.accounts import AccountRecord, AccountsRepository
 from control_plane.repositories.auth import AuthRepository
+from control_plane.repositories.bindings import ChannelBindingsRepository
 from control_plane.repositories.configs import ConfigRepository
 from control_plane.repositories.households import HouseholdRecord, HouseholdsRepository
 from control_plane.repositories.jobs import JobsRepository
@@ -49,6 +50,7 @@ class ControlPlaneStack:
     onboarding: OnboardingRepository
     jobs: JobsRepository
     configs: ConfigRepository
+    bindings: ChannelBindingsRepository
     email_identities: EmailIdentityRepository
     channel_prefs: ChannelPreferencesRepository
     sessions: SessionService
@@ -116,6 +118,7 @@ class ControlPlaneStack:
             self.households,
             self.onboarding,
             self.configs,
+            self.bindings,
         )
         return ProvisioningWorker(
             jobs=self.jobs,
@@ -190,6 +193,7 @@ def cp_stack(tmp_path: Path) -> ControlPlaneStack:
     onboarding = OnboardingRepository(database, cipher, lookup)
     jobs = JobsRepository(database, cipher, lookup)
     configs = ConfigRepository(database, cipher, lookup, token_hasher)
+    bindings = ChannelBindingsRepository(database, cipher, lookup, token_hasher)
     email_identities = EmailIdentityRepository(database, cipher, lookup)
     email_identity_service = EmailIdentityService(email_identities)
     channel_prefs = ChannelPreferencesRepository(database)
@@ -209,6 +213,7 @@ def cp_stack(tmp_path: Path) -> ControlPlaneStack:
         onboarding=onboarding,
         jobs=jobs,
         configs=configs,
+        bindings=bindings,
         email_identities=email_identities,
         channel_prefs=channel_prefs,
         sessions=sessions,
