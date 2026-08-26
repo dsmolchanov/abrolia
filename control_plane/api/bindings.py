@@ -22,7 +22,12 @@ from fastapi import status as http_status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from control_plane.api.dependencies import CurrentHousehold, container, current_household_mutation
+from control_plane.api.dependencies import (
+    CurrentHousehold,
+    container,
+    current_household_mutation,
+    read_bounded_json,
+)
 from control_plane.repositories.bindings import BindingError
 
 router = APIRouter()
@@ -42,10 +47,18 @@ class VerifyRequest(BaseModel):
     code: str = Field(min_length=1, max_length=256)
 
 
+async def _challenge_body(request: Request) -> ChallengeRequest:
+    return await read_bounded_json(request, ChallengeRequest)
+
+
+async def _verify_body(request: Request) -> VerifyRequest:
+    return await read_bounded_json(request, VerifyRequest)
+
+
 @router.post("/api/v1/household/bindings/challenges")
-def issue_binding_challenge(
+async def issue_binding_challenge(
     request: Request,
-    payload: ChallengeRequest,
+    payload: Annotated[ChallengeRequest, Depends(_challenge_body)],
     current: Annotated[CurrentHousehold, Depends(current_household_mutation)],
 ) -> JSONResponse:
     active = container(request)
@@ -89,9 +102,9 @@ def issue_binding_challenge(
 
 
 @router.post("/api/v1/household/bindings/verify")
-def verify_binding_challenge(
+async def verify_binding_challenge(
     request: Request,
-    payload: VerifyRequest,
+    payload: Annotated[VerifyRequest, Depends(_verify_body)],
     current: Annotated[CurrentHousehold, Depends(current_household_mutation)],
 ) -> JSONResponse:
     active = container(request)
@@ -106,7 +119,10 @@ def verify_binding_challenge(
             )
         try:
             binding = active.bindings.verify_challenge(
-                connection, code=payload.code, owner_actor_id=owner
+                connection,
+                code=payload.code,
+                household_id=current.household.id,
+                owner_actor_id=owner,
             )
         except BindingError as error:
             raise HTTPException(http_status.HTTP_403_FORBIDDEN, str(error)) from error

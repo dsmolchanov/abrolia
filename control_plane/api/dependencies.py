@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any, NamedTuple
 
 from fastapi import Header, HTTPException, Request, status
+from pydantic import ValidationError
 
 from control_plane.container import ControlPlaneContainer
 from control_plane.db import new_id
@@ -198,3 +199,40 @@ def browser_session(request: Request) -> BrowserSession:
     except (PermissionError, HouseholdNotFound) as error:
         raise SeeOther("/start") from error
     return BrowserSession(household, account)
+
+
+#: Bodies are bounded before they are PARSED, not after. A Pydantic body
+#: parameter lets FastAPI materialise the whole document first, so the field
+#: limits on a model bound what is accepted and never what is read — an
+#: authenticated caller could spend the process's memory without reaching any
+#: handler. `Content-Length` is checked when offered, and the stream is bounded
+#: regardless, because a chunked request offers none.
+MAX_JSON_BODY_BYTES = 64 * 1024
+
+
+async def read_bounded_json(
+    request: Request, model: type[Any], *, limit: int = MAX_JSON_BODY_BYTES
+) -> Any:
+    declared = request.headers.get("content-length")
+    if declared is not None:
+        try:
+            if int(declared) > limit:
+                raise HTTPException(
+                    status.HTTP_413_CONTENT_TOO_LARGE, "body too large"
+                )
+        except ValueError as error:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST, "invalid content-length"
+            ) from error
+    body = bytearray()
+    async for chunk in request.stream():
+        body.extend(chunk)
+        # Catches a request that declares nothing, or lies about it.
+        if len(body) > limit:
+            raise HTTPException(status.HTTP_413_CONTENT_TOO_LARGE, "body too large")
+    try:
+        return model.model_validate_json(bytes(body))
+    except ValidationError as error:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT, "invalid request body"
+        ) from error

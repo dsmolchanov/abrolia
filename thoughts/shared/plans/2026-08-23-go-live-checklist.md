@@ -86,6 +86,34 @@ Ordered slices:
   validation; second-adult binding flow (planner currently hardcodes
   `family=(owner,)` — `provisioning/planner.py:137-146`). This is the
   foundation the gateway lookup and preferences routing both consume.
+  **Scope corrected 2026-08-26.** The second adult is NOT deliverable in this
+  slice and the reason is structural — see C3a below. What C3 delivers is the
+  writer, the challenge lifecycle, and the manifest as a projection of the
+  table.
+- [ ] **C3a. Separate a sender's identity from the chat it speaks in.**
+  `channel_bindings.external_id` answers two incompatible questions:
+  `gateway/whatsapp_router.py:128` matches it against an incoming SENDER, and
+  the manifest projection reads it as `chat_id`, the place the assistant
+  SPEAKS. For the owner the two coincide because onboarding wrote one value
+  that happens to answer both; for a second adult on the same channel they
+  cannot — the household's chat collides with the owner's row under
+  `UNIQUE (household_id, channel, external_id)`, and an identity of their own
+  makes the projection emit two verified chats for the primary channel, which
+  `parse_runtime_manifest` (`runtime_manifest.py:342-347`) refuses outright.
+  Both reproduced 2026-08-26. Needs a distinct `chat_id` column, a migration
+  for 0007's rows, and the three consumers — gateway lookup, planner
+  projection, runtime manifest — moved together. Blocks the second adult on
+  the primary channel; adults on other channels already work.
+
+- [ ] **C3b. Roll a revision out to an already-active household.** Verifying a
+  binding plans revision N, but nothing schedules `ensure_runtime` or advances
+  `households.current_config_revision`, so the runtime stays on N-1 and never
+  sees the new member. The only existing path
+  (`provisioning/worker.py:2579-2606`) also flips the household to
+  `provisioning` and drives the ONBOARDING workflow to `runtime_provisioning`
+  — first-time semantics that a live household gaining a member should not
+  inherit. Re-provisioning is its own lifecycle, not a copied block.
+
 - [ ] **C4. Make preferences real.** Production write path (API/onboarding);
   consumer that routes replies/fallbacks; self-contained agent-inbox rejection
   (replace dead `_validate_no_self_ingestion`, persist the fallback ref);
@@ -153,7 +181,8 @@ accumulates branches stops bounding any of them.
 `control_plane/api/bindings.py`, `control_plane/api/app.py`,
 `control_plane/provisioning/planner.py`, `control_plane/container.py`,
 `control_plane/repositories/__init__.py`, `control_plane/models.py`,
-`control_plane/privacy/retention.py`, `tests/control_plane/conftest.py`,
+`control_plane/privacy/retention.py`, `control_plane/api/dependencies.py`,
+`control_plane/api/web.py`, `tests/control_plane/conftest.py`,
 `tests/control_plane/test_channel_bindings.py`,
 `tests/control_plane/test_binding_api.py`, `tests/control_plane/test_db.py`,
 `tests/control_plane/test_manifest.py`,
@@ -197,6 +226,46 @@ Prerequisite: O1 ticked. Order is not negotiable per runbook and canon.
   open). Shared-WA relay last, after C5.
 
 ## Execution log
+
+- 2026-08-26: **C3 review round 1 — five findings, three fixed, and the second
+  adult turned out to be unrepresentable.** All five were verified against the
+  code first.
+
+  **Redemption was not scoped to the caller's household.** `verify_challenge`
+  looked a code up globally and compared only `issued_by_actor_id`, but an
+  actor ID is unique within a household and nowhere else — two households may
+  both call their owner `synthetic-owner`. The colliding owner could redeem
+  the other household's challenge, writing the binding into the ISSUING
+  household while their own received the revision. The household is now part
+  of the lookup predicate, so the collision is unreachable rather than
+  unlikely.
+
+  **Both binding endpoints buffered unbounded bodies.** The identical defect
+  was fixed for `/api/web/message` in #71 and then not applied to the two
+  endpoints written in the same session — the instance fixed, the invariant
+  missed. The bounded reader now lives in `api/dependencies.py` and all three
+  routes share it.
+
+  **The second adult cannot be represented, and that is C3a.**
+  `channel_bindings.external_id` is asked both "which sender is this" (the
+  gateway) and "where does the assistant speak" (the projection). Giving an
+  adult the household's chat collides under `UNIQUE (household_id, channel,
+  external_id)`; giving them an identity of their own makes the runtime refuse
+  the revision with `channels.primary: multiple chats`. Both reproduced. The
+  conflation arrived with 0007 and this projection is merely the first thing
+  to ask it for two answers at once — so C3 refuses an adult on the primary
+  channel where someone asks for it, instead of writing a row whose deployment
+  fails later. Adults on OTHER channels are unaffected, supported, and now
+  tested through the real runtime parser.
+
+  That last point is the testing lesson: a manifest has two contracts —
+  `DesiredHouseholdSpecV1`, which the control plane writes, and
+  `parse_runtime_manifest`, which the runtime reads. The original test asserted
+  the first and never exercised the second, which is exactly how a revision the
+  runtime cannot start looked green.
+
+  Left to C3b and argued rather than patched: a verified binding plans a
+  revision that nothing rolls out. Suite 1523 green, ruff and sanitizer clean.
 
 - 2026-08-25: **Review round 3 — two fail-open defects in C1's own work.**
   Both were verified before changing anything and both were real.

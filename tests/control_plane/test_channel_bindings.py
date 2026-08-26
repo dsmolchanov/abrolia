@@ -47,7 +47,10 @@ def test_a_verified_challenge_is_what_writes_the_binding_row(cp_stack) -> None:
         ) == ()
 
         binding = cp_stack.bindings.verify_challenge(
-            connection, code=issued.code, owner_actor_id=OWNER, now=BASE_TIME + 60
+            connection,
+                code=issued.code,
+                household_id=cp_stack.household.id,
+                owner_actor_id=OWNER, now=BASE_TIME + 60
         )
 
     assert binding.actor_id == ADULT
@@ -76,19 +79,26 @@ def test_an_expired_or_reused_challenge_is_refused(cp_stack) -> None:
             cp_stack.bindings.verify_challenge(
                 connection,
                 code=expired.code,
+                household_id=cp_stack.household.id,
                 owner_actor_id=OWNER,
                 now=BASE_TIME + 10_000,
             )
 
         once = _issue(cp_stack, connection)
         cp_stack.bindings.verify_challenge(
-            connection, code=once.code, owner_actor_id=OWNER, now=BASE_TIME + 60
+            connection,
+            code=once.code,
+            household_id=cp_stack.household.id,
+            owner_actor_id=OWNER, now=BASE_TIME + 60
         )
         # Single use: the same code must not bind a second time, even though
         # the binding it produced is perfectly valid.
         with pytest.raises(BindingError, match="invalid or expired"):
             cp_stack.bindings.verify_challenge(
-                connection, code=once.code, owner_actor_id=OWNER, now=BASE_TIME + 61
+                connection,
+            code=once.code,
+            household_id=cp_stack.household.id,
+            owner_actor_id=OWNER, now=BASE_TIME + 61
             )
 
 
@@ -99,6 +109,7 @@ def test_a_code_cannot_be_redeemed_under_a_different_owner(cp_stack) -> None:
             cp_stack.bindings.verify_challenge(
                 connection,
                 code=issued.code,
+                household_id=cp_stack.household.id,
                 owner_actor_id="synthetic-someone-else",
                 now=BASE_TIME + 60,
             )
@@ -156,7 +167,10 @@ def test_an_external_id_bound_elsewhere_is_refused_at_issue_and_at_verify(
         )
         with pytest.raises(BindingError, match="another household"):
             cp_stack.bindings.verify_challenge(
-                connection, code=issued.code, owner_actor_id=OWNER, now=BASE_TIME + 60
+                connection,
+                code=issued.code,
+                household_id=cp_stack.household.id,
+                owner_actor_id=OWNER, now=BASE_TIME + 60
             )
 
 
@@ -166,12 +180,18 @@ def test_rebinding_the_same_id_to_a_different_member_is_refused(cp_stack) -> Non
     with cp_stack.database.write() as connection:
         first = _issue(cp_stack, connection)
         cp_stack.bindings.verify_challenge(
-            connection, code=first.code, owner_actor_id=OWNER, now=BASE_TIME + 60
+            connection,
+            code=first.code,
+            household_id=cp_stack.household.id,
+            owner_actor_id=OWNER, now=BASE_TIME + 60
         )
 
         again = _issue(cp_stack, connection)
         repeat = cp_stack.bindings.verify_challenge(
-            connection, code=again.code, owner_actor_id=OWNER, now=BASE_TIME + 120
+            connection,
+            code=again.code,
+            household_id=cp_stack.household.id,
+            owner_actor_id=OWNER, now=BASE_TIME + 120
         )
         assert repeat.actor_id == ADULT
         assert repeat.verified_at == BASE_TIME + 60  # the original row, not a new one
@@ -179,7 +199,10 @@ def test_rebinding_the_same_id_to_a_different_member_is_refused(cp_stack) -> Non
         stolen = _issue(cp_stack, connection, actor_id="synthetic-third-adult")
         with pytest.raises(BindingError, match="already bound to another member"):
             cp_stack.bindings.verify_challenge(
-                connection, code=stolen.code, owner_actor_id=OWNER, now=BASE_TIME + 180
+                connection,
+                code=stolen.code,
+                household_id=cp_stack.household.id,
+                owner_actor_id=OWNER, now=BASE_TIME + 180
             )
 
 
@@ -195,7 +218,10 @@ def test_hmac_column_stays_null_until_c5_provisions_the_key(cp_stack) -> None:
     with cp_stack.database.write() as connection:
         issued = _issue(cp_stack, connection)
         cp_stack.bindings.verify_challenge(
-            connection, code=issued.code, owner_actor_id=OWNER, now=BASE_TIME + 60
+            connection,
+                code=issued.code,
+                household_id=cp_stack.household.id,
+                owner_actor_id=OWNER, now=BASE_TIME + 60
         )
 
     rows = cp_stack.database.query("SELECT external_id_hmac FROM channel_bindings")
@@ -219,6 +245,8 @@ def test_the_retention_sweep_retires_a_challenge_nobody_answered(cp_stack) -> No
 
 from control_plane.models import StepKind  # noqa: E402
 from control_plane.provisioning.manifest import DesiredHouseholdSpecV1  # noqa: E402
+from control_plane.provisioning.manifest_toml import manifest_to_toml  # noqa: E402
+from hermes_cloud.core.runtime_manifest import parse_runtime_manifest  # noqa: E402
 from tests.control_plane.test_manifest import (  # noqa: E402
     CHANNEL_SELECTION,
     EMAIL_SELECTION,
@@ -288,20 +316,67 @@ def test_the_owners_binding_is_seeded_into_the_table_planning_writes_it(
     ]
 
 
-def test_a_verified_second_adult_reaches_the_manifest_as_a_new_revision(
+def test_an_adult_on_the_primary_channel_is_refused_because_the_store_cannot_hold_one(
     cp_stack,
 ) -> None:
-    """The planner hardcoded `family=(owner,)`, so a household could never
-    have a second member however many bindings it verified."""
-    first = _provisioned(cp_stack)
-    assert first.actors.family == (CHANNEL_SELECTION["actor_id"],)
+    """The limit C3 stops at, and the reason, both pinned.
 
+    `channel_bindings.external_id` answers two questions at once: the gateway
+    matches it against a SENDER, the planner projects it as the manifest's
+    `chat_id`. For the owner they coincide. For a second adult on that channel
+    they cannot — the household's chat collides with the owner's row under
+    `UNIQUE (household_id, channel, external_id)`, and an identity of their own
+    makes the projection emit two verified chats for the primary channel, which
+    the runtime refuses outright.
+
+    So it is refused where someone asks for it, rather than written and left to
+    fail at a deployment nobody is watching.
+    """
+    _provisioned(cp_stack)
+    for external_id in (CHANNEL_SELECTION["chat_id"], "synthetic-a-chat-of-their-own"):
+        with cp_stack.database.write() as connection:
+            issued = cp_stack.bindings.issue_challenge(
+                connection,
+                household_id=cp_stack.household.id,
+                channel=CHANNEL_SELECTION["kind"],
+                external_id=external_id,
+                actor_id=ADULT,
+                role="adult",
+                issued_by_actor_id=CHANNEL_SELECTION["actor_id"],
+                now=BASE_TIME + 100,
+            )
+            with pytest.raises(BindingError, match="primary"):
+                cp_stack.bindings.verify_challenge(
+                    connection,
+                    code=issued.code,
+                    household_id=cp_stack.household.id,
+                    owner_actor_id=CHANNEL_SELECTION["actor_id"],
+                    now=BASE_TIME + 200,
+                )
+            assert cp_stack.database.query(
+                "SELECT id FROM channel_bindings WHERE actor_id = ?", (ADULT,)
+            ) == []
+
+
+def test_an_adult_on_another_channel_is_bound_and_the_runtime_can_start_it(
+    cp_stack,
+) -> None:
+    """What the lifecycle does deliver.
+
+    A different channel takes no part in the primary-chat constraint and cannot
+    collide with the owner's row, so the adult is representable there — and the
+    projection is checked through the REAL runtime parser, not merely against
+    the control plane's own contract. A manifest has two contracts and the
+    earlier version of this test exercised only one, which is how a revision
+    the runtime refuses looked green.
+    """
+    _provisioned(cp_stack)
     with cp_stack.database.write() as connection:
         issued = cp_stack.bindings.issue_challenge(
             connection,
             household_id=cp_stack.household.id,
-            channel=CHANNEL_SELECTION["kind"],
-            external_id="synthetic-second-chat",
+            channel="whatsapp",
+            external_id="+999511234567",
             actor_id=ADULT,
             role="adult",
             issued_by_actor_id=CHANNEL_SELECTION["actor_id"],
@@ -310,6 +385,7 @@ def test_a_verified_second_adult_reaches_the_manifest_as_a_new_revision(
         cp_stack.bindings.verify_challenge(
             connection,
             code=issued.code,
+            household_id=cp_stack.household.id,
             owner_actor_id=CHANNEL_SELECTION["actor_id"],
             now=BASE_TIME + 200,
         )
@@ -317,23 +393,18 @@ def test_a_verified_second_adult_reaches_the_manifest_as_a_new_revision(
             connection, household_id=cp_stack.household.id
         )
 
-    second = DesiredHouseholdSpecV1.model_validate(
+    spec = DesiredHouseholdSpecV1.model_validate(
         cp_stack.configs.manifest(cp_stack.household.id, 2)
     )
-    assert second.actors.owner == CHANNEL_SELECTION["actor_id"]
-    assert second.actors.family == (CHANNEL_SELECTION["actor_id"], ADULT)
-    assert {binding.actor_id for binding in second.channel_bindings} == {
-        CHANNEL_SELECTION["actor_id"],
-        ADULT,
-    }
-    # The owner's binding keeps the provider reference it was proved by; an
-    # adult verified by challenge has no provider row to point at.
-    by_actor = {binding.actor_id: binding for binding in second.channel_bindings}
-    assert by_actor[CHANNEL_SELECTION["actor_id"]].external_ref is not None
-    assert by_actor[ADULT].external_ref is None
-    # A new member is a new configuration, so the projection has to move —
-    # and not merely because the revision number did.
-    assert _shape(second) != _shape(first)
+    assert spec.actors.family == (CHANNEL_SELECTION["actor_id"], ADULT)
+
+    runtime = parse_runtime_manifest(manifest_to_toml(spec))
+    # One chat to speak into; the adult authorized from their own channel.
+    assert runtime.primary_chat_id == CHANNEL_SELECTION["chat_id"]
+    assert runtime.verified_actor_chat_pairs == frozenset({
+        (CHANNEL_SELECTION["actor_id"], CHANNEL_SELECTION["chat_id"]),
+        (ADULT, "+999511234567"),
+    })
 
 
 def test_replanning_without_a_new_binding_leaves_the_manifest_identical(

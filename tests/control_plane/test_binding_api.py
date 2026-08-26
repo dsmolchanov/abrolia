@@ -15,14 +15,24 @@ ADULT = "synthetic-second-adult"
 CHAT = "synthetic-second-chat"
 
 
-def _seed_owner(harness, household_id: str, actor_id: str = "synthetic-owner") -> None:
-    """Give the household the owner binding provisioning would have written."""
+def _seed_owner(
+    harness,
+    household_id: str,
+    actor_id: str = "synthetic-owner",
+    external_id: str = "synthetic-owner-chat",
+) -> None:
+    """Give the household the owner binding provisioning would have written.
+
+    `external_id` is per-household on purpose: an ID held by one household is
+    refused to every other, which is the rule that keeps the gateway from
+    answering `ambiguous_sender` for both.
+    """
     with harness.container.database.write() as connection:
         harness.container.bindings.ensure_owner_binding(
             connection,
             household_id=household_id,
             channel="telegram",
-            external_id="synthetic-owner-chat",
+            external_id=external_id,
             actor_id=actor_id,
         )
 
@@ -137,9 +147,11 @@ def test_an_unprovisionable_household_is_declined_not_broken(api_harness) -> Non
     world = api_harness.create_principal()
     api_harness.authenticate(world)
     _seed_owner(api_harness, world.household.id)
+    # A NON-primary channel, so the request gets past the primary-channel
+    # refusal and actually reaches the planner, which is what is under test.
     issued = api_harness.client.post(
         CHALLENGES,
-        json={"channel": "telegram", "external_id": CHAT, "actor_id": ADULT},
+        json={"channel": "whatsapp", "external_id": "+999511234567", "actor_id": ADULT},
         headers=api_harness.mutation_headers,
     )
 
@@ -159,3 +171,68 @@ def test_an_unprovisionable_household_is_declined_not_broken(api_harness) -> Non
     assert api_harness.container.database.query(
         "SELECT consumed_at FROM channel_binding_challenges"
     )[0]["consumed_at"] is None
+
+
+def test_a_challenge_cannot_be_redeemed_from_another_household(api_harness) -> None:
+    """Actor IDs are unique within a household and nowhere else.
+
+    `channel_bindings.actor_id` is plain TEXT, so two households may both call
+    their owner `synthetic-owner`. The lookup was global and compared only
+    `issued_by_actor_id`, so the colliding owner could redeem the other
+    household's challenge — writing the binding into the ISSUING household
+    while their own got the revision.
+    """
+    victim = api_harness.create_principal(email="victim@family.test")
+    attacker = api_harness.create_principal(email="attacker@family.test")
+    # The collision the schema permits: the same owner actor ID in both.
+    _seed_owner(
+        api_harness,
+        victim.household.id,
+        actor_id="synthetic-owner",
+        external_id="synthetic-victim-chat",
+    )
+    _seed_owner(
+        api_harness,
+        attacker.household.id,
+        actor_id="synthetic-owner",
+        external_id="synthetic-attacker-chat",
+    )
+
+    with api_harness.container.database.write() as connection:
+        issued = api_harness.container.bindings.issue_challenge(
+            connection,
+            household_id=victim.household.id,
+            channel="whatsapp",
+            external_id="+999511234567",
+            actor_id=ADULT,
+            role="adult",
+            issued_by_actor_id="synthetic-owner",
+        )
+
+    api_harness.authenticate(attacker)
+    response = api_harness.client.post(
+        VERIFY, json={"code": issued.code}, headers=api_harness.mutation_headers
+    )
+    assert response.status_code == 403
+    assert api_harness.container.database.query(
+        "SELECT id FROM channel_bindings WHERE household_id = ? AND actor_id = ?",
+        (victim.household.id, ADULT),
+    ) == []
+
+
+def test_both_binding_routes_bound_the_body_before_parsing_it(api_harness) -> None:
+    """The invariant fixed for `/api/web/message` and then not applied to the
+    two endpoints written in the same session — the instance, not the rule."""
+    world = api_harness.create_principal()
+    api_harness.authenticate(world)
+    _seed_owner(api_harness, world.household.id)
+
+    huge = "я" * (200 * 1024)
+    for path, payload in (
+        (CHALLENGES, {"channel": "whatsapp", "external_id": huge, "actor_id": ADULT}),
+        (VERIFY, {"code": huge}),
+    ):
+        response = api_harness.client.post(
+            path, json=payload, headers=api_harness.mutation_headers
+        )
+        assert response.status_code == 413, path

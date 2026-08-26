@@ -255,20 +255,30 @@ class ChannelBindingsRepository(Repository):
         connection: sqlite3.Connection,
         *,
         code: str,
+        household_id: str,
         owner_actor_id: str,
         now: float | None = None,
     ) -> BindingRecord:
         """Answer a challenge and write the binding it was standing in for.
 
+        `household_id` is the CALLER'S household, and it is part of the lookup
+        rather than a check afterwards. An actor ID is unique within a
+        household and nowhere else — `channel_bindings.actor_id` is plain TEXT
+        and two households may both call their owner `synthetic-owner`. With
+        only `issued_by_actor_id` compared, an owner whose actor ID happened to
+        match another household's could redeem that household's challenge: the
+        binding would be written into the ISSUING household (the row carries
+        its ID) while the caller's own household got the revision. Scoping the
+        lookup makes the collision unreachable instead of merely unlikely.
+
         `owner_actor_id` is what the row records as `verified_by_actor_id`: the
-        household member whose authority the binding rests on. It is checked
-        against the actor that issued the challenge, so a code issued under one
-        owner cannot be redeemed into a binding attributed to another.
+        member whose authority the binding rests on.
         """
         now = time.time() if now is None else now
         row = connection.execute(
-            "SELECT * FROM channel_binding_challenges WHERE code_hash = ?",
-            (self.token_hasher.digest(code),),
+            "SELECT * FROM channel_binding_challenges WHERE code_hash = ?"
+            " AND household_id = ?",
+            (self.token_hasher.digest(code), household_id),
         ).fetchone()
         # One message for every rejection a holder of a bad code can reach:
         # distinguishing "no such code" from "expired" tells an attacker which
@@ -287,6 +297,11 @@ class ChannelBindingsRepository(Repository):
             channel=row["channel"],
             external_id=row["external_id"],
             household_id=row["household_id"],
+        )
+        self._reject_unrepresentable_member(
+            connection,
+            household_id=row["household_id"],
+            channel=row["channel"],
         )
         existing = connection.execute(
             "SELECT * FROM channel_bindings WHERE household_id = ? AND channel = ?"
@@ -314,6 +329,53 @@ class ChannelBindingsRepository(Repository):
         )
 
     # --- internals -------------------------------------------------------
+
+    @staticmethod
+    def _reject_unrepresentable_member(
+        connection: sqlite3.Connection,
+        *,
+        household_id: str,
+        channel: str,
+    ) -> None:
+        """Refuse an adult on the PRIMARY channel: the store cannot hold one.
+
+        `channel_bindings.external_id` is asked two incompatible questions.
+        `gateway/whatsapp_router.py:128` matches it against an incoming SENDER;
+        `provisioning/planner.py` projects it as the manifest's `chat_id`, the
+        place the assistant SPEAKS. For the owner the two coincide, because
+        onboarding wrote one value that happens to answer both. For a second
+        adult on that same channel they cannot:
+
+        * give the adult the household's chat and the row collides with the
+          owner's under `UNIQUE (household_id, channel, external_id)`;
+        * give the adult an identity of their own and the projection emits two
+          verified chats for the primary channel, which
+          `parse_runtime_manifest` refuses with `channels.primary: multiple
+          chats` — a revision that cannot start.
+
+        Both were reproduced. The conflation arrived with `0007` and this
+        projection is simply the first thing to ask it for two answers at once.
+        Separating the sender's identity from the chat is a schema change with
+        three consumers, so it is its own slice; until then the honest thing is
+        to refuse where someone asks, rather than write a row whose deployment
+        fails later.
+
+        An adult on a NON-primary channel is unaffected and supported: a
+        different channel takes no part in the primary-chat constraint and
+        cannot collide with the owner's row.
+        """
+        owner = connection.execute(
+            "SELECT channel FROM channel_bindings WHERE household_id = ?"
+            " AND role = 'owner' ORDER BY verified_at, id LIMIT 1",
+            (household_id,),
+        ).fetchone()
+        if owner is None or owner["channel"] != channel:
+            return
+        raise BindingError(
+            "a second member cannot yet be bound on the household's primary"
+            " channel — the binding store does not separate a sender's"
+            " identity from the chat it speaks in"
+        )
 
     @staticmethod
     def _reject_foreign_holder(
