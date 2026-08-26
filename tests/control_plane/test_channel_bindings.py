@@ -424,3 +424,94 @@ def test_replanning_without_a_new_binding_leaves_the_manifest_identical(
     assert second.config_revision == first.config_revision + 1
     # Seeding is idempotent: replanning must not add a duplicate owner row.
     assert len(cp_stack.database.query("SELECT id FROM channel_bindings")) == 1
+
+
+def test_reprovisioning_the_primary_channel_retires_what_it_replaces(
+    cp_stack,
+) -> None:
+    """`reset_from(PRIMARY_CHANNEL)` lets a household re-run the step onto a
+    different chat, or a different channel. Seeding only ever inserted, so the
+    previous owner row survived — and two of them are not merely untidy.
+
+    Two owner rows on one channel make the projection emit two verified chats
+    for the primary channel, which the runtime refuses; and a row on the
+    channel the household LEFT keeps its sender routable, because
+    `gateway/whatsapp_router.py` resolves senders across the whole table and
+    has no notion of a binding having been superseded. An owner who moves the
+    household off a channel has revoked it.
+    """
+    hid = cp_stack.household.id
+    with cp_stack.database.write() as connection:
+        cp_stack.bindings.ensure_owner_binding(
+            connection, household_id=hid, channel="telegram",
+            external_id="synthetic-chat-one", actor_id=OWNER, now=BASE_TIME,
+        )
+        # Re-onboarded onto a different chat on the same channel.
+        cp_stack.bindings.ensure_owner_binding(
+            connection, household_id=hid, channel="telegram",
+            external_id="synthetic-chat-two", actor_id=OWNER, now=BASE_TIME + 10,
+        )
+        rows = cp_stack.bindings.verified(connection, household_id=hid)
+
+    assert [(r.channel, r.external_id) for r in rows] == [
+        ("telegram", "synthetic-chat-two")
+    ]
+
+    # And onto a different channel entirely: the old sender stops routing.
+    with cp_stack.database.write() as connection:
+        cp_stack.bindings.ensure_owner_binding(
+            connection, household_id=hid, channel="whatsapp",
+            external_id=PHONE, actor_id=OWNER, now=BASE_TIME + 20,
+        )
+    remaining = cp_stack.database.query(
+        "SELECT channel, external_id FROM channel_bindings WHERE household_id = ?",
+        (hid,),
+    )
+    assert [(r["channel"], r["external_id"]) for r in remaining] == [
+        ("whatsapp", PHONE)
+    ]
+
+
+def test_reprovisioning_drops_outstanding_challenges_and_dependent_adults(
+    cp_stack,
+) -> None:
+    """A code issued against the arrangement that just changed must not redeem
+    into the one that replaced it — and an adult on the channel now becoming
+    primary cannot be represented there, so it goes with it rather than
+    rebuilding the unstartable manifest by another route."""
+    hid = cp_stack.household.id
+    with cp_stack.database.write() as connection:
+        cp_stack.bindings.ensure_owner_binding(
+            connection, household_id=hid, channel="telegram",
+            external_id="synthetic-chat-one", actor_id=OWNER, now=BASE_TIME,
+        )
+        issued = cp_stack.bindings.issue_challenge(
+            connection, household_id=hid, channel="whatsapp", external_id=PHONE,
+            actor_id=ADULT, role="adult", issued_by_actor_id=OWNER, now=BASE_TIME,
+        )
+        cp_stack.bindings.verify_challenge(
+            connection, code=issued.code, household_id=hid,
+            owner_actor_id=OWNER, now=BASE_TIME + 5,
+        )
+        pending = cp_stack.bindings.issue_challenge(
+            connection, household_id=hid, channel="whatsapp",
+            external_id="+999511119999", actor_id="synthetic-third",
+            role="adult", issued_by_actor_id=OWNER, now=BASE_TIME + 6,
+        )
+        # The household moves its primary channel onto WhatsApp, where that
+        # adult already sits.
+        cp_stack.bindings.ensure_owner_binding(
+            connection, household_id=hid, channel="whatsapp",
+            external_id="+999511230000", actor_id=OWNER, now=BASE_TIME + 20,
+        )
+        rows = cp_stack.bindings.verified(connection, household_id=hid)
+        # The outstanding code no longer redeems.
+        with pytest.raises(BindingError, match="invalid or expired"):
+            cp_stack.bindings.verify_challenge(
+                connection, code=pending.code, household_id=hid,
+                owner_actor_id=OWNER, now=BASE_TIME + 25,
+            )
+
+    assert [(r.channel, r.external_id, r.role) for r in rows] == [
+        ("whatsapp", "+999511230000", "owner")
+    ]

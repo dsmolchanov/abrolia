@@ -227,6 +227,36 @@ Prerequisite: O1 ticked. Order is not negotiable per runbook and canon.
 
 ## Execution log
 
+- 2026-08-26: **C3 review round 2 — two more authorization defects, both
+  reproduced, both fixed.** This is the third generation on this branch and the
+  second to find something structural, which is the signal `CLAUDE.md`
+  describes; the hand-back is requested in the thread.
+
+  **Any household member could attest a binding.** Both endpoints used
+  `current_household_mutation`, which resolves the household through
+  `households.for_account` — a query that accepts any ACTIVE membership and
+  never reads `role`. Nothing in the dependency layer ever did. So an adult
+  could issue a code, redeem it, and have `owner_actor()` record the binding
+  against the OWNER's actor, adding a member to durable routing state without
+  the owner being asked. `current_household_owner_mutation` now reads the
+  membership row, and reads it there rather than inferring from the binding
+  table, because what is in question is the ACCOUNT's authority and not which
+  actor a channel maps to.
+
+  **Re-onboarding left the old channel authorized.** `ensure_owner_binding`
+  only ever inserted, so `reset_from(PRIMARY_CHANNEL)` onto a different chat
+  left both rows — the projection then emits two verified chats for the primary
+  channel and the runtime refuses the revision. Worse on a channel CHANGE: the
+  row for the channel the household left keeps its sender routable, because
+  `gateway/whatsapp_router.py` resolves senders across the whole table and has
+  no notion of supersession. An owner who moves the household off a channel has
+  revoked it, and the table is what the gateway believes. Establishing an owner
+  binding now retires the prior one, the adult bindings on the channel becoming
+  primary (unrepresentable there, and otherwise a second route to the
+  unstartable manifest), and every outstanding challenge — a code issued
+  against the arrangement that just changed must not redeem into its
+  replacement. Suite 1526 green.
+
 - 2026-08-26: **C3 review round 1 — five findings, three fixed, and the second
   adult turned out to be unrepresentable.** All five were verified against the
   code first.

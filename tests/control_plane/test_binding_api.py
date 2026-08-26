@@ -236,3 +236,49 @@ def test_both_binding_routes_bound_the_body_before_parsing_it(api_harness) -> No
             path, json=payload, headers=api_harness.mutation_headers
         )
         assert response.status_code == 413, path
+
+
+def test_only_the_owner_may_attest_a_binding(api_harness) -> None:
+    """`current_household_mutation` accepts any ACTIVE membership regardless of
+    role, and nothing above these routes ever read `household_memberships.role`.
+
+    An adult could therefore issue a code, redeem it, and have `owner_actor()`
+    record the binding against the OWNER's actor — adding a member to the
+    household's durable routing state without the owner being asked.
+    """
+    owner = api_harness.create_principal(email="the-owner@family.test")
+    adult = api_harness.create_principal(email="the-adult@family.test")
+    _seed_owner(api_harness, owner.household.id)
+
+    # An active adult membership in the OWNER's household — the shape the
+    # schema permits and the route did not distinguish.
+    with api_harness.container.database.write() as connection:
+        connection.execute(
+            "DELETE FROM household_memberships WHERE account_id = ?",
+            (adult.account.id,),
+        )
+        connection.execute(
+            "INSERT INTO household_memberships (account_id, household_id, role,"
+            " status, created_at, accepted_at) VALUES (?, ?, 'adult', 'active', 1, 1)",
+            (adult.account.id, owner.household.id),
+        )
+
+    api_harness.authenticate(adult)
+    for path, payload in (
+        (CHALLENGES, {"channel": "whatsapp", "external_id": "+999511234567", "actor_id": ADULT}),
+        (VERIFY, {"code": "anything"}),
+    ):
+        response = api_harness.client.post(
+            path, json=payload, headers=api_harness.mutation_headers
+        )
+        assert response.status_code == 403, path
+        assert "owner" in response.json()["detail"]
+
+    # The owner completes the same flow the adult was refused.
+    api_harness.authenticate(owner)
+    issued = api_harness.client.post(
+        CHALLENGES,
+        json={"channel": "whatsapp", "external_id": "+999511234567", "actor_id": ADULT},
+        headers=api_harness.mutation_headers,
+    )
+    assert issued.status_code == 200

@@ -104,6 +104,38 @@ def current_household_mutation(
     return CurrentHousehold(principal, household)
 
 
+def current_household_owner_mutation(
+    request: Request,
+    x_csrf_token: str | None = Header(default=None, alias="X-CSRF-Token"),
+) -> CurrentHousehold:
+    """A mutation only the household's OWNER may perform.
+
+    `current_household_mutation` resolves the household through
+    `households.for_account`, which accepts any ACTIVE membership regardless of
+    role — `household_memberships.role` CHECKs `owner`/`adult`, and nothing
+    above this line ever looked at it. For most household mutations that is
+    right. For attesting a new binding it is not: an adult could issue a code,
+    redeem it, and have the binding recorded against the owner's actor, adding
+    a member to the household's durable routing state without the owner ever
+    being asked.
+
+    The role is read from the membership row rather than inferred from the
+    binding table, because it is the ACCOUNT's authority that is in question
+    here, not which actor a channel maps to.
+    """
+    current = current_household_mutation(request, x_csrf_token)
+    row = container(request).database.query_one(
+        "SELECT role FROM household_memberships WHERE household_id = ?"
+        " AND account_id = ? AND status = 'active'",
+        (current.household.id, current.principal.account_id),
+    )
+    if row is None or row["role"] != "owner":
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN, "household owner role required"
+        )
+    return current
+
+
 def current_household_fresh_mutation(
     request: Request,
     x_csrf_token: str | None = Header(default=None, alias="X-CSRF-Token"),

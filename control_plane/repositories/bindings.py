@@ -181,6 +181,9 @@ class ChannelBindingsRepository(Repository):
         self._reject_foreign_holder(
             connection, channel=channel, external_id=external_id, household_id=household_id
         )
+        self._retire_superseded(
+            connection, household_id=household_id, channel=channel
+        )
         return self._insert(
             connection,
             household_id=household_id,
@@ -190,6 +193,51 @@ class ChannelBindingsRepository(Repository):
             role="owner",
             verified_at=now,
             verified_by_actor_id=actor_id,
+        )
+
+    @staticmethod
+    def _retire_superseded(
+        connection: sqlite3.Connection, *, household_id: str, channel: str
+    ) -> None:
+        """Establishing an owner binding RETIRES what it replaces.
+
+        `reset_from(PRIMARY_CHANNEL)` lets a household re-run the step onto a
+        different chat, or a different channel entirely. This method only ever
+        inserted, so the previous owner row survived — and two of them are not
+        merely untidy:
+
+        * two owner rows on one channel make the projection emit two verified
+          chats for the primary channel, which `parse_runtime_manifest`
+          refuses, so re-onboarding produced a revision that cannot start;
+        * a row on the channel the household LEFT keeps its sender routable —
+          `gateway/whatsapp_router.py` resolves senders across the whole table
+          and has no notion of a binding having been superseded, so a revoked
+          channel stayed authorized.
+
+        The second is the one that matters: an owner who moves the household
+        off a channel has revoked it, and the table is what the gateway
+        believes.
+
+        Adult bindings on the channel now becoming primary go with it. They
+        cannot be represented there — see `_reject_unrepresentable_member` —
+        so leaving them would rebuild the unstartable manifest by another
+        route. Outstanding challenges for the household are dropped too: a code
+        issued against the arrangement that just changed must not redeem into
+        the one that replaced it.
+        """
+        connection.execute(
+            "DELETE FROM channel_bindings WHERE household_id = ? AND role = 'owner'",
+            (household_id,),
+        )
+        connection.execute(
+            "DELETE FROM channel_bindings WHERE household_id = ? AND channel = ?"
+            " AND role != 'owner'",
+            (household_id, channel),
+        )
+        connection.execute(
+            "DELETE FROM channel_binding_challenges WHERE household_id = ?"
+            " AND consumed_at IS NULL",
+            (household_id,),
         )
 
     def issue_challenge(

@@ -25,7 +25,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from control_plane.api.dependencies import (
     CurrentHousehold,
     container,
-    current_household_mutation,
+    current_household_owner_mutation,
     read_bounded_json,
 )
 from control_plane.repositories.bindings import BindingError
@@ -59,7 +59,7 @@ async def _verify_body(request: Request) -> VerifyRequest:
 async def issue_binding_challenge(
     request: Request,
     payload: Annotated[ChallengeRequest, Depends(_challenge_body)],
-    current: Annotated[CurrentHousehold, Depends(current_household_mutation)],
+    current: Annotated[CurrentHousehold, Depends(current_household_owner_mutation)],
 ) -> JSONResponse:
     active = container(request)
     with active.database.write() as connection:
@@ -105,7 +105,7 @@ async def issue_binding_challenge(
 async def verify_binding_challenge(
     request: Request,
     payload: Annotated[VerifyRequest, Depends(_verify_body)],
-    current: Annotated[CurrentHousehold, Depends(current_household_mutation)],
+    current: Annotated[CurrentHousehold, Depends(current_household_owner_mutation)],
 ) -> JSONResponse:
     active = container(request)
     with active.database.write() as connection:
