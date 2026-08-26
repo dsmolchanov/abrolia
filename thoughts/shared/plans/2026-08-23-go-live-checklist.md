@@ -245,6 +245,22 @@ Prerequisite: O1 ticked. Order is not negotiable per runbook and canon.
 
 ## Execution log
 
+- 2026-08-26: **A regression I introduced in the follow-up PR, caught in
+  review.** Fixing "a reset onto an identical tuple crosses an onboarding
+  generation invisibly" I invalidated outstanding challenges from
+  `ensure_owner_binding`'s IDEMPOTENT path, using the current time as a stand-in
+  for a generation boundary. The planner runs on every revision — including the
+  one issued immediately after a verification — so redeeming one invitation
+  deleted every other outstanding one. A household inviting two people could
+  seat only the first. Reproduced: two issued, one redeemed, zero surviving.
+
+  The deletion was also unnecessary, which is the part worth keeping. If the
+  owner state did not change, an outstanding invitation still creates exactly
+  the binding it always would have and no boundary is crossed; when the owner
+  state DOES change, `_retire_superseded` already invalidates challenges, and
+  that is the only case where the generation actually moved. Removed rather
+  than narrowed. Suite 1531 green.
+
 - 2026-08-26: **The four findings that merged untriaged on #72 are fixed.**
   All reproduced first; all four turned out to share one cause. C3 gave
   `channel_bindings` its first production writer, and three consumers that had

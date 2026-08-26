@@ -664,3 +664,65 @@ def test_a_household_cannot_grow_challenges_or_bindings_without_end(
                 connection, code=over.code, household_id=hid,
                 owner_actor_id=OWNER, now=BASE_TIME + 1,
             )
+
+
+def test_redeeming_one_invitation_leaves_the_others_standing(cp_stack) -> None:
+    """Replanning is not a reset.
+
+    The planner runs on every revision — including the one issued immediately
+    after a verification — so invalidating outstanding challenges from its
+    idempotent path meant redeeming one invitation silently cancelled every
+    other. A household inviting two people could only ever seat the first.
+    """
+    hid = cp_stack.household.id
+    with cp_stack.database.write() as connection:
+        cp_stack.bindings.ensure_owner_binding(
+            connection, household_id=hid, channel="telegram",
+            external_id="synthetic-chat", actor_id=OWNER, now=BASE_TIME,
+        )
+        first = cp_stack.bindings.issue_challenge(
+            connection, household_id=hid, channel="whatsapp",
+            external_id="+999511110001", actor_id="synthetic-adult-a",
+            role="adult", issued_by_actor_id=OWNER, now=BASE_TIME,
+        )
+        second = cp_stack.bindings.issue_challenge(
+            connection, household_id=hid, channel="whatsapp",
+            external_id="+999511110002", actor_id="synthetic-adult-b",
+            role="adult", issued_by_actor_id=OWNER, now=BASE_TIME,
+        )
+        cp_stack.bindings.verify_challenge(
+            connection, code=first.code, household_id=hid,
+            owner_actor_id=OWNER, now=BASE_TIME + 1,
+        )
+        # What the verify endpoint does next, and what onboarding and the
+        # provisioning worker do routinely.
+        cp_stack.bindings.ensure_owner_binding(
+            connection, household_id=hid, channel="telegram",
+            external_id="synthetic-chat", actor_id=OWNER, now=BASE_TIME + 2,
+        )
+        # The second invitation is still redeemable.
+        bound = cp_stack.bindings.verify_challenge(
+            connection, code=second.code, household_id=hid,
+            owner_actor_id=OWNER, now=BASE_TIME + 3,
+        )
+
+    assert bound.actor_id == "synthetic-adult-b"
+
+    # A real owner-state change still invalidates them, which is the only case
+    # where the generation actually moved.
+    with cp_stack.database.write() as connection:
+        pending = cp_stack.bindings.issue_challenge(
+            connection, household_id=hid, channel="web",
+            external_id="synthetic-web-seat", actor_id="synthetic-adult-c",
+            role="adult", issued_by_actor_id=OWNER, now=BASE_TIME + 4,
+        )
+        cp_stack.bindings.ensure_owner_binding(
+            connection, household_id=hid, channel="telegram",
+            external_id="synthetic-a-different-chat", actor_id=OWNER,
+            now=BASE_TIME + 5,
+        )
+        with pytest.raises(BindingError, match="invalid or expired"):
+            cp_stack.bindings.verify_challenge(
+                connection, code=pending.code, household_id=hid,
+                owner_actor_id=OWNER, now=BASE_TIME + 6,
+            )

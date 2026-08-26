@@ -208,14 +208,21 @@ class ChannelBindingsRepository(Repository):
             and existing["role"] == "owner"
             and existing["actor_id"] == actor_id
         ):
-            # Genuinely the same owner state. Outstanding challenges still go:
-            # a code issued under the previous onboarding generation must not
-            # redeem into this one just because the chat happens to match.
-            connection.execute(
-                "DELETE FROM channel_binding_challenges WHERE household_id = ?"
-                " AND consumed_at IS NULL AND created_at < ?",
-                (household_id, now),
-            )
+            # Genuinely the same owner state: nothing to reconcile, and
+            # nothing to invalidate. An earlier revision of this method also
+            # dropped outstanding challenges here, reasoning that a reset onto
+            # an identical tuple crosses an onboarding generation invisibly.
+            # That was over-applied, and it broke concurrency: the planner runs
+            # on EVERY revision, including the one issued immediately after a
+            # verification, so redeeming one invitation deleted every other
+            # outstanding one.
+            #
+            # It was also unnecessary. If the owner state did not change, an
+            # outstanding invitation still creates exactly the binding it
+            # always would have — no boundary is crossed. When the owner state
+            # DOES change, `_retire_superseded` below invalidates the
+            # challenges, which is the only case where the generation actually
+            # moved.
             return self._record(existing)
         self._reject_foreign_holder(
             connection, channel=channel, external_id=external_id, household_id=household_id
