@@ -169,11 +169,10 @@ that is stuck there.
   in principle be delivered without replacing the Machine config. Whether that
   is worth a second deployment path is a product question, not a defect.
 
-#### Inventory — C3b implementation
+#### Inventory
 
-**Files:** `control_plane/provisioning/worker.py`,
-`control_plane/provisioning/rollout.py`, `control_plane/api/bindings.py`,
-`tests/control_plane/test_provisioning_jobs.py`,
-`tests/control_plane/test_channel_bindings.py`.
-
-**Branches:** `codex/c3b-revision-rollout`.
+Carried by the go-live checklist's "Inventory — C3b revision rollout" step,
+which is where execution is tracked. A design document that also claimed the
+branch made two steps claim it, and the scope gate refuses to guess between
+them — correctly, since the whole point of that gate is that scope is stated
+rather than inferred.
