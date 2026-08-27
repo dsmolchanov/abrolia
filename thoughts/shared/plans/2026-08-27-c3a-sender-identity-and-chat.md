@@ -125,10 +125,10 @@ breaks delivery for both households, including the innocent one.
 
 ### D3. The manifest designates its review surface instead of deducing it
 
-Replace the "exactly one chat" rule with an explicit one. Two candidates:
+**Decided 2026-08-27: derive it from the owner.**
 
-**(a) Derive from the owner.** `primary_chat_id` = the `chat_id` of the
-primary-channel verified binding whose `actor_id == actors.owner`.
+`primary_chat_id` = the `chat_id` of the primary-channel verified binding whose
+`actor_id == actors.owner`.
 
 Note the identification: the runtime's `ChannelBinding` has **no `role`
 field** — only the control-plane table does — so "the owner's binding" has to
@@ -136,19 +136,38 @@ be found through `actors.owner`, which the manifest does carry
 (`runtime_manifest.py:54`). That is not a workaround. The write side already
 enforces exactly this pairing: `DesiredHouseholdSpecV1.validate_contract`
 refuses a manifest unless some verified primary-channel binding belongs to
-`actors.owner` (`control_plane/provisioning/manifest.py:106-109`). So the rule
-this proposes is already half-written, on the side that produces the document;
-D3 makes the reading side agree instead of counting chats.
+`actors.owner` (`control_plane/provisioning/manifest.py:106-109`). The rule is
+already half-written, on the side that produces the document; D3 makes the
+reading side agree instead of counting chats.
 
-**(b) Carry it explicitly.** Add `channels.primary_chat` to the manifest and
-have the planner write it.
+What this costs: the review surface **must** be the owner's conversation. It
+cannot be anything else — a dedicated "assistant" channel that nobody talks in,
+for instance, is not expressible. Nothing asks for that today.
 
-**Recommend (a).** It adds no field, no schema version, and no second place for
-the value to drift from. The owner's binding is already the household's
-anchor — `owner_actor()` reads it, `_retire_superseded` reconciles around it —
-and "the family reviews things where the owner is" is a rule someone can hold
-in their head. (b) is worth revisiting only if a household ever needs a review
-surface that is not the owner's conversation, which nothing asks for today.
+#### The alternative, and why it was not taken
+
+**Carry it explicitly** — add `channels.primary_chat` to the manifest and have
+the planner write it. It buys exactly the flexibility named above. It was
+rejected for three costs, the third of which is easy to miss:
+
+1. **A second place for the value to live.** Derived, it cannot disagree with
+   the bindings. As a field, it can point at a chat that is not among the
+   verified bindings at all — so it would need a validator tying it back to
+   them, which is the relationship the derived form gets for free.
+2. **Schema surface.** `ChannelsV1` is `extra="forbid"` and frozen; a new field
+   moves `config_sha256` for every new revision. Expected, but not free.
+3. **Asymmetric rollback cost.** The runtime's parser is *lenient* about
+   unknown keys — it reads `_text(raw_channels, "primary")` and ignores the
+   rest — so a new manifest survives an old runtime. The control plane is
+   *strict*: `extra="forbid"`, and stored revisions are re-read through
+   `DesiredHouseholdSpecV1.model_validate(stored)`. So rolling the control
+   plane BACK would break reading revisions already written with the field.
+   The derived form has no such cost, because there is nothing new to read.
+
+If a household ever does need a review surface that is not the owner's
+conversation, the field can be added on top of this decision without rework:
+"default to the owner's chat when the field is absent" is a rule that survives
+both states.
 
 `parse_runtime_manifest` changes from:
 
@@ -286,7 +305,8 @@ must be true, each naming the test that proves it:
   slice; the worker requires `household_status = 'provisioning'`
   (`worker.py:2667, 2715, 2823`), so re-provisioning a live household has to
   drive that transition deliberately rather than by copying onboarding's block.
-- **Per-member review surfaces.** (b) in D3, if a household ever needs one.
+- **A review surface that is not the owner's conversation.** The rejected
+  alternative in D3, addable on top without rework if it is ever asked for.
 - **Learning sender IDs at ingest.** M1 option 2.
 
 #### Inventory — C3a implementation
