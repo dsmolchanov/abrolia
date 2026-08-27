@@ -2246,6 +2246,11 @@ class ProvisioningWorker:
                 self.email_identities.finish_disconnect(
                     connection, request["email_identity_id"], now=now
                 )
+            if (
+                job.operation == REPROVISION_RUNTIME_OPERATION
+                and job_status == "failed"
+            ):
+                self._restore_settled_household(connection, job, now=now)
             step_kind = request.get("step_kind")
             if step_kind in {item.value for item in StepKind if item is not StepKind.RUNTIME}:
                 step_status = {
@@ -2673,6 +2678,42 @@ class ProvisioningWorker:
                 now=now,
             )
         return WorkResult(job.id, "succeeded")
+
+    @staticmethod
+    def _restore_settled_household(connection, job: JobRecord, *, now: float) -> None:
+        """Put a household back where it was when a rollout terminally fails.
+
+        `schedule_runtime_rollout` moves the household to `provisioning` and to
+        revision N BEFORE any provider work, because the worker's currency
+        guards read that pair on every phase. If the provider then rejects the
+        manifest or the launch, the job settles `failed` and nothing else
+        happened — leaving a household permanently `provisioning`, pointing at
+        a revision that never activated, with no runnable job to move it. The
+        member never arrives and the family cannot be told why.
+
+        The revision to return to is not remembered anywhere, and does not need
+        to be: `config_revisions.status` still marks the one actually serving
+        as `active`, because activation is what supersedes it and activation
+        never happened. So the row that is `active` IS the answer.
+
+        Only for a re-provisioning failure. An `ensure_runtime` failure during
+        onboarding leaves a household that never had a settled state to return
+        to, and its recovery is the onboarding flow's own.
+        """
+        settled = connection.execute(
+            "SELECT revision FROM config_revisions WHERE household_id = ?"
+            " AND status = 'active' ORDER BY revision DESC LIMIT 1",
+            (job.household_id,),
+        ).fetchone()
+        if settled is None:
+            # Nothing ever activated, so there is no settled state to restore.
+            # Leaving the household as it is beats inventing one.
+            return
+        connection.execute(
+            "UPDATE households SET status = 'active', current_config_revision = ?,"
+            " updated_at = ? WHERE id = ? AND status = 'provisioning'",
+            (settled["revision"], now, job.household_id),
+        )
 
     @staticmethod
     def _runtime_state(connection, job: JobRecord):

@@ -26,6 +26,10 @@ from control_plane.repositories.jobs import JobsRepository
 from control_plane.repositories.onboarding import OnboardingRepository
 
 
+class RolloutNotReady(RuntimeError):
+    """A rollout was asked for while the household was still settling."""
+
+
 def schedule_runtime_rollout(
     connection: sqlite3.Connection,
     *,
@@ -50,6 +54,25 @@ def schedule_runtime_rollout(
     """
     now = time.time() if now is None else now
     workflow = onboarding.workflow_for_household(household_id)
+    state = connection.execute(
+        "SELECT status FROM households WHERE id = ?", (household_id,)
+    ).fetchone()
+    # A rollout may only be scheduled against the settled state its currency
+    # guards require. `_workflow_states_for` accepts `complete` and nothing
+    # else for this operation, so scheduling one while the FIRST rollout is
+    # still in flight enqueues revision N+1, overwrites the household's single
+    # `current_config_revision`, and strands both jobs: the original
+    # `ensure_runtime` no longer matches the revision, and the new one no
+    # longer matches the workflow. Two stranded jobs and, after prepare, a
+    # cleanup that can take the shared runtime with it.
+    #
+    # Refusing here is not a limitation to work around later — the owner can
+    # add the member once setup finishes, and until then there is nothing to
+    # roll out onto.
+    if state is None or state["status"] != "active" or workflow.state != "complete":
+        raise RolloutNotReady(
+            "the household is not in a settled state a rollout can be planned against"
+        )
     revision = planned.revision.revision
     job_id, _ = jobs.create(
         connection,

@@ -132,6 +132,18 @@ Ordered slices:
   `BootstrapService.activate` publishes the revision, and a terminal rollback
   retires them. Its own slice because it is a lifecycle, not a predicate.
 
+- [ ] **C3d. Tests that reach what they claim to cover.** Two C3b regressions
+  assert the right things without touching the path they are named for. The
+  rollout test calls the repository, planner and `schedule_runtime_rollout`
+  directly, bypassing `verify_binding_challenge` — delete the endpoint's
+  scheduling call and every test stays green. The currency-guard test calls
+  `_workflow_states_for` alone, so none of the four checkpoints runs with a
+  stale revision or runtime ref; drop the revision clause from any of them and
+  nothing fails. Needs one authenticated HTTP regression carrying a
+  secondary-channel binding through worker, claim and activation, and a
+  parameterized worker regression over both operations × both stale fields ×
+  all four checkpoints.
+
 - [ ] **C4. Make preferences real.** Production write path (API/onboarding);
   consumer that routes replies/fallbacks; self-contained agent-inbox rejection
   (replace dead `_validate_no_self_ingestion`, persist the fallback ref);
@@ -279,6 +291,32 @@ Prerequisite: O1 ticked. Order is not negotiable per runbook and canon.
   open). Shared-WA relay last, after C5.
 
 ## Execution log
+
+- 2026-08-28: **C3b review round 2 — the two ways a household could get
+  stuck, fixed; the two thin tests recorded as C3d.**
+
+  **A failed rollout stranded the household.** `schedule_runtime_rollout`
+  moves it to `provisioning` and revision N before any provider work, because
+  the currency guards read that pair at every phase. A provider rejection then
+  settled the job `failed` and left the household there permanently, pointing
+  at a revision that never activated, with no runnable job to move it. This was
+  my own acceptance criterion 5, written and not implemented. The revision to
+  return to needed no new bookkeeping: `config_revisions.status` still marks the
+  serving one `active`, because activation is what supersedes it and activation
+  never happened.
+
+  **A rollout could be scheduled mid-onboarding.** Verifying a binding before
+  the first rollout activated enqueued N+1 and overwrote the single
+  `current_config_revision`, stranding BOTH jobs — the original no longer
+  matched the revision, the new one no longer matched the workflow — and after
+  prepare the cleanup could take the shared runtime. Now refused, and the
+  endpoint answers 409 rather than half-applying.
+
+  **Recorded as C3d rather than fixed:** two C3b regressions assert correctly
+  without reaching what they are named for. Worth stating plainly because I
+  reported the mechanism as "fully exercised" and it was not: the rollout test
+  bypasses the endpoint entirely, so the feature could be deleted with every
+  test still green. Suite 1538 green.
 
 - 2026-08-28: **C3b review round 1 — I had protected half a path.**
   `_workflow_states_for` keeps a re-provisioning job at `complete` so the
