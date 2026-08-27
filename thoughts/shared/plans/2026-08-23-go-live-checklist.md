@@ -245,6 +245,30 @@ Prerequisite: O1 ticked. Order is not negotiable per runbook and canon.
 
 ## Execution log
 
+- 2026-08-27: **The caps bounded the wrong collections.**
+  `MAX_OPEN_CHALLENGES` counts only UNCONSUMED challenges, so issue-then-verify
+  loops freely; `verify_challenge` returns the existing binding on a repeat, so
+  the binding cap never fires either. Both reported room while the endpoint
+  replanned on every pass and `create_revision` inserted another encrypted
+  manifest — `config_revisions` growing without limit on a shared volume, past
+  two caps that were watching the wrong things.
+
+  Fixed by refusing at ISSUE: a tuple already bound in this household is
+  nothing to invite anyone to. That is the better place for the refusal
+  regardless — nobody is sent a code that could not have done anything — and it
+  bounds the durable collections structurally, because a verification can now
+  only follow a binding that did not exist, so revisions are bounded by the
+  binding cap. Suite 1532 green.
+
+  **Also today: CI was wedged, not slow.** Both runs on `2bd7886` sat 26 hours
+  reporting `queued` with zero jobs created, while the API refused to cancel
+  them ("already completed") AND refused to re-run them ("already running") —
+  three mutually contradictory states. Not exhausted minutes, which was the
+  theory: closing and reopening the PR fired fresh events and runners were
+  allocated immediately. Recorded because the diagnosis cost most of a day and
+  the remedy is one command that touches no code — which matters, since the
+  gate's rule is never to push a commit to shake a verdict loose.
+
 - 2026-08-26: **A regression I introduced in the follow-up PR, caught in
   review.** Fixing "a reset onto an identical tuple crosses an onboarding
   generation invisibly" I invalidated outstanding challenges from

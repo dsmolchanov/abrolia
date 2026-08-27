@@ -314,6 +314,27 @@ class ChannelBindingsRepository(Repository):
         self._reject_foreign_holder(
             connection, channel=channel, external_id=external_id, household_id=household_id
         )
+        # Nothing worth inviting someone to. Refusing HERE is what bounds the
+        # durable collections: the caps below count challenge rows and binding
+        # rows, and neither grows on a repeat verification — `verify_challenge`
+        # returns the existing binding — but the endpoint replans afterwards
+        # and `create_revision` inserts another encrypted manifest every time.
+        # An owner looping issue-then-verify on an already-bound tuple
+        # therefore grew `config_revisions` without limit while every cap
+        # reported room to spare. With this refusal a verification can only
+        # follow a binding that did not exist, so revisions are bounded by
+        # MAX_BINDINGS.
+        held = connection.execute(
+            "SELECT actor_id FROM channel_bindings WHERE household_id = ?"
+            " AND channel = ? AND external_id = ?",
+            (household_id, channel, external_id),
+        ).fetchone()
+        if held is not None:
+            raise BindingError(
+                "this channel is already bound to that member"
+                if held["actor_id"] == actor_id
+                else "this channel is already bound to another member"
+            )
         open_challenges = connection.execute(
             "SELECT COUNT(*) AS total FROM channel_binding_challenges"
             " WHERE household_id = ? AND consumed_at IS NULL AND expires_at > ?",

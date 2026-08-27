@@ -174,36 +174,47 @@ def test_an_external_id_bound_elsewhere_is_refused_at_issue_and_at_verify(
             )
 
 
-def test_rebinding_the_same_id_to_a_different_member_is_refused(cp_stack) -> None:
-    """Re-running the flow is fine; silently moving a channel to someone else
-    is not — neither member would be told."""
+def test_an_already_bound_channel_is_refused_before_a_code_is_sent(
+    cp_stack,
+) -> None:
+    """The refusal moved to issue time, and that is the better place.
+
+    It also bounds the durable collections: `verify_challenge` returns the
+    existing binding on a repeat, so no challenge or binding row grew — but the
+    endpoint replans afterwards and `create_revision` inserts another encrypted
+    manifest each time. An owner looping issue-then-verify on an already-bound
+    tuple grew `config_revisions` without limit while every cap reported room.
+
+    Refusing here means a verification can only ever follow a binding that did
+    not exist, so revisions are bounded by the binding cap — and nobody is sent
+    a code that could not have done anything.
+    """
     with cp_stack.database.write() as connection:
         first = _issue(cp_stack, connection)
         cp_stack.bindings.verify_challenge(
             connection,
             code=first.code,
             household_id=cp_stack.household.id,
-            owner_actor_id=OWNER, now=BASE_TIME + 60
+            owner_actor_id=OWNER,
         )
 
-        again = _issue(cp_stack, connection)
-        repeat = cp_stack.bindings.verify_challenge(
-            connection,
-            code=again.code,
-            household_id=cp_stack.household.id,
-            owner_actor_id=OWNER, now=BASE_TIME + 120
-        )
-        assert repeat.actor_id == ADULT
-        assert repeat.verified_at == BASE_TIME + 60  # the original row, not a new one
+        # Same member, same channel: already true, so nothing to invite to.
+        with pytest.raises(BindingError, match="already bound to that member"):
+            _issue(cp_stack, connection)
 
-        stolen = _issue(cp_stack, connection, actor_id="synthetic-third-adult")
+        # Somebody else's member on a channel this household has bound: the
+        # refusal that stops one person's channel being handed to another.
         with pytest.raises(BindingError, match="already bound to another member"):
-            cp_stack.bindings.verify_challenge(
-                connection,
-                code=stolen.code,
-                household_id=cp_stack.household.id,
-                owner_actor_id=OWNER, now=BASE_TIME + 180
-            )
+            _issue(cp_stack, connection, actor_id="synthetic-third-adult")
+
+        rows = cp_stack.bindings.verified(
+            connection, household_id=cp_stack.household.id
+        )
+    assert [(r.actor_id, r.external_id) for r in rows] == [(ADULT, PHONE)]
+    # Nothing was persisted by either refusal.
+    assert cp_stack.database.query(
+        "SELECT id FROM channel_binding_challenges WHERE consumed_at IS NULL"
+    ) == []
 
 
 def test_hmac_column_stays_null_until_c5_provisions_the_key(cp_stack) -> None:
@@ -333,7 +344,26 @@ def test_an_adult_on_the_primary_channel_is_refused_because_the_store_cannot_hol
     fail at a deployment nobody is watching.
     """
     _provisioned(cp_stack)
-    for external_id in (CHANNEL_SELECTION["chat_id"], "synthetic-a-chat-of-their-own"):
+    # The household's own chat is already bound to the owner, so that shape is
+    # now refused before a code exists at all.
+    with (
+        cp_stack.database.write() as connection,
+        pytest.raises(BindingError, match="already bound to another member"),
+    ):
+        cp_stack.bindings.issue_challenge(
+                connection,
+                household_id=cp_stack.household.id,
+                channel=CHANNEL_SELECTION["kind"],
+                external_id=CHANNEL_SELECTION["chat_id"],
+                actor_id=ADULT,
+                role="adult",
+                issued_by_actor_id=CHANNEL_SELECTION["actor_id"],
+                now=BASE_TIME + 100,
+            )
+
+    # A chat of their own reaches verification, and is refused there because
+    # the manifest could not hold it.
+    for external_id in ("synthetic-a-chat-of-their-own",):
         with cp_stack.database.write() as connection:
             issued = cp_stack.bindings.issue_challenge(
                 connection,
