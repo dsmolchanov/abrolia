@@ -174,36 +174,47 @@ def test_an_external_id_bound_elsewhere_is_refused_at_issue_and_at_verify(
             )
 
 
-def test_rebinding_the_same_id_to_a_different_member_is_refused(cp_stack) -> None:
-    """Re-running the flow is fine; silently moving a channel to someone else
-    is not — neither member would be told."""
+def test_an_already_bound_channel_is_refused_before_a_code_is_sent(
+    cp_stack,
+) -> None:
+    """The refusal moved to issue time, and that is the better place.
+
+    It also bounds the durable collections: `verify_challenge` returns the
+    existing binding on a repeat, so no challenge or binding row grew — but the
+    endpoint replans afterwards and `create_revision` inserts another encrypted
+    manifest each time. An owner looping issue-then-verify on an already-bound
+    tuple grew `config_revisions` without limit while every cap reported room.
+
+    Refusing here means a verification can only ever follow a binding that did
+    not exist, so revisions are bounded by the binding cap — and nobody is sent
+    a code that could not have done anything.
+    """
     with cp_stack.database.write() as connection:
         first = _issue(cp_stack, connection)
         cp_stack.bindings.verify_challenge(
             connection,
             code=first.code,
             household_id=cp_stack.household.id,
-            owner_actor_id=OWNER, now=BASE_TIME + 60
+            owner_actor_id=OWNER,
         )
 
-        again = _issue(cp_stack, connection)
-        repeat = cp_stack.bindings.verify_challenge(
-            connection,
-            code=again.code,
-            household_id=cp_stack.household.id,
-            owner_actor_id=OWNER, now=BASE_TIME + 120
-        )
-        assert repeat.actor_id == ADULT
-        assert repeat.verified_at == BASE_TIME + 60  # the original row, not a new one
+        # Same member, same channel: already true, so nothing to invite to.
+        with pytest.raises(BindingError, match="already bound to that member"):
+            _issue(cp_stack, connection)
 
-        stolen = _issue(cp_stack, connection, actor_id="synthetic-third-adult")
+        # Somebody else's member on a channel this household has bound: the
+        # refusal that stops one person's channel being handed to another.
         with pytest.raises(BindingError, match="already bound to another member"):
-            cp_stack.bindings.verify_challenge(
-                connection,
-                code=stolen.code,
-                household_id=cp_stack.household.id,
-                owner_actor_id=OWNER, now=BASE_TIME + 180
-            )
+            _issue(cp_stack, connection, actor_id="synthetic-third-adult")
+
+        rows = cp_stack.bindings.verified(
+            connection, household_id=cp_stack.household.id
+        )
+    assert [(r.actor_id, r.external_id) for r in rows] == [(ADULT, PHONE)]
+    # Nothing was persisted by either refusal.
+    assert cp_stack.database.query(
+        "SELECT id FROM channel_binding_challenges WHERE consumed_at IS NULL"
+    ) == []
 
 
 def test_hmac_column_stays_null_until_c5_provisions_the_key(cp_stack) -> None:
@@ -333,7 +344,26 @@ def test_an_adult_on_the_primary_channel_is_refused_because_the_store_cannot_hol
     fail at a deployment nobody is watching.
     """
     _provisioned(cp_stack)
-    for external_id in (CHANNEL_SELECTION["chat_id"], "synthetic-a-chat-of-their-own"):
+    # The household's own chat is already bound to the owner, so that shape is
+    # now refused before a code exists at all.
+    with (
+        cp_stack.database.write() as connection,
+        pytest.raises(BindingError, match="already bound to another member"),
+    ):
+        cp_stack.bindings.issue_challenge(
+                connection,
+                household_id=cp_stack.household.id,
+                channel=CHANNEL_SELECTION["kind"],
+                external_id=CHANNEL_SELECTION["chat_id"],
+                actor_id=ADULT,
+                role="adult",
+                issued_by_actor_id=CHANNEL_SELECTION["actor_id"],
+                now=BASE_TIME + 100,
+            )
+
+    # A chat of their own reaches verification, and is refused there because
+    # the manifest could not hold it.
+    for external_id in ("synthetic-a-chat-of-their-own",):
         with cp_stack.database.write() as connection:
             issued = cp_stack.bindings.issue_challenge(
                 connection,
@@ -515,3 +545,214 @@ def test_reprovisioning_drops_outstanding_challenges_and_dependent_adults(
     assert [(r.channel, r.external_id, r.role) for r in rows] == [
         ("whatsapp", "+999511230000", "owner")
     ]
+
+
+# --- review follow-ups: four findings that arrived after the last fix ------
+
+
+def test_one_actor_with_several_bindings_is_one_family_member(cp_stack) -> None:
+    """`family` was built per BINDING, not per actor.
+
+    `verify_challenge` lets one actor hold several bindings — an adult
+    reachable on WhatsApp and on web is two rows and one person — so the
+    projection emitted `family=(owner, adult, adult)`, which the runtime
+    rejects as `actors.family: duplicate actor`. Another revision that cannot
+    start, reached by a different route than the primary-channel one.
+    """
+    _provisioned(cp_stack)
+    with cp_stack.database.write() as connection:
+        for channel, external_id in (
+            ("whatsapp", "+999511234567"),
+            ("web", "synthetic-web-seat"),
+        ):
+            issued = cp_stack.bindings.issue_challenge(
+                connection,
+                household_id=cp_stack.household.id,
+                channel=channel,
+                external_id=external_id,
+                actor_id=ADULT,
+                role="adult",
+                issued_by_actor_id=CHANNEL_SELECTION["actor_id"],
+                now=BASE_TIME + 100,
+            )
+            cp_stack.bindings.verify_challenge(
+                connection,
+                code=issued.code,
+                household_id=cp_stack.household.id,
+                owner_actor_id=CHANNEL_SELECTION["actor_id"],
+                now=BASE_TIME + 200,
+            )
+        cp_stack.make_worker().planner.issue(
+            connection, household_id=cp_stack.household.id
+        )
+
+    spec = DesiredHouseholdSpecV1.model_validate(
+        cp_stack.configs.manifest(cp_stack.household.id, 2)
+    )
+    assert spec.actors.family == (CHANNEL_SELECTION["actor_id"], ADULT)
+    # Two bindings, one member — and the runtime accepts it.
+    assert len(spec.channel_bindings) == 3
+    parse_runtime_manifest(manifest_to_toml(spec))
+
+
+def test_seeding_reconciles_role_and_actor_not_just_the_tuple(cp_stack) -> None:
+    """The early return matched `(channel, external_id)` whatever the row WAS.
+
+    Reproduced twice: re-onboarding onto a tuple an ADULT holds wrote no owner
+    binding at all while the stale owner row survived on the channel the
+    household had just left; and an owner whose ACTOR changed during reset
+    never became authoritative.
+    """
+    hid = cp_stack.household.id
+    with cp_stack.database.write() as connection:
+        cp_stack.bindings.ensure_owner_binding(
+            connection, household_id=hid, channel="telegram",
+            external_id="synthetic-chat-one", actor_id=OWNER, now=BASE_TIME,
+        )
+        issued = cp_stack.bindings.issue_challenge(
+            connection, household_id=hid, channel="whatsapp", external_id=PHONE,
+            actor_id=ADULT, role="adult", issued_by_actor_id=OWNER, now=BASE_TIME,
+        )
+        cp_stack.bindings.verify_challenge(
+            connection, code=issued.code, household_id=hid,
+            owner_actor_id=OWNER, now=BASE_TIME + 1,
+        )
+        # 1. The owner re-onboards onto the tuple the adult holds.
+        cp_stack.bindings.ensure_owner_binding(
+            connection, household_id=hid, channel="whatsapp",
+            external_id=PHONE, actor_id=OWNER, now=BASE_TIME + 10,
+        )
+        rows = cp_stack.bindings.verified(connection, household_id=hid)
+
+    assert [(r.channel, r.external_id, r.actor_id, r.role) for r in rows] == [
+        ("whatsapp", PHONE, OWNER, "owner")
+    ]
+
+    # 2. The actor changes while the chat stays the same.
+    with cp_stack.database.write() as connection:
+        cp_stack.bindings.ensure_owner_binding(
+            connection, household_id=hid, channel="whatsapp",
+            external_id=PHONE, actor_id="synthetic-owner-renamed", now=BASE_TIME + 20,
+        )
+        rows = cp_stack.bindings.verified(connection, household_id=hid)
+
+    assert [(r.actor_id, r.role) for r in rows] == [
+        ("synthetic-owner-renamed", "owner")
+    ]
+
+
+def test_a_household_cannot_grow_challenges_or_bindings_without_end(
+    cp_stack,
+) -> None:
+    """Every issued challenge is a stored row and every verified binding
+    becomes a manifest entry and a config revision, so an authenticated owner
+    looping over unique IDs grows a shared volume and the manifest with it."""
+    from control_plane.repositories.bindings import (
+        MAX_BINDINGS,
+        MAX_OPEN_CHALLENGES,
+    )
+
+    hid = cp_stack.household.id
+    with cp_stack.database.write() as connection:
+        cp_stack.bindings.ensure_owner_binding(
+            connection, household_id=hid, channel="telegram",
+            external_id="synthetic-chat", actor_id=OWNER, now=BASE_TIME,
+        )
+        for index in range(MAX_OPEN_CHALLENGES):
+            cp_stack.bindings.issue_challenge(
+                connection, household_id=hid, channel="whatsapp",
+                external_id=f"+99951100{index:04d}", actor_id=f"synthetic-a{index}",
+                role="adult", issued_by_actor_id=OWNER, now=BASE_TIME,
+            )
+        with pytest.raises(BindingError, match="outstanding challenges"):
+            cp_stack.bindings.issue_challenge(
+                connection, household_id=hid, channel="whatsapp",
+                external_id="+999511009999", actor_id="synthetic-one-too-many",
+                role="adult", issued_by_actor_id=OWNER, now=BASE_TIME,
+            )
+
+        # Bindings are capped where rows are created, so the limit holds
+        # however the row was reached.
+        connection.execute("DELETE FROM channel_binding_challenges")
+        for index in range(MAX_BINDINGS - 1):
+            issued = cp_stack.bindings.issue_challenge(
+                connection, household_id=hid, channel="whatsapp",
+                external_id=f"+99951199{index:04d}", actor_id=f"synthetic-b{index}",
+                role="adult", issued_by_actor_id=OWNER, now=BASE_TIME,
+            )
+            cp_stack.bindings.verify_challenge(
+                connection, code=issued.code, household_id=hid,
+                owner_actor_id=OWNER, now=BASE_TIME + 1,
+            )
+        over = cp_stack.bindings.issue_challenge(
+            connection, household_id=hid, channel="whatsapp",
+            external_id="+999511998888", actor_id="synthetic-last",
+            role="adult", issued_by_actor_id=OWNER, now=BASE_TIME,
+        )
+        with pytest.raises(BindingError, match="as many bindings"):
+            cp_stack.bindings.verify_challenge(
+                connection, code=over.code, household_id=hid,
+                owner_actor_id=OWNER, now=BASE_TIME + 1,
+            )
+
+
+def test_redeeming_one_invitation_leaves_the_others_standing(cp_stack) -> None:
+    """Replanning is not a reset.
+
+    The planner runs on every revision — including the one issued immediately
+    after a verification — so invalidating outstanding challenges from its
+    idempotent path meant redeeming one invitation silently cancelled every
+    other. A household inviting two people could only ever seat the first.
+    """
+    hid = cp_stack.household.id
+    with cp_stack.database.write() as connection:
+        cp_stack.bindings.ensure_owner_binding(
+            connection, household_id=hid, channel="telegram",
+            external_id="synthetic-chat", actor_id=OWNER, now=BASE_TIME,
+        )
+        first = cp_stack.bindings.issue_challenge(
+            connection, household_id=hid, channel="whatsapp",
+            external_id="+999511110001", actor_id="synthetic-adult-a",
+            role="adult", issued_by_actor_id=OWNER, now=BASE_TIME,
+        )
+        second = cp_stack.bindings.issue_challenge(
+            connection, household_id=hid, channel="whatsapp",
+            external_id="+999511110002", actor_id="synthetic-adult-b",
+            role="adult", issued_by_actor_id=OWNER, now=BASE_TIME,
+        )
+        cp_stack.bindings.verify_challenge(
+            connection, code=first.code, household_id=hid,
+            owner_actor_id=OWNER, now=BASE_TIME + 1,
+        )
+        # What the verify endpoint does next, and what onboarding and the
+        # provisioning worker do routinely.
+        cp_stack.bindings.ensure_owner_binding(
+            connection, household_id=hid, channel="telegram",
+            external_id="synthetic-chat", actor_id=OWNER, now=BASE_TIME + 2,
+        )
+        # The second invitation is still redeemable.
+        bound = cp_stack.bindings.verify_challenge(
+            connection, code=second.code, household_id=hid,
+            owner_actor_id=OWNER, now=BASE_TIME + 3,
+        )
+
+    assert bound.actor_id == "synthetic-adult-b"
+
+    # A real owner-state change still invalidates them, which is the only case
+    # where the generation actually moved.
+    with cp_stack.database.write() as connection:
+        pending = cp_stack.bindings.issue_challenge(
+            connection, household_id=hid, channel="web",
+            external_id="synthetic-web-seat", actor_id="synthetic-adult-c",
+            role="adult", issued_by_actor_id=OWNER, now=BASE_TIME + 4,
+        )
+        cp_stack.bindings.ensure_owner_binding(
+            connection, household_id=hid, channel="telegram",
+            external_id="synthetic-a-different-chat", actor_id=OWNER,
+            now=BASE_TIME + 5,
+        )
+        with pytest.raises(BindingError, match="invalid or expired"):
+            cp_stack.bindings.verify_challenge(
+                connection, code=pending.code, household_id=hid,
+                owner_actor_id=OWNER, now=BASE_TIME + 6,
+            )

@@ -229,6 +229,26 @@ class HouseholdExporter:
             " FROM consent_receipts WHERE household_id = ? OR account_id = ?",
             (household_id, account_id),
         )
+        # `channel_bindings` is marked exportable in `TABLE_CLASSIFICATION` and
+        # `docs/privacy/data-map.md` promises it, and until C3 nothing wrote a
+        # row so the omission cost nothing. It holds the household's channel
+        # identities now — a phone number or chat ID, the actor it maps to, and
+        # who attested it — which is exactly the kind of personal data a
+        # subject access request exists to return.
+        #
+        # `external_id_hmac` is deliberately left out: it is a keyed digest of
+        # the value in the column beside it, so it adds nothing for the reader
+        # and publishes a lookup token. `channel_binding_challenges` is not
+        # exported at all — `TABLE_CLASSIFICATION` marks it export=False
+        # because a live challenge is a credential, and its durable outcome is
+        # the row below.
+        channel_bindings = self._rows(
+            "channel_bindings",
+            "SELECT channel, external_id, actor_id, role, verified_at,"
+            " verified_by_actor_id FROM channel_bindings WHERE household_id = ?"
+            " ORDER BY verified_at, id",
+            (household_id,),
+        )
         runtime_status = "absent"
         runtime_export = None
         if household.runtime_ref:
@@ -279,6 +299,7 @@ class HouseholdExporter:
             "email_address_reservations": email_reservations,
             "email_activation_receipts": email_activation_receipts,
             "consent_receipts": consents,
+            "channel_bindings": channel_bindings,
             "runtime": {
                 "status": runtime_status,
                 "data": runtime_export,

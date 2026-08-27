@@ -787,3 +787,60 @@ def test_retention_sweeps_short_lived_rows_and_scrubs_before_metadata_delete(
         "SELECT household_id_hmac FROM deletion_tombstones WHERE household_id_hmac = ?",
         (expired_tombstone,),
     ) is None
+
+
+def test_the_export_carries_the_household_s_channel_bindings(cp_stack) -> None:
+    """`channel_bindings` is marked exportable and `docs/privacy/data-map.md`
+    promises it. Nothing wrote a row until C3, so the omission cost nothing;
+    the table now holds channel identities, which is precisely what a subject
+    access request exists to return.
+    """
+    hid = cp_stack.household.id
+    with cp_stack.database.write() as connection:
+        cp_stack.bindings.ensure_owner_binding(
+            connection,
+            household_id=hid,
+            channel="telegram",
+            external_id="synthetic-owner-chat",
+            actor_id="synthetic-owner",
+            now=BASE_TIME,
+        )
+        issued = cp_stack.bindings.issue_challenge(
+            connection,
+            household_id=hid,
+            channel="whatsapp",
+            external_id="+999511234567",
+            actor_id="synthetic-adult",
+            role="adult",
+            issued_by_actor_id="synthetic-owner",
+            now=BASE_TIME,
+        )
+        cp_stack.bindings.verify_challenge(
+            connection,
+            code=issued.code,
+            household_id=hid,
+            owner_actor_id="synthetic-owner",
+            now=BASE_TIME + 1,
+        )
+
+    document = HouseholdExporter(
+        cp_stack.accounts,
+        cp_stack.households,
+        cp_stack.onboarding,
+        cp_stack.jobs,
+        runtime=SyntheticRuntimeExporter(),
+    ).export(cp_stack.account.id, hid)
+    bindings = document["channel_bindings"]
+
+    assert [(b["channel"], b["external_id"], b["role"]) for b in bindings] == [
+        ("telegram", "synthetic-owner-chat", "owner"),
+        ("whatsapp", "+999511234567", "adult"),
+    ]
+    assert bindings[1]["verified_by_actor_id"] == "synthetic-owner"
+
+    # A credential never rides along: the keyed lookup digest adds nothing for
+    # the reader, and the challenge table is export=False by classification.
+    serialized = json.dumps(document)
+    assert "external_id_hmac" not in serialized
+    assert issued.code not in serialized
+    assert "code_hash" not in serialized

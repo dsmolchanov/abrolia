@@ -282,3 +282,66 @@ def test_only_the_owner_may_attest_a_binding(api_harness) -> None:
         headers=api_harness.mutation_headers,
     )
     assert issued.status_code == 200
+
+
+def test_repeated_verification_cannot_grow_the_revision_history(api_harness) -> None:
+    """The cap that wasn't.
+
+    `MAX_OPEN_CHALLENGES` counts only UNCONSUMED challenges, so issue-then-
+    verify loops freely; `verify_challenge` returns the existing binding, so
+    `_reject_when_full` never fires either. Both caps reported room while the
+    endpoint replanned on every pass and `create_revision` inserted another
+    encrypted manifest — `config_revisions` growing without limit on a shared
+    volume.
+    """
+    world = api_harness.create_principal()
+    api_harness.authenticate(world)
+    _seed_owner(api_harness, world.household.id)
+    body = {"channel": "whatsapp", "external_id": "+999511234567", "actor_id": ADULT}
+
+    # Bind the tuple through the repository, which does not replan — the point
+    # under test is what the ENDPOINT does once a binding exists.
+    with api_harness.container.database.write() as connection:
+        issued = api_harness.container.bindings.issue_challenge(
+            connection,
+            household_id=world.household.id,
+            channel="whatsapp",
+            external_id="+999511234567",
+            actor_id=ADULT,
+            role="adult",
+            issued_by_actor_id="synthetic-owner",
+        )
+        api_harness.container.bindings.verify_challenge(
+            connection,
+            code=issued.code,
+            household_id=world.household.id,
+            owner_actor_id="synthetic-owner",
+        )
+
+    revisions_before = len(
+        api_harness.container.database.query(
+            "SELECT id FROM config_revisions WHERE household_id = ?",
+            (world.household.id,),
+        )
+    )
+
+    # The loop: the same tuple, over and over.
+    for _ in range(5):
+        repeat = api_harness.client.post(
+            CHALLENGES, json=body, headers=api_harness.mutation_headers
+        )
+        assert repeat.status_code == 409
+        assert "already bound" in repeat.json()["detail"]
+
+    challenges = api_harness.container.database.query(
+        "SELECT id FROM channel_binding_challenges WHERE household_id = ?",
+        (world.household.id,),
+    )
+    revisions_after = api_harness.container.database.query(
+        "SELECT id FROM config_revisions WHERE household_id = ?",
+        (world.household.id,),
+    )
+    # The one consumed challenge that made the binding, and not one more —
+    # nor a single extra revision.
+    assert len(challenges) == 1
+    assert len(revisions_after) == revisions_before

@@ -210,6 +210,25 @@ The scope becomes well-defined the moment #71 merges and this branch rebases
 onto main — which is the honest reading: a stacked branch does not have a
 scope of its own until its base has one.
 
+#### Inventory — C3 review follow-ups
+
+**Files:** `control_plane/repositories/bindings.py`,
+`control_plane/provisioning/planner.py`, `control_plane/privacy/export.py`,
+`tests/control_plane/test_channel_bindings.py`,
+`tests/control_plane/test_export_delete.py`,
+`tests/control_plane/test_binding_api.py`.
+
+**Branches:** `codex/c3-review-followups`.
+
+Four findings that arrived on #72 after its last fix and merged untriaged.
+All four were reproduced before anything changed. They are one step because
+they share a cause: C3 gave `channel_bindings` its first writer, and every
+consumer that had been correct only because the table was always empty stopped
+being correct at that moment — the exporter that never read it, the projection
+that assumed one binding per actor, the seeding that matched a tuple without
+looking at whose row it was.
+
+
 ## Track R — Staged rollout (fixed order; runbook §Rollout)
 
 Prerequisite: O1 ticked. Order is not negotiable per runbook and canon.
@@ -226,6 +245,88 @@ Prerequisite: O1 ticked. Order is not negotiable per runbook and canon.
   open). Shared-WA relay last, after C5.
 
 ## Execution log
+
+- 2026-08-27: **A note on running the scope gate.** It compares COMMITS
+  (`git diff <merge-base> HEAD`), not the working tree, so a file that is
+  modified but not yet committed is invisible to it — the suite passes locally
+  and CI, which only ever sees commits, fails on the same check. Run it after
+  committing, not before. Cost one CI round here.
+
+- 2026-08-27: **The caps bounded the wrong collections.**
+  `MAX_OPEN_CHALLENGES` counts only UNCONSUMED challenges, so issue-then-verify
+  loops freely; `verify_challenge` returns the existing binding on a repeat, so
+  the binding cap never fires either. Both reported room while the endpoint
+  replanned on every pass and `create_revision` inserted another encrypted
+  manifest — `config_revisions` growing without limit on a shared volume, past
+  two caps that were watching the wrong things.
+
+  Fixed by refusing at ISSUE: a tuple already bound in this household is
+  nothing to invite anyone to. That is the better place for the refusal
+  regardless — nobody is sent a code that could not have done anything — and it
+  bounds the durable collections structurally, because a verification can now
+  only follow a binding that did not exist, so revisions are bounded by the
+  binding cap. Suite 1532 green.
+
+  **Also today: CI was wedged, not slow.** Both runs on `2bd7886` sat 26 hours
+  reporting `queued` with zero jobs created, while the API refused to cancel
+  them ("already completed") AND refused to re-run them ("already running") —
+  three mutually contradictory states. Not exhausted minutes, which was the
+  theory: closing and reopening the PR fired fresh events and runners were
+  allocated immediately. Recorded because the diagnosis cost most of a day and
+  the remedy is one command that touches no code — which matters, since the
+  gate's rule is never to push a commit to shake a verdict loose.
+
+- 2026-08-26: **A regression I introduced in the follow-up PR, caught in
+  review.** Fixing "a reset onto an identical tuple crosses an onboarding
+  generation invisibly" I invalidated outstanding challenges from
+  `ensure_owner_binding`'s IDEMPOTENT path, using the current time as a stand-in
+  for a generation boundary. The planner runs on every revision — including the
+  one issued immediately after a verification — so redeeming one invitation
+  deleted every other outstanding one. A household inviting two people could
+  seat only the first. Reproduced: two issued, one redeemed, zero surviving.
+
+  The deletion was also unnecessary, which is the part worth keeping. If the
+  owner state did not change, an outstanding invitation still creates exactly
+  the binding it always would have and no boundary is crossed; when the owner
+  state DOES change, `_retire_superseded` already invalidates challenges, and
+  that is the only case where the generation actually moved. Removed rather
+  than narrowed. Suite 1531 green.
+
+- 2026-08-26: **The four findings that merged untriaged on #72 are fixed.**
+  All reproduced first; all four turned out to share one cause. C3 gave
+  `channel_bindings` its first production writer, and three consumers that had
+  been correct only because the table was always empty stopped being correct
+  the moment it filled.
+
+  **The DSAR export omitted it.** `TABLE_CLASSIFICATION` marks the table
+  exportable and `docs/privacy/data-map.md:53` promises it with a ✔, and
+  `HouseholdExporter.export` never read it — costless while every household's
+  binding list was empty, and a genuinely incomplete subject access request
+  now that it holds channel identities, actors, roles and verification
+  metadata. Exported without `external_id_hmac`, which is a keyed digest of
+  the column beside it and so publishes a lookup token for no reader benefit;
+  challenges stay out entirely by their own classification.
+
+  **One actor with two bindings became two family members.** The projection
+  appended per BINDING, so an adult reachable on WhatsApp and on web produced
+  `family=(owner, adult, adult)` — rejected by `parse_runtime_manifest` as
+  `actors.family: duplicate actor`. The same unstartable-revision class as the
+  primary-channel case, reached by a different route, which is what made it
+  worth fixing at the projection rather than at either symptom.
+
+  **Seeding matched a tuple without asking whose row it was.**
+  `ensure_owner_binding` returned early on `(channel, external_id)` alone, so
+  re-onboarding the owner onto a tuple an ADULT held wrote no owner binding at
+  all while the stale owner row survived on the channel the household had just
+  left; and an owner whose ACTOR changed during reset never became
+  authoritative. Reconciliation now compares role, actor and tuple together,
+  and anything else is a reset that retires what it replaces.
+
+  **Nothing bounded the collections.** An authenticated owner could loop
+  unique IDs, each one a stored challenge row or a binding that becomes both a
+  manifest entry and a config revision. Capped per household at both ends.
+
+  Suite 1530 green, ruff and sanitizer clean.
 
 - 2026-08-26: **C3 review round 2 — two more authorization defects, both
   reproduced, both fixed.** This is the third generation on this branch and the

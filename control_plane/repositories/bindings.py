@@ -61,6 +61,20 @@ CHALLENGE_ROLES = ("adult",)
 
 CHANNELS = ("telegram", "whatsapp", "web")
 
+#: How many challenges a household may have outstanding at once, and how many
+#: members it may bind. Both are bounds on a collection an authenticated owner
+#: can grow one request at a time: every issued challenge is a stored row, and
+#: every verified binding becomes a manifest entry AND a config revision. A
+#: household with thousands of either is not a household that outgrew the
+#: product, it is a loop — and the cost lands on a shared SQLite volume and on
+#: a manifest the runtime has to parse.
+#:
+#: The numbers are deliberately far above any real family and far below
+#: anything that hurts, so the limit never has to be reasoned about in the
+#: ordinary case.
+MAX_OPEN_CHALLENGES = 10
+MAX_BINDINGS = 25
+
 
 class BindingError(PermissionError):
     """A binding was refused. The message is safe to show; it names no code."""
@@ -161,14 +175,27 @@ class ChannelBindingsRepository(Repository):
         actor_id: str,
         now: float | None = None,
     ) -> BindingRecord:
-        """Seed the owner's own binding from verified onboarding, idempotently.
+        """Make `channel_bindings` match the authoritative owner state.
 
         The owner never answers a challenge: their binding is established by
         the onboarding step that already proved the channel, and re-proving it
-        over that same channel would verify nothing. Calling this twice returns
-        the first row rather than raising on the UNIQUE constraint — the
-        planner runs on every revision, and a second revision must not depend
-        on whether a first one happened to run.
+        over that same channel would verify nothing. Running twice for the same
+        owner state is therefore a no-op — the planner runs on every revision,
+        and a second revision must not depend on whether a first one ran.
+
+        "The same owner state" is the part that was wrong. This returned early
+        whenever `(channel, external_id)` already existed, whatever that row
+        WAS, so two reset shapes slipped past reconciliation entirely:
+
+        * the tuple belonged to an ADULT. No owner row was written at all, the
+          previous owner row survived on the channel the household had just
+          left, and the manifest either lost its owner binding or attributed
+          the primary channel to the adult;
+        * the tuple was the owner's but the ACTOR had changed during reset. The
+          old actor stayed authoritative and the new one never appeared.
+
+        Both reproduced. Matching now means role, actor and tuple together;
+        anything else is a reset, and a reset retires what it replaces.
         """
         now = time.time() if now is None else now
         existing = connection.execute(
@@ -176,7 +203,26 @@ class ChannelBindingsRepository(Repository):
             " AND external_id = ?",
             (household_id, channel, external_id),
         ).fetchone()
-        if existing is not None:
+        if (
+            existing is not None
+            and existing["role"] == "owner"
+            and existing["actor_id"] == actor_id
+        ):
+            # Genuinely the same owner state: nothing to reconcile, and
+            # nothing to invalidate. An earlier revision of this method also
+            # dropped outstanding challenges here, reasoning that a reset onto
+            # an identical tuple crosses an onboarding generation invisibly.
+            # That was over-applied, and it broke concurrency: the planner runs
+            # on EVERY revision, including the one issued immediately after a
+            # verification, so redeeming one invitation deleted every other
+            # outstanding one.
+            #
+            # It was also unnecessary. If the owner state did not change, an
+            # outstanding invitation still creates exactly the binding it
+            # always would have — no boundary is crossed. When the owner state
+            # DOES change, `_retire_superseded` below invalidates the
+            # challenges, which is the only case where the generation actually
+            # moved.
             return self._record(existing)
         self._reject_foreign_holder(
             connection, channel=channel, external_id=external_id, household_id=household_id
@@ -268,6 +314,34 @@ class ChannelBindingsRepository(Repository):
         self._reject_foreign_holder(
             connection, channel=channel, external_id=external_id, household_id=household_id
         )
+        # Nothing worth inviting someone to. Refusing HERE is what bounds the
+        # durable collections: the caps below count challenge rows and binding
+        # rows, and neither grows on a repeat verification — `verify_challenge`
+        # returns the existing binding — but the endpoint replans afterwards
+        # and `create_revision` inserts another encrypted manifest every time.
+        # An owner looping issue-then-verify on an already-bound tuple
+        # therefore grew `config_revisions` without limit while every cap
+        # reported room to spare. With this refusal a verification can only
+        # follow a binding that did not exist, so revisions are bounded by
+        # MAX_BINDINGS.
+        held = connection.execute(
+            "SELECT actor_id FROM channel_bindings WHERE household_id = ?"
+            " AND channel = ? AND external_id = ?",
+            (household_id, channel, external_id),
+        ).fetchone()
+        if held is not None:
+            raise BindingError(
+                "this channel is already bound to that member"
+                if held["actor_id"] == actor_id
+                else "this channel is already bound to another member"
+            )
+        open_challenges = connection.execute(
+            "SELECT COUNT(*) AS total FROM channel_binding_challenges"
+            " WHERE household_id = ? AND consumed_at IS NULL AND expires_at > ?",
+            (household_id, now),
+        ).fetchone()["total"]
+        if open_challenges >= MAX_OPEN_CHALLENGES:
+            raise BindingError("too many outstanding challenges for this household")
         code = secrets.token_urlsafe(32)
         row_id = new_id()
         connection.execute(
@@ -441,6 +515,15 @@ class ChannelBindingsRepository(Repository):
         if held is not None:
             raise BindingError("this channel is already bound to another household")
 
+    @staticmethod
+    def _reject_when_full(connection: sqlite3.Connection, *, household_id: str) -> None:
+        total = connection.execute(
+            "SELECT COUNT(*) AS total FROM channel_bindings WHERE household_id = ?",
+            (household_id,),
+        ).fetchone()["total"]
+        if total >= MAX_BINDINGS:
+            raise BindingError("this household has as many bindings as it may hold")
+
     def _insert(
         self,
         connection: sqlite3.Connection,
@@ -453,6 +536,7 @@ class ChannelBindingsRepository(Repository):
         verified_at: float,
         verified_by_actor_id: str,
     ) -> BindingRecord:
+        self._reject_when_full(connection, household_id=household_id)
         row_id = new_id()
         # `external_id_hmac` stays NULL, and that is a KNOWN GAP rather than an
         # oversight: the digest the gateway compares against is keyed with the
