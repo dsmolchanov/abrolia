@@ -235,6 +235,20 @@ that assumed one binding per actor, the seeding that matched a tuple without
 looking at whose row it was.
 
 
+#### Inventory — C3b revision rollout
+
+**Files:** `control_plane/provisioning/worker.py`,
+`control_plane/provisioning/rollout.py`, `control_plane/api/bindings.py`,
+`tests/control_plane/test_provisioning_jobs.py`,
+`tests/control_plane/test_channel_bindings.py`.
+
+**Branches:** `codex/c3b-revision-rollout`.
+
+`worker.py` is the consolidation of four currency checks into one answer;
+`rollout.py` exists so the scheduling can be tested without an HTTP client,
+which is what the endpoint's own shape was preventing.
+
+
 ## Track R — Staged rollout (fixed order; runbook §Rollout)
 
 Prerequisite: O1 ticked. Order is not negotiable per runbook and canon.
@@ -251,6 +265,38 @@ Prerequisite: O1 ticked. Order is not negotiable per runbook and canon.
   open). Shared-WA relay last, after C5.
 
 ## Execution log
+
+- 2026-08-27: **C3b implemented; C3a designed and decided.** Both designs were
+  written before either was typed, and both changed on contact with the code.
+
+  **C3b was not the small slice the checklist recorded.** That estimate came
+  from the job-creation site alone. A runtime job's progress is gated by FOUR
+  independent currency checks (`worker.py:2662, 2711, 2819, 2849`), each
+  restating a phase-specific expectation for the ONBOARDING workflow — the
+  shape this same file warns about at line 112. A household adding a member
+  matches none of them: onboarding finished, workflow `complete`. Reusing that
+  workflow was rejected because `workflow.state` is USER-VISIBLE through
+  `OnboardingSnapshot`; a family that finished setup months ago would be shown
+  as mid-setup to serve a rollout. Instead a `reprovision_runtime` operation,
+  with the four state sets consolidated into one answer parameterised by
+  operation, and the rollout itself extracted to `provisioning/rollout.py` so
+  it can be exercised without authenticating first.
+
+  **Nobody re-authorizes when a member is added** — asked during review, and
+  worth recording because the answer was not obvious. The bootstrap token is a
+  MACHINE credential reachable only over the private `.flycast` transport
+  (`internal_bootstrap.py:41-63`), and `required_consent_purposes` derives from
+  the email provider and WhatsApp number type, neither of which membership
+  changes. What it does cost is a restart: `_machine_payload` embeds the
+  revision and manifest hash (`fly.py:483-513`), so the Machine config no longer
+  matches and is replaced. Volume mounted, nothing lost, brief unavailability —
+  the same cost every configuration change already carries.
+
+  **Built ahead of C3a by decision**, against my recommendation to reverse the
+  order. The consequence is recorded rather than hidden: the end-to-end test
+  binds a member on a SECONDARY channel, because the primary channel is still
+  refused until C3a. The mechanism is fully exercised; the case the feature
+  exists for gets its test when C3a lands. Suite 1535 green.
 
 - 2026-08-27: **A note on running the scope gate.** It compares COMMITS
   (`git diff <merge-base> HEAD`), not the working tree, so a file that is

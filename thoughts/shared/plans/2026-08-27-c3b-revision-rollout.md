@@ -103,6 +103,12 @@ C3a has no such dependency: its acceptance is about what the manifest contains
 and whether `parse_runtime_manifest` accepts it, which is complete without a
 rollout.
 
+**Built ahead of C3a anyway, 2026-08-27, by decision.** The consequence is
+recorded rather than hidden: the end-to-end test binds a member on a SECONDARY
+channel, because a member on the primary channel is still refused until C3a.
+The rollout mechanism is fully exercised; the case the feature exists for is
+not, and gets its test when C3a lands.
+
 ## Acceptance
 
 1. **A live household reaches revision N.** Verify a binding on an active
@@ -133,11 +139,24 @@ that is stuck there.
 - **The consolidation touches the code that prevents acting on stale state.**
   A subtle loosening would not fail a test that only exercises the happy path —
   hence criterion 3 covering all four phases explicitly.
-- **Re-bootstrap semantics.** `_finish_runtime` issues a bootstrap token and
-  activation flips the household back to `active`
-  (`bootstrap.py:427`). Whether a re-provisioning rollout should reuse that path
-  or a lighter one is an open question this plan does not answer; it must be
-  settled before implementation, not during.
+- **Re-bootstrap semantics — settled 2026-08-27, and it costs the family
+  nothing.** The question was whether reusing the bootstrap/activation path
+  imposes anything on the household. It does not: the bootstrap token is a
+  MACHINE credential living in the runtime's own secret namespace, and
+  `_bootstrap_transport_allowed` accepts it only over the private `.flycast`
+  host (`api/internal_bootstrap.py:41-63`) — a family member cannot reach that
+  endpoint at all. Consent is unaffected for a separate reason:
+  `required_consent_purposes` derives the owed set from the email provider and
+  the WhatsApp number type (`privacy/consent.py:165-179`), neither of which
+  membership changes, so no new receipt comes due. **Nobody re-authorizes.**
+
+  What it does cost is a restart. `_machine_payload` embeds
+  `abrolia_revision` and `HERMES_CONFIG_SHA256` in the Machine config
+  (`provisioning/fly.py:483-513`), so a new revision fails `_machine_matches`
+  and `_ensure_machine` updates the Machine — which replaces its config and
+  restarts it. The volume is mounted, so nothing is lost; the household's
+  assistant is briefly unavailable. That is the same cost every configuration
+  change already carries, and adding a member is a configuration change.
 - **Concurrency.** Two members verified in quick succession plan revisions N and
   N+1. The intent key is `{household}:runtime:{revision}` so the jobs are
   distinct, but the household's `current_config_revision` is a single value —
@@ -146,14 +165,15 @@ that is stuck there.
 ## Deliberately not here
 
 - **C3a**, which this now waits on — see Sequencing.
-- **Answering the re-bootstrap question**, which is the first thing to settle
-  when this slice starts.
+- **Avoiding the restart.** A rollout that changed only the member list could
+  in principle be delivered without replacing the Machine config. Whether that
+  is worth a second deployment path is a product question, not a defect.
 
 #### Inventory — C3b implementation
 
 **Files:** `control_plane/provisioning/worker.py`,
-`control_plane/api/bindings.py`, `control_plane/repositories/jobs.py`,
+`control_plane/provisioning/rollout.py`, `control_plane/api/bindings.py`,
 `tests/control_plane/test_provisioning_jobs.py`,
-`tests/control_plane/test_binding_api.py`.
+`tests/control_plane/test_channel_bindings.py`.
 
 **Branches:** `codex/c3b-revision-rollout`.

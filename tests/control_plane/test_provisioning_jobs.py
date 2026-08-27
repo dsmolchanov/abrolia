@@ -1791,3 +1791,83 @@ def test_redeploying_with_the_key_does_not_reach_an_existing_runtime(cp_stack) -
 
     assert again is None or again.status == "succeeded"
     assert sink.get(runtime_ref, "ANTHROPIC_API_KEY") is None
+
+
+def test_the_currency_guard_answers_per_operation_and_still_refuses_stale_work() -> None:
+    """The consolidation is where the stale-work property could be lost.
+
+    Four sites asked "is this job still current" and each restated a
+    phase-specific expectation for the ONBOARDING workflow. They ask one place
+    now, so that place has to keep every phase's answer exactly — and give the
+    re-provisioning operation the only answer that is true for it, since a
+    household adding a member stays at `complete` throughout.
+    """
+    from control_plane.provisioning.worker import (
+        REPROVISION_RUNTIME_OPERATION,
+        _workflow_states_for,
+    )
+
+    class _Job:
+        def __init__(self, operation: str) -> None:
+            self.operation = operation
+
+    onboarding = _Job("ensure_runtime")
+    rollout = _Job(REPROVISION_RUNTIME_OPERATION)
+
+    # Every phase keeps its onboarding answer, unchanged.
+    for phase in (
+        {"runtime_provisioning", "activating"},
+        {"activating"},
+        {"activating", "complete"},
+    ):
+        assert _workflow_states_for(onboarding, phase) == phase
+
+    # And the rollout's answer is `complete` at every phase — never one of
+    # onboarding's transient states, which it will never be in.
+    for phase in (
+        {"runtime_provisioning", "activating"},
+        {"activating"},
+        {"activating", "complete"},
+    ):
+        assert _workflow_states_for(rollout, phase) == {"complete"}
+        assert "runtime_provisioning" not in _workflow_states_for(rollout, phase)
+
+
+def test_a_rollout_job_leaves_the_onboarding_workflow_where_it_found_it(
+    cp_stack,
+) -> None:
+    """`workflow.state` reaches the family through `OnboardingSnapshot`, so a
+    household that finished setup months ago must not be shown as mid-setup
+    because somebody added an adult."""
+    from control_plane.provisioning.rollout import schedule_runtime_rollout
+
+    _advance_to_runtime(cp_stack)
+    with cp_stack.database.write() as connection:
+        connection.execute(
+            "UPDATE households SET status = 'active' WHERE id = ?",
+            (cp_stack.household.id,),
+        )
+        connection.execute(
+            "UPDATE onboarding_workflows SET state = 'complete' WHERE household_id = ?",
+            (cp_stack.household.id,),
+        )
+        planned = cp_stack.make_worker().planner.issue(
+            connection, household_id=cp_stack.household.id
+        )
+        schedule_runtime_rollout(
+            connection,
+            jobs=cp_stack.jobs,
+            onboarding=cp_stack.onboarding,
+            household_id=cp_stack.household.id,
+            planned=planned,
+            runtime_provider="dry-run-runtime",
+            now=BASE_TIME + 400,
+        )
+
+    assert cp_stack.onboarding.snapshot(cp_stack.household.id).state.value == "complete"
+    household = cp_stack.database.query_one(
+        "SELECT status, current_config_revision FROM households WHERE id = ?",
+        (cp_stack.household.id,),
+    )
+    assert household["status"] == "provisioning"
+    assert household["current_config_revision"] == planned.revision.revision

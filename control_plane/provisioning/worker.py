@@ -122,6 +122,34 @@ def requires_current_content_restriction(
     )
 
 
+#: A rollout to a household that already finished onboarding. Same `runtime`
+#: kind and the same provider work; a different operation because the currency
+#: question has a different answer for it — see `_workflow_states_for`.
+REPROVISION_RUNTIME_OPERATION = "reprovision_runtime"
+
+
+def _workflow_states_for(job: JobRecord, onboarding: set[str]) -> set[str]:
+    """Which onboarding-workflow states mean "this job is still current".
+
+    A runtime job's progress is gated in four places, each asking whether the
+    projection it was planned against still holds. Three clauses of that
+    question — household status, config revision, runtime ref — mean the same
+    thing whenever it is asked. The fourth named onboarding states, because
+    until now every runtime job WAS onboarding.
+
+    A household adding a member finished onboarding long ago: its workflow sits
+    at `complete` and stays there, deliberately, because `workflow.state` is
+    user-visible through `OnboardingSnapshot` and a family that finished months
+    ago must not be shown as mid-setup to serve a rollout.
+
+    So the four sites ask here instead of restating it — the remedy this file
+    already prescribes at the top for exactly this shape.
+    """
+    if job.operation == REPROVISION_RUNTIME_OPERATION:
+        return {"complete"}
+    return onboarding
+
+
 #: Name the runtime reads its model credential under. The runtime's own
 #: client library looks for exactly this variable.
 RUNTIME_MODEL_SECRET = "ANTHROPIC_API_KEY"
@@ -2663,7 +2691,8 @@ class ProvisioningWorker:
         return bool(
             state is not None
             and state["job_status"] in {"running", "outcome_unknown"}
-            and state["workflow_state"] in {"runtime_provisioning", "activating"}
+            and state["workflow_state"]
+            in _workflow_states_for(job, {"runtime_provisioning", "activating"})
             and state["household_status"] == "provisioning"
             and state["current_config_revision"] == job.desired_revision
         )
@@ -2711,7 +2740,8 @@ class ProvisioningWorker:
             if (
                 state is None
                 or state["job_status"] not in {"running", "outcome_unknown"}
-                or state["workflow_state"] not in {"runtime_provisioning", "activating"}
+                or state["workflow_state"]
+                not in _workflow_states_for(job, {"runtime_provisioning", "activating"})
                 or state["household_status"] != "provisioning"
                 or state["current_config_revision"] != job.desired_revision
             ):
@@ -2749,11 +2779,17 @@ class ProvisioningWorker:
                     workflow_row["version"],
                 )
                 new_version = workflow.version + 1
-                connection.execute(
-                    "UPDATE onboarding_workflows SET state = 'activating', version = ?,"
-                    " updated_at = ? WHERE id = ?",
-                    (new_version, now, job.workflow_id),
-                )
+                if job.operation != REPROVISION_RUNTIME_OPERATION:
+                    # A rollout to an already-onboarded household leaves the
+                    # workflow at `complete`. Moving it would put a household
+                    # that finished setup months ago back into
+                    # `runtime_provisioning` on the onboarding page, which is
+                    # the user-visible cost this operation exists to avoid.
+                    connection.execute(
+                        "UPDATE onboarding_workflows SET state = 'activating',"
+                        " version = ?, updated_at = ? WHERE id = ?",
+                        (new_version, now, job.workflow_id),
+                    )
                 owner = connection.execute(
                     "SELECT account_id FROM household_memberships WHERE household_id = ?"
                     " AND role = 'owner' AND status = 'active' LIMIT 1",
@@ -2819,7 +2855,8 @@ class ProvisioningWorker:
             if (
                 state is None
                 or state["job_status"] not in {"running", "outcome_unknown"}
-                or state["workflow_state"] != "activating"
+                or state["workflow_state"]
+                not in _workflow_states_for(job, {"activating"})
                 or state["household_status"] != "provisioning"
                 or state["current_config_revision"] != job.desired_revision
                 or state["runtime_ref"] != prepared.external_ref
@@ -2849,7 +2886,8 @@ class ProvisioningWorker:
             if (
                 state is None
                 or state["job_status"] not in {"running", "outcome_unknown"}
-                or state["workflow_state"] not in {"activating", "complete"}
+                or state["workflow_state"]
+                not in _workflow_states_for(job, {"activating", "complete"})
                 or state["household_status"] not in {"provisioning", "active"}
                 or state["current_config_revision"] != job.desired_revision
                 or state["runtime_ref"] != result.external_ref
