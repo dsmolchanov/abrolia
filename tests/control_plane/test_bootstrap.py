@@ -847,3 +847,58 @@ def test_a_rollout_is_refused_while_the_first_one_is_still_in_flight(
     assert (
         active.households.get(household_id).current_config_revision == runtime.revision
     )
+
+
+def test_a_rollout_that_touched_the_provider_is_not_declared_active(
+    api_harness,
+) -> None:
+    """The limit that keeps the recovery honest.
+
+    `_restore_settled_household` writes only to the database. After a failure
+    that reached the provider, the Machine may already carry revision N's
+    config, so recording N-1 as active would say something false about what is
+    running. A household stuck in `provisioning` is visible and fixable; one
+    that is falsely `active` is neither, because nothing goes looking.
+    """
+    from control_plane.provisioning.rollout import schedule_runtime_rollout
+
+    runtime = _provision_runtime(api_harness)
+    active = api_harness.container
+    binding = _binding(runtime)
+    active.bootstrap.claim(runtime.raw_token, **binding)
+    active.bootstrap.activate(
+        runtime.raw_token, **binding, activated_sha256=runtime.manifest_sha256
+    )
+    household_id = runtime.world.household.id
+
+    with active.database.write() as connection:
+        planned = active.planner.issue(connection, household_id=household_id)
+        schedule_runtime_rollout(
+            connection,
+            jobs=active.jobs,
+            onboarding=active.onboarding_repository,
+            household_id=household_id,
+            planned=planned,
+            runtime_provider=active.config.runtime_provider,
+        )
+        # The provider was reached for THIS revision: `_finish_runtime` records
+        # exactly this row as soon as `prepare` returns.
+        connection.execute(
+            "UPDATE external_resources SET config_revision = ?"
+            " WHERE household_id = ? AND resource_type = 'runtime'",
+            (planned.revision.revision, household_id),
+        )
+
+    job = active.database.query_one(
+        "SELECT id FROM provisioning_jobs WHERE household_id = ? AND desired_revision = ?",
+        (household_id, planned.revision.revision),
+    )
+    with active.database.write() as connection:
+        active.worker._restore_settled_household(
+            connection,
+            active.jobs.get(job["id"]),
+            now=1_800_000_900.0,
+        )
+
+    # Declined to guess: still provisioning, and honestly so.
+    assert active.households.get(household_id).status == "provisioning"

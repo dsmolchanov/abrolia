@@ -2699,7 +2699,29 @@ class ProvisioningWorker:
         Only for a re-provisioning failure. An `ensure_runtime` failure during
         onboarding leaves a household that never had a settled state to return
         to, and its recovery is the onboarding flow's own.
+
+        And only when the provider was never touched for this revision. That
+        limit is the important half, because without it this method makes
+        things WORSE rather than better: it writes only to the database, so
+        after a post-launch failure — where the Machine may already carry N's
+        config — it would record N-1 as active while N, or nothing, is running.
+        A household stuck in `provisioning` is visible and fixable; a household
+        that is falsely `active` is neither, because nothing goes looking.
+
+        `_finish_runtime` records an `external_resources` row against this
+        job's revision as soon as `prepare` returns (`status="creating"`), so
+        the absence of that row is durable evidence that no provider mutation
+        happened. Where one exists, this declines to guess: the household stays
+        `provisioning`, which is honest about a state nobody can currently
+        reconcile from here, and is tracked as its own slice.
         """
+        touched = connection.execute(
+            "SELECT 1 FROM external_resources WHERE household_id = ?"
+            " AND resource_type = 'runtime' AND config_revision = ? LIMIT 1",
+            (job.household_id, job.desired_revision),
+        ).fetchone()
+        if touched is not None:
+            return
         settled = connection.execute(
             "SELECT revision FROM config_revisions WHERE household_id = ?"
             " AND status = 'active' ORDER BY revision DESC LIMIT 1",

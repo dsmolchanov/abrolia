@@ -132,6 +132,20 @@ Ordered slices:
   `BootstrapService.activate` publishes the revision, and a terminal rollback
   retires them. Its own slice because it is a lifecycle, not a predicate.
 
+- [ ] **C3e. A rollout is not terminal until a revision is active.** Two
+  stranding paths this slice does NOT close, both found in review and both
+  needing a lifecycle rather than a patch. (1) `_settle_runtime_ready` settles
+  `succeeded` right after launch, so a runtime that never claims its token, or
+  whose activation is rejected, leaves the household `provisioning` at N with a
+  succeeded job `lease` will never revisit — and the failure recovery handles
+  only `failed`. (2) After a failure that reached the provider, the Machine may
+  already carry N's config, so no database-only write can honestly say which
+  revision is serving. The fix for both is the same shape: keep the job
+  non-terminal until activation, link the bootstrap token to it, and reconverge
+  the provider before declaring a previous revision active. C3b's recovery is
+  deliberately narrowed to pre-mutation failures so it never asserts what it
+  cannot know.
+
 - [ ] **C3d. Tests that reach what they claim to cover.** Two C3b regressions
   assert the right things without touching the path they are named for. The
   rollout test calls the repository, planner and `schedule_runtime_rollout`
@@ -291,6 +305,28 @@ Prerequisite: O1 ticked. Order is not negotiable per runbook and canon.
   open). Shared-WA relay last, after C5.
 
 ## Execution log
+
+- 2026-08-28: **The recovery I added could make things worse; narrowed it, and
+  stopped.** Review round 3 found two things, both inside my own fix. The job
+  settles `succeeded` after launch, before activation, so a runtime that never
+  claims its token strands the household in a state my recovery does not cover
+  — it handles `failed` only. And more seriously,
+  `_restore_settled_household` writes only to the database: after a failure
+  that reached the provider, the Machine may already carry N's config, so
+  recording N-1 as active states something false about what is running. A
+  household stuck in `provisioning` is visible and fixable; one that is falsely
+  `active` is neither, because nothing goes looking.
+
+  Narrowed to pre-mutation failures only, keyed on the `external_resources`
+  row `_finish_runtime` writes as soon as `prepare` returns. The recovery now
+  fixes the case it understands and declines the rest, which leaves the
+  original symptom rather than replacing it with a quieter one. Proven in both
+  directions: the test fails against the version that guessed.
+
+  Both stranding paths are C3e. Stopping here rather than a fourth round: the
+  previous fix introduced a failure mode, and continuing to patch provisioning
+  failure paths I do not command in full is how the outcome gets worse than not
+  having touched them. Suite 1539 green.
 
 - 2026-08-28: **C3b review round 2 — the two ways a household could get
   stuck, fixed; the two thin tests recorded as C3d.**
