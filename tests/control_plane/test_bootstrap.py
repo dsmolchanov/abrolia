@@ -653,3 +653,95 @@ def test_crash_after_activate_response_cannot_delete_secret_before_local_receipt
         "SELECT * FROM provisioning_jobs WHERE kind = 'bootstrap_cleanup'"
     )
     assert cleanup is not None and cleanup["status"] == "pending"
+
+
+def test_a_member_rollout_activates_the_revision_without_rewriting_onboarding(
+    api_harness,
+) -> None:
+    """Activation is the other half of the path, and it was rewriting history.
+
+    `_workflow_states_for` keeps a re-provisioning job at `complete` so the
+    onboarding page does not claim a settled household is mid-setup. But
+    `activate` then re-stamped `completed_at`, bumped the version and appended
+    an `activate_runtime` transition unconditionally — moving the date a family
+    finished setting up to the day somebody added an adult, and recording a
+    `complete -> complete` event that never happened. Guarding the worker's
+    transition and not this one protected half the path.
+    """
+    from control_plane.provisioning.rollout import schedule_runtime_rollout
+
+    runtime = _provision_runtime(api_harness)
+    active = api_harness.container
+    binding = _binding(runtime)
+    active.bootstrap.claim(runtime.raw_token, **binding)
+    active.bootstrap.activate(
+        runtime.raw_token, **binding, activated_sha256=runtime.manifest_sha256
+    )
+
+    household_id = runtime.world.household.id
+    settled = active.database.query_one(
+        "SELECT state, version, completed_at FROM onboarding_workflows"
+        " WHERE household_id = ?",
+        (household_id,),
+    )
+    transitions_before = active.database.query_one(
+        "SELECT COUNT(*) AS total FROM onboarding_transitions t"
+        " JOIN onboarding_workflows w ON w.id = t.workflow_id"
+        " WHERE w.household_id = ?",
+        (household_id,),
+    )["total"]
+    assert settled["state"] == "complete" and settled["completed_at"] is not None
+
+    # A member is added: plan revision N and schedule its rollout.
+    with active.database.write() as connection:
+        planned = active.planner.issue(connection, household_id=household_id)
+        schedule_runtime_rollout(
+            connection,
+            jobs=active.jobs,
+            onboarding=active.onboarding_repository,
+            household_id=household_id,
+            planned=planned,
+            runtime_provider=active.config.runtime_provider,
+        )
+    rollout = active.worker.run_once()
+    assert rollout is not None and rollout.status == "succeeded"
+
+    # Activate the NEW revision — without this the guard under test is never
+    # reached, and the assertions below would pass on a broken implementation.
+    household = active.households.get(household_id)
+    raw = active.secret_sink.get(household.runtime_ref, "HERMES_BOOTSTRAP_TOKEN")
+    assert raw is not None, "the rollout issued no bootstrap token"
+    rollout_binding = {
+        "household_id": household_id,
+        "runtime_ref": household.runtime_ref,
+        "config_revision": planned.revision.revision,
+    }
+    active.bootstrap.claim(raw.decode("ascii"), **rollout_binding)
+    active.bootstrap.activate(
+        raw.decode("ascii"),
+        **rollout_binding,
+        activated_sha256=planned.spec.config_sha256,
+    )
+
+    # The revision really did become the active one.
+    assert (
+        active.households.get(household_id).current_config_revision
+        == planned.revision.revision
+    )
+
+    after = active.database.query_one(
+        "SELECT state, version, completed_at FROM onboarding_workflows"
+        " WHERE household_id = ?",
+        (household_id,),
+    )
+    transitions_after = active.database.query_one(
+        "SELECT COUNT(*) AS total FROM onboarding_transitions t"
+        " JOIN onboarding_workflows w ON w.id = t.workflow_id"
+        " WHERE w.household_id = ?",
+        (household_id,),
+    )["total"]
+
+    # The onboarding record is stamped exactly once, whatever else happens.
+    assert after["completed_at"] == settled["completed_at"]
+    assert after["state"] == "complete"
+    assert transitions_after == transitions_before

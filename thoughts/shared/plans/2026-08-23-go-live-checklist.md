@@ -120,6 +120,18 @@ Ordered slices:
   — first-time semantics that a live household gaining a member should not
   inherit. Re-provisioning is its own lifecycle, not a copied block.
 
+- [ ] **C3c. A binding must not route before the revision that authorizes it.**
+  `gateway/whatsapp_router.py:113-116, 126-129` resolves a sender with no
+  household or revision predicate, and `verify_challenge` commits the row
+  immediately. So between the write and activation the gateway routes the new
+  member's traffic to a runtime still serving N-1, whose manifest has no pair
+  for them — the runtime denies it and the member's message goes nowhere. C3b
+  narrowed that window from unbounded to "until the rollout activates"; it did
+  not close it. Closing it needs a staged/published lifecycle on the binding:
+  the planner includes staged rows, the gateway exposes them only once
+  `BootstrapService.activate` publishes the revision, and a terminal rollback
+  retires them. Its own slice because it is a lifecycle, not a predicate.
+
 - [ ] **C4. Make preferences real.** Production write path (API/onboarding);
   consumer that routes replies/fallbacks; self-contained agent-inbox rejection
   (replace dead `_validate_no_self_ingestion`, persist the fallback ref);
@@ -239,8 +251,10 @@ looking at whose row it was.
 
 **Files:** `control_plane/provisioning/worker.py`,
 `control_plane/provisioning/rollout.py`, `control_plane/api/bindings.py`,
+`control_plane/provisioning/bootstrap.py`,
 `tests/control_plane/test_provisioning_jobs.py`,
-`tests/control_plane/test_channel_bindings.py`.
+`tests/control_plane/test_channel_bindings.py`,
+`tests/control_plane/test_bootstrap.py`.
 
 **Branches:** `codex/c3b-revision-rollout`.
 
@@ -265,6 +279,28 @@ Prerequisite: O1 ticked. Order is not negotiable per runbook and canon.
   open). Shared-WA relay last, after C5.
 
 ## Execution log
+
+- 2026-08-28: **C3b review round 1 — I had protected half a path.**
+  `_workflow_states_for` keeps a re-provisioning job at `complete` so the
+  onboarding page never claims a settled household is mid-setup. Activation
+  then re-stamped `completed_at`, bumped the workflow version and appended an
+  `activate_runtime` transition unconditionally (`bootstrap.py:438-456`) —
+  moving the date a family finished setting up to the day somebody added an
+  adult, and recording a `complete -> complete` event that never happened. The
+  worker's transition was guarded; the activation write was not, and it is the
+  same decision one step later. Now branched on the pre-existing state, with
+  the rollout recorded where it belongs: `provisioning_jobs` for the job and
+  `config_revisions.activated_at` for the revision.
+
+  The regression test was checked in BOTH directions — it fails without the
+  guard and passes with it. The first version of it asserted the right things
+  and never activated the new revision, so it would have passed on the broken
+  implementation. Worth remembering: a test for a guard has to reach the guard.
+
+  **Recorded as C3c rather than fixed:** a binding routes before the revision
+  authorizing it is active. C3b narrowed that window from unbounded to "until
+  activation"; closing it needs a staged/published lifecycle on the binding,
+  not a predicate. Suite 1536 green.
 
 - 2026-08-27: **C3b implemented; C3a designed and decided.** Both designs were
   written before either was typed, and both changed on contact with the code.
