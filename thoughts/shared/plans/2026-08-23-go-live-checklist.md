@@ -215,7 +215,8 @@ scope of its own until its base has one.
 **Files:** `control_plane/repositories/bindings.py`,
 `control_plane/provisioning/planner.py`, `control_plane/privacy/export.py`,
 `tests/control_plane/test_channel_bindings.py`,
-`tests/control_plane/test_export_delete.py`.
+`tests/control_plane/test_export_delete.py`,
+`tests/control_plane/test_binding_api.py`.
 
 **Branches:** `codex/c3-review-followups`.
 
@@ -244,6 +245,12 @@ Prerequisite: O1 ticked. Order is not negotiable per runbook and canon.
   open). Shared-WA relay last, after C5.
 
 ## Execution log
+
+- 2026-08-27: **A note on running the scope gate.** It compares COMMITS
+  (`git diff <merge-base> HEAD`), not the working tree, so a file that is
+  modified but not yet committed is invisible to it — the suite passes locally
+  and CI, which only ever sees commits, fails on the same check. Run it after
+  committing, not before. Cost one CI round here.
 
 - 2026-08-27: **The caps bounded the wrong collections.**
   `MAX_OPEN_CHALLENGES` counts only UNCONSUMED challenges, so issue-then-verify
