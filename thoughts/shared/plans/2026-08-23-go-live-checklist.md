@@ -91,6 +91,8 @@ Ordered slices:
   writer, the challenge lifecycle, and the manifest as a projection of the
   table.
 - [ ] **C3a. Separate a sender's identity from the chat it speaks in.**
+  *Design written 2026-08-27:
+  `thoughts/shared/plans/2026-08-27-c3a-sender-identity-and-chat.md`.*
   `channel_bindings.external_id` answers two incompatible questions:
   `gateway/whatsapp_router.py:128` matches it against an incoming SENDER, and
   the manifest projection reads it as `chat_id`, the place the assistant
@@ -105,7 +107,11 @@ Ordered slices:
   projection, runtime manifest — moved together. Blocks the second adult on
   the primary channel; adults on other channels already work.
 
-- [ ] **C3b. Roll a revision out to an already-active household.** Verifying a
+- [ ] **C3b. Roll a revision out to an already-active household.**
+  *Design written 2026-08-27:
+  `thoughts/shared/plans/2026-08-27-c3b-revision-rollout.md`. Sequencing
+  corrected there — C3b now waits on C3a, because its acceptance criterion
+  cannot be written honestly until a second member is representable.* Verifying a
   binding plans revision N, but nothing schedules `ensure_runtime` or advances
   `households.current_config_revision`, so the runtime stays on N-1 and never
   sees the new member. The only existing path
@@ -113,6 +119,44 @@ Ordered slices:
   `provisioning` and drives the ONBOARDING workflow to `runtime_provisioning`
   — first-time semantics that a live household gaining a member should not
   inherit. Re-provisioning is its own lifecycle, not a copied block.
+
+- [ ] **C3c. A binding must not route before the revision that authorizes it.**
+  `gateway/whatsapp_router.py:113-116, 126-129` resolves a sender with no
+  household or revision predicate, and `verify_challenge` commits the row
+  immediately. So between the write and activation the gateway routes the new
+  member's traffic to a runtime still serving N-1, whose manifest has no pair
+  for them — the runtime denies it and the member's message goes nowhere. C3b
+  narrowed that window from unbounded to "until the rollout activates"; it did
+  not close it. Closing it needs a staged/published lifecycle on the binding:
+  the planner includes staged rows, the gateway exposes them only once
+  `BootstrapService.activate` publishes the revision, and a terminal rollback
+  retires them. Its own slice because it is a lifecycle, not a predicate.
+
+- [ ] **C3e. A rollout is not terminal until a revision is active.** Two
+  stranding paths this slice does NOT close, both found in review and both
+  needing a lifecycle rather than a patch. (1) `_settle_runtime_ready` settles
+  `succeeded` right after launch, so a runtime that never claims its token, or
+  whose activation is rejected, leaves the household `provisioning` at N with a
+  succeeded job `lease` will never revisit — and the failure recovery handles
+  only `failed`. (2) After a failure that reached the provider, the Machine may
+  already carry N's config, so no database-only write can honestly say which
+  revision is serving. The fix for both is the same shape: keep the job
+  non-terminal until activation, link the bootstrap token to it, and reconverge
+  the provider before declaring a previous revision active. C3b's recovery is
+  deliberately narrowed to pre-mutation failures so it never asserts what it
+  cannot know.
+
+- [ ] **C3d. Tests that reach what they claim to cover.** Two C3b regressions
+  assert the right things without touching the path they are named for. The
+  rollout test calls the repository, planner and `schedule_runtime_rollout`
+  directly, bypassing `verify_binding_challenge` — delete the endpoint's
+  scheduling call and every test stays green. The currency-guard test calls
+  `_workflow_states_for` alone, so none of the four checkpoints runs with a
+  stale revision or runtime ref; drop the revision clause from any of them and
+  nothing fails. Needs one authenticated HTTP regression carrying a
+  secondary-channel binding through worker, claim and activation, and a
+  parameterized worker regression over both operations × both stale fields ×
+  all four checkpoints.
 
 - [ ] **C4. Make preferences real.** Production write path (API/onboarding);
   consumer that routes replies/fallbacks; self-contained agent-inbox rejection
@@ -229,6 +273,22 @@ that assumed one binding per actor, the seeding that matched a tuple without
 looking at whose row it was.
 
 
+#### Inventory — C3b revision rollout
+
+**Files:** `control_plane/provisioning/worker.py`,
+`control_plane/provisioning/rollout.py`, `control_plane/api/bindings.py`,
+`control_plane/provisioning/bootstrap.py`,
+`tests/control_plane/test_provisioning_jobs.py`,
+`tests/control_plane/test_channel_bindings.py`,
+`tests/control_plane/test_bootstrap.py`.
+
+**Branches:** `codex/c3b-revision-rollout`.
+
+`worker.py` is the consolidation of four currency checks into one answer;
+`rollout.py` exists so the scheduling can be tested without an HTTP client,
+which is what the endpoint's own shape was preventing.
+
+
 ## Track R — Staged rollout (fixed order; runbook §Rollout)
 
 Prerequisite: O1 ticked. Order is not negotiable per runbook and canon.
@@ -245,6 +305,108 @@ Prerequisite: O1 ticked. Order is not negotiable per runbook and canon.
   open). Shared-WA relay last, after C5.
 
 ## Execution log
+
+- 2026-08-28: **The recovery I added could make things worse; narrowed it, and
+  stopped.** Review round 3 found two things, both inside my own fix. The job
+  settles `succeeded` after launch, before activation, so a runtime that never
+  claims its token strands the household in a state my recovery does not cover
+  — it handles `failed` only. And more seriously,
+  `_restore_settled_household` writes only to the database: after a failure
+  that reached the provider, the Machine may already carry N's config, so
+  recording N-1 as active states something false about what is running. A
+  household stuck in `provisioning` is visible and fixable; one that is falsely
+  `active` is neither, because nothing goes looking.
+
+  Narrowed to pre-mutation failures only, keyed on the `external_resources`
+  row `_finish_runtime` writes as soon as `prepare` returns. The recovery now
+  fixes the case it understands and declines the rest, which leaves the
+  original symptom rather than replacing it with a quieter one. Proven in both
+  directions: the test fails against the version that guessed.
+
+  Both stranding paths are C3e. Stopping here rather than a fourth round: the
+  previous fix introduced a failure mode, and continuing to patch provisioning
+  failure paths I do not command in full is how the outcome gets worse than not
+  having touched them. Suite 1539 green.
+
+- 2026-08-28: **C3b review round 2 — the two ways a household could get
+  stuck, fixed; the two thin tests recorded as C3d.**
+
+  **A failed rollout stranded the household.** `schedule_runtime_rollout`
+  moves it to `provisioning` and revision N before any provider work, because
+  the currency guards read that pair at every phase. A provider rejection then
+  settled the job `failed` and left the household there permanently, pointing
+  at a revision that never activated, with no runnable job to move it. This was
+  my own acceptance criterion 5, written and not implemented. The revision to
+  return to needed no new bookkeeping: `config_revisions.status` still marks the
+  serving one `active`, because activation is what supersedes it and activation
+  never happened.
+
+  **A rollout could be scheduled mid-onboarding.** Verifying a binding before
+  the first rollout activated enqueued N+1 and overwrote the single
+  `current_config_revision`, stranding BOTH jobs — the original no longer
+  matched the revision, the new one no longer matched the workflow — and after
+  prepare the cleanup could take the shared runtime. Now refused, and the
+  endpoint answers 409 rather than half-applying.
+
+  **Recorded as C3d rather than fixed:** two C3b regressions assert correctly
+  without reaching what they are named for. Worth stating plainly because I
+  reported the mechanism as "fully exercised" and it was not: the rollout test
+  bypasses the endpoint entirely, so the feature could be deleted with every
+  test still green. Suite 1538 green.
+
+- 2026-08-28: **C3b review round 1 — I had protected half a path.**
+  `_workflow_states_for` keeps a re-provisioning job at `complete` so the
+  onboarding page never claims a settled household is mid-setup. Activation
+  then re-stamped `completed_at`, bumped the workflow version and appended an
+  `activate_runtime` transition unconditionally (`bootstrap.py:438-456`) —
+  moving the date a family finished setting up to the day somebody added an
+  adult, and recording a `complete -> complete` event that never happened. The
+  worker's transition was guarded; the activation write was not, and it is the
+  same decision one step later. Now branched on the pre-existing state, with
+  the rollout recorded where it belongs: `provisioning_jobs` for the job and
+  `config_revisions.activated_at` for the revision.
+
+  The regression test was checked in BOTH directions — it fails without the
+  guard and passes with it. The first version of it asserted the right things
+  and never activated the new revision, so it would have passed on the broken
+  implementation. Worth remembering: a test for a guard has to reach the guard.
+
+  **Recorded as C3c rather than fixed:** a binding routes before the revision
+  authorizing it is active. C3b narrowed that window from unbounded to "until
+  activation"; closing it needs a staged/published lifecycle on the binding,
+  not a predicate. Suite 1536 green.
+
+- 2026-08-27: **C3b implemented; C3a designed and decided.** Both designs were
+  written before either was typed, and both changed on contact with the code.
+
+  **C3b was not the small slice the checklist recorded.** That estimate came
+  from the job-creation site alone. A runtime job's progress is gated by FOUR
+  independent currency checks (`worker.py:2662, 2711, 2819, 2849`), each
+  restating a phase-specific expectation for the ONBOARDING workflow — the
+  shape this same file warns about at line 112. A household adding a member
+  matches none of them: onboarding finished, workflow `complete`. Reusing that
+  workflow was rejected because `workflow.state` is USER-VISIBLE through
+  `OnboardingSnapshot`; a family that finished setup months ago would be shown
+  as mid-setup to serve a rollout. Instead a `reprovision_runtime` operation,
+  with the four state sets consolidated into one answer parameterised by
+  operation, and the rollout itself extracted to `provisioning/rollout.py` so
+  it can be exercised without authenticating first.
+
+  **Nobody re-authorizes when a member is added** — asked during review, and
+  worth recording because the answer was not obvious. The bootstrap token is a
+  MACHINE credential reachable only over the private `.flycast` transport
+  (`internal_bootstrap.py:41-63`), and `required_consent_purposes` derives from
+  the email provider and WhatsApp number type, neither of which membership
+  changes. What it does cost is a restart: `_machine_payload` embeds the
+  revision and manifest hash (`fly.py:483-513`), so the Machine config no longer
+  matches and is replaced. Volume mounted, nothing lost, brief unavailability —
+  the same cost every configuration change already carries.
+
+  **Built ahead of C3a by decision**, against my recommendation to reverse the
+  order. The consequence is recorded rather than hidden: the end-to-end test
+  binds a member on a SECONDARY channel, because the primary channel is still
+  refused until C3a. The mechanism is fully exercised; the case the feature
+  exists for gets its test when C3a lands. Suite 1535 green.
 
 - 2026-08-27: **A note on running the scope gate.** It compares COMMITS
   (`git diff <merge-base> HEAD`), not the working tree, so a file that is

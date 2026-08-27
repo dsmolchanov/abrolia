@@ -28,6 +28,10 @@ from control_plane.api.dependencies import (
     current_household_owner_mutation,
     read_bounded_json,
 )
+from control_plane.provisioning.rollout import (
+    RolloutNotReady,
+    schedule_runtime_rollout,
+)
 from control_plane.repositories.bindings import BindingError
 
 router = APIRouter()
@@ -137,6 +141,29 @@ async def verify_binding_challenge(
                 connection, household_id=current.household.id
             )
         except ValueError as error:
+            raise HTTPException(
+                http_status.HTTP_409_CONFLICT,
+                "household configuration cannot be issued yet",
+            ) from error
+
+        # Planning a revision is not deploying one — see
+        # `provisioning/rollout.py` for what that cost and why the onboarding
+        # workflow is left alone. Scheduled in the SAME transaction as the row
+        # and the revision, so a member is never durable without the work that
+        # makes them real.
+        try:
+            schedule_runtime_rollout(
+                connection,
+                jobs=active.jobs,
+                onboarding=active.onboarding_repository,
+                household_id=current.household.id,
+                planned=planned,
+                runtime_provider=active.config.runtime_provider,
+            )
+        except RolloutNotReady as error:
+            # The household is still settling — its first rollout has not
+            # activated. A state, not a fault, and the transaction rolls back
+            # with it: no binding, no revision, nothing half-applied.
             raise HTTPException(
                 http_status.HTTP_409_CONFLICT,
                 "household configuration cannot be issued yet",

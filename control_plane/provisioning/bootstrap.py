@@ -436,6 +436,28 @@ class BootstrapService:
                 workflow_row["version"],
             )
             new_version = workflow.version + 1
+            if workflow.state == "complete":
+                # A rollout to a household that already finished setup. The
+                # revision above is activated exactly as for onboarding — that
+                # is the point — but the ONBOARDING record is left alone.
+                #
+                # Rewriting it here would undo the decision made one step
+                # earlier in `_workflow_states_for`: re-stamping `completed_at`
+                # moves the date a family finished setting up to the day
+                # somebody added an adult, and appending an `activate_runtime`
+                # transition records a `complete -> complete` event that never
+                # happened. Guarding the worker's transition and not this one
+                # protected half the path.
+                #
+                # Where the rollout IS recorded: `provisioning_jobs` carries
+                # the job, and `config_revisions` carries `activated_at` for
+                # the revision, which is the history that actually describes it.
+                return ActivationReceipt(
+                    household_id,
+                    runtime_ref,
+                    config_revision,
+                    activated_sha256,
+                )
             connection.execute(
                 "UPDATE onboarding_workflows SET state = 'complete', current_step = 'runtime',"
                 " version = ?, updated_at = ?, completed_at = ? WHERE id = ?",

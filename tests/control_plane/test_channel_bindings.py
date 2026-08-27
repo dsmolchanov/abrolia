@@ -756,3 +756,94 @@ def test_redeeming_one_invitation_leaves_the_others_standing(cp_stack) -> None:
                 connection, code=pending.code, household_id=hid,
                 owner_actor_id=OWNER, now=BASE_TIME + 6,
             )
+
+
+# --- C3b: the revision reaches the runtime ---------------------------------
+
+
+def test_verifying_a_binding_schedules_the_rollout_and_leaves_onboarding_alone(
+    cp_stack,
+) -> None:
+    """Planning a revision is not deploying one.
+
+    The endpoint answered with revision N while the runtime kept serving N-1,
+    so the gateway could route a new member to a runtime that had never heard
+    of them. The rollout is scheduled now — and the onboarding workflow stays
+    `complete`, because `workflow.state` is user-visible through
+    `OnboardingSnapshot` and a household that finished setup months ago must
+    not be shown as mid-setup to serve a rollout.
+    """
+    from control_plane.provisioning.rollout import schedule_runtime_rollout
+    from control_plane.provisioning.worker import REPROVISION_RUNTIME_OPERATION
+
+    _provisioned(cp_stack)
+    # The precondition, not the subject: a household that finished setup.
+    # `_provisioned` stops at `runtime_provisioning` because activation runs
+    # through the runtime's bootstrap, which this harness does not host. These
+    # two writes are exactly what activation performs
+    # (`provisioning/bootstrap.py:427` and `:440`).
+    with cp_stack.database.write() as connection:
+        connection.execute(
+            "UPDATE households SET status = 'active' WHERE id = ?",
+            (cp_stack.household.id,),
+        )
+        connection.execute(
+            "UPDATE onboarding_workflows SET state = 'complete' WHERE household_id = ?",
+            (cp_stack.household.id,),
+        )
+    before = cp_stack.onboarding.snapshot(cp_stack.household.id)
+    assert before.state.value == "complete"
+
+    with cp_stack.database.write() as connection:
+        issued = cp_stack.bindings.issue_challenge(
+            connection,
+            household_id=cp_stack.household.id,
+            channel="whatsapp",
+            external_id=PHONE,
+            actor_id=ADULT,
+            role="adult",
+            issued_by_actor_id=CHANNEL_SELECTION["actor_id"],
+            now=BASE_TIME + 100,
+        )
+
+    with cp_stack.database.write() as connection:
+        cp_stack.bindings.verify_challenge(
+            connection,
+            code=issued.code,
+            household_id=cp_stack.household.id,
+            owner_actor_id=CHANNEL_SELECTION["actor_id"],
+            now=BASE_TIME + 200,
+        )
+        planned = cp_stack.make_worker().planner.issue(
+            connection, household_id=cp_stack.household.id
+        )
+        schedule_runtime_rollout(
+            connection,
+            jobs=cp_stack.jobs,
+            onboarding=cp_stack.onboarding,
+            household_id=cp_stack.household.id,
+            planned=planned,
+            runtime_provider="dry-run-runtime",
+            now=BASE_TIME + 300,
+        )
+    assert planned.revision.revision == 2
+
+    job = cp_stack.database.query_one(
+        "SELECT kind, operation, desired_revision FROM provisioning_jobs"
+        " WHERE household_id = ? AND desired_revision = 2",
+        (cp_stack.household.id,),
+    )
+    assert job is not None
+    assert (job["kind"], job["operation"]) == ("runtime", REPROVISION_RUNTIME_OPERATION)
+
+    household = cp_stack.database.query_one(
+        "SELECT status, current_config_revision FROM households WHERE id = ?",
+        (cp_stack.household.id,),
+    )
+    assert household["current_config_revision"] == 2
+    assert household["status"] == "provisioning"
+
+    # The criterion that rejects reusing the onboarding workflow.
+    after = cp_stack.onboarding.snapshot(cp_stack.household.id)
+    assert after.state.value == "complete"
+    assert after.current_step == before.current_step

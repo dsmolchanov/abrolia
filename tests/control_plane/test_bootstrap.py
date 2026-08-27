@@ -653,3 +653,252 @@ def test_crash_after_activate_response_cannot_delete_secret_before_local_receipt
         "SELECT * FROM provisioning_jobs WHERE kind = 'bootstrap_cleanup'"
     )
     assert cleanup is not None and cleanup["status"] == "pending"
+
+
+def test_a_member_rollout_activates_the_revision_without_rewriting_onboarding(
+    api_harness,
+) -> None:
+    """Activation is the other half of the path, and it was rewriting history.
+
+    `_workflow_states_for` keeps a re-provisioning job at `complete` so the
+    onboarding page does not claim a settled household is mid-setup. But
+    `activate` then re-stamped `completed_at`, bumped the version and appended
+    an `activate_runtime` transition unconditionally — moving the date a family
+    finished setting up to the day somebody added an adult, and recording a
+    `complete -> complete` event that never happened. Guarding the worker's
+    transition and not this one protected half the path.
+    """
+    from control_plane.provisioning.rollout import schedule_runtime_rollout
+
+    runtime = _provision_runtime(api_harness)
+    active = api_harness.container
+    binding = _binding(runtime)
+    active.bootstrap.claim(runtime.raw_token, **binding)
+    active.bootstrap.activate(
+        runtime.raw_token, **binding, activated_sha256=runtime.manifest_sha256
+    )
+
+    household_id = runtime.world.household.id
+    settled = active.database.query_one(
+        "SELECT state, version, completed_at FROM onboarding_workflows"
+        " WHERE household_id = ?",
+        (household_id,),
+    )
+    transitions_before = active.database.query_one(
+        "SELECT COUNT(*) AS total FROM onboarding_transitions t"
+        " JOIN onboarding_workflows w ON w.id = t.workflow_id"
+        " WHERE w.household_id = ?",
+        (household_id,),
+    )["total"]
+    assert settled["state"] == "complete" and settled["completed_at"] is not None
+
+    # A member is added: plan revision N and schedule its rollout.
+    with active.database.write() as connection:
+        planned = active.planner.issue(connection, household_id=household_id)
+        schedule_runtime_rollout(
+            connection,
+            jobs=active.jobs,
+            onboarding=active.onboarding_repository,
+            household_id=household_id,
+            planned=planned,
+            runtime_provider=active.config.runtime_provider,
+        )
+    rollout = active.worker.run_once()
+    assert rollout is not None and rollout.status == "succeeded"
+
+    # Activate the NEW revision — without this the guard under test is never
+    # reached, and the assertions below would pass on a broken implementation.
+    household = active.households.get(household_id)
+    raw = active.secret_sink.get(household.runtime_ref, "HERMES_BOOTSTRAP_TOKEN")
+    assert raw is not None, "the rollout issued no bootstrap token"
+    rollout_binding = {
+        "household_id": household_id,
+        "runtime_ref": household.runtime_ref,
+        "config_revision": planned.revision.revision,
+    }
+    active.bootstrap.claim(raw.decode("ascii"), **rollout_binding)
+    active.bootstrap.activate(
+        raw.decode("ascii"),
+        **rollout_binding,
+        activated_sha256=planned.spec.config_sha256,
+    )
+
+    # The revision really did become the active one.
+    assert (
+        active.households.get(household_id).current_config_revision
+        == planned.revision.revision
+    )
+
+    after = active.database.query_one(
+        "SELECT state, version, completed_at FROM onboarding_workflows"
+        " WHERE household_id = ?",
+        (household_id,),
+    )
+    transitions_after = active.database.query_one(
+        "SELECT COUNT(*) AS total FROM onboarding_transitions t"
+        " JOIN onboarding_workflows w ON w.id = t.workflow_id"
+        " WHERE w.household_id = ?",
+        (household_id,),
+    )["total"]
+
+    # The onboarding record is stamped exactly once, whatever else happens.
+    assert after["completed_at"] == settled["completed_at"]
+    assert after["state"] == "complete"
+    assert transitions_after == transitions_before
+
+
+def test_a_rollout_that_fails_gives_the_household_back(api_harness) -> None:
+    """C3b acceptance criterion 5, which the first implementation did not meet.
+
+    `schedule_runtime_rollout` moves the household to `provisioning` and to
+    revision N before any provider work, because the worker's currency guards
+    read that pair at every phase. A provider that then rejects left the job
+    `failed` and the household permanently `provisioning`, pointing at a
+    revision that never activated, with no runnable job to move it.
+    """
+    from control_plane.provisioning.contracts import ProviderRejected
+    from control_plane.provisioning.rollout import schedule_runtime_rollout
+
+    runtime = _provision_runtime(api_harness)
+    active = api_harness.container
+    binding = _binding(runtime)
+    active.bootstrap.claim(runtime.raw_token, **binding)
+    active.bootstrap.activate(
+        runtime.raw_token, **binding, activated_sha256=runtime.manifest_sha256
+    )
+    household_id = runtime.world.household.id
+    settled = active.households.get(household_id)
+    assert settled.status == "active"
+
+    with active.database.write() as connection:
+        planned = active.planner.issue(connection, household_id=household_id)
+        schedule_runtime_rollout(
+            connection,
+            jobs=active.jobs,
+            onboarding=active.onboarding_repository,
+            household_id=household_id,
+            planned=planned,
+            runtime_provider=active.config.runtime_provider,
+        )
+    # Mid-rollout the household is deliberately not settled.
+    assert active.households.get(household_id).status == "provisioning"
+
+    provider = active.providers.get(active.config.runtime_provider)
+
+    def _reject(*args, **kwargs):
+        raise ProviderRejected("runtime_rejected", "synthetic refusal")
+
+    provider.prepare = _reject  # type: ignore[method-assign]
+    provider.ensure = _reject  # type: ignore[method-assign]
+
+    result = active.worker.run_once()
+    assert result is not None and result.status == "failed"
+
+    # Given back: the revision that is actually serving, and a status that lets
+    # the owner try again.
+    restored = active.households.get(household_id)
+    assert restored.status == "active"
+    assert restored.current_config_revision == settled.current_config_revision
+
+
+def test_a_rollout_is_refused_while_the_first_one_is_still_in_flight(
+    api_harness,
+) -> None:
+    """Verifying a binding mid-onboarding used to strand two jobs at once.
+
+    `_workflow_states_for` accepts `complete` and nothing else for a rollout,
+    so scheduling one before the initial `ensure_runtime` activates enqueued
+    revision N+1 and overwrote the household's single
+    `current_config_revision`: the original job no longer matched the revision,
+    the new one no longer matched the workflow, and both cancelled — after
+    prepare, taking the shared runtime with them.
+    """
+    from control_plane.provisioning.rollout import (
+        RolloutNotReady,
+        schedule_runtime_rollout,
+    )
+
+    runtime = _provision_runtime(api_harness)
+    active = api_harness.container
+    household_id = runtime.world.household.id
+    # Deliberately NOT activated: the first rollout is still in flight.
+    assert active.households.get(household_id).status == "provisioning"
+
+    with active.database.write() as connection:
+        planned = active.planner.issue(connection, household_id=household_id)
+        with pytest.raises(RolloutNotReady, match="settled state"):
+            schedule_runtime_rollout(
+                connection,
+                jobs=active.jobs,
+                onboarding=active.onboarding_repository,
+                household_id=household_id,
+                planned=planned,
+                runtime_provider=active.config.runtime_provider,
+            )
+
+    # The in-flight rollout is untouched: one runtime job, still pointing at
+    # the revision it was planned for.
+    jobs = active.database.query(
+        "SELECT desired_revision FROM provisioning_jobs WHERE household_id = ?"
+        " AND kind = 'runtime' AND operation = 'ensure_runtime'",
+        (household_id,),
+    )
+    assert [row["desired_revision"] for row in jobs] == [runtime.revision]
+    assert (
+        active.households.get(household_id).current_config_revision == runtime.revision
+    )
+
+
+def test_a_rollout_that_touched_the_provider_is_not_declared_active(
+    api_harness,
+) -> None:
+    """The limit that keeps the recovery honest.
+
+    `_restore_settled_household` writes only to the database. After a failure
+    that reached the provider, the Machine may already carry revision N's
+    config, so recording N-1 as active would say something false about what is
+    running. A household stuck in `provisioning` is visible and fixable; one
+    that is falsely `active` is neither, because nothing goes looking.
+    """
+    from control_plane.provisioning.rollout import schedule_runtime_rollout
+
+    runtime = _provision_runtime(api_harness)
+    active = api_harness.container
+    binding = _binding(runtime)
+    active.bootstrap.claim(runtime.raw_token, **binding)
+    active.bootstrap.activate(
+        runtime.raw_token, **binding, activated_sha256=runtime.manifest_sha256
+    )
+    household_id = runtime.world.household.id
+
+    with active.database.write() as connection:
+        planned = active.planner.issue(connection, household_id=household_id)
+        schedule_runtime_rollout(
+            connection,
+            jobs=active.jobs,
+            onboarding=active.onboarding_repository,
+            household_id=household_id,
+            planned=planned,
+            runtime_provider=active.config.runtime_provider,
+        )
+        # The provider was reached for THIS revision: `_finish_runtime` records
+        # exactly this row as soon as `prepare` returns.
+        connection.execute(
+            "UPDATE external_resources SET config_revision = ?"
+            " WHERE household_id = ? AND resource_type = 'runtime'",
+            (planned.revision.revision, household_id),
+        )
+
+    job = active.database.query_one(
+        "SELECT id FROM provisioning_jobs WHERE household_id = ? AND desired_revision = ?",
+        (household_id, planned.revision.revision),
+    )
+    with active.database.write() as connection:
+        active.worker._restore_settled_household(
+            connection,
+            active.jobs.get(job["id"]),
+            now=1_800_000_900.0,
+        )
+
+    # Declined to guess: still provisioning, and honestly so.
+    assert active.households.get(household_id).status == "provisioning"
