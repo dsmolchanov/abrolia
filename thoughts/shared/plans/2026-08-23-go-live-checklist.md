@@ -105,7 +105,11 @@ Ordered slices:
   projection, runtime manifest — moved together. Blocks the second adult on
   the primary channel; adults on other channels already work.
 
-- [ ] **C3b. Roll a revision out to an already-active household.** Verifying a
+- [ ] **C3b. Roll a revision out to an already-active household.**
+  *Design written 2026-08-27:
+  `thoughts/shared/plans/2026-08-27-c3b-revision-rollout.md`. Sequencing
+  corrected there — C3b now waits on C3a, because its acceptance criterion
+  cannot be written honestly until a second member is representable.* Verifying a
   binding plans revision N, but nothing schedules `ensure_runtime` or advances
   `households.current_config_revision`, so the runtime stays on N-1 and never
   sees the new member. The only existing path
