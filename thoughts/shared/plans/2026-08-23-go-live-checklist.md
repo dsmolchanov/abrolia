@@ -91,6 +91,8 @@ Ordered slices:
   writer, the challenge lifecycle, and the manifest as a projection of the
   table.
 - [ ] **C3a. Separate a sender's identity from the chat it speaks in.**
+  *Design written 2026-08-27:
+  `thoughts/shared/plans/2026-08-27-c3a-sender-identity-and-chat.md`.*
   `channel_bindings.external_id` answers two incompatible questions:
   `gateway/whatsapp_router.py:128` matches it against an incoming SENDER, and
   the manifest projection reads it as `chat_id`, the place the assistant
