@@ -179,7 +179,7 @@ def test_an_external_id_bound_elsewhere_is_refused_at_issue_and_at_verify(
             household_id=second_household,
             channel="whatsapp",
             external_id=PHONE,
-            chat_id=PHONE,
+            chat_id=PHONE_CHAT,
             actor_id=PHONE,
             now=BASE_TIME,
         )
@@ -197,7 +197,7 @@ def test_an_external_id_bound_elsewhere_is_refused_at_issue_and_at_verify(
             household_id=second_household,
             channel="whatsapp",
             external_id=PHONE,
-            chat_id=PHONE,
+            chat_id=PHONE_CHAT,
             actor_id=PHONE,
             now=BASE_TIME,
         )
@@ -636,7 +636,7 @@ def test_reprovisioning_the_primary_channel_retires_what_it_replaces(
         cp_stack.bindings.ensure_owner_binding(
             connection, household_id=hid, channel="whatsapp",
             external_id=PHONE, actor_id=PHONE, now=BASE_TIME + 20,
-            chat_id=PHONE,
+            chat_id=PHONE_CHAT,
         )
     remaining = cp_stack.database.query(
         "SELECT channel, external_id FROM channel_bindings WHERE household_id = ?",
@@ -728,16 +728,16 @@ def test_the_owner_appears_in_family_once_though_two_things_name_them(
         # projection does not promise. It is stable for a given database,
         # which is what `config_sha256` needs; it is not predictable across
         # them, which is what a test would need.
-        for offset, (channel, external_id) in enumerate((
-            ("whatsapp", "+999511234"),
-            ("web", "synthetic-web-seat"),
+        for offset, (channel, external_id, chat) in enumerate((
+            ("whatsapp", PHONE, PHONE_CHAT),
+            ("web", "synthetic-web-seat", "synthetic-web-seat"),
         )):
             issued = cp_stack.bindings.issue_challenge(
                 connection,
                 household_id=cp_stack.household.id,
                 channel=channel,
                 external_id=external_id,
-                chat_id=external_id,
+                chat_id=chat,
                 actor_id=external_id,
                 role="adult",
                 issued_by_actor_id=owner_actor(cp_stack),
@@ -806,7 +806,7 @@ def test_seeding_reconciles_the_whole_row_not_just_the_tuple(cp_stack) -> None:
         cp_stack.bindings.ensure_owner_binding(
             connection, household_id=hid, channel="whatsapp",
             external_id=PHONE, actor_id=PHONE, now=BASE_TIME + 10,
-            chat_id=PHONE,
+            chat_id=PHONE_CHAT,
         )
         rows = cp_stack.bindings.verified(connection, household_id=hid)
 
@@ -1610,3 +1610,140 @@ def test_a_household_still_settling_is_reported_and_never_forced(cp_stack) -> No
             "SELECT COUNT(*) AS total FROM provisioning_jobs WHERE operation = ?",
             (REPROVISION_RUNTIME_OPERATION,),
         ).fetchone()["total"] == 0
+
+
+# --- D3: canonical means each channel's rule, not strip() ------------------
+
+from control_plane.channels import (  # noqa: E402
+    ChannelIdentityError,
+    canonical_chat,
+    canonical_sender,
+)
+from hermes_cloud.channels.telegram import parse_update  # noqa: E402
+from hermes_cloud.ingest.whatsapp_webhook import (  # noqa: E402
+    parse_webhook,
+)
+
+
+def _whatsapp_ingest(sender: str, chat: str) -> tuple[str, str]:
+    """The (actor, chat) a REAL WhatsApp turn arrives as.
+
+    Driven all the way through the provider's own parser, `as_eml`, and
+    `trusted_run_context` rather than asserted against a string this test made
+    up. A canonicalizer checked against an invented expectation proves the test
+    and the code agree, which is not the property that matters.
+    """
+    payload = json.dumps({
+        "instance": "synthetic-instance",
+        "message": {
+            "id": "synthetic-wa-canon",
+            "from": sender,
+            "remote_jid": chat,
+            "text": "привет",
+        },
+    }).encode()
+    inbound = parse_webhook(payload, expected_instance="synthetic-instance")
+    raw = as_eml(inbound)
+    household = Household(
+        household_id="h", family=frozenset(), allowed_chats=frozenset()
+    )
+    context = trusted_run_context(raw, household)
+    return context.actor_id, context.chat_id
+
+
+def _telegram_ingest(sender: str, chat: str) -> tuple[str, str]:
+    """The same, for Telegram, through `parse_update`."""
+    household = Household(
+        household_id="h", family=frozenset(), allowed_chats=frozenset()
+    )
+    message = parse_update(
+        {"message": {"message_id": 1, "text": "привет",
+                     "from": {"id": sender}, "chat": {"id": chat}}},
+        household,
+    )
+    return message.context.actor_id, message.context.chat_id
+
+
+@pytest.mark.parametrize(
+    ("channel", "spellings", "sender", "chat"),
+    [
+        pytest.param(
+            "whatsapp",
+            # Bare and `+`-prefixed are the same person; `as_eml` adds the `+`,
+            # so that is the form authorization sees. A JID's domain is
+            # case-insensitive where its local part is not.
+            ("  +999511234\n", "999511234", "+999511234 "),
+            "+999511234",
+            "999511234@s.whatsapp.invalid",
+            id="whatsapp",
+        ),
+        pytest.param(
+            "telegram",
+            ("990000002", " 990000002 ", "990000002\t"),
+            "990000002",
+            "-100990000101",
+            id="telegram",
+        ),
+    ],
+)
+def test_canonical_identity_is_what_that_channels_ingest_produces(
+    channel, spellings, sender, chat
+) -> None:
+    """Every spelling normalizes to the ONE string a real turn carries.
+
+    `strip()` closed the reported case and only that. Whitespace is the easiest
+    way to spell an identity wrongly, not the only one — and two spellings of
+    one identity are two rows, of which the second authorizes nobody.
+
+    The expected value is not written down here. It is whatever the channel's
+    own parser emits for the same turn, so this fails if the canonicalizer and
+    the ingest path ever drift, which is the agreement the debt plan wanted a
+    per-channel owner for and that the dependency direction forbade.
+    """
+    ingest = _whatsapp_ingest if channel == "whatsapp" else _telegram_ingest
+    actual_sender, actual_chat = ingest(sender, chat)
+
+    for spelling in spellings:
+        assert canonical_sender(channel, spelling) == actual_sender
+    for spelling in (chat, f"  {chat} ", chat.upper() if channel == "whatsapp" else chat):
+        assert canonical_chat(channel, spelling) == actual_chat
+
+
+@pytest.mark.parametrize(
+    ("field", "channel", "value", "reason"),
+    [
+        # The conflation C3a removed, refused at the door: a WhatsApp
+        # conversation is a JID, and a phone number is not one.
+        ("chat", "whatsapp", "+999511234", "JID"),
+        ("sender", "whatsapp", "not-a-number", "phone number"),
+        ("chat", "telegram", "not-an-id", "numeric chat ID"),
+        ("sender", "telegram", "user-two", "numeric user ID"),
+        ("sender", "whatsapp", "   ", "external ID is required"),
+        ("chat", "telegram", "  ", "chat ID is required"),
+    ],
+)
+def test_an_identity_that_channel_could_never_carry_is_refused(
+    field, channel, value, reason
+) -> None:
+    """One field per case, so a passing assertion names which rule fired.
+
+    An earlier version called both canonicalizers inside one `raises` block,
+    where the first refusal hides whether the second would have refused at all.
+    """
+    canonicalize = canonical_sender if field == "sender" else canonical_chat
+    with pytest.raises(ChannelIdentityError, match=reason):
+        canonicalize(channel, value)
+
+
+def test_the_synthetic_namespace_is_canonical_as_written(cp_stack) -> None:
+    """B-07's identities have no transport form to normalize into.
+
+    `synthetic-owner.<household>` is not a phone number waiting to be
+    reshaped, and applying WhatsApp's rule to it would refuse the only
+    identities this deployment is allowed to hold. It is an opaque token, so
+    the rule for it is the rule for any opaque token: strip and store.
+    """
+    actor, chat = synthetic_channel_identity(cp_stack.household.id)
+    for channel in ("telegram", "whatsapp", "web"):
+        assert canonical_sender(channel, f"  {actor} ") == actor
+        assert canonical_chat(channel, f"\t{chat}") == chat

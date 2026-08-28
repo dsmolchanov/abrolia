@@ -166,11 +166,24 @@ part; a JID is `@s.whatsapp.net` for a thread and `@g.us` for a group; Telegram
 IDs are digit strings that arrive from JSON. Two spellings of one identity are
 two rows, and the second one silently authorizes nobody.
 
-**The shape of the fix** is a per-channel canonicalizer owned next to the
-channel, not in the repository — the control plane should not be the second
-place that knows WhatsApp's JID format, which is the mistake C3a rejected when
-it refused to derive a chat from a sender. The repository asks the channel what
-canonical means.
+**The shape of the fix** was going to be a per-channel canonicalizer owned next
+to the channel, so the control plane would not be the second place that knows
+WhatsApp's JID format — the mistake C3a rejected when it refused to derive a
+chat from a sender.
+
+**Corrected during implementation: that inverts the dependency.** `hermes_cloud`
+imports `control_plane` (`runtime/service.py`, `gateway/whatsapp_router.py`)
+and never the reverse, so a canonicalizer living beside the ingest code would
+mean the control plane importing the runtime in order to write a row. The rules
+therefore live in `control_plane/channels.py`, and what keeps them honest is a
+test that drives a real webhook and a real Telegram update through their own
+parsers and asserts the canonical form equals what came out. Agreement proven
+by running something beats agreement promised by placement.
+
+A second correction, found the same way: the rules cannot be applied to the
+synthetic namespace. `synthetic-owner.<household>` is not a phone number
+waiting to be reshaped, and WhatsApp's rule would refuse the only identities
+B-07 permits. The namespace is canonical as written.
 
 **Acceptance.** A parameterized test over each channel's plausible spellings,
 asserting they either normalize to one stored value or are refused, and that
@@ -271,9 +284,16 @@ claim about which job the worker reaches first, so it is not governed by the
 
 ## Inventory — D3 canonical identity per channel
 
-**Files:** `control_plane/repositories/bindings.py`,
-`hermes_cloud/ingest/whatsapp_webhook.py`, `hermes_cloud/channels/telegram.py`,
-`tests/control_plane/test_channel_bindings.py`.
+**Files:** `control_plane/channels.py`,
+`control_plane/repositories/bindings.py`,
+`tests/control_plane/test_channel_bindings.py`,
+`tests/control_plane/test_binding_api.py`.
+
+`control_plane/channels.py` replaces the two `hermes_cloud/` entries this
+inventory first named: see the dependency correction above. The runtime is
+still what defines canonical — it is just read by a test rather than imported
+by the repository. `tests/control_plane/test_binding_api.py` is here because
+its fixtures passed a phone as a WhatsApp chat, which the new rules refuse.
 
 **Branches:** `codex/d3-canonical-identity`.
 
