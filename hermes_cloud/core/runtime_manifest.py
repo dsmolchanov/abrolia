@@ -126,12 +126,33 @@ class RuntimeManifest:
 
     @property
     def primary_chat_id(self) -> str:
-        chats = {
-            item.chat_id
-            for item in self.verified_bindings
-            if item.channel == self.primary_channel
-        }
-        return next(iter(chats))
+        """The household's REVIEW SURFACE: where cards, approvals and digests go.
+
+        Not "the household's only conversation". Dialogue already answers
+        wherever it was spoken to — `Pipeline.handle_update` replies to
+        `parsed.context.chat_id` — and only the unsolicited output goes to one
+        place, `config.require_chat()`. So this being singular is a property of
+        the review surface, not a limit on how many chats a family is reachable
+        in.
+
+        It is DESIGNATED by the owner rather than deduced by counting chats.
+        Counting was what forced every verified binding on the primary channel
+        to name the same conversation, which is why a household could not have
+        a second member there at all. `actors.owner` is carried in the manifest
+        and the write side already refuses a spec whose primary channel has no
+        verified binding for it (`DesiredHouseholdSpecV1.validate_contract`),
+        so this reads the rule the producer already enforces instead of
+        inventing a second one.
+
+        `parse_runtime_manifest` proves there is exactly one such binding, so
+        the loop below cannot fall through for a parsed manifest. A manifest
+        assembled in memory can, and raises rather than guessing: a review
+        surface picked arbitrarily is worse than one refused.
+        """
+        for item in self.verified_bindings:
+            if item.channel == self.primary_channel and item.actor_id == self.actors.owner:
+                return item.chat_id
+        raise ManifestError("channels.primary: no verified owner binding")
 
 
 def _truthy(value: str | None) -> bool:
@@ -339,11 +360,29 @@ def parse_runtime_manifest(
             verified=verified,
             external_ref=_optional_text(raw, "external_ref", where),
         ))
-    primary_chats = {
-        item.chat_id for item in bindings if item.verified and item.channel == primary
-    }
-    if len(primary_chats) != 1:
-        detail = "no verified binding" if not primary_chats else "multiple chats"
+    # The review surface is the OWNER's conversation on the primary channel —
+    # see `RuntimeManifest.primary_chat_id`. Before C3a this counted distinct
+    # chats instead, which made "two members on the primary channel" and "a
+    # revision that can start" mutually exclusive: give a second member the
+    # household's chat and the store collided, give them one of their own and
+    # this refused the revision outright.
+    #
+    # EXACTLY one, not at least one. Two owner bindings on the primary channel
+    # would make the review surface ambiguous again, which is the failure this
+    # check exists to prevent; the write side already guarantees a single owner
+    # binding, since `_retire_superseded` deletes what it replaces and a
+    # challenge can never mint an owner.
+    owner_primary = [
+        item
+        for item in bindings
+        if item.verified and item.channel == primary and item.actor_id == actors.owner
+    ]
+    if len(owner_primary) != 1:
+        detail = (
+            "no verified owner binding"
+            if not owner_primary
+            else "multiple owner bindings"
+        )
         raise ManifestError(f"channels.primary: {detail}")
 
     raw_email = _table(document, "email")

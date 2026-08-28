@@ -26,6 +26,33 @@ Three properties are load-bearing, and each has a test named after it:
   account that holds the household; a code delivered over a channel cannot
   confer it. The schema's CHECK constraint says the same thing in SQL.
 
+Two columns, one question each. `external_id` is the SENDER's identity on the
+channel — what `gateway/whatsapp_router.py` matches an inbound message against
+— and `chat_id` is the CONVERSATION the binding speaks in, which is what the
+manifest projects. C3a separated them (migration 0010); before that one column
+answered both questions, and a household therefore could not hold a second
+member on its primary channel at all. Uniqueness stays on the sender, so two
+members may now share one chat.
+
+A binding names THREE things and only two of them are free. `actor_id` is the
+identity the RUNTIME authorizes — `build_run_context` is handed
+`message.from.id` on Telegram and the `+999…` actor on WhatsApp — and
+`external_id` is the identity the GATEWAY routes by. Both are the transport
+sender, so they must be the same value, and `_reject_actor_that_is_not_the_sender`
+refuses a binding where they differ rather than publishing one the runtime will
+never honour. Only `chat_id` is genuinely independent.
+
+Neither `external_id` nor `chat_id` is derivable from the other, and the caller
+must supply both. It is
+tempting to treat a WhatsApp 1:1 thread as "the same as the number", and it is
+not: `hermes_cloud/ingest/whatsapp_webhook.py` normalizes the SENDER to
+`+999…` and reports the CHAT as the provider's `remote_jid`,
+`999…@s.whatsapp.net` — and a group is `@g.us`, which is precisely the shared
+conversation this slice exists to allow. `trusted_run_context` authorizes the
+exact pair, by string, so a binding built by copying one field into the other
+is a binding no inbound turn can ever match. Deriving a chat from a sender is
+the conflation this module just removed, wearing a different hat.
+
 What this does NOT yet establish, stated plainly because the column is called
 `verified_at` and would otherwise be read as more than it is: the control plane
 has no sender for telegram or WhatsApp — outbound goes through the gateway and
@@ -103,7 +130,10 @@ class BindingRecord:
     id: str
     household_id: str
     channel: str
+    #: The SENDER's identity on this channel. What the gateway matches.
     external_id: str
+    #: The CONVERSATION this binding speaks in. What the manifest projects.
+    chat_id: str
     actor_id: str
     role: str
     verified_at: float
@@ -152,11 +182,20 @@ class ChannelBindingsRepository(Repository):
 
     @staticmethod
     def _record(row: sqlite3.Row) -> BindingRecord:
+        chat_id = row["chat_id"]
+        if chat_id is None:
+            # 0010 backfills every row and a trigger refuses a NULL insert, so
+            # this is unreachable from a migrated database. It is raised rather
+            # than defaulted to `external_id`, because that default IS the
+            # conflation C3a removed — it would silently answer the chat
+            # question with the sender's identity all over again.
+            raise BindingError("binding row predates the chat/sender split")
         return BindingRecord(
             id=row["id"],
             household_id=row["household_id"],
             channel=row["channel"],
             external_id=row["external_id"],
+            chat_id=str(chat_id),
             actor_id=row["actor_id"],
             role=row["role"],
             verified_at=float(row["verified_at"]),
@@ -172,6 +211,7 @@ class ChannelBindingsRepository(Repository):
         household_id: str,
         channel: str,
         external_id: str,
+        chat_id: str,
         actor_id: str,
         now: float | None = None,
     ) -> BindingRecord:
@@ -196,8 +236,21 @@ class ChannelBindingsRepository(Repository):
 
         Both reproduced. Matching now means role, actor and tuple together;
         anything else is a reset, and a reset retires what it replaces.
+
+        C3a adds `chat_id` to that list for the same reason it added the actor.
+        An owner who re-runs `primary_channel` onto a different conversation
+        keeps their sender identity — on Telegram the user ID does not change
+        when the family moves to a new group — so a match on the tuple alone
+        would leave the household's REVIEW SURFACE pointing at the chat it just
+        left, which is where cards, approvals and digests appear.
         """
         now = time.time() if now is None else now
+        # Before the lookup, for the same reason as in `issue_challenge`: the
+        # query below matches by string, so a padded value would miss the row
+        # it means to reconcile and insert a second one beside it.
+        external_id = self._canonical(external_id, "external ID")
+        chat_id = self._canonical(chat_id, "chat ID")
+        actor_id = self._canonical(actor_id, "actor ID")
         existing = connection.execute(
             "SELECT * FROM channel_bindings WHERE household_id = ? AND channel = ?"
             " AND external_id = ?",
@@ -207,6 +260,7 @@ class ChannelBindingsRepository(Repository):
             existing is not None
             and existing["role"] == "owner"
             and existing["actor_id"] == actor_id
+            and existing["chat_id"] == chat_id
         ):
             # Genuinely the same owner state: nothing to reconcile, and
             # nothing to invalidate. An earlier revision of this method also
@@ -235,6 +289,7 @@ class ChannelBindingsRepository(Repository):
             household_id=household_id,
             channel=channel,
             external_id=external_id,
+            chat_id=chat_id,
             actor_id=actor_id,
             role="owner",
             verified_at=now,
@@ -264,12 +319,14 @@ class ChannelBindingsRepository(Repository):
         off a channel has revoked it, and the table is what the gateway
         believes.
 
-        Adult bindings on the channel now becoming primary go with it. They
-        cannot be represented there — see `_reject_unrepresentable_member` —
-        so leaving them would rebuild the unstartable manifest by another
-        route. Outstanding challenges for the household are dropped too: a code
-        issued against the arrangement that just changed must not redeem into
-        the one that replaced it.
+        Adult bindings on the channel now becoming primary go with it. C3a
+        made them REPRESENTABLE — two members may share a chat now — but not
+        CURRENT: they were verified against the arrangement the owner has just
+        replaced, and their `chat_id` is a conversation the household may have
+        left. Carrying them across would authorize an actor in a chat nobody
+        re-attested. Outstanding challenges are dropped for the same reason: a
+        code issued against the old arrangement must not redeem into the new
+        one.
         """
         connection.execute(
             "DELETE FROM channel_bindings WHERE household_id = ? AND role = 'owner'",
@@ -296,16 +353,40 @@ class ChannelBindingsRepository(Repository):
         actor_id: str,
         role: str,
         issued_by_actor_id: str,
+        chat_id: str,
         now: float | None = None,
         ttl_seconds: float = CHALLENGE_TTL_SECONDS,
     ) -> IssuedChallenge:
+        """Stand a question up that a binding will be the answer to.
+
+        `external_id` is the SENDER — the identity the gateway will match an
+        inbound message against. `chat_id` is the CONVERSATION that member
+        speaks in, and it may be one another member already holds: that is the
+        arrangement C3a exists to allow, an owner and an adult in the family's
+        one group chat.
+
+        BOTH are required, and `chat_id` is never defaulted from the sender.
+        An earlier version of this method defaulted it, on the reasoning that a
+        WhatsApp 1:1 thread is the number — see the module docstring for why
+        that is false in this system. The value must be the identifier the
+        channel's own ingest produces, because that is the string
+        authorization compares.
+        """
         now = time.time() if now is None else now
         if channel not in CHANNELS:
             raise BindingError("unknown channel")
         if role not in CHALLENGE_ROLES:
             raise BindingError("a challenge cannot confer this role")
-        if not external_id.strip():
-            raise BindingError("external ID is required")
+        # Canonicalized BEFORE the uniqueness and ownership checks below, not
+        # after: a padded duplicate of a bound sender would otherwise slip past
+        # `_reject_foreign_holder` and the already-bound lookup, both of which
+        # compare by string, and land as a second row for one identity.
+        external_id = self._canonical(external_id, "external ID")
+        chat_id = self._canonical(chat_id, "chat ID")
+        actor_id = self._canonical(actor_id, "actor ID")
+        self._reject_actor_that_is_not_the_sender(
+            external_id=external_id, actor_id=actor_id
+        )
         if actor_id == issued_by_actor_id:
             raise BindingError("a challenge cannot rebind its issuer")
         # Refusing here as well as at verification is not redundant: an owner
@@ -346,14 +427,15 @@ class ChannelBindingsRepository(Repository):
         row_id = new_id()
         connection.execute(
             "INSERT INTO channel_binding_challenges (id, household_id, channel,"
-            " external_id, actor_id, role, code_hash, issued_by_actor_id,"
-            " expires_at, attempts, consumed_at, created_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?)",
+            " external_id, chat_id, actor_id, role, code_hash,"
+            " issued_by_actor_id, expires_at, attempts, consumed_at, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?)",
             (
                 row_id,
                 household_id,
                 channel,
                 external_id,
+                chat_id,
                 actor_id,
                 role,
                 self.token_hasher.digest(code),
@@ -420,11 +502,6 @@ class ChannelBindingsRepository(Repository):
             external_id=row["external_id"],
             household_id=row["household_id"],
         )
-        self._reject_unrepresentable_member(
-            connection,
-            household_id=row["household_id"],
-            channel=row["channel"],
-        )
         existing = connection.execute(
             "SELECT * FROM channel_bindings WHERE household_id = ? AND channel = ?"
             " AND external_id = ?",
@@ -438,12 +515,22 @@ class ChannelBindingsRepository(Repository):
             # told.
             if existing["actor_id"] != row["actor_id"]:
                 raise BindingError("this channel is already bound to another member")
+            # Nor may it silently move the CONVERSATION. Two challenges naming
+            # one sender and two chats are two different bindings; answering
+            # the second by returning the first would report a change that did
+            # not happen, and the household's review surface is derived from a
+            # chat_id.
+            if existing["chat_id"] != row["chat_id"]:
+                raise BindingError(
+                    "this sender is already bound in a different conversation"
+                )
             return self._record(existing)
         return self._insert(
             connection,
             household_id=row["household_id"],
             channel=row["channel"],
             external_id=row["external_id"],
+            chat_id=row["chat_id"],
             actor_id=row["actor_id"],
             role=row["role"],
             verified_at=now,
@@ -453,51 +540,60 @@ class ChannelBindingsRepository(Repository):
     # --- internals -------------------------------------------------------
 
     @staticmethod
-    def _reject_unrepresentable_member(
-        connection: sqlite3.Connection,
-        *,
-        household_id: str,
-        channel: str,
-    ) -> None:
-        """Refuse an adult on the PRIMARY channel: the store cannot hold one.
+    def _canonical(value: str, field: str) -> str:
+        """The stored identity is the string ingest produces, byte for byte.
 
-        `channel_bindings.external_id` is asked two incompatible questions.
-        `gateway/whatsapp_router.py:128` matches it against an incoming SENDER;
-        `provisioning/planner.py` projects it as the manifest's `chat_id`, the
-        place the assistant SPEAKS. For the owner the two coincide, because
-        onboarding wrote one value that happens to answer both. For a second
-        adult on that same channel they cannot:
+        Every ingest path strips before it reports: `whatsapp_webhook._text`
+        returns `value.strip()`, and Telegram's IDs come out of JSON as bare
+        numbers. So a padded identity is not a variant of the canonical one, it
+        is a value no inbound turn can ever carry — and `knows_binding`
+        compares by string, so `"999…@g.us "` issues, verifies, publishes and
+        rolls out, and then matches nothing.
 
-        * give the adult the household's chat and the row collides with the
-          owner's under `UNIQUE (household_id, channel, external_id)`;
-        * give the adult an identity of their own and the projection emits two
-          verified chats for the primary channel, which
-          `parse_runtime_manifest` refuses with `channels.primary: multiple
-          chats` — a revision that cannot start.
-
-        Both were reproduced. The conflation arrived with `0007` and this
-        projection is simply the first thing to ask it for two answers at once.
-        Separating the sender's identity from the chat is a schema change with
-        three consumers, so it is its own slice; until then the honest thing is
-        to refuse where someone asks, rather than write a row whose deployment
-        fails later.
-
-        An adult on a NON-primary channel is unaffected and supported: a
-        different channel takes no part in the primary-chat constraint and
-        cannot collide with the owner's row.
+        Normalizing rather than refusing is deliberate: the canonical form IS
+        the stripped form, because that is what ingest emits, so stripping
+        stores what the runtime will see instead of rejecting a request whose
+        only fault is a trailing space.
         """
-        owner = connection.execute(
-            "SELECT channel FROM channel_bindings WHERE household_id = ?"
-            " AND role = 'owner' ORDER BY verified_at, id LIMIT 1",
-            (household_id,),
-        ).fetchone()
-        if owner is None or owner["channel"] != channel:
-            return
-        raise BindingError(
-            "a second member cannot yet be bound on the household's primary"
-            " channel — the binding store does not separate a sender's"
-            " identity from the chat it speaks in"
-        )
+        canonical = value.strip()
+        if not canonical:
+            raise BindingError(f"{field} is required")
+        return canonical
+
+    @staticmethod
+    def _reject_actor_that_is_not_the_sender(
+        *, external_id: str, actor_id: str
+    ) -> None:
+        """A published binding must authorize the pair channel ingest produces.
+
+        `actor_id` is not a name this system is free to choose. Every channel's
+        ingest derives the actor from the TRANSPORT SENDER — Telegram reads
+        `message.from.id` (`hermes_cloud/channels/telegram.py:264`), WhatsApp
+        reports the `+999…` normalized sender — and `Household.knows_binding`
+        compares the resulting `(actor, chat)` pair by string. The gateway
+        meanwhile resolves a household from `external_id`, which is the same
+        sender seen at the other end of the wire. Two columns, one identity.
+
+        Letting them differ produced a binding that succeeded at every layer
+        that could see it and failed at the only one that mattered: the row was
+        written, the revision was published, the rollout was scheduled, and then
+        every real inbound turn from that member was classified `unknown` and
+        got no family capabilities. Nothing reported it, because nothing in the
+        control plane can see an authorization that never happens.
+
+        Refusing here is the same remedy C3 chose for the chat conflation:
+        refuse where somebody asks, rather than write a row whose failure
+        surfaces somewhere nobody is watching. Translating a sender into an
+        internal actor would be the alternative, and it is a real design — a
+        verified sender-to-actor mapping carried through the manifest — that
+        this code does not have and must not pretend to.
+        """
+        if actor_id != external_id:
+            raise BindingError(
+                "a member's actor must be the identity their channel sends"
+                " from — the runtime authorizes the sender, so a binding under"
+                " any other name would never match a message"
+            )
 
     @staticmethod
     def _reject_foreign_holder(
@@ -531,11 +627,22 @@ class ChannelBindingsRepository(Repository):
         household_id: str,
         channel: str,
         external_id: str,
+        chat_id: str,
         actor_id: str,
         role: str,
         verified_at: float,
         verified_by_actor_id: str,
     ) -> BindingRecord:
+        # Every write passes here, so the identity invariant is checked here as
+        # well as at issue time. `issue_challenge` refuses early so that nobody
+        # is handed a code that could not have redeemed; this is the one place
+        # that no path can go around, including `ensure_owner_binding`.
+        external_id = self._canonical(external_id, "external ID")
+        chat_id = self._canonical(chat_id, "chat ID")
+        actor_id = self._canonical(actor_id, "actor ID")
+        self._reject_actor_that_is_not_the_sender(
+            external_id=external_id, actor_id=actor_id
+        )
         self._reject_when_full(connection, household_id=household_id)
         row_id = new_id()
         # `external_id_hmac` stays NULL, and that is a KNOWN GAP rather than an
@@ -547,13 +654,14 @@ class ChannelBindingsRepository(Repository):
         # pins it so the gap fails a test rather than a delivery.
         connection.execute(
             "INSERT INTO channel_bindings (id, household_id, channel, external_id,"
-            " external_id_hmac, actor_id, role, verified_at, verified_by_actor_id)"
-            " VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?)",
+            " chat_id, external_id_hmac, actor_id, role, verified_at,"
+            " verified_by_actor_id) VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)",
             (
                 row_id,
                 household_id,
                 channel,
                 external_id,
+                chat_id,
                 actor_id,
                 role,
                 verified_at,
@@ -565,6 +673,7 @@ class ChannelBindingsRepository(Repository):
             household_id=household_id,
             channel=channel,
             external_id=external_id,
+            chat_id=chat_id,
             actor_id=actor_id,
             role=role,
             verified_at=verified_at,

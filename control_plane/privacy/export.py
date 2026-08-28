@@ -244,7 +244,7 @@ class HouseholdExporter:
         # the row below.
         channel_bindings = self._rows(
             "channel_bindings",
-            "SELECT channel, external_id, actor_id, role, verified_at,"
+            "SELECT channel, external_id, chat_id, actor_id, role, verified_at,"
             " verified_by_actor_id FROM channel_bindings WHERE household_id = ?"
             " ORDER BY verified_at, id",
             (household_id,),

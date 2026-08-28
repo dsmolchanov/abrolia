@@ -12,7 +12,16 @@ CHALLENGES = "/api/v1/household/bindings/challenges"
 VERIFY = "/api/v1/household/bindings/verify"
 
 ADULT = "synthetic-second-adult"
-CHAT = "synthetic-second-chat"
+#: The member's SENDER identity, and the CONVERSATION they speak in. Two
+#: values since C3a, and deliberately different strings here: a test that
+#: passes one value for both cannot notice a consumer reading the wrong one.
+SENDER = "synthetic-second-sender"
+CHAT = "synthetic-household-chat"
+#: The same distinction on WhatsApp, where the two are NOT interchangeable:
+#: ingest normalizes the sender to `+999…` and reports the conversation as the
+#: provider's `remote_jid`.
+WA_SENDER = "+999511234567"
+WA_CHAT = "999511234567@s.whatsapp.invalid"
 
 
 def _seed_owner(
@@ -33,7 +42,8 @@ def _seed_owner(
             household_id=household_id,
             channel="telegram",
             external_id=external_id,
-            actor_id=actor_id,
+            chat_id=external_id,
+            actor_id=external_id,
         )
 
 
@@ -43,7 +53,7 @@ def test_both_routes_gate_like_every_other_private_mutation(api_harness) -> None
     api_harness.authenticate(world)
     _seed_owner(api_harness, world.household.id)
     origin_only = {"Origin": api_harness.config.public_origin}
-    body = {"channel": "telegram", "external_id": CHAT, "actor_id": ADULT}
+    body = {"channel": "telegram", "external_id": SENDER, "chat_id": CHAT, "actor_id": SENDER}
 
     for path, payload in ((CHALLENGES, body), (VERIFY, {"code": "whatever"})):
         assert api_harness.client.post(path, json=payload).status_code == 403
@@ -68,7 +78,7 @@ def test_a_household_without_an_owner_binding_cannot_acquire_a_second_member(
     api_harness.authenticate(world)
     response = api_harness.client.post(
         CHALLENGES,
-        json={"channel": "telegram", "external_id": CHAT, "actor_id": ADULT},
+        json={"channel": "telegram", "external_id": SENDER, "chat_id": CHAT, "actor_id": SENDER},
         headers=api_harness.mutation_headers,
     )
     assert response.status_code == 409
@@ -83,7 +93,7 @@ def test_the_code_is_returned_once_and_never_written_down(api_harness, caplog) -
     with caplog.at_level("DEBUG"):
         response = api_harness.client.post(
             CHALLENGES,
-            json={"channel": "telegram", "external_id": CHAT, "actor_id": ADULT},
+            json={"channel": "telegram", "external_id": SENDER, "chat_id": CHAT, "actor_id": SENDER},
             headers=api_harness.mutation_headers,
         )
     assert response.status_code == 200
@@ -103,7 +113,7 @@ def test_a_wrong_code_is_refused_and_writes_nothing(api_harness) -> None:
     _seed_owner(api_harness, world.household.id)
     api_harness.client.post(
         CHALLENGES,
-        json={"channel": "telegram", "external_id": CHAT, "actor_id": ADULT},
+        json={"channel": "telegram", "external_id": SENDER, "chat_id": CHAT, "actor_id": SENDER},
         headers=api_harness.mutation_headers,
     )
 
@@ -128,13 +138,14 @@ def test_an_owner_cannot_bind_an_id_another_household_holds(api_harness) -> None
             connection,
             household_id=other.household.id,
             channel="telegram",
-            external_id=CHAT,
-            actor_id="synthetic-other-owner",
+            external_id=SENDER,
+            chat_id=CHAT,
+            actor_id=SENDER,
         )
 
     response = api_harness.client.post(
         CHALLENGES,
-        json={"channel": "telegram", "external_id": CHAT, "actor_id": ADULT},
+        json={"channel": "telegram", "external_id": SENDER, "chat_id": CHAT, "actor_id": SENDER},
         headers=api_harness.mutation_headers,
     )
     assert response.status_code == 409
@@ -147,11 +158,17 @@ def test_an_unprovisionable_household_is_declined_not_broken(api_harness) -> Non
     world = api_harness.create_principal()
     api_harness.authenticate(world)
     _seed_owner(api_harness, world.household.id)
-    # A NON-primary channel, so the request gets past the primary-channel
-    # refusal and actually reaches the planner, which is what is under test.
+    # Any channel reaches the planner now — C3a removed the primary-channel
+    # refusal this comment used to route around — and the planner is what is
+    # under test.
     issued = api_harness.client.post(
         CHALLENGES,
-        json={"channel": "whatsapp", "external_id": "+999511234567", "actor_id": ADULT},
+        json={
+            "channel": "whatsapp",
+            "external_id": WA_SENDER,
+            "chat_id": WA_CHAT,
+            "actor_id": WA_SENDER,
+        },
         headers=api_harness.mutation_headers,
     )
 
@@ -204,7 +221,8 @@ def test_a_challenge_cannot_be_redeemed_from_another_household(api_harness) -> N
             household_id=victim.household.id,
             channel="whatsapp",
             external_id="+999511234567",
-            actor_id=ADULT,
+            chat_id="+999511234567",
+            actor_id="+999511234567",
             role="adult",
             issued_by_actor_id="synthetic-owner",
         )
@@ -229,7 +247,15 @@ def test_both_binding_routes_bound_the_body_before_parsing_it(api_harness) -> No
 
     huge = "я" * (200 * 1024)
     for path, payload in (
-        (CHALLENGES, {"channel": "whatsapp", "external_id": huge, "actor_id": ADULT}),
+        (
+            CHALLENGES,
+            {
+                "channel": "whatsapp",
+                "external_id": huge,
+                "chat_id": WA_CHAT,
+                "actor_id": huge,
+            },
+        ),
         (VERIFY, {"code": huge}),
     ):
         response = api_harness.client.post(
@@ -265,7 +291,15 @@ def test_only_the_owner_may_attest_a_binding(api_harness) -> None:
 
     api_harness.authenticate(adult)
     for path, payload in (
-        (CHALLENGES, {"channel": "whatsapp", "external_id": "+999511234567", "actor_id": ADULT}),
+        (
+            CHALLENGES,
+            {
+                "channel": "whatsapp",
+                "external_id": WA_SENDER,
+                "chat_id": WA_CHAT,
+                "actor_id": WA_SENDER,
+            },
+        ),
         (VERIFY, {"code": "anything"}),
     ):
         response = api_harness.client.post(
@@ -278,7 +312,12 @@ def test_only_the_owner_may_attest_a_binding(api_harness) -> None:
     api_harness.authenticate(owner)
     issued = api_harness.client.post(
         CHALLENGES,
-        json={"channel": "whatsapp", "external_id": "+999511234567", "actor_id": ADULT},
+        json={
+            "channel": "whatsapp",
+            "external_id": WA_SENDER,
+            "chat_id": WA_CHAT,
+            "actor_id": WA_SENDER,
+        },
         headers=api_harness.mutation_headers,
     )
     assert issued.status_code == 200
@@ -297,7 +336,12 @@ def test_repeated_verification_cannot_grow_the_revision_history(api_harness) -> 
     world = api_harness.create_principal()
     api_harness.authenticate(world)
     _seed_owner(api_harness, world.household.id)
-    body = {"channel": "whatsapp", "external_id": "+999511234567", "actor_id": ADULT}
+    body = {
+        "channel": "whatsapp",
+        "external_id": WA_SENDER,
+        "chat_id": WA_CHAT,
+        "actor_id": WA_SENDER,
+    }
 
     # Bind the tuple through the repository, which does not replan — the point
     # under test is what the ENDPOINT does once a binding exists.
@@ -307,7 +351,8 @@ def test_repeated_verification_cannot_grow_the_revision_history(api_harness) -> 
             household_id=world.household.id,
             channel="whatsapp",
             external_id="+999511234567",
-            actor_id=ADULT,
+            chat_id="+999511234567",
+            actor_id="+999511234567",
             role="adult",
             issued_by_actor_id="synthetic-owner",
         )
@@ -345,3 +390,71 @@ def test_repeated_verification_cannot_grow_the_revision_history(api_harness) -> 
     # nor a single extra revision.
     assert len(challenges) == 1
     assert len(revisions_after) == revisions_before
+
+
+def test_the_endpoint_carries_a_chat_alongside_the_sender(api_harness) -> None:
+    """C3a's HTTP half: an owner can put a member into an existing conversation.
+
+    `external_id` is the SENDER the gateway will match; `chat_id` is where that
+    member speaks. Sending both is how a second adult joins the family's own
+    Telegram group, which the pre-C3a store could not represent at all — the
+    chat was the only identity a binding had, so it collided with the owner's.
+    """
+    world = api_harness.create_principal()
+    api_harness.authenticate(world)
+    _seed_owner(api_harness, world.household.id)
+
+    issued = api_harness.client.post(
+        CHALLENGES,
+        json={
+            "channel": "telegram",
+            "external_id": "synthetic-adult-sender",
+            "chat_id": "synthetic-owner-chat",
+            "actor_id": "synthetic-adult-sender",
+        },
+        headers=api_harness.mutation_headers,
+    )
+    assert issued.status_code == 200
+    challenge = api_harness.container.database.query(
+        "SELECT external_id, chat_id FROM channel_binding_challenges"
+    )[0]
+    assert (challenge["external_id"], challenge["chat_id"]) == (
+        "synthetic-adult-sender",
+        "synthetic-owner-chat",
+    )
+
+
+def test_a_challenge_without_a_chat_is_refused_rather_than_guessed(
+    api_harness,
+) -> None:
+    """`chat_id` is required at the endpoint, and writes nothing when absent.
+
+    The first cut made it optional and defaulted it to `external_id`, on the
+    reasoning that a WhatsApp 1:1 thread is the number. It is not the string
+    this system authorizes against: `whatsapp_webhook.parse_webhook` reports
+    the conversation as the provider's `remote_jid`, so the default published a
+    binding no inbound turn could match — a success the owner had no way to
+    tell from a working one.
+
+    Deriving the JID instead of requiring it was the other option and is worse:
+    the control plane does not own that format, and a rule right for
+    `@s.whatsapp.invalid` is wrong for the `@g.us` group that is the very
+    arrangement this slice exists to allow.
+    """
+    world = api_harness.create_principal()
+    api_harness.authenticate(world)
+    _seed_owner(api_harness, world.household.id)
+
+    response = api_harness.client.post(
+        CHALLENGES,
+        json={
+            "channel": "whatsapp",
+            "external_id": WA_SENDER,
+            "actor_id": WA_SENDER,
+        },
+        headers=api_harness.mutation_headers,
+    )
+    assert response.status_code == 422
+    assert api_harness.container.database.query(
+        "SELECT id FROM channel_binding_challenges"
+    ) == []

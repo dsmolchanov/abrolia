@@ -13,9 +13,35 @@ import pytest
 from control_plane.repositories.bindings import BindingError
 from tests.control_plane.conftest import BASE_TIME
 
+
+def _jid(phone: str) -> str:
+    """The conversation identifier WhatsApp ingest reports for a 1:1 thread.
+
+    Deliberately NOT the sender. `parse_webhook` normalizes the actor to
+    `+999…` and reads the chat from the provider's `remote_jid`, and
+    `trusted_run_context` compares both by string — so a fixture that passes
+    one value for both cannot notice a consumer reading the wrong column. The
+    reserved `.invalid` TLD and the `99XXXXXXX` range are what the repository's
+    synthetic-fixture checker requires; `tests/test_whatsapp.py` uses the same
+    shape against the real parser.
+    """
+    return f"{phone.lstrip('+')}@s.whatsapp.invalid"
+
+
 OWNER = "synthetic-owner"
-ADULT = "synthetic-second-adult"
-PHONE = "+999511234567"
+#: The second adult's identity ON TELEGRAM, and it is one value, not two.
+#: `actor_id` and `external_id` are two readings of the transport sender —
+#: the runtime authorizes `message.from.id`, the gateway routes by the same
+#: string — so a fixture that gave the adult an "internal" actor beside a
+#: separate sender was encoding a binding the runtime silently ignores. That
+#: was the second [BLOCKER] on #76.
+ADULT = "990000002"
+PHONE = "+999511234"
+#: What `hermes_cloud/ingest/whatsapp_webhook.py` actually reports as the CHAT
+#: for a 1:1 thread with PHONE. It is not the sender: the actor is normalized
+#: to `+999…` and the conversation is the provider's `remote_jid`. Copying one
+#: field into the other writes a pair no inbound turn can ever match.
+PHONE_CHAT = _jid("+999511234")
 
 
 @pytest.fixture
@@ -30,12 +56,16 @@ def _issue(cp_stack, connection, **overrides):
         household_id=cp_stack.household.id,
         channel="whatsapp",
         external_id=PHONE,
-        actor_id=ADULT,
+        chat_id=PHONE_CHAT,
         role="adult",
         issued_by_actor_id=OWNER,
         now=BASE_TIME,
     )
     kwargs.update(overrides)
+    # The actor IS the sender, so it follows an overridden `external_id`
+    # instead of being named separately. A helper that let them drift would
+    # hand every caller the binding shape the runtime cannot honour.
+    kwargs.setdefault("actor_id", kwargs["external_id"])
     return cp_stack.bindings.issue_challenge(connection, **kwargs)
 
 
@@ -53,7 +83,9 @@ def test_a_verified_challenge_is_what_writes_the_binding_row(cp_stack) -> None:
                 owner_actor_id=OWNER, now=BASE_TIME + 60
         )
 
-    assert binding.actor_id == ADULT
+    # One identity, read twice: the actor the runtime authorizes IS the
+    # sender the gateway routes by.
+    assert binding.actor_id == binding.external_id == PHONE
     assert binding.role == "adult"
     # The two columns 0007 declared and nothing ever filled.
     assert binding.verified_at == BASE_TIME + 60
@@ -74,7 +106,7 @@ def test_the_raw_code_is_never_stored(cp_stack) -> None:
 
 def test_an_expired_or_reused_challenge_is_refused(cp_stack) -> None:
     with cp_stack.database.write() as connection:
-        expired = _issue(cp_stack, connection, external_id="+999511111111")
+        expired = _issue(cp_stack, connection, external_id="+999511111")
         with pytest.raises(BindingError, match="invalid or expired"):
             cp_stack.bindings.verify_challenge(
                 connection,
@@ -145,7 +177,8 @@ def test_an_external_id_bound_elsewhere_is_refused_at_issue_and_at_verify(
             household_id=second_household,
             channel="whatsapp",
             external_id=PHONE,
-            actor_id="synthetic-other-owner",
+            chat_id=PHONE,
+            actor_id=PHONE,
             now=BASE_TIME,
         )
 
@@ -162,7 +195,8 @@ def test_an_external_id_bound_elsewhere_is_refused_at_issue_and_at_verify(
             household_id=second_household,
             channel="whatsapp",
             external_id=PHONE,
-            actor_id="synthetic-other-owner",
+            chat_id=PHONE,
+            actor_id=PHONE,
             now=BASE_TIME,
         )
         with pytest.raises(BindingError, match="another household"):
@@ -202,15 +236,22 @@ def test_an_already_bound_channel_is_refused_before_a_code_is_sent(
         with pytest.raises(BindingError, match="already bound to that member"):
             _issue(cp_stack, connection)
 
-        # Somebody else's member on a channel this household has bound: the
-        # refusal that stops one person's channel being handed to another.
-        with pytest.raises(BindingError, match="already bound to another member"):
+        # Handing one person's channel to another used to be expressible —
+        # same sender, different actor — and was refused by name. It is no
+        # longer CONSTRUCTIBLE: the actor is the sender, so "a different
+        # member" is a different tuple. The refusal that fires now is the
+        # identity invariant itself, one step earlier. The
+        # "already bound to another member" guards are kept rather than
+        # deleted: they are the fail-closed answer if a sender-to-actor
+        # mapping is ever introduced, which is the design that would make
+        # them reachable again.
+        with pytest.raises(BindingError, match="actor must be the identity"):
             _issue(cp_stack, connection, actor_id="synthetic-third-adult")
 
         rows = cp_stack.bindings.verified(
             connection, household_id=cp_stack.household.id
         )
-    assert [(r.actor_id, r.external_id) for r in rows] == [(ADULT, PHONE)]
+    assert [(r.actor_id, r.external_id) for r in rows] == [(PHONE, PHONE)]
     # Nothing was persisted by either refusal.
     assert cp_stack.database.query(
         "SELECT id FROM channel_binding_challenges WHERE consumed_at IS NULL"
@@ -257,7 +298,13 @@ def test_the_retention_sweep_retires_a_challenge_nobody_answered(cp_stack) -> No
 from control_plane.models import StepKind  # noqa: E402
 from control_plane.provisioning.manifest import DesiredHouseholdSpecV1  # noqa: E402
 from control_plane.provisioning.manifest_toml import manifest_to_toml  # noqa: E402
+from hermes_cloud.core.runcontext import Household  # noqa: E402
 from hermes_cloud.core.runtime_manifest import parse_runtime_manifest  # noqa: E402
+from hermes_cloud.ingest.whatsapp_webhook import (  # noqa: E402
+    WhatsAppInbound,
+    as_eml,
+    trusted_run_context,
+)
 from tests.control_plane.test_manifest import (  # noqa: E402
     CHANNEL_SELECTION,
     EMAIL_SELECTION,
@@ -317,8 +364,14 @@ def test_the_owners_binding_is_seeded_into_the_table_planning_writes_it(
     rows = cp_stack.database.query("SELECT * FROM channel_bindings")
     assert len(rows) == 1
     assert rows[0]["role"] == "owner"
+    # Three names, each from the field that means it: the owner's SENDER is
+    # onboarding's `actor_id` — which becomes `actors.owner` and is what
+    # `message.from.id` is compared against — and the CHAT is its `chat_id`.
+    # Seeding the sender column from the chat was the other half of the
+    # conflation, and M1 of the plan wrongly called it uncorrectable.
     assert rows[0]["actor_id"] == CHANNEL_SELECTION["actor_id"]
-    assert rows[0]["external_id"] == CHANNEL_SELECTION["chat_id"]
+    assert rows[0]["external_id"] == CHANNEL_SELECTION["actor_id"]
+    assert rows[0]["chat_id"] == CHANNEL_SELECTION["chat_id"]
     # And the manifest is the same fact, not a second one.
     assert spec.actors.owner == CHANNEL_SELECTION["actor_id"]
     assert spec.actors.family == (CHANNEL_SELECTION["actor_id"],)
@@ -327,65 +380,140 @@ def test_the_owners_binding_is_seeded_into_the_table_planning_writes_it(
     ]
 
 
-def test_an_adult_on_the_primary_channel_is_refused_because_the_store_cannot_hold_one(
+def test_two_members_share_one_chat_and_the_revision_still_starts(
     cp_stack,
 ) -> None:
-    """The limit C3 stops at, and the reason, both pinned.
+    """C3a's whole point, as one case: the arrangement the store could not hold.
 
-    `channel_bindings.external_id` answers two questions at once: the gateway
-    matches it against a SENDER, the planner projects it as the manifest's
-    `chat_id`. For the owner they coincide. For a second adult on that channel
-    they cannot — the household's chat collides with the owner's row under
-    `UNIQUE (household_id, channel, external_id)`, and an identity of their own
-    makes the projection emit two verified chats for the primary channel, which
-    the runtime refuses outright.
+    This replaces `test_an_adult_on_the_primary_channel_is_refused_because_
+    the_store_cannot_hold_one`, deleted rather than skipped. That test
+    documented a limitation, and a test that documents a limitation must die
+    with the limitation — leaving it skipped would keep asserting that the
+    refusal is the correct behaviour.
 
-    So it is refused where someone asks for it, rather than written and left to
-    fail at a deployment nobody is watching.
+    An owner and an adult with DISTINCT sender identities in the SAME Telegram
+    chat. Before the split that was two impossible shapes and no third option:
+    the household's chat collided with the owner's row under `UNIQUE
+    (household_id, channel, external_id)`, and an identity of their own made
+    the projection emit two verified chats for the primary channel, which the
+    runtime refused with `channels.primary: multiple chats`.
+
+    It is round-tripped through the REAL runtime parser and not asserted
+    against `DesiredHouseholdSpecV1` alone. A manifest has two contracts, and
+    checking only the control plane's is exactly how an unstartable revision
+    looked green in C3.
     """
     _provisioned(cp_stack)
-    # The household's own chat is already bound to the owner, so that shape is
-    # now refused before a code exists at all.
-    with (
-        cp_stack.database.write() as connection,
-        pytest.raises(BindingError, match="already bound to another member"),
-    ):
-        cp_stack.bindings.issue_challenge(
-                connection,
-                household_id=cp_stack.household.id,
-                channel=CHANNEL_SELECTION["kind"],
-                external_id=CHANNEL_SELECTION["chat_id"],
-                actor_id=ADULT,
-                role="adult",
-                issued_by_actor_id=CHANNEL_SELECTION["actor_id"],
-                now=BASE_TIME + 100,
-            )
+    household_chat = CHANNEL_SELECTION["chat_id"]
 
-    # A chat of their own reaches verification, and is refused there because
-    # the manifest could not hold it.
-    for external_id in ("synthetic-a-chat-of-their-own",):
-        with cp_stack.database.write() as connection:
+    with cp_stack.database.write() as connection:
+        issued = cp_stack.bindings.issue_challenge(
+            connection,
+            household_id=cp_stack.household.id,
+            channel=CHANNEL_SELECTION["kind"],
+            # A sender of their own — a Telegram user ID is not a chat ID —
+            # speaking in the chat the household already has.
+            external_id=ADULT,
+            chat_id=household_chat,
+            actor_id=ADULT,
+            role="adult",
+            issued_by_actor_id=CHANNEL_SELECTION["actor_id"],
+            now=BASE_TIME + 100,
+        )
+        binding = cp_stack.bindings.verify_challenge(
+            connection,
+            code=issued.code,
+            household_id=cp_stack.household.id,
+            owner_actor_id=CHANNEL_SELECTION["actor_id"],
+            now=BASE_TIME + 200,
+        )
+        cp_stack.make_worker().planner.issue(
+            connection, household_id=cp_stack.household.id
+        )
+
+    # The row says both things, and says them separately.
+    assert (binding.external_id, binding.chat_id) == (ADULT, household_chat)
+
+    spec = DesiredHouseholdSpecV1.model_validate(
+        cp_stack.configs.manifest(cp_stack.household.id, 2)
+    )
+    assert spec.actors.family == (CHANNEL_SELECTION["actor_id"], ADULT)
+
+    runtime = parse_runtime_manifest(manifest_to_toml(spec))
+    # Two members, one conversation, one review surface — and the review
+    # surface is the OWNER's chat because that is what designates it now,
+    # rather than the manifest happening to carry exactly one chat.
+    assert runtime.primary_chat_id == household_chat
+    assert runtime.verified_actor_chat_pairs == frozenset({
+        (CHANNEL_SELECTION["actor_id"], household_chat),
+        (ADULT, household_chat),
+    })
+
+
+def test_relaxing_uniqueness_did_not_relax_the_pair_check(cp_stack) -> None:
+    """Cross-pair denial, which is the property most likely to be lost here.
+
+    `chat_id` stopped being part of any unique key, so the store no longer
+    objects to a member in a second conversation. Authorization must, and it is
+    a PAIR that authorizes: an actor verified in one chat is not verified in
+    another, and the owner is not authorized in the adult's private thread just
+    because they own the household.
+    """
+    _provisioned(cp_stack)
+    household_chat = CHANNEL_SELECTION["chat_id"]
+    owner = CHANNEL_SELECTION["actor_id"]
+
+    with cp_stack.database.write() as connection:
+        for external_id, chat_id in (
+            (ADULT, household_chat),
+            # The same adult, a second binding, a private thread of their own.
+            # Sender and conversation are deliberately different strings.
+            (PHONE, PHONE_CHAT),
+        ):
             issued = cp_stack.bindings.issue_challenge(
                 connection,
                 household_id=cp_stack.household.id,
-                channel=CHANNEL_SELECTION["kind"],
+                channel=(
+                    CHANNEL_SELECTION["kind"] if chat_id == household_chat
+                    else "whatsapp"
+                ),
                 external_id=external_id,
-                actor_id=ADULT,
+                chat_id=chat_id,
+                actor_id=external_id,
                 role="adult",
-                issued_by_actor_id=CHANNEL_SELECTION["actor_id"],
+                issued_by_actor_id=owner,
                 now=BASE_TIME + 100,
             )
-            with pytest.raises(BindingError, match="primary"):
-                cp_stack.bindings.verify_challenge(
-                    connection,
-                    code=issued.code,
-                    household_id=cp_stack.household.id,
-                    owner_actor_id=CHANNEL_SELECTION["actor_id"],
-                    now=BASE_TIME + 200,
-                )
-            assert cp_stack.database.query(
-                "SELECT id FROM channel_bindings WHERE actor_id = ?", (ADULT,)
-            ) == []
+            cp_stack.bindings.verify_challenge(
+                connection,
+                code=issued.code,
+                household_id=cp_stack.household.id,
+                owner_actor_id=owner,
+                now=BASE_TIME + 200,
+            )
+        cp_stack.make_worker().planner.issue(
+            connection, household_id=cp_stack.household.id
+        )
+
+    spec = DesiredHouseholdSpecV1.model_validate(
+        cp_stack.configs.manifest(cp_stack.household.id, 2)
+    )
+    runtime = parse_runtime_manifest(manifest_to_toml(spec))
+
+    # `Household.knows_binding` is a membership test on exactly this set, and
+    # `tests/test_runcontext.py` exercises the denial through it. What belongs
+    # HERE is that the projection still produces pairs and not a widened chat
+    # allowlist — the pair is the only thing standing between "chat_id may now
+    # repeat" and "any known actor is authorized in any known chat".
+    assert runtime.verified_actor_chat_pairs == frozenset({
+        (owner, household_chat),
+        (ADULT, household_chat),
+        (PHONE, PHONE_CHAT),
+    })
+    assert (owner, PHONE_CHAT) not in runtime.verified_actor_chat_pairs
+    # `allowed_chats` widened, exactly as the plan said it would. It is now the
+    # weaker check, and nothing authorizes from it while pairs are present.
+    assert runtime.allowed_chats == frozenset({household_chat, PHONE_CHAT})
 
 
 def test_an_adult_on_another_channel_is_bound_and_the_runtime_can_start_it(
@@ -406,8 +534,9 @@ def test_an_adult_on_another_channel_is_bound_and_the_runtime_can_start_it(
             connection,
             household_id=cp_stack.household.id,
             channel="whatsapp",
-            external_id="+999511234567",
-            actor_id=ADULT,
+            external_id="+999511234",
+            chat_id=_jid("+999511234"),
+            actor_id="+999511234",
             role="adult",
             issued_by_actor_id=CHANNEL_SELECTION["actor_id"],
             now=BASE_TIME + 100,
@@ -426,14 +555,18 @@ def test_an_adult_on_another_channel_is_bound_and_the_runtime_can_start_it(
     spec = DesiredHouseholdSpecV1.model_validate(
         cp_stack.configs.manifest(cp_stack.household.id, 2)
     )
-    assert spec.actors.family == (CHANNEL_SELECTION["actor_id"], ADULT)
+    assert spec.actors.family == (CHANNEL_SELECTION["actor_id"], PHONE)
 
     runtime = parse_runtime_manifest(manifest_to_toml(spec))
     # One chat to speak into; the adult authorized from their own channel.
     assert runtime.primary_chat_id == CHANNEL_SELECTION["chat_id"]
     assert runtime.verified_actor_chat_pairs == frozenset({
         (CHANNEL_SELECTION["actor_id"], CHANNEL_SELECTION["chat_id"]),
-        (ADULT, "+999511234567"),
+        # The pair is (sender, conversation) and the two are different strings
+        # on WhatsApp. This assertion used to read `(ADULT, "+999511234")`,
+        # which is the shape `trusted_run_context` can never see: it compares
+        # the +-normalized actor against the provider's `remote_jid`.
+        (PHONE, PHONE_CHAT),
     })
 
 
@@ -474,12 +607,14 @@ def test_reprovisioning_the_primary_channel_retires_what_it_replaces(
     with cp_stack.database.write() as connection:
         cp_stack.bindings.ensure_owner_binding(
             connection, household_id=hid, channel="telegram",
-            external_id="synthetic-chat-one", actor_id=OWNER, now=BASE_TIME,
+            external_id="synthetic-chat-one", actor_id="synthetic-chat-one", now=BASE_TIME,
+            chat_id="synthetic-chat-one",
         )
         # Re-onboarded onto a different chat on the same channel.
         cp_stack.bindings.ensure_owner_binding(
             connection, household_id=hid, channel="telegram",
-            external_id="synthetic-chat-two", actor_id=OWNER, now=BASE_TIME + 10,
+            external_id="synthetic-chat-two", actor_id="synthetic-chat-two", now=BASE_TIME + 10,
+            chat_id="synthetic-chat-two",
         )
         rows = cp_stack.bindings.verified(connection, household_id=hid)
 
@@ -491,7 +626,8 @@ def test_reprovisioning_the_primary_channel_retires_what_it_replaces(
     with cp_stack.database.write() as connection:
         cp_stack.bindings.ensure_owner_binding(
             connection, household_id=hid, channel="whatsapp",
-            external_id=PHONE, actor_id=OWNER, now=BASE_TIME + 20,
+            external_id=PHONE, actor_id=PHONE, now=BASE_TIME + 20,
+            chat_id=PHONE,
         )
     remaining = cp_stack.database.query(
         "SELECT channel, external_id FROM channel_bindings WHERE household_id = ?",
@@ -513,11 +649,13 @@ def test_reprovisioning_drops_outstanding_challenges_and_dependent_adults(
     with cp_stack.database.write() as connection:
         cp_stack.bindings.ensure_owner_binding(
             connection, household_id=hid, channel="telegram",
-            external_id="synthetic-chat-one", actor_id=OWNER, now=BASE_TIME,
+            external_id="synthetic-chat-one", actor_id="synthetic-chat-one", now=BASE_TIME,
+            chat_id="synthetic-chat-one",
         )
         issued = cp_stack.bindings.issue_challenge(
             connection, household_id=hid, channel="whatsapp", external_id=PHONE,
-            actor_id=ADULT, role="adult", issued_by_actor_id=OWNER, now=BASE_TIME,
+                                                                          chat_id=PHONE_CHAT,
+            actor_id=PHONE, role="adult", issued_by_actor_id=OWNER, now=BASE_TIME,
         )
         cp_stack.bindings.verify_challenge(
             connection, code=issued.code, household_id=hid,
@@ -525,14 +663,16 @@ def test_reprovisioning_drops_outstanding_challenges_and_dependent_adults(
         )
         pending = cp_stack.bindings.issue_challenge(
             connection, household_id=hid, channel="whatsapp",
-            external_id="+999511119999", actor_id="synthetic-third",
+            external_id="+999511119", actor_id="+999511119",
+            chat_id=_jid("+999511119"),
             role="adult", issued_by_actor_id=OWNER, now=BASE_TIME + 6,
         )
         # The household moves its primary channel onto WhatsApp, where that
         # adult already sits.
         cp_stack.bindings.ensure_owner_binding(
             connection, household_id=hid, channel="whatsapp",
-            external_id="+999511230000", actor_id=OWNER, now=BASE_TIME + 20,
+            external_id="+999511230", actor_id="+999511230", now=BASE_TIME + 20,
+            chat_id=_jid("+999511230"),
         )
         rows = cp_stack.bindings.verified(connection, household_id=hid)
         # The outstanding code no longer redeems.
@@ -543,34 +683,53 @@ def test_reprovisioning_drops_outstanding_challenges_and_dependent_adults(
             )
 
     assert [(r.channel, r.external_id, r.role) for r in rows] == [
-        ("whatsapp", "+999511230000", "owner")
+        ("whatsapp", "+999511230", "owner")
     ]
 
 
 # --- review follow-ups: four findings that arrived after the last fix ------
 
 
-def test_one_actor_with_several_bindings_is_one_family_member(cp_stack) -> None:
+def test_the_owner_appears_in_family_once_though_two_things_name_them(
+    cp_stack,
+) -> None:
     """`family` was built per BINDING, not per actor.
 
-    `verify_challenge` lets one actor hold several bindings — an adult
-    reachable on WhatsApp and on web is two rows and one person — so the
-    projection emitted `family=(owner, adult, adult)`, which the runtime
-    rejects as `actors.family: duplicate actor`. Another revision that cannot
-    start, reached by a different route than the primary-channel one.
+    The projection is `(actors.owner, *every binding's actor)`, and the owner
+    is BOTH — so without `dict.fromkeys` it emitted `family=(owner, owner, …)`,
+    which the runtime rejects as `actors.family: duplicate actor`. A revision
+    that cannot start.
+
+    This case used to be written as one adult reachable on two channels, and
+    that shape is no longer expressible — worth recording, because it is a
+    real consequence of the identity invariant rather than a test being
+    tidied. An actor IS a transport sender, so the same human on WhatsApp and
+    on web has two sender identities and is two members of `family`. The
+    system has no cross-channel notion of a person; inventing internal actor
+    names in the control plane made it look as though it did, and that
+    appearance was the defect. Giving one person one identity across channels
+    is the sender-to-actor mapping design C3a deliberately does not build.
     """
     _provisioned(cp_stack)
     with cp_stack.database.write() as connection:
-        for channel, external_id in (
-            ("whatsapp", "+999511234567"),
+        # Distinct verification times on purpose. `verified()` orders by
+        # `(verified_at, id)`, and `id` is a fresh UUID — so two bindings
+        # verified in the same instant are ordered by a value nothing chose,
+        # and asserting their order would be asserting something the
+        # projection does not promise. It is stable for a given database,
+        # which is what `config_sha256` needs; it is not predictable across
+        # them, which is what a test would need.
+        for offset, (channel, external_id) in enumerate((
+            ("whatsapp", "+999511234"),
             ("web", "synthetic-web-seat"),
-        ):
+        )):
             issued = cp_stack.bindings.issue_challenge(
                 connection,
                 household_id=cp_stack.household.id,
                 channel=channel,
                 external_id=external_id,
-                actor_id=ADULT,
+                chat_id=external_id,
+                actor_id=external_id,
                 role="adult",
                 issued_by_actor_id=CHANNEL_SELECTION["actor_id"],
                 now=BASE_TIME + 100,
@@ -580,7 +739,7 @@ def test_one_actor_with_several_bindings_is_one_family_member(cp_stack) -> None:
                 code=issued.code,
                 household_id=cp_stack.household.id,
                 owner_actor_id=CHANNEL_SELECTION["actor_id"],
-                now=BASE_TIME + 200,
+                now=BASE_TIME + 200 + offset,
             )
         cp_stack.make_worker().planner.issue(
             connection, household_id=cp_stack.household.id
@@ -589,29 +748,46 @@ def test_one_actor_with_several_bindings_is_one_family_member(cp_stack) -> None:
     spec = DesiredHouseholdSpecV1.model_validate(
         cp_stack.configs.manifest(cp_stack.household.id, 2)
     )
-    assert spec.actors.family == (CHANNEL_SELECTION["actor_id"], ADULT)
-    # Two bindings, one member — and the runtime accepts it.
+    # The owner once, then each adult sender in verification order — and the
+    # owner is not repeated despite `actors.owner` and their own binding both
+    # naming them.
+    assert spec.actors.family == (
+        CHANNEL_SELECTION["actor_id"], PHONE, "synthetic-web-seat",
+    )
     assert len(spec.channel_bindings) == 3
+    # Two senders, two members: the honest projection of what the runtime can
+    # actually tell apart.
+    assert len(set(spec.actors.family)) == len(spec.actors.family)
     parse_runtime_manifest(manifest_to_toml(spec))
 
 
-def test_seeding_reconciles_role_and_actor_not_just_the_tuple(cp_stack) -> None:
+def test_seeding_reconciles_the_whole_row_not_just_the_tuple(cp_stack) -> None:
     """The early return matched `(channel, external_id)` whatever the row WAS.
 
-    Reproduced twice: re-onboarding onto a tuple an ADULT holds wrote no owner
-    binding at all while the stale owner row survived on the channel the
-    household had just left; and an owner whose ACTOR changed during reset
-    never became authoritative.
+    Two shapes slipped past reconciliation. Re-onboarding onto a tuple an
+    ADULT holds wrote no owner binding at all, while the stale owner row
+    survived on the channel the household had just left. And the owner's CHAT
+    could change while their sender stayed the same — a family moving to a new
+    Telegram group keeps its user IDs — which left the household's review
+    surface pointing at the conversation it had just left.
+
+    The second case used to be written as "the ACTOR changed while the tuple
+    stayed the same". Under the identity invariant that cannot happen: the
+    actor is the sender, so an actor change IS a tuple change and takes the
+    ordinary reset path. The chat is now the field that can move underneath a
+    matching tuple, and it is the one that must be reconciled.
     """
     hid = cp_stack.household.id
     with cp_stack.database.write() as connection:
         cp_stack.bindings.ensure_owner_binding(
             connection, household_id=hid, channel="telegram",
-            external_id="synthetic-chat-one", actor_id=OWNER, now=BASE_TIME,
+            external_id="synthetic-chat-one", actor_id="synthetic-chat-one", now=BASE_TIME,
+            chat_id="synthetic-chat-one",
         )
         issued = cp_stack.bindings.issue_challenge(
             connection, household_id=hid, channel="whatsapp", external_id=PHONE,
-            actor_id=ADULT, role="adult", issued_by_actor_id=OWNER, now=BASE_TIME,
+                                                                          chat_id=PHONE_CHAT,
+            actor_id=PHONE, role="adult", issued_by_actor_id=OWNER, now=BASE_TIME,
         )
         cp_stack.bindings.verify_challenge(
             connection, code=issued.code, household_id=hid,
@@ -620,24 +796,29 @@ def test_seeding_reconciles_role_and_actor_not_just_the_tuple(cp_stack) -> None:
         # 1. The owner re-onboards onto the tuple the adult holds.
         cp_stack.bindings.ensure_owner_binding(
             connection, household_id=hid, channel="whatsapp",
-            external_id=PHONE, actor_id=OWNER, now=BASE_TIME + 10,
+            external_id=PHONE, actor_id=PHONE, now=BASE_TIME + 10,
+            chat_id=PHONE,
         )
         rows = cp_stack.bindings.verified(connection, household_id=hid)
 
+    # The adult's row is gone and the owner holds the tuple, as the owner —
+    # not merged into whatever the previous row said.
     assert [(r.channel, r.external_id, r.actor_id, r.role) for r in rows] == [
-        ("whatsapp", PHONE, OWNER, "owner")
+        ("whatsapp", PHONE, PHONE, "owner")
     ]
 
-    # 2. The actor changes while the chat stays the same.
+    # 2. The chat moves while the sender stays put: the family keeps its
+    #    WhatsApp number and the assistant is pointed at a new conversation.
     with cp_stack.database.write() as connection:
         cp_stack.bindings.ensure_owner_binding(
             connection, household_id=hid, channel="whatsapp",
-            external_id=PHONE, actor_id="synthetic-owner-renamed", now=BASE_TIME + 20,
+            external_id=PHONE, actor_id=PHONE, now=BASE_TIME + 20,
+            chat_id="999511230@g.whatsapp.invalid",
         )
         rows = cp_stack.bindings.verified(connection, household_id=hid)
 
-    assert [(r.actor_id, r.role) for r in rows] == [
-        ("synthetic-owner-renamed", "owner")
+    assert [(r.actor_id, r.chat_id, r.role) for r in rows] == [
+        (PHONE, "999511230@g.whatsapp.invalid", "owner")
     ]
 
 
@@ -656,18 +837,22 @@ def test_a_household_cannot_grow_challenges_or_bindings_without_end(
     with cp_stack.database.write() as connection:
         cp_stack.bindings.ensure_owner_binding(
             connection, household_id=hid, channel="telegram",
-            external_id="synthetic-chat", actor_id=OWNER, now=BASE_TIME,
+            external_id="synthetic-chat", actor_id="synthetic-chat", now=BASE_TIME,
+            chat_id="synthetic-chat",
         )
         for index in range(MAX_OPEN_CHALLENGES):
+            phone = f"+{999110000 + index}"
             cp_stack.bindings.issue_challenge(
                 connection, household_id=hid, channel="whatsapp",
-                external_id=f"+99951100{index:04d}", actor_id=f"synthetic-a{index}",
+                external_id=phone, actor_id=phone,
+                chat_id=_jid(phone),
                 role="adult", issued_by_actor_id=OWNER, now=BASE_TIME,
             )
         with pytest.raises(BindingError, match="outstanding challenges"):
             cp_stack.bindings.issue_challenge(
                 connection, household_id=hid, channel="whatsapp",
-                external_id="+999511009999", actor_id="synthetic-one-too-many",
+                external_id="+999110999", actor_id="+999110999",
+                chat_id=_jid("+999110999"),
                 role="adult", issued_by_actor_id=OWNER, now=BASE_TIME,
             )
 
@@ -675,9 +860,11 @@ def test_a_household_cannot_grow_challenges_or_bindings_without_end(
         # however the row was reached.
         connection.execute("DELETE FROM channel_binding_challenges")
         for index in range(MAX_BINDINGS - 1):
+            phone = f"+{999119000 + index}"
             issued = cp_stack.bindings.issue_challenge(
                 connection, household_id=hid, channel="whatsapp",
-                external_id=f"+99951199{index:04d}", actor_id=f"synthetic-b{index}",
+                external_id=phone, actor_id=phone,
+                chat_id=_jid(phone),
                 role="adult", issued_by_actor_id=OWNER, now=BASE_TIME,
             )
             cp_stack.bindings.verify_challenge(
@@ -686,7 +873,8 @@ def test_a_household_cannot_grow_challenges_or_bindings_without_end(
             )
         over = cp_stack.bindings.issue_challenge(
             connection, household_id=hid, channel="whatsapp",
-            external_id="+999511998888", actor_id="synthetic-last",
+            external_id="+999119888", actor_id="+999119888",
+            chat_id=_jid("+999119888"),
             role="adult", issued_by_actor_id=OWNER, now=BASE_TIME,
         )
         with pytest.raises(BindingError, match="as many bindings"):
@@ -708,16 +896,19 @@ def test_redeeming_one_invitation_leaves_the_others_standing(cp_stack) -> None:
     with cp_stack.database.write() as connection:
         cp_stack.bindings.ensure_owner_binding(
             connection, household_id=hid, channel="telegram",
-            external_id="synthetic-chat", actor_id=OWNER, now=BASE_TIME,
+            external_id="synthetic-chat", actor_id="synthetic-chat", now=BASE_TIME,
+            chat_id="synthetic-chat",
         )
         first = cp_stack.bindings.issue_challenge(
             connection, household_id=hid, channel="whatsapp",
-            external_id="+999511110001", actor_id="synthetic-adult-a",
+            external_id="+999511101", actor_id="+999511101",
+            chat_id=_jid("+999511101"),
             role="adult", issued_by_actor_id=OWNER, now=BASE_TIME,
         )
         second = cp_stack.bindings.issue_challenge(
             connection, household_id=hid, channel="whatsapp",
-            external_id="+999511110002", actor_id="synthetic-adult-b",
+            external_id="+999511102", actor_id="+999511102",
+            chat_id=_jid("+999511102"),
             role="adult", issued_by_actor_id=OWNER, now=BASE_TIME,
         )
         cp_stack.bindings.verify_challenge(
@@ -728,7 +919,8 @@ def test_redeeming_one_invitation_leaves_the_others_standing(cp_stack) -> None:
         # provisioning worker do routinely.
         cp_stack.bindings.ensure_owner_binding(
             connection, household_id=hid, channel="telegram",
-            external_id="synthetic-chat", actor_id=OWNER, now=BASE_TIME + 2,
+            external_id="synthetic-chat", actor_id="synthetic-chat", now=BASE_TIME + 2,
+            chat_id="synthetic-chat",
         )
         # The second invitation is still redeemable.
         bound = cp_stack.bindings.verify_challenge(
@@ -736,19 +928,21 @@ def test_redeeming_one_invitation_leaves_the_others_standing(cp_stack) -> None:
             owner_actor_id=OWNER, now=BASE_TIME + 3,
         )
 
-    assert bound.actor_id == "synthetic-adult-b"
+    assert bound.actor_id == bound.external_id == "+999511102"
 
     # A real owner-state change still invalidates them, which is the only case
     # where the generation actually moved.
     with cp_stack.database.write() as connection:
         pending = cp_stack.bindings.issue_challenge(
             connection, household_id=hid, channel="web",
-            external_id="synthetic-web-seat", actor_id="synthetic-adult-c",
+            external_id="synthetic-web-seat", actor_id="synthetic-web-seat",
+            chat_id="synthetic-web-seat",
             role="adult", issued_by_actor_id=OWNER, now=BASE_TIME + 4,
         )
         cp_stack.bindings.ensure_owner_binding(
             connection, household_id=hid, channel="telegram",
-            external_id="synthetic-a-different-chat", actor_id=OWNER,
+            external_id="synthetic-a-different-chat", actor_id="synthetic-a-different-chat",
+            chat_id="synthetic-a-different-chat",
             now=BASE_TIME + 5,
         )
         with pytest.raises(BindingError, match="invalid or expired"):
@@ -800,7 +994,8 @@ def test_verifying_a_binding_schedules_the_rollout_and_leaves_onboarding_alone(
             household_id=cp_stack.household.id,
             channel="whatsapp",
             external_id=PHONE,
-            actor_id=ADULT,
+            chat_id=PHONE_CHAT,
+            actor_id=PHONE,
             role="adult",
             issued_by_actor_id=CHANNEL_SELECTION["actor_id"],
             now=BASE_TIME + 100,
@@ -847,3 +1042,209 @@ def test_verifying_a_binding_schedules_the_rollout_and_leaves_onboarding_alone(
     after = cp_stack.onboarding.snapshot(cp_stack.household.id)
     assert after.state.value == "complete"
     assert after.current_step == before.current_step
+
+
+def test_a_bound_whatsapp_member_is_authorized_by_a_real_inbound_turn(
+    cp_stack,
+) -> None:
+    """A stored `chat_id` is only worth anything if ingest produces that string.
+
+    The first cut of C3a let `chat_id` default to `external_id`, documented as
+    "the truth for WhatsApp, where a 1:1 thread IS the number". It is not the
+    truth in this system, and Codex blocked the PR for it:
+    `hermes_cloud/ingest/whatsapp_webhook.py` normalizes the SENDER to `+999…`
+    and reports the CHAT as the provider's `remote_jid`, `999…@s.whatsapp.invalid`.
+    `trusted_run_context` then authorizes that exact pair by string. A binding
+    written as `(+999…, +999…)` therefore succeeded, published a revision, and
+    was unknown to every real message that followed.
+
+    So the assertion is made through the ACTUAL ingest path — a webhook-shaped
+    inbound, rendered by `as_eml`, read back by `trusted_run_context` — rather
+    than against a pair this test made up. A control-plane test that invents
+    both halves of the comparison cannot notice that neither matches reality.
+    """
+    _provisioned(cp_stack)
+    owner = CHANNEL_SELECTION["actor_id"]
+
+    with cp_stack.database.write() as connection:
+        issued = cp_stack.bindings.issue_challenge(
+            connection,
+            household_id=cp_stack.household.id,
+            channel="whatsapp",
+            external_id=PHONE,
+            chat_id=PHONE_CHAT,
+            actor_id=PHONE,
+            role="adult",
+            issued_by_actor_id=owner,
+            now=BASE_TIME + 100,
+        )
+        cp_stack.bindings.verify_challenge(
+            connection,
+            code=issued.code,
+            household_id=cp_stack.household.id,
+            owner_actor_id=owner,
+            now=BASE_TIME + 200,
+        )
+        cp_stack.make_worker().planner.issue(
+            connection, household_id=cp_stack.household.id
+        )
+
+    spec = DesiredHouseholdSpecV1.model_validate(
+        cp_stack.configs.manifest(cp_stack.household.id, 2)
+    )
+    manifest = parse_runtime_manifest(manifest_to_toml(spec))
+    household = Household(
+        household_id=manifest.household_id,
+        owner=manifest.actors.owner,
+        family=manifest.actors.family,
+        guests=manifest.actors.guests,
+        allowed_chats=manifest.allowed_chats,
+        verified_bindings=manifest.verified_actor_chat_pairs,
+    )
+
+    raw = as_eml(
+        WhatsAppInbound(
+            message_id="synthetic-wa-1",
+            chat_id=PHONE_CHAT,
+            actor_id=PHONE,
+            text="я заберу его в пятницу",
+            display_name=None,
+            instance="synthetic-instance",
+        )
+    )
+    context = trusted_run_context(raw, household)
+
+    # The CHAT the control plane stored is the string ingest produces, so the
+    # chat half of the authorization pair matches a real turn...
+    assert context.chat_id == PHONE_CHAT
+    assert (PHONE, context.chat_id) in manifest.verified_actor_chat_pairs
+    # ...and the string the removed default would have stored does not. This is
+    # the assertion that fails against the first cut of this slice.
+    assert context.chat_id != PHONE
+    assert (PHONE, PHONE) not in manifest.verified_actor_chat_pairs
+    assert PHONE not in household.allowed_chats
+
+    # And the ACTOR half, which was the second [BLOCKER] and is now closed:
+    # `trusted_run_context` reports the channel sender, `channel_bindings`
+    # stores that same sender as the actor, so the pair matches end to end and
+    # the member is a known family member rather than an unknown.
+    assert context.actor_id == PHONE
+    assert household.knows_binding(context.actor_id, context.chat_id), (
+        "the binding the control plane wrote must authorize the turn the"
+        " runtime actually receives — both halves of the pair, not one"
+    )
+    assert context.role != "unknown"
+
+
+def test_a_challenge_cannot_borrow_the_sender_as_its_chat(cp_stack) -> None:
+    """`chat_id` is required, and no longer defaulted from `external_id`.
+
+    Requiring it is the fix rather than deriving it: the control plane does not
+    own WhatsApp's JID format, and a derivation right for a 1:1 thread
+    (`@s.whatsapp.invalid`) is wrong for a group (`@g.us`) — which is the shared
+    conversation this whole slice exists to allow. A guess that answers the
+    chat question from the sender is the conflation C3a removed, rebuilt one
+    layer up.
+    """
+    _provisioned(cp_stack)
+    with cp_stack.database.write() as connection:
+        with pytest.raises(TypeError, match="chat_id"):
+            cp_stack.bindings.issue_challenge(
+                connection,
+                household_id=cp_stack.household.id,
+                channel="whatsapp",
+                external_id=PHONE,
+                actor_id=PHONE,
+                role="adult",
+                issued_by_actor_id=CHANNEL_SELECTION["actor_id"],
+                now=BASE_TIME + 100,
+            )
+        with pytest.raises(BindingError, match="chat ID is required"):
+            cp_stack.bindings.issue_challenge(
+                connection,
+                household_id=cp_stack.household.id,
+                channel="whatsapp",
+                external_id=PHONE,
+                chat_id="   ",
+                actor_id=PHONE,
+                role="adult",
+                issued_by_actor_id=CHANNEL_SELECTION["actor_id"],
+                now=BASE_TIME + 100,
+            )
+
+
+def test_a_padded_identity_is_stored_as_the_string_ingest_produces(
+    cp_stack,
+) -> None:
+    """Whitespace is not a variant of an identity; it is a different string.
+
+    `Household.knows_binding` compares by string and every ingest path strips
+    before it reports — `whatsapp_webhook._text` returns `value.strip()`. So a
+    binding stored as `"999…@g.us "` issues, verifies, publishes a revision and
+    schedules a rollout, and then matches nothing: another arrangement that
+    succeeds at every layer the control plane can see and fails at the only one
+    that matters.
+
+    Canonicalizing happens BEFORE the uniqueness checks, which is the half that
+    is easy to get wrong. `_reject_foreign_holder` and the already-bound lookup
+    both compare by string, so a padded duplicate of a bound sender would slip
+    past them and land as a second row for one identity.
+    """
+    _provisioned(cp_stack)
+    owner = CHANNEL_SELECTION["actor_id"]
+    chat = CHANNEL_SELECTION["chat_id"]
+
+    with cp_stack.database.write() as connection:
+        issued = cp_stack.bindings.issue_challenge(
+            connection,
+            household_id=cp_stack.household.id,
+            channel=CHANNEL_SELECTION["kind"],
+            external_id=f"  {ADULT}\n",
+            chat_id=f"\t{chat} ",
+            actor_id=f" {ADULT}  ",
+            role="adult",
+            issued_by_actor_id=owner,
+            now=BASE_TIME + 100,
+        )
+        binding = cp_stack.bindings.verify_challenge(
+            connection,
+            code=issued.code,
+            household_id=cp_stack.household.id,
+            owner_actor_id=owner,
+            now=BASE_TIME + 200,
+        )
+        # Stored canonical, so the row says what ingest will say.
+        assert (binding.external_id, binding.chat_id, binding.actor_id) == (
+            ADULT, chat, ADULT,
+        )
+        # And the padded form is not a second identity: re-inviting the same
+        # sender with different padding is refused as already bound, not
+        # written beside it.
+        with pytest.raises(BindingError, match="already bound"):
+            cp_stack.bindings.issue_challenge(
+                connection,
+                household_id=cp_stack.household.id,
+                channel=CHANNEL_SELECTION["kind"],
+                external_id=f"{ADULT} ",
+                chat_id=chat,
+                actor_id=f"{ADULT} ",
+                role="adult",
+                issued_by_actor_id=owner,
+                now=BASE_TIME + 300,
+            )
+        # An identity that is only whitespace is nothing at all.
+        for field, kwargs in (
+            ("external ID", {"external_id": "   ", "chat_id": chat}),
+            ("chat ID", {"external_id": "990000007", "chat_id": "  "}),
+        ):
+            with pytest.raises(BindingError, match=f"{field} is required"):
+                cp_stack.bindings.issue_challenge(
+                    connection,
+                    household_id=cp_stack.household.id,
+                    channel=CHANNEL_SELECTION["kind"],
+                    actor_id=kwargs["external_id"],
+                    role="adult",
+                    issued_by_actor_id=owner,
+                    now=BASE_TIME + 400,
+                    **kwargs,
+                )

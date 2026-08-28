@@ -98,9 +98,30 @@ ALTER TABLE channel_bindings ADD COLUMN chat_id TEXT;
 | `external_id` | the **sender's** identity on this channel — Telegram user ID, WhatsApp phone, web account ref | `gateway/whatsapp_router.py` matching an inbound sender |
 | `chat_id` | the **conversation** this binding speaks in | the manifest projection, and `verified_actor_chat_pairs` |
 
-For WhatsApp the two coincide (a 1:1 thread *is* that number) and the migration
-writes them equal. For Telegram they differ: the sender is a user ID, the chat
-is a group. Today's rows hold the CHAT in `external_id` for the owner, because
+For Telegram they differ: the sender is a user ID, the chat is a group.
+
+**Correction, 2026-08-28 (Codex `[BLOCKER]` on #76).** This section originally
+said the two *coincide* for WhatsApp, "a 1:1 thread is that number", and drew
+the conclusion that a caller may omit `chat_id` and have it default to
+`external_id`. That is false in this system and the conclusion was a live
+defect. `hermes_cloud/ingest/whatsapp_webhook.py` normalizes the SENDER to
+`+999…` and reports the CHAT as the provider's `remote_jid` —
+`999…@s.whatsapp.invalid` in fixtures, `@s.whatsapp.net` in production, `@g.us`
+for a group — and `trusted_run_context` authorizes that exact pair BY STRING.
+A binding written as `(+999…, +999…)` therefore succeeded, published a
+revision, and matched no inbound turn: a success the owner could not tell from
+a working one.
+
+`chat_id` is consequently REQUIRED at both the repository and the endpoint, and
+never derived. Deriving the JID was the other option and is worse: the control
+plane does not own that format, and a rule right for `@s.whatsapp.net` is wrong
+for the `@g.us` group that is the very arrangement this slice exists to allow —
+one value answering two questions, which is the defect being removed.
+
+The MIGRATION still writes them equal, and that is unchanged and correct: it
+preserves exactly what the projection emitted before, which acceptance 4
+requires. Backfilling existing rows and guessing for new ones are different
+acts. Today's rows hold the CHAT in `external_id` for the owner, because
 that is what onboarding's `primary_channel` step captured — so the migration
 must backfill `chat_id = external_id` and leave `external_id` alone. See M1 for
 why that is correct-but-incomplete, and what it costs.
@@ -220,9 +241,21 @@ plan changes is that the gap becomes *nameable*: after the migration a row with
 `external_id == chat_id` on Telegram is visibly un-migrated data, not an
 ambiguity in the schema.
 
-Correcting those values needs the owner's Telegram user ID, which onboarding
+**Correction, 2026-08-28 (second Codex `[BLOCKER]` on #76).** The paragraph
+below is wrong, and its wrongness is what left the sender column holding a
+chat. Onboarding DOES capture the owner's sender identity: it is
+`PrimaryChannelSelection.actor_id`, which becomes `actors.owner` and is exactly
+what `message.from.id` is compared against (`telegram.py:264`). The planner was
+reading `chat_id` where `actor_id` was sitting beside it. So there is no gap to
+defer — `external_id` is seeded from `actor_id`, 0010 realigns the rows that
+exist, and the invariant is recorded in `AGENTS.repo-invariants.md`. Neither
+option below is needed. They are left in place because the reasoning that
+produced them is the reasoning to distrust: a value the code cannot see is not
+the same as a value the code never captured.
+
+~~Correcting those values needs the owner's Telegram user ID, which onboarding
 never captured. Two ways to get it, both out of scope here and recorded so the
-choice is deliberate:
+choice is deliberate:~~
 
 1. **Re-onboard.** `reset_from(PRIMARY_CHANNEL)` already retires and rewrites
    the owner binding (`_retire_superseded`), so an owner who re-runs the step
@@ -318,10 +351,23 @@ must be true, each naming the test that proves it:
 `tests/control_plane/test_channel_bindings.py`,
 `tests/control_plane/test_binding_api.py`, `tests/control_plane/test_db.py`,
 `tests/control_plane/test_export_delete.py`, `tests/test_runcontext.py`,
-`tests/test_gateway_routing.py`.
+`tests/test_gateway_routing.py`, `tests/test_feature_flags.py`,
+`AGENTS.repo-invariants.md`.
 
 **Branches:** `codex/c3a-sender-identity-and-chat`.
 
 The two `hermes_cloud/` entries are not scope creep: D3 changes a rule the
 runtime enforces, and it must land in the same change as the index that lets
 rows violate the old one.
+
+`tests/test_feature_flags.py` was added to this inventory during
+implementation, and the reason is worth stating rather than hiding in a diff.
+M1 leaves `chat_id` nullable in the schema — SQLite cannot add a `NOT NULL`
+column to a populated table without inventing a default, and `DEFAULT ''` is a
+lie that reads as data — so the column is required by a trigger instead, the
+treatment `email_identities.domain_lookup_hmac` gets in `0003`. That trigger
+fires on every `INSERT`, including the raw ones tests write directly against
+the table, and this file has one. It is a one-line change and it is a
+CONSEQUENCE of D1 rather than a second piece of work; the alternative — leaving
+the column unenforced so no test had to move — would let a binding that speaks
+nowhere reach the manifest, which is the failure the trigger exists to prevent.

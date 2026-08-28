@@ -137,11 +137,32 @@ class DesiredSpecPlanner:
         # manifest considered fully bound. Seeding the owner's row here from
         # the onboarding step that already proved the channel makes the two
         # agree by construction: everything below reads the table.
+        # THREE names, and each comes from the field that means it.
+        #
+        # `external_id` is the SENDER — what the gateway matches an inbound
+        # message against — and it is seeded from `actor_id`, NOT from
+        # `chat_id`. This was the other half of the same defect: the sender
+        # column held a conversation, so a strict-mode gateway lookup matched a
+        # chat where it meant to match a sender.
+        #
+        # M1 of the C3a plan called that gap uncorrectable, on the grounds that
+        # it "needs the owner's Telegram user ID, which onboarding never
+        # captured". That premise is false and the plan is corrected: onboarding
+        # DOES capture it. `PrimaryChannelSelection.actor_id` becomes
+        # `actors.owner`, and `actors.owner` is compared against
+        # `message.from.id` (`hermes_cloud/channels/telegram.py:264`) and
+        # against the `+999…` actor WhatsApp ingest reports. It IS the transport
+        # sender identity; the planner was reading the wrong field.
+        #
+        # The manifest projection is unaffected — `external_id` is not projected
+        # at all, `chat_id` is — so this changes what the GATEWAY matches and
+        # nothing the runtime parses.
         self.bindings.ensure_owner_binding(
             connection,
             household_id=household_id,
             channel=primary,
-            external_id=chat_id,
+            external_id=actor_id,
+            chat_id=chat_id,
             actor_id=actor_id,
         )
         bound = self.bindings.verified(connection, household_id=household_id)
@@ -175,7 +196,7 @@ class DesiredSpecPlanner:
                 ChannelBindingV1(
                     channel=binding.channel,
                     actor_id=binding.actor_id,
-                    chat_id=binding.external_id,
+                    chat_id=binding.chat_id,
                     # Only the owner's binding came from a provider result, so
                     # only it carries that provider's reference. An adult
                     # verified by challenge has no provider row to point at,
