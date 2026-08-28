@@ -268,6 +268,40 @@ conversation — including on the channel it moved off — are untouched.
   household, still synthetic. Removing the synthetic gate is B-07's.
 * **Strict-mode routing.** D2 explains why it belongs to C5.
 
+## How these shipped, and why one inventory covers four items
+
+D0, D1, D3 and D4/D5 were written as four branches so they would review as four
+small PRs, and that is how they were opened (#77, #78, #79, #80). Each was then
+squash-merged into D0's branch rather than into `main`, so what reaches `main`
+is one branch carrying all four.
+
+The inventory below follows that, because the scope gate checks a real thing:
+exactly one plan step may claim a branch, and it must declare every path that
+branch changes. Splitting the claim across four steps would either leave paths
+undeclared — which is what CI caught — or make four steps applicable at once,
+which the gate refuses for a better reason than tidiness: the scope of a change
+is not something it can infer.
+
+The per-item file lists are kept below the combined one. They are the record of
+which item moved what, and three of the four moved during implementation for
+reasons written down beside them. Their `**Branches:**` name branches that were
+deleted on merge, so no step but the first is ever applicable.
+
+## Inventory — C3a identity debt, as merged
+
+**Files:** `control_plane/api/web.py`, `control_plane/channels.py`,
+`control_plane/cli.py`, `control_plane/models.py`,
+`control_plane/onboarding/service.py`, `control_plane/provisioning/fakes.py`,
+`control_plane/provisioning/rollout.py`,
+`control_plane/repositories/bindings.py`,
+`control_plane/web/static/onboarding.js`,
+`tests/control_plane/test_api.py`, `tests/control_plane/test_binding_api.py`,
+`tests/control_plane/test_channel_bindings.py`,
+`tests/control_plane/test_manifest.py`,
+`tests/control_plane/test_art9_household_consent.py`.
+
+**Branches:** `codex/d0-per-household-channel-identity`.
+
 ## Inventory — D0 primary-channel identity
 
 **Files:** `control_plane/api/web.py`, `control_plane/models.py`,
@@ -287,7 +321,7 @@ route minting its own, which is the same defect with one fewer client.
 turned out not to need changes; the routing assertion lives with the
 two-household case in `test_channel_bindings.py`.
 
-**Branches:** `codex/d0-per-household-channel-identity`.
+**Branches:** `codex/d0-per-household-channel-identity-item`.
 
 ## Inventory — D1 revocation propagation
 
