@@ -306,20 +306,6 @@ def reconcile_stale_bindings(
             entry["action"] = "skipped"
             results.append(entry)
             continue
-        # One household per SAVEPOINT, because this loop visits households
-        # that have nothing to do with each other. `cli.main` holds a single
-        # write transaction around the whole sweep, so before this an
-        # exception at either call below rolled back the revisions and jobs
-        # already created for EARLIER households and abandoned every later
-        # one — one unplannable household leaving every other stale runtime
-        # authorizing its revoked bindings.
-        #
-        # `_blocked_by` cannot be extended to cover the rest: `issue` refuses
-        # on an incomplete profile, an unverified provider result, a missing
-        # account owner and a consent receipt that is absent, revoked or
-        # superseded, and asking it those questions here would be a second
-        # copy of the planner's preconditions that drifts from the first. The
-        # honest answer is to let the planner decide and report what it said.
         # THE DRY RUN TAKES THE SAME BRANCH, and that is why the planner runs
         # in both modes. `_blocked_by` cannot answer for it: `issue` refuses on
         # an incomplete profile, an unverified provider result, a missing
