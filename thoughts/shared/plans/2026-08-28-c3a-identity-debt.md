@@ -211,7 +211,35 @@ directly rather than as a consequence of the equality.
 
 ---
 
-## D5. An abandoned channel keeps its adults routable
+## D5. An abandoned CHAT keeps its members routable
+
+**Corrected during implementation. The item below is stated too broadly, and
+the rule it describes would revoke bindings nobody superseded.**
+
+Scoping retirement to the CHANNEL is wrong in both directions. C3 deleted every
+adult on the channel about to become primary, which was right only while
+`_reject_unrepresentable_member` refused an adult there at all; C3a removed
+that limitation, so the deletion became a way to unbind a member because the
+owner arrived on their channel. And this item then asked for the mirror image —
+that nothing remain on the channel the household left — which revokes an adult
+verified in a thread of their own, on a non-primary channel, which is a
+supported arrangement.
+
+What is actually stale is a binding into the CONVERSATION the owner has just
+left: nobody speaks there for the household any more, so an actor authorized in
+it is authorized in an abandoned room. `_retire_superseded` therefore takes
+every previous owner chat's non-owner bindings with it, and nothing else moves.
+
+One case fell out of the change and is worth naming, because the old rule hid
+it: an owner re-onboarding onto an identity a MEMBER of their household holds
+used to be resolved by deleting that member. It is now refused. Unreachable
+through the endpoints — `issue_challenge` refuses an actor equal to the issuer
+— but reachable enough to have raised a bare `IntegrityError` from the unique
+index once the deletion stopped clearing the way.
+
+The original statement follows, for the record.
+
+### As originally written
 
 Noted in #76's PR body and deliberately not fixed there.
 `_retire_superseded` (`repositories/bindings.py:337`) deletes adult rows on the
@@ -224,8 +252,9 @@ The method's own docstring already states the principle: "an owner who moves
 the household off a channel has revoked it, and the table is what the gateway
 believes." The adults are simply not covered by it.
 
-**Acceptance.** After a household moves its primary channel, no binding of any
-role remains on the channel it left.
+**Acceptance (revised).** After a household moves its chat, no binding of any
+role remains in the conversation it left, and bindings in every other
+conversation — including on the channel it moved off — are untouched.
 
 ---
 
@@ -303,3 +332,8 @@ its fixtures passed a phone as a WhatsApp chat, which the new rules refuse.
 `tests/control_plane/test_channel_bindings.py`.
 
 **Branches:** `codex/d4-d5-revocation-guards`.
+
+The inventory held. D4 turned out to be one predicate and D5 one scope change,
+both inside the file this named — which is what a correctly scoped item looks
+like, and worth noting beside D0, D1 and D3, where implementation moved the
+file list every time.

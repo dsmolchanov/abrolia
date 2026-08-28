@@ -647,13 +647,21 @@ def test_reprovisioning_the_primary_channel_retires_what_it_replaces(
     ]
 
 
-def test_reprovisioning_drops_outstanding_challenges_and_dependent_adults(
+def test_reprovisioning_drops_outstanding_challenges_but_keeps_other_chats(
     cp_stack,
 ) -> None:
-    """A code issued against the arrangement that just changed must not redeem
-    into the one that replaced it — and an adult on the channel now becoming
-    primary cannot be represented there, so it goes with it rather than
-    rebuilding the unstartable manifest by another route."""
+    """Retirement is scoped to the chat the owner leaves, not to the channel.
+
+    This used to assert the opposite — that an adult on the channel becoming
+    primary goes with the move — and that was right only while
+    `_reject_unrepresentable_member` refused an adult there at all. C3a removed
+    the limitation, so deleting a member because the owner ARRIVED on their
+    channel revokes a binding nobody superseded.
+
+    What is still dropped: outstanding challenges, whatever their chat, because
+    a code issued against the arrangement that just changed must not redeem
+    into the one that replaced it.
+    """
     hid = cp_stack.household.id
     with cp_stack.database.write() as connection:
         cp_stack.bindings.ensure_owner_binding(
@@ -677,7 +685,8 @@ def test_reprovisioning_drops_outstanding_challenges_and_dependent_adults(
             role="adult", issued_by_actor_id=OWNER, now=BASE_TIME + 6,
         )
         # The household moves its primary channel onto WhatsApp, where that
-        # adult already sits.
+        # adult already sits — in a thread of their own, which the owner's
+        # move does not touch.
         cp_stack.bindings.ensure_owner_binding(
             connection, household_id=hid, channel="whatsapp",
             external_id="+999511230", actor_id="+999511230", now=BASE_TIME + 20,
@@ -691,8 +700,11 @@ def test_reprovisioning_drops_outstanding_challenges_and_dependent_adults(
                 owner_actor_id=OWNER, now=BASE_TIME + 25,
             )
 
+    # The adult keeps their own thread. The owner arriving on WhatsApp is not
+    # a revocation of somebody who was verified there independently.
     assert [(r.channel, r.external_id, r.role) for r in rows] == [
-        ("whatsapp", "+999511230", "owner")
+        ("whatsapp", PHONE, "adult"),
+        ("whatsapp", "+999511230", "owner"),
     ]
 
 
@@ -773,61 +785,84 @@ def test_the_owner_appears_in_family_once_though_two_things_name_them(
 def test_seeding_reconciles_the_whole_row_not_just_the_tuple(cp_stack) -> None:
     """The early return matched `(channel, external_id)` whatever the row WAS.
 
-    Two shapes slipped past reconciliation. Re-onboarding onto a tuple an
-    ADULT holds wrote no owner binding at all, while the stale owner row
-    survived on the channel the household had just left. And the owner's CHAT
-    could change while their sender stayed the same — a family moving to a new
-    Telegram group keeps its user IDs — which left the household's review
-    surface pointing at the conversation it had just left.
+    The original defect: re-onboarding onto a tuple an ADULT held wrote no
+    owner binding at all, while the stale owner row survived on the channel the
+    household had just left. Matching now means role, actor, tuple and chat
+    together.
 
-    The second case used to be written as "the ACTOR changed while the tuple
-    stayed the same". Under the identity invariant that cannot happen: the
-    actor is the sender, so an actor change IS a tuple change and takes the
-    ordinary reset path. The chat is now the field that can move underneath a
-    matching tuple, and it is the one that must be reconciled.
+    Both halves of this case have been rewritten since, and the reasons are
+    worth keeping because each was a design change rather than a tidy-up.
+
+    The owner taking a member's identity is now REFUSED. C3 resolved it by
+    deleting every adult on the arriving channel, which was right only while
+    the store could not hold one there; C3a removed that limitation, so the
+    deletion became a way to unbind a member by accident. It is unreachable
+    through the endpoints — `issue_challenge` refuses an actor equal to the
+    issuer — and it is refused rather than left to raise `IntegrityError` from
+    the unique index.
+
+    And the second half used to read "the ACTOR changed while the tuple stayed
+    the same", which the identity invariant makes impossible: the actor is the
+    sender, so an actor change IS a tuple change. The CHAT is the field that
+    can now move underneath a matching tuple, and it is the one reconciliation
+    has to notice.
     """
     hid = cp_stack.household.id
     with cp_stack.database.write() as connection:
         cp_stack.bindings.ensure_owner_binding(
             connection, household_id=hid, channel="telegram",
-            external_id="synthetic-chat-one", actor_id="synthetic-chat-one", now=BASE_TIME,
-            chat_id="synthetic-chat-one",
+            external_id="synthetic-chat-one", actor_id="synthetic-chat-one",
+            now=BASE_TIME, chat_id="synthetic-chat-one",
         )
         issued = cp_stack.bindings.issue_challenge(
             connection, household_id=hid, channel="whatsapp", external_id=PHONE,
-                                                                          chat_id=PHONE_CHAT,
-            actor_id=PHONE, role="adult", issued_by_actor_id=OWNER, now=BASE_TIME,
+            chat_id=PHONE_CHAT, actor_id=PHONE, role="adult",
+            issued_by_actor_id=OWNER, now=BASE_TIME,
         )
         cp_stack.bindings.verify_challenge(
             connection, code=issued.code, household_id=hid,
             owner_actor_id=OWNER, now=BASE_TIME + 1,
         )
-        # 1. The owner re-onboards onto the tuple the adult holds.
-        cp_stack.bindings.ensure_owner_binding(
-            connection, household_id=hid, channel="whatsapp",
-            external_id=PHONE, actor_id=PHONE, now=BASE_TIME + 10,
-            chat_id=PHONE_CHAT,
-        )
-        rows = cp_stack.bindings.verified(connection, household_id=hid)
 
-    # The adult's row is gone and the owner holds the tuple, as the owner —
-    # not merged into whatever the previous row said.
-    assert [(r.channel, r.external_id, r.actor_id, r.role) for r in rows] == [
-        ("whatsapp", PHONE, PHONE, "owner")
+        # 1. The owner cannot re-onboard onto an identity a member holds.
+        with pytest.raises(BindingError, match="another member of the household"):
+            cp_stack.bindings.ensure_owner_binding(
+                connection, household_id=hid, channel="whatsapp",
+                external_id=PHONE, actor_id=PHONE, now=BASE_TIME + 10,
+                chat_id=PHONE_CHAT,
+            )
+        # A refused reset changes nothing: the adult keeps their binding and
+        # the owner keeps the one they had.
+        rows = cp_stack.bindings.verified(connection, household_id=hid)
+    assert [(r.channel, r.external_id, r.role) for r in rows] == [
+        ("telegram", "synthetic-chat-one", "owner"),
+        ("whatsapp", PHONE, "adult"),
     ]
 
     # 2. The chat moves while the sender stays put: the family keeps its
-    #    WhatsApp number and the assistant is pointed at a new conversation.
+    #    Telegram user IDs and the assistant is pointed at a new group. The
+    #    adult who was speaking in the OLD chat goes with it; the one with a
+    #    thread of their own does not.
     with cp_stack.database.write() as connection:
+        issued = cp_stack.bindings.issue_challenge(
+            connection, household_id=hid, channel="telegram",
+            external_id=ADULT, chat_id="synthetic-chat-one", actor_id=ADULT,
+            role="adult", issued_by_actor_id=OWNER, now=BASE_TIME + 15,
+        )
+        cp_stack.bindings.verify_challenge(
+            connection, code=issued.code, household_id=hid,
+            owner_actor_id=OWNER, now=BASE_TIME + 16,
+        )
         cp_stack.bindings.ensure_owner_binding(
-            connection, household_id=hid, channel="whatsapp",
-            external_id=PHONE, actor_id=PHONE, now=BASE_TIME + 20,
-            chat_id="999511230@g.whatsapp.invalid",
+            connection, household_id=hid, channel="telegram",
+            external_id="synthetic-chat-one", actor_id="synthetic-chat-one",
+            now=BASE_TIME + 20, chat_id="synthetic-chat-two",
         )
         rows = cp_stack.bindings.verified(connection, household_id=hid)
 
-    assert [(r.actor_id, r.chat_id, r.role) for r in rows] == [
-        (PHONE, "999511230@g.whatsapp.invalid", "owner")
+    assert [(r.channel, r.actor_id, r.chat_id, r.role) for r in rows] == [
+        ("whatsapp", PHONE, PHONE_CHAT, "adult"),
+        ("telegram", "synthetic-chat-one", "synthetic-chat-two", "owner"),
     ]
 
 
@@ -1747,3 +1782,129 @@ def test_the_synthetic_namespace_is_canonical_as_written(cp_stack) -> None:
     for channel in ("telegram", "whatsapp", "web"):
         assert canonical_sender(channel, f"  {actor} ") == actor
         assert canonical_chat(channel, f"\t{chat}") == chat
+
+
+# --- D4 and D5: the revocation guards, asserted directly -------------------
+
+
+def test_two_households_cannot_hold_one_actor_on_one_channel(
+    cp_stack, second_household
+) -> None:
+    """D4: the guard covers both readings of the identity, not just one.
+
+    `_reject_foreign_holder` asked about `external_id` alone. `actor_id` is the
+    same transport identity read by the runtime instead of the gateway, and
+    C3a enforces the two equal on every new row — so today the actor predicate
+    can never fire on its own.
+
+    It is asserted anyway, and directly rather than as a consequence of that
+    equality, because "they happen to be equal" is not the rule. Migration
+    `0010` has already had to delete both halves of a shared-actor pair that
+    legacy rows could hold, and a future write path that relaxes the equality
+    somewhere else must not quietly reintroduce it.
+    """
+    with cp_stack.database.write() as connection:
+        cp_stack.bindings.ensure_owner_binding(
+            connection,
+            household_id=second_household,
+            channel="telegram",
+            external_id=ADULT,
+            chat_id="synthetic-other-chat",
+            actor_id=ADULT,
+            now=BASE_TIME,
+        )
+        # The identity is held by another household under BOTH names, so both
+        # halves of the guard have something to find.
+        row = cp_stack.database.query_one(
+            "SELECT external_id, actor_id FROM channel_bindings WHERE household_id = ?",
+            (second_household,),
+        )
+        assert row["external_id"] == row["actor_id"] == ADULT
+
+        with pytest.raises(BindingError, match="another household"):
+            cp_stack.bindings.ensure_owner_binding(
+                connection,
+                household_id=cp_stack.household.id,
+                channel="telegram",
+                external_id=ADULT,
+                chat_id="synthetic-our-chat",
+                actor_id=ADULT,
+                now=BASE_TIME + 1,
+            )
+
+        # And the actor predicate specifically: a row whose sender differs but
+        # whose actor collides is still refused. Only a direct write can build
+        # that shape now, which is the point of checking it.
+        connection.execute(
+            "UPDATE channel_bindings SET external_id = ? WHERE household_id = ?",
+            ("990000777", second_household),
+        )
+        with pytest.raises(BindingError, match="another household"):
+            cp_stack.bindings.ensure_owner_binding(
+                connection,
+                household_id=cp_stack.household.id,
+                channel="telegram",
+                external_id=ADULT,
+                chat_id="synthetic-our-chat",
+                actor_id=ADULT,
+                now=BASE_TIME + 2,
+            )
+
+
+def test_moving_the_household_chat_retires_only_that_conversation(cp_stack) -> None:
+    """D5, corrected: retirement is scoped to the chat, not to the channel.
+
+    The debt plan asked that nothing of any role remain on the channel the
+    household LEFT. That is too broad. An adult verified in a thread of their
+    own was never re-attested by the owner moving house, and a non-primary
+    channel is a supported arrangement — the owner's departure from it does not
+    revoke everybody else's presence.
+
+    What IS stale is a binding into the conversation the owner has just left:
+    nobody speaks there for the household any more, so an actor authorized in
+    it is authorized in an abandoned room.
+
+    Three members, three fates, one move.
+    """
+    hid = cp_stack.household.id
+    with cp_stack.database.write() as connection:
+        cp_stack.bindings.ensure_owner_binding(
+            connection, household_id=hid, channel="telegram",
+            external_id="synthetic-owner-one", chat_id="synthetic-family-chat",
+            actor_id="synthetic-owner-one", now=BASE_TIME,
+        )
+        for external_id, channel, chat in (
+            # Shares the household chat the owner is about to leave.
+            (ADULT, "telegram", "synthetic-family-chat"),
+            # Same channel, a thread of their own.
+            ("990000003", "telegram", "-100990000303"),
+            # A different channel entirely.
+            (PHONE, "whatsapp", PHONE_CHAT),
+        ):
+            issued = cp_stack.bindings.issue_challenge(
+                connection, household_id=hid, channel=channel,
+                external_id=external_id, chat_id=chat, actor_id=external_id,
+                role="adult", issued_by_actor_id="synthetic-owner-one",
+                now=BASE_TIME + 1,
+            )
+            cp_stack.bindings.verify_challenge(
+                connection, code=issued.code, household_id=hid,
+                owner_actor_id="synthetic-owner-one", now=BASE_TIME + 2,
+            )
+
+        # The family moves to a new group, keeping their Telegram user IDs.
+        cp_stack.bindings.ensure_owner_binding(
+            connection, household_id=hid, channel="telegram",
+            external_id="synthetic-owner-one", chat_id="synthetic-new-chat",
+            actor_id="synthetic-owner-one", now=BASE_TIME + 10,
+        )
+        rows = cp_stack.bindings.verified(connection, household_id=hid)
+
+    survivors = {(r.channel, r.actor_id, r.chat_id, r.role) for r in rows}
+    assert survivors == {
+        # The member who was only ever in the abandoned chat is retired.
+        ("telegram", "990000003", "-100990000303", "adult"),
+        ("whatsapp", PHONE, PHONE_CHAT, "adult"),
+        ("telegram", "synthetic-owner-one", "synthetic-new-chat", "owner"),
+    }
+    assert ADULT not in {r.actor_id for r in rows}
