@@ -320,6 +320,26 @@ identity everywhere a real one will later go, and it has no transport form to
 canonicalize into. Removing the gate is B-07's, as "Deliberately not here"
 says.
 
+**Review round 2 — the invariant, not the instance.** Two findings, both
+correct, and both cases where the first pass fixed one side of a rule.
+
+The cross-household guard compared canonically while the three same-household
+lookups — `issue_challenge`, `verify_challenge` and the owner row
+`ensure_owner_binding` reconciles — still compared strings, so a household
+holding the bare spelling could be handed a SECOND row for one transport
+sender: a duplicate actor in the manifest, and binding and revision capacity
+spent on it. `_holders` is now the one lookup all four use, and the case that
+is not about duplication is covered too — an owner claiming an identity a
+member holds was silently unbinding that member, because the exact-string
+`member` check could not see a legacy row.
+
+The dry run reported `would_reconcile` for a household the apply run then
+refused, because only the apply branch reached the planner. That breaks the
+promise this report makes — the branch it describes is the branch the apply
+run takes — so the planner now runs in both modes, inside a savepoint the dry
+run always rolls back, including the `config_revisions` row `issue` writes to
+answer the question.
+
 **Left as debt.** A legacy row whose spelling is not canonical can never match
 ingest, so it authorizes nobody while still counting as a verified binding in
 the table and in the manifest projection. The guard closes the cross-household

@@ -293,15 +293,17 @@ def reconcile_stale_bindings(
     Skipping is per household in the transaction as well as in the report: the
     planner can refuse a household this cannot ask about in advance, and one
     such refusal must not roll back the rollouts already scheduled for the
-    others.
+    others. The dry run asks the planner the same question inside a savepoint
+    it always rolls back, so both modes classify a household identically and
+    the report keeps its promise.
     """
     results: list[dict[str, object]] = []
     for household in find_stale_bindings(
         connection, configs=configs, bindings=bindings, onboarding=onboarding
     ):
         entry = household.public_dict()
-        if household.blocked_by is not None or not apply:
-            entry["action"] = "skipped" if household.blocked_by else "would_reconcile"
+        if household.blocked_by is not None:
+            entry["action"] = "skipped"
             results.append(entry)
             continue
         # One household per SAVEPOINT, because this loop visits households
@@ -318,19 +320,38 @@ def reconcile_stale_bindings(
         # superseded, and asking it those questions here would be a second
         # copy of the planner's preconditions that drifts from the first. The
         # honest answer is to let the planner decide and report what it said.
+        # THE DRY RUN TAKES THE SAME BRANCH, and that is why the planner runs
+        # in both modes. `_blocked_by` cannot answer for it: `issue` refuses on
+        # an incomplete profile, an unverified provider result, a missing
+        # account owner and a consent receipt that is absent, revoked or
+        # superseded, and asking those questions here would be a second copy of
+        # the planner's preconditions that drifts from the first. Asking the
+        # planner itself and rolling the answer back is what keeps the promise
+        # this report makes — the branch it describes is the branch the apply
+        # run takes — instead of reporting `would_reconcile` for a household
+        # that then refuses.
+        #
+        # One household per SAVEPOINT, because this loop visits households that
+        # have nothing to do with each other. `cli.main` holds a single write
+        # transaction around the whole sweep, so before this an exception at
+        # either call below rolled back the revisions and jobs already created
+        # for EARLIER households and abandoned every later one — one
+        # unplannable household leaving every other stale runtime authorizing
+        # its revoked bindings.
         savepoint = f"reconcile_{len(results)}"
         connection.execute(f"SAVEPOINT {savepoint}")
         try:
             planned = planner.issue(connection, household_id=household.household_id)
-            schedule_runtime_rollout(
-                connection,
-                jobs=jobs,
-                onboarding=onboarding,
-                household_id=household.household_id,
-                planned=planned,
-                runtime_provider=runtime_provider,
-                now=now,
-            )
+            if apply:
+                schedule_runtime_rollout(
+                    connection,
+                    jobs=jobs,
+                    onboarding=onboarding,
+                    household_id=household.household_id,
+                    planned=planned,
+                    runtime_provider=runtime_provider,
+                    now=now,
+                )
         except (ValueError, PermissionError, RolloutNotReady) as error:
             connection.execute(f"ROLLBACK TO {savepoint}")
             connection.execute(f"RELEASE {savepoint}")
@@ -339,6 +360,15 @@ def reconcile_stale_bindings(
             # verified results" — which names a precondition and no identity.
             entry["action"] = "skipped"
             entry["blocked_by"] = f"planner_refused: {error}"
+            results.append(entry)
+            continue
+        if not apply:
+            # Everything the planner wrote goes back: a dry run must leave the
+            # database as it found it, including the `config_revisions` row
+            # `issue` inserts to answer the question.
+            connection.execute(f"ROLLBACK TO {savepoint}")
+            connection.execute(f"RELEASE {savepoint}")
+            entry["action"] = "would_reconcile"
             results.append(entry)
             continue
         connection.execute(f"RELEASE {savepoint}")

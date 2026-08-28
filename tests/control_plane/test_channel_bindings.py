@@ -2117,6 +2117,34 @@ def test_one_household_the_planner_refuses_leaves_the_others_reconciled(
             (refused.id,),
         )
 
+        revisions = connection.execute(
+            "SELECT COUNT(*) AS total FROM config_revisions"
+        ).fetchone()["total"]
+        # The dry run classifies both households the way the apply run will —
+        # including the one only the planner can refuse — and writes nothing.
+        dry = {
+            item["household_id"]: item
+            for item in reconcile_stale_bindings(
+                connection,
+                planner=cp_stack.make_worker().planner,
+                jobs=cp_stack.jobs,
+                onboarding=cp_stack.onboarding,
+                configs=cp_stack.configs,
+                bindings=cp_stack.bindings,
+                runtime_provider=cp_stack.config.runtime_provider,
+            )
+        }
+        assert dry[refused.id]["action"] == "skipped"
+        assert str(dry[refused.id]["blocked_by"]).startswith("planner_refused")
+        assert dry[cp_stack.household.id]["action"] == "would_reconcile"
+        assert connection.execute(
+            "SELECT COUNT(*) AS total FROM config_revisions"
+        ).fetchone()["total"] == revisions
+        assert not connection.execute(
+            "SELECT id FROM provisioning_jobs WHERE operation = ?",
+            (REPROVISION_RUNTIME_OPERATION,),
+        ).fetchall()
+
         applied = {
             item["household_id"]: item
             for item in reconcile_stale_bindings(
@@ -2144,3 +2172,100 @@ def test_one_household_the_planner_refuses_leaves_the_others_reconciled(
         "SELECT id FROM provisioning_jobs WHERE operation = ? AND household_id = ?",
         (REPROVISION_RUNTIME_OPERATION, refused.id),
     )
+
+
+@pytest.mark.parametrize(
+    "writer", ("issue_challenge", "verify_challenge", "ensure_owner_binding")
+)
+def test_a_legacy_spelling_is_one_identity_to_every_writer(cp_stack, writer) -> None:
+    """The household's own rows are matched canonically too, not just others'.
+
+    `_reject_foreign_holder` asks about OTHER households. The three writers
+    below each asked their own household the same question with an exact-string
+    `WHERE external_id = ?`, so a household holding the bare `999511234` did
+    not, to any of them, hold `+999511234` — and the challenge that should have
+    been refused, or the row that should have been reconciled, produced a
+    SECOND row for one transport sender instead: a duplicate actor in the
+    manifest, and binding and revision capacity spent on it.
+
+    One lookup answers all four now. The parameterisation is per writer so a
+    passing assertion names which one was covered.
+    """
+    _provisioned(cp_stack)
+    owner = owner_actor(cp_stack)
+    bare = PHONE.lstrip("+")
+
+    with cp_stack.database.write() as connection:
+        if writer == "verify_challenge":
+            # Issued while the table held no such sender, which is the only
+            # order in which a challenge for this identity can exist. The
+            # legacy row is written underneath it below: what is under test is
+            # the STATE the two make together, not the sequence.
+            issued = cp_stack.bindings.issue_challenge(
+                connection,
+                household_id=cp_stack.household.id,
+                channel="whatsapp",
+                external_id=PHONE,
+                chat_id=PHONE_CHAT,
+                actor_id=PHONE,
+                role="adult",
+                issued_by_actor_id=owner,
+                now=BASE_TIME + 100,
+            )
+        # The row as a pre-D3 write left it: the same person, spelled bare.
+        connection.execute(
+            "INSERT INTO channel_bindings (id, household_id, channel,"
+            " external_id, chat_id, actor_id, role, verified_at,"
+            " verified_by_actor_id) VALUES ('legacy', ?, 'whatsapp', ?, ?, ?,"
+            " 'adult', ?, 'o')",
+            (cp_stack.household.id, bare, PHONE_CHAT, bare, BASE_TIME),
+        )
+
+        if writer == "issue_challenge":
+            with pytest.raises(BindingError, match="already bound to that member"):
+                cp_stack.bindings.issue_challenge(
+                    connection,
+                    household_id=cp_stack.household.id,
+                    channel="whatsapp",
+                    external_id=PHONE,
+                    chat_id=PHONE_CHAT,
+                    actor_id=PHONE,
+                    role="adult",
+                    issued_by_actor_id=owner,
+                    now=BASE_TIME + 200,
+                )
+        elif writer == "verify_challenge":
+            cp_stack.bindings.verify_challenge(
+                connection,
+                code=issued.code,
+                household_id=cp_stack.household.id,
+                owner_actor_id=owner,
+                now=BASE_TIME + 200,
+            )
+        else:
+            # The owner moving onto an identity a MEMBER holds. This one is not
+            # about a duplicate row: `_retire_superseded` would have cleared
+            # the household's rows and inserted over them, so the legacy adult
+            # was silently unbound to make room — which the refusal below
+            # exists to prevent and the exact-string lookup could not see.
+            with pytest.raises(
+                BindingError, match="another member of the household"
+            ):
+                cp_stack.bindings.ensure_owner_binding(
+                    connection,
+                    household_id=cp_stack.household.id,
+                    channel="whatsapp",
+                    external_id=PHONE,
+                    chat_id=PHONE_CHAT,
+                    actor_id=PHONE,
+                    now=BASE_TIME + 200,
+                )
+
+        # One transport sender, one row — whichever spelling reached the table
+        # first.
+        held = connection.execute(
+            "SELECT external_id FROM channel_bindings WHERE household_id = ?"
+            " AND channel = 'whatsapp'",
+            (cp_stack.household.id,),
+        ).fetchall()
+        assert [row["external_id"] for row in held] in ([bare], [PHONE])
