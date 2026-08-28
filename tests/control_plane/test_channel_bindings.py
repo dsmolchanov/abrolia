@@ -8,6 +8,8 @@ writes one, and — mostly — the things it must not write.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from control_plane.repositories.bindings import BindingError
@@ -298,6 +300,10 @@ def test_the_retention_sweep_retires_a_challenge_nobody_answered(cp_stack) -> No
 from control_plane.models import StepKind, synthetic_channel_identity  # noqa: E402
 from control_plane.provisioning.manifest import DesiredHouseholdSpecV1  # noqa: E402
 from control_plane.provisioning.manifest_toml import manifest_to_toml  # noqa: E402
+from control_plane.provisioning.rollout import schedule_runtime_rollout  # noqa: E402
+from control_plane.provisioning.worker import (  # noqa: E402
+    REPROVISION_RUNTIME_OPERATION,
+)
 from gateway.whatsapp_router import WhatsAppGatewayRouter  # noqa: E402
 from hermes_cloud.core.runcontext import Household  # noqa: E402
 from hermes_cloud.core.runtime_manifest import parse_runtime_manifest  # noqa: E402
@@ -1366,3 +1372,241 @@ def test_a_second_household_can_provision_and_routes_to_itself(cp_stack) -> None
     )
     assert router.route(first_actor, "telegram").household_id == cp_stack.household.id
     assert router.route(second_actor, "telegram").household_id == second.id
+
+
+# --- D1: the runtime kept authorizing what the table had revoked -----------
+
+from control_plane.provisioning.rollout import (  # noqa: E402
+    find_stale_bindings,
+    reconcile_stale_bindings,
+)
+
+
+def _drain(worker) -> None:
+    """Run the queue out. `cancelled` is a terminal state, not a failure.
+
+    Scheduling a revision supersedes an older runtime job for the same
+    household, and the worker cancels it deliberately. Asserting `succeeded`
+    for every job would make this helper fail on the very behaviour a
+    re-planning sweep depends on.
+    """
+    while (result := worker.run_once()) is not None:
+        assert result.status in {"succeeded", "cancelled"}, result
+
+
+def _activated(cp_stack) -> None:
+    """The precondition, not the subject: a household that finished setup.
+
+    `_provisioned` stops at `runtime_provisioning` because activation runs
+    through the runtime's bootstrap, which this harness does not host. These
+    two writes are exactly what activation performs
+    (`provisioning/bootstrap.py:427` and `:440`).
+    """
+    with cp_stack.database.write() as connection:
+        connection.execute(
+            "UPDATE households SET status = 'active' WHERE id = ?",
+            (cp_stack.household.id,),
+        )
+        connection.execute(
+            "UPDATE onboarding_workflows SET state = 'complete' WHERE household_id = ?",
+            (cp_stack.household.id,),
+        )
+
+
+def _served_pairs(cp_stack, household_id: str):
+    """The (actor, chat) pairs the RUNTIME is authorizing right now.
+
+    Read through the real parser from the revision the household is serving,
+    not from the newest one planned — those differ exactly when a rollout is
+    in flight, which is the state this whole area is about.
+    """
+    served = cp_stack.households.get(household_id).current_config_revision
+    spec = DesiredHouseholdSpecV1.model_validate(
+        cp_stack.configs.manifest(household_id, served)
+    )
+    return parse_runtime_manifest(manifest_to_toml(spec)).verified_actor_chat_pairs
+
+
+def test_a_revoked_binding_still_authorizes_until_the_sweep_replans(
+    cp_stack,
+) -> None:
+    """D1: revoking a binding does not reach a runtime that is already deployed.
+
+    `Household.knows_binding` answers from the manifest the runtime booted
+    with, and the runtime does not read `channel_bindings`. So anything that
+    changes the table WITHOUT issuing a revision leaves the two disagreeing —
+    and the disagreement is invisible, because every layer the control plane
+    can see reports success while the runtime goes on authorizing somebody it
+    has been told not to.
+
+    Migration 0010 is the instance: it retires bindings whose identities were
+    never provenanced, and nothing re-plans. `ControlPlaneDatabase.migrate`
+    does not call the planner and neither does startup.
+
+    The revocation is done here by deleting the row, which is what the
+    migration does — not through a lifecycle method — because the point is that
+    ANY path which changes the table without a revision leaves this gap.
+    """
+    _provisioned(cp_stack)
+    _activated(cp_stack)
+    owner = owner_actor(cp_stack)
+    household_chat = owner_chat(cp_stack)
+
+    with cp_stack.database.write() as connection:
+        issued = cp_stack.bindings.issue_challenge(
+            connection,
+            household_id=cp_stack.household.id,
+            channel=CHANNEL_SELECTION["kind"],
+            external_id=ADULT,
+            chat_id=household_chat,
+            actor_id=ADULT,
+            role="adult",
+            issued_by_actor_id=owner,
+            now=BASE_TIME + 100,
+        )
+        cp_stack.bindings.verify_challenge(
+            connection,
+            code=issued.code,
+            household_id=cp_stack.household.id,
+            owner_actor_id=owner,
+            now=BASE_TIME + 200,
+        )
+        planned = cp_stack.make_worker().planner.issue(
+            connection, household_id=cp_stack.household.id
+        )
+        schedule_runtime_rollout(
+            connection,
+            jobs=cp_stack.jobs,
+            onboarding=cp_stack.onboarding,
+            household_id=cp_stack.household.id,
+            planned=planned,
+            runtime_provider=cp_stack.config.runtime_provider,
+            now=BASE_TIME + 201,
+        )
+    _drain(cp_stack.make_worker(now=BASE_TIME + 202))
+    # A scheduled rollout leaves the household `provisioning` until the
+    # runtime's bootstrap activates it, which this harness does not host.
+    _activated(cp_stack)
+
+    assert (ADULT, household_chat) in _served_pairs(cp_stack, cp_stack.household.id)
+
+    # Now revoke it the way 0010 does: the row goes, and nothing re-plans.
+    with cp_stack.database.write() as connection:
+        connection.execute(
+            "DELETE FROM channel_bindings WHERE actor_id = ?", (ADULT,)
+        )
+
+    # The defect, stated: the table has revoked the member and the runtime has
+    # not heard. Nothing raised, nothing logged, and the deployed manifest goes
+    # on authorizing them.
+    assert (ADULT, household_chat) in _served_pairs(cp_stack, cp_stack.household.id)
+
+    with cp_stack.database.write() as connection:
+        stale = find_stale_bindings(
+            connection,
+            configs=cp_stack.configs,
+            bindings=cp_stack.bindings,
+            onboarding=cp_stack.onboarding,
+        )
+    assert [item.household_id for item in stale] == [cp_stack.household.id]
+    assert stale[0].blocked_by is None
+    # The report names counts and identifiers, never the identities themselves.
+    report = stale[0].public_dict()
+    assert report["revoked"] == 1 and report["added"] == 0
+    assert ADULT not in json.dumps(report)
+
+    # A dry run reports and writes nothing — the default, because this
+    # schedules real deployments for households nobody asked about.
+    with cp_stack.database.write() as connection:
+        dry = reconcile_stale_bindings(
+            connection,
+            planner=cp_stack.make_worker().planner,
+            jobs=cp_stack.jobs,
+            onboarding=cp_stack.onboarding,
+            configs=cp_stack.configs,
+            bindings=cp_stack.bindings,
+            runtime_provider=cp_stack.config.runtime_provider,
+        )
+    assert [item["action"] for item in dry] == ["would_reconcile"]
+    assert (ADULT, household_chat) in _served_pairs(cp_stack, cp_stack.household.id)
+
+    with cp_stack.database.write() as connection:
+        applied = reconcile_stale_bindings(
+            connection,
+            planner=cp_stack.make_worker().planner,
+            jobs=cp_stack.jobs,
+            onboarding=cp_stack.onboarding,
+            configs=cp_stack.configs,
+            bindings=cp_stack.bindings,
+            runtime_provider=cp_stack.config.runtime_provider,
+            apply=True,
+            now=BASE_TIME + 300,
+        )
+    assert [item["action"] for item in applied] == ["reconciled"]
+    _drain(cp_stack.make_worker(now=BASE_TIME + 301))
+    _activated(cp_stack)
+
+    # The runtime now authorizes what the table says, and only that.
+    pairs = _served_pairs(cp_stack, cp_stack.household.id)
+    assert (ADULT, household_chat) not in pairs
+    assert (owner, household_chat) in pairs
+
+    # And a second sweep finds nothing: the fix converges rather than
+    # re-planning the same household on every run.
+    with cp_stack.database.write() as connection:
+        assert find_stale_bindings(
+            connection,
+            configs=cp_stack.configs,
+            bindings=cp_stack.bindings,
+            onboarding=cp_stack.onboarding,
+        ) == ()
+
+
+def test_a_household_still_settling_is_reported_and_never_forced(cp_stack) -> None:
+    """A blocked household is skipped, not pushed through.
+
+    `schedule_runtime_rollout` refuses a household that is not `active` with a
+    `complete` workflow, and those are the states where forcing strands jobs: a
+    second rollout while the first is in flight overwrites the single
+    `current_config_revision`, and then neither job can match it.
+
+    The sweep asks the same two facts that scheduler asks, so the report cannot
+    promise a rollout the scheduler then declines.
+    """
+    _provisioned(cp_stack)
+    _activated(cp_stack)
+    with cp_stack.database.write() as connection:
+        connection.execute(
+            "DELETE FROM channel_bindings WHERE household_id = ?",
+            (cp_stack.household.id,),
+        )
+        # A rollout already in flight: the state where forcing a second one
+        # overwrites `current_config_revision` and strands both jobs.
+        connection.execute(
+            "UPDATE households SET status = 'provisioning' WHERE id = ?",
+            (cp_stack.household.id,),
+        )
+        stale = find_stale_bindings(
+            connection,
+            configs=cp_stack.configs,
+            bindings=cp_stack.bindings,
+            onboarding=cp_stack.onboarding,
+        )
+        assert [item.blocked_by for item in stale] == ["household_status_provisioning"]
+
+        applied = reconcile_stale_bindings(
+            connection,
+            planner=cp_stack.make_worker().planner,
+            jobs=cp_stack.jobs,
+            onboarding=cp_stack.onboarding,
+            configs=cp_stack.configs,
+            bindings=cp_stack.bindings,
+            runtime_provider=cp_stack.config.runtime_provider,
+            apply=True,
+        )
+        assert [item["action"] for item in applied] == ["skipped"]
+        # Nothing was queued for a household that could not take one.
+        assert connection.execute(
+            "SELECT COUNT(*) AS total FROM provisioning_jobs WHERE operation = ?",
+            (REPROVISION_RUNTIME_OPERATION,),
+        ).fetchone()["total"] == 0

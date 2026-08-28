@@ -19,9 +19,12 @@ from __future__ import annotations
 
 import sqlite3
 import time
+from dataclasses import dataclass
 
-from control_plane.provisioning.planner import PlannedRevision
+from control_plane.provisioning.planner import DesiredSpecPlanner, PlannedRevision
 from control_plane.provisioning.worker import REPROVISION_RUNTIME_OPERATION
+from control_plane.repositories.bindings import ChannelBindingsRepository
+from control_plane.repositories.configs import ConfigRepository
 from control_plane.repositories.jobs import JobsRepository
 from control_plane.repositories.onboarding import OnboardingRepository
 
@@ -100,3 +103,184 @@ def schedule_runtime_rollout(
         (revision, now, household_id),
     )
     return job_id
+
+
+# --- reconciling a household whose runtime is serving a stale binding set ---
+
+
+@dataclass(frozen=True)
+class StaleHousehold:
+    """One household whose deployed manifest disagrees with the binding table."""
+
+    household_id: str
+    served_revision: int
+    #: `(channel, actor_id, chat_id)` triples, sorted, as the table says now.
+    bindings_now: tuple[tuple[str, str, str], ...]
+    #: The same, as the revision the runtime is actually serving says.
+    bindings_served: tuple[tuple[str, str, str], ...]
+    #: Why a rollout cannot be scheduled for this household right now, or None.
+    blocked_by: str | None
+
+    def public_dict(self) -> dict[str, object]:
+        """Identifiers and counts only. A binding is a channel identity."""
+        return {
+            "household_id": self.household_id,
+            "served_revision": self.served_revision,
+            "bindings_now": len(self.bindings_now),
+            "bindings_served": len(self.bindings_served),
+            "revoked": len(set(self.bindings_served) - set(self.bindings_now)),
+            "added": len(set(self.bindings_now) - set(self.bindings_served)),
+            "blocked_by": self.blocked_by,
+        }
+
+
+def _projected(bindings: tuple) -> tuple[tuple[str, str, str], ...]:
+    return tuple(sorted(
+        (record.channel, record.actor_id, record.chat_id) for record in bindings
+    ))
+
+
+def _served(manifest: dict) -> tuple[tuple[str, str, str], ...]:
+    return tuple(sorted(
+        (str(entry.get("channel")), str(entry.get("actor_id")), str(entry.get("chat_id")))
+        for entry in manifest.get("channel_bindings", ())
+    ))
+
+
+def find_stale_bindings(
+    connection: sqlite3.Connection,
+    *,
+    configs: ConfigRepository,
+    bindings: ChannelBindingsRepository,
+    onboarding: OnboardingRepository,
+) -> tuple[StaleHousehold, ...]:
+    """Households whose runtime authorizes a binding set the table no longer has.
+
+    The control plane's table is authoritative, and the runtime does not read
+    it: `Household.knows_binding` answers from the manifest the runtime booted
+    with. So anything that changes `channel_bindings` WITHOUT issuing a
+    revision leaves the two disagreeing, and the disagreement is invisible —
+    every layer the control plane can see reports success while the runtime
+    goes on authorizing somebody it has been told not to.
+
+    Migration 0010 is the instance this was written for: it retires bindings
+    whose identities were never provenanced, and nothing re-plans afterwards.
+    `ControlPlaneDatabase.migrate` does not call `DesiredSpecPlanner.issue`,
+    and neither does the startup path, so "the next revision will fix it" is
+    true only if something happens to issue one.
+
+    Staleness is DERIVED rather than recorded, which is why this finds drift
+    from any cause and not only from that migration. A revocation table would
+    have to be written by everything that can revoke, and the one thing that
+    already knows the answer is the comparison itself: what the table says now
+    against what the served revision says. `households.current_config_revision`
+    is the revision being served — `schedule_runtime_rollout` advances it and
+    the worker confirms it — so it is the manifest to compare against, not the
+    newest one, which may be planned and not yet deployed.
+    """
+    rows = connection.execute(
+        "SELECT id, status, current_config_revision FROM households"
+        " WHERE current_config_revision IS NOT NULL AND current_config_revision > 0"
+        " ORDER BY id"
+    ).fetchall()
+    stale: list[StaleHousehold] = []
+    for row in rows:
+        household_id = str(row["id"])
+        revision = int(row["current_config_revision"])
+        try:
+            manifest = configs.manifest(household_id, revision)
+        except KeyError:
+            # The household points at a revision that is not stored. That is a
+            # different fault and not one a binding sweep should paper over by
+            # planning a fresh revision on top of it.
+            stale.append(StaleHousehold(
+                household_id=household_id,
+                served_revision=revision,
+                bindings_now=_projected(
+                    bindings.verified(connection, household_id=household_id)
+                ),
+                bindings_served=(),
+                blocked_by="served_revision_missing",
+            ))
+            continue
+        now_bindings = _projected(
+            bindings.verified(connection, household_id=household_id)
+        )
+        served = _served(manifest)
+        if now_bindings == served:
+            continue
+        stale.append(StaleHousehold(
+            household_id=household_id,
+            served_revision=revision,
+            bindings_now=now_bindings,
+            bindings_served=served,
+            blocked_by=_blocked_by(row, onboarding, household_id),
+        ))
+    return tuple(stale)
+
+
+def _blocked_by(row, onboarding: OnboardingRepository, household_id: str) -> str | None:
+    """The reason `schedule_runtime_rollout` would refuse, asked the same way.
+
+    Read from the same two facts that function checks, so the report cannot
+    promise a rollout the scheduler then declines. It is stated as a reason
+    rather than a boolean because "still settling" and "never finished setup"
+    are different operator problems.
+    """
+    if row["status"] != "active":
+        return f"household_status_{row['status']}"
+    try:
+        workflow = onboarding.workflow_for_household(household_id)
+    except Exception:
+        return "workflow_missing"
+    if workflow.state != "complete":
+        return f"workflow_{workflow.state}"
+    return None
+
+
+def reconcile_stale_bindings(
+    connection: sqlite3.Connection,
+    *,
+    planner: DesiredSpecPlanner,
+    jobs: JobsRepository,
+    onboarding: OnboardingRepository,
+    configs: ConfigRepository,
+    bindings: ChannelBindingsRepository,
+    runtime_provider: str,
+    apply: bool = False,
+    now: float | None = None,
+) -> tuple[dict[str, object], ...]:
+    """Report every stale household, and — only with `apply` — re-plan them.
+
+    Dry run is the default because this schedules real deployments for
+    households nobody asked about. The report is the same shape either way, so
+    what an operator reads is what the apply run acts on.
+
+    A blocked household is REPORTED and skipped, never forced. The states
+    `schedule_runtime_rollout` refuses are the states where forcing strands
+    jobs — a second rollout while the first is in flight overwrites the single
+    `current_config_revision` and leaves both unable to match it.
+    """
+    results: list[dict[str, object]] = []
+    for household in find_stale_bindings(
+        connection, configs=configs, bindings=bindings, onboarding=onboarding
+    ):
+        entry = household.public_dict()
+        if household.blocked_by is not None or not apply:
+            entry["action"] = "skipped" if household.blocked_by else "would_reconcile"
+            results.append(entry)
+            continue
+        planned = planner.issue(connection, household_id=household.household_id)
+        schedule_runtime_rollout(
+            connection,
+            jobs=jobs,
+            onboarding=onboarding,
+            household_id=household.household_id,
+            planned=planned,
+            runtime_provider=runtime_provider,
+            now=now,
+        )
+        entry["action"] = "reconciled"
+        entry["planned_revision"] = planned.revision.revision
+        results.append(entry)
+    return tuple(results)

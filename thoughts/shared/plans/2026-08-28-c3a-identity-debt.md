@@ -249,10 +249,23 @@ two-household case in `test_channel_bindings.py`.
 
 ## Inventory — D1 revocation propagation
 
-**Files:** `control_plane/provisioning/rollout.py`,
-`control_plane/provisioning/worker.py`, `control_plane/repositories/bindings.py`,
-`tests/control_plane/test_provision_dry_run.py`,
+**Files:** `control_plane/provisioning/rollout.py`, `control_plane/cli.py`,
 `tests/control_plane/test_channel_bindings.py`.
+
+`control_plane/cli.py` was added to this inventory during implementation: D1
+resolved to option (1), an operator-invoked sweep, and `cli.py` is where every
+other sweep lives — `retention`, `runtime-health`, `resume-deletions`. Putting
+it anywhere else would have made it the one operator action with no operator
+entry point.
+
+`worker.py` and `repositories/bindings.py` turned out not to need changes.
+Staleness is DERIVED by comparing the binding table against the manifest of
+`households.current_config_revision`, so nothing has to record a revocation and
+no write path has to learn a new duty — which also means the sweep finds drift
+from any cause rather than only from `0010`. `test_provision_dry_run.py` is
+untouched for the same reason: this report is not a job report and makes no
+claim about which job the worker reaches first, so it is not governed by the
+"a report describes the branch the worker will actually take" invariant.
 
 **Branches:** `codex/d1-revocation-propagation`.
 
