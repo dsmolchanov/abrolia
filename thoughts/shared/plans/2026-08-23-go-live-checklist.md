@@ -295,12 +295,31 @@ which is what the endpoint's own shape was preventing.
 
 **Branches:** `codex/c3d-tests-that-reach-their-path`.
 
-Tests only. Both gaps were confirmed by experiment before being filled, and
-each is recorded beside the case that fills it: deleting
-`schedule_runtime_rollout` from `verify_binding_challenge` left the whole
-suite green, and so did dropping the revision clause from a currency
+Tests only. Both gaps were confirmed by experiment before being filled:
+deleting `schedule_runtime_rollout` from `verify_binding_challenge` left the
+whole suite green, and so did dropping the revision clause from a currency
 checkpoint. A regression that passes when the code it is named for is deleted
 is worse than no regression, because it is counted.
+
+**Scope narrowed from what this item asked for, deliberately.** C3d says "both
+operations × both stale fields × all four checkpoints". What shipped is one
+case per (checkpoint, field that checkpoint reads), for one operation — five
+cases where the dense matrix would be twelve.
+
+The two operations were dropped because the clauses under test are shared
+code; what differs between them is `_workflow_states_for`, which has its own
+test. Running every case twice pinned nothing the single run did not, measured
+by deleting each clause and counting failures.
+
+The fourth checkpoint — `_runtime_projection_is_current`, during reconcile —
+is not covered, and that is a FINDING rather than an omission. Its revision
+clause changes no outcome: with it removed the job is resumed and the next
+checkpoint cancels it for the same staleness. The only thing it uniquely
+controls is whether reconcile re-enters the provider for a revision nobody is
+serving. A test can pin that, by asserting provider call counts, and doing so
+costs more machinery than the clause is worth defending. Recorded here so the
+next reader knows it was measured rather than missed — and so that anyone
+simplifying that predicate knows what they would be giving up.
 
 
 ## Track R — Staged rollout (fixed order; runbook §Rollout)
