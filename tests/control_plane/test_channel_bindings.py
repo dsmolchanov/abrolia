@@ -13,13 +13,33 @@ import pytest
 from control_plane.repositories.bindings import BindingError
 from tests.control_plane.conftest import BASE_TIME
 
+
+def _jid(phone: str) -> str:
+    """The conversation identifier WhatsApp ingest reports for a 1:1 thread.
+
+    Deliberately NOT the sender. `parse_webhook` normalizes the actor to
+    `+999…` and reads the chat from the provider's `remote_jid`, and
+    `trusted_run_context` compares both by string — so a fixture that passes
+    one value for both cannot notice a consumer reading the wrong column. The
+    reserved `.invalid` TLD and the `99XXXXXXX` range are what the repository's
+    synthetic-fixture checker requires; `tests/test_whatsapp.py` uses the same
+    shape against the real parser.
+    """
+    return f"{phone.lstrip('+')}@s.whatsapp.invalid"
+
+
 OWNER = "synthetic-owner"
 ADULT = "synthetic-second-adult"
 #: A SENDER identity, not a chat. The distinction is the whole of C3a: on
 #: Telegram a user ID and a chat ID are different values, and before the split
 #: one column had to be both.
 ADULT_SENDER = "synthetic-second-adult-sender"
-PHONE = "+999511234567"
+PHONE = "+999511234"
+#: What `hermes_cloud/ingest/whatsapp_webhook.py` actually reports as the CHAT
+#: for a 1:1 thread with PHONE. It is not the sender: the actor is normalized
+#: to `+999…` and the conversation is the provider's `remote_jid`. Copying one
+#: field into the other writes a pair no inbound turn can ever match.
+PHONE_CHAT = _jid("+999511234")
 
 
 @pytest.fixture
@@ -34,6 +54,7 @@ def _issue(cp_stack, connection, **overrides):
         household_id=cp_stack.household.id,
         channel="whatsapp",
         external_id=PHONE,
+        chat_id=PHONE_CHAT,
         actor_id=ADULT,
         role="adult",
         issued_by_actor_id=OWNER,
@@ -78,7 +99,7 @@ def test_the_raw_code_is_never_stored(cp_stack) -> None:
 
 def test_an_expired_or_reused_challenge_is_refused(cp_stack) -> None:
     with cp_stack.database.write() as connection:
-        expired = _issue(cp_stack, connection, external_id="+999511111111")
+        expired = _issue(cp_stack, connection, external_id="+999511111")
         with pytest.raises(BindingError, match="invalid or expired"):
             cp_stack.bindings.verify_challenge(
                 connection,
@@ -263,7 +284,13 @@ def test_the_retention_sweep_retires_a_challenge_nobody_answered(cp_stack) -> No
 from control_plane.models import StepKind  # noqa: E402
 from control_plane.provisioning.manifest import DesiredHouseholdSpecV1  # noqa: E402
 from control_plane.provisioning.manifest_toml import manifest_to_toml  # noqa: E402
+from hermes_cloud.core.runcontext import Household  # noqa: E402
 from hermes_cloud.core.runtime_manifest import parse_runtime_manifest  # noqa: E402
+from hermes_cloud.ingest.whatsapp_webhook import (  # noqa: E402
+    WhatsAppInbound,
+    as_eml,
+    trusted_run_context,
+)
 from tests.control_plane.test_manifest import (  # noqa: E402
     CHANNEL_SELECTION,
     EMAIL_SELECTION,
@@ -420,7 +447,8 @@ def test_relaxing_uniqueness_did_not_relax_the_pair_check(cp_stack) -> None:
         for external_id, chat_id in (
             (ADULT_SENDER, household_chat),
             # The same adult, a second binding, a private thread of their own.
-            ("+999511234567", "+999511234567"),
+            # Sender and conversation are deliberately different strings.
+            (PHONE, PHONE_CHAT),
         ):
             issued = cp_stack.bindings.issue_challenge(
                 connection,
@@ -460,12 +488,12 @@ def test_relaxing_uniqueness_did_not_relax_the_pair_check(cp_stack) -> None:
     assert runtime.verified_actor_chat_pairs == frozenset({
         (owner, household_chat),
         (ADULT, household_chat),
-        (ADULT, "+999511234567"),
+        (ADULT, PHONE_CHAT),
     })
-    assert (owner, "+999511234567") not in runtime.verified_actor_chat_pairs
+    assert (owner, PHONE_CHAT) not in runtime.verified_actor_chat_pairs
     # `allowed_chats` widened, exactly as the plan said it would. It is now the
     # weaker check, and nothing authorizes from it while pairs are present.
-    assert runtime.allowed_chats == frozenset({household_chat, "+999511234567"})
+    assert runtime.allowed_chats == frozenset({household_chat, PHONE_CHAT})
 
 
 def test_an_adult_on_another_channel_is_bound_and_the_runtime_can_start_it(
@@ -486,7 +514,8 @@ def test_an_adult_on_another_channel_is_bound_and_the_runtime_can_start_it(
             connection,
             household_id=cp_stack.household.id,
             channel="whatsapp",
-            external_id="+999511234567",
+            external_id="+999511234",
+            chat_id=_jid("+999511234"),
             actor_id=ADULT,
             role="adult",
             issued_by_actor_id=CHANNEL_SELECTION["actor_id"],
@@ -513,7 +542,11 @@ def test_an_adult_on_another_channel_is_bound_and_the_runtime_can_start_it(
     assert runtime.primary_chat_id == CHANNEL_SELECTION["chat_id"]
     assert runtime.verified_actor_chat_pairs == frozenset({
         (CHANNEL_SELECTION["actor_id"], CHANNEL_SELECTION["chat_id"]),
-        (ADULT, "+999511234567"),
+        # The pair is (sender, conversation) and the two are different strings
+        # on WhatsApp. This assertion used to read `(ADULT, "+999511234")`,
+        # which is the shape `trusted_run_context` can never see: it compares
+        # the +-normalized actor against the provider's `remote_jid`.
+        (ADULT, PHONE_CHAT),
     })
 
 
@@ -601,6 +634,7 @@ def test_reprovisioning_drops_outstanding_challenges_and_dependent_adults(
         )
         issued = cp_stack.bindings.issue_challenge(
             connection, household_id=hid, channel="whatsapp", external_id=PHONE,
+                                                                          chat_id=PHONE_CHAT,
             actor_id=ADULT, role="adult", issued_by_actor_id=OWNER, now=BASE_TIME,
         )
         cp_stack.bindings.verify_challenge(
@@ -609,15 +643,16 @@ def test_reprovisioning_drops_outstanding_challenges_and_dependent_adults(
         )
         pending = cp_stack.bindings.issue_challenge(
             connection, household_id=hid, channel="whatsapp",
-            external_id="+999511119999", actor_id="synthetic-third",
+            external_id="+999511119", actor_id="synthetic-third",
+            chat_id=_jid("+999511119"),
             role="adult", issued_by_actor_id=OWNER, now=BASE_TIME + 6,
         )
         # The household moves its primary channel onto WhatsApp, where that
         # adult already sits.
         cp_stack.bindings.ensure_owner_binding(
             connection, household_id=hid, channel="whatsapp",
-            external_id="+999511230000", actor_id=OWNER, now=BASE_TIME + 20,
-            chat_id="+999511230000",
+            external_id="+999511230", actor_id=OWNER, now=BASE_TIME + 20,
+            chat_id=_jid("+999511230"),
         )
         rows = cp_stack.bindings.verified(connection, household_id=hid)
         # The outstanding code no longer redeems.
@@ -628,7 +663,7 @@ def test_reprovisioning_drops_outstanding_challenges_and_dependent_adults(
             )
 
     assert [(r.channel, r.external_id, r.role) for r in rows] == [
-        ("whatsapp", "+999511230000", "owner")
+        ("whatsapp", "+999511230", "owner")
     ]
 
 
@@ -647,7 +682,7 @@ def test_one_actor_with_several_bindings_is_one_family_member(cp_stack) -> None:
     _provisioned(cp_stack)
     with cp_stack.database.write() as connection:
         for channel, external_id in (
-            ("whatsapp", "+999511234567"),
+            ("whatsapp", "+999511234"),
             ("web", "synthetic-web-seat"),
         ):
             issued = cp_stack.bindings.issue_challenge(
@@ -655,6 +690,7 @@ def test_one_actor_with_several_bindings_is_one_family_member(cp_stack) -> None:
                 household_id=cp_stack.household.id,
                 channel=channel,
                 external_id=external_id,
+                chat_id=external_id,
                 actor_id=ADULT,
                 role="adult",
                 issued_by_actor_id=CHANNEL_SELECTION["actor_id"],
@@ -697,6 +733,7 @@ def test_seeding_reconciles_role_and_actor_not_just_the_tuple(cp_stack) -> None:
         )
         issued = cp_stack.bindings.issue_challenge(
             connection, household_id=hid, channel="whatsapp", external_id=PHONE,
+                                                                          chat_id=PHONE_CHAT,
             actor_id=ADULT, role="adult", issued_by_actor_id=OWNER, now=BASE_TIME,
         )
         cp_stack.bindings.verify_challenge(
@@ -748,15 +785,18 @@ def test_a_household_cannot_grow_challenges_or_bindings_without_end(
             chat_id="synthetic-chat",
         )
         for index in range(MAX_OPEN_CHALLENGES):
+            phone = f"+{999110000 + index}"
             cp_stack.bindings.issue_challenge(
                 connection, household_id=hid, channel="whatsapp",
-                external_id=f"+99951100{index:04d}", actor_id=f"synthetic-a{index}",
+                external_id=phone, actor_id=f"synthetic-a{index}",
+                chat_id=_jid(phone),
                 role="adult", issued_by_actor_id=OWNER, now=BASE_TIME,
             )
         with pytest.raises(BindingError, match="outstanding challenges"):
             cp_stack.bindings.issue_challenge(
                 connection, household_id=hid, channel="whatsapp",
-                external_id="+999511009999", actor_id="synthetic-one-too-many",
+                external_id="+999110999", actor_id="synthetic-one-too-many",
+                chat_id=_jid("+999110999"),
                 role="adult", issued_by_actor_id=OWNER, now=BASE_TIME,
             )
 
@@ -764,9 +804,11 @@ def test_a_household_cannot_grow_challenges_or_bindings_without_end(
         # however the row was reached.
         connection.execute("DELETE FROM channel_binding_challenges")
         for index in range(MAX_BINDINGS - 1):
+            phone = f"+{999119000 + index}"
             issued = cp_stack.bindings.issue_challenge(
                 connection, household_id=hid, channel="whatsapp",
-                external_id=f"+99951199{index:04d}", actor_id=f"synthetic-b{index}",
+                external_id=phone, actor_id=f"synthetic-b{index}",
+                chat_id=_jid(phone),
                 role="adult", issued_by_actor_id=OWNER, now=BASE_TIME,
             )
             cp_stack.bindings.verify_challenge(
@@ -775,7 +817,8 @@ def test_a_household_cannot_grow_challenges_or_bindings_without_end(
             )
         over = cp_stack.bindings.issue_challenge(
             connection, household_id=hid, channel="whatsapp",
-            external_id="+999511998888", actor_id="synthetic-last",
+            external_id="+999119888", actor_id="synthetic-last",
+            chat_id=_jid("+999119888"),
             role="adult", issued_by_actor_id=OWNER, now=BASE_TIME,
         )
         with pytest.raises(BindingError, match="as many bindings"):
@@ -802,12 +845,14 @@ def test_redeeming_one_invitation_leaves_the_others_standing(cp_stack) -> None:
         )
         first = cp_stack.bindings.issue_challenge(
             connection, household_id=hid, channel="whatsapp",
-            external_id="+999511110001", actor_id="synthetic-adult-a",
+            external_id="+999511101", actor_id="synthetic-adult-a",
+            chat_id=_jid("+999511101"),
             role="adult", issued_by_actor_id=OWNER, now=BASE_TIME,
         )
         second = cp_stack.bindings.issue_challenge(
             connection, household_id=hid, channel="whatsapp",
-            external_id="+999511110002", actor_id="synthetic-adult-b",
+            external_id="+999511102", actor_id="synthetic-adult-b",
+            chat_id=_jid("+999511102"),
             role="adult", issued_by_actor_id=OWNER, now=BASE_TIME,
         )
         cp_stack.bindings.verify_challenge(
@@ -835,6 +880,7 @@ def test_redeeming_one_invitation_leaves_the_others_standing(cp_stack) -> None:
         pending = cp_stack.bindings.issue_challenge(
             connection, household_id=hid, channel="web",
             external_id="synthetic-web-seat", actor_id="synthetic-adult-c",
+            chat_id="synthetic-web-seat",
             role="adult", issued_by_actor_id=OWNER, now=BASE_TIME + 4,
         )
         cp_stack.bindings.ensure_owner_binding(
@@ -892,6 +938,7 @@ def test_verifying_a_binding_schedules_the_rollout_and_leaves_onboarding_alone(
             household_id=cp_stack.household.id,
             channel="whatsapp",
             external_id=PHONE,
+            chat_id=PHONE_CHAT,
             actor_id=ADULT,
             role="adult",
             issued_by_actor_id=CHANNEL_SELECTION["actor_id"],
@@ -939,3 +986,133 @@ def test_verifying_a_binding_schedules_the_rollout_and_leaves_onboarding_alone(
     after = cp_stack.onboarding.snapshot(cp_stack.household.id)
     assert after.state.value == "complete"
     assert after.current_step == before.current_step
+
+
+def test_a_bound_whatsapp_member_is_authorized_by_a_real_inbound_turn(
+    cp_stack,
+) -> None:
+    """A stored `chat_id` is only worth anything if ingest produces that string.
+
+    The first cut of C3a let `chat_id` default to `external_id`, documented as
+    "the truth for WhatsApp, where a 1:1 thread IS the number". It is not the
+    truth in this system, and Codex blocked the PR for it:
+    `hermes_cloud/ingest/whatsapp_webhook.py` normalizes the SENDER to `+999…`
+    and reports the CHAT as the provider's `remote_jid`, `999…@s.whatsapp.invalid`.
+    `trusted_run_context` then authorizes that exact pair by string. A binding
+    written as `(+999…, +999…)` therefore succeeded, published a revision, and
+    was unknown to every real message that followed.
+
+    So the assertion is made through the ACTUAL ingest path — a webhook-shaped
+    inbound, rendered by `as_eml`, read back by `trusted_run_context` — rather
+    than against a pair this test made up. A control-plane test that invents
+    both halves of the comparison cannot notice that neither matches reality.
+    """
+    _provisioned(cp_stack)
+    owner = CHANNEL_SELECTION["actor_id"]
+
+    with cp_stack.database.write() as connection:
+        issued = cp_stack.bindings.issue_challenge(
+            connection,
+            household_id=cp_stack.household.id,
+            channel="whatsapp",
+            external_id=PHONE,
+            chat_id=PHONE_CHAT,
+            actor_id=ADULT,
+            role="adult",
+            issued_by_actor_id=owner,
+            now=BASE_TIME + 100,
+        )
+        cp_stack.bindings.verify_challenge(
+            connection,
+            code=issued.code,
+            household_id=cp_stack.household.id,
+            owner_actor_id=owner,
+            now=BASE_TIME + 200,
+        )
+        cp_stack.make_worker().planner.issue(
+            connection, household_id=cp_stack.household.id
+        )
+
+    spec = DesiredHouseholdSpecV1.model_validate(
+        cp_stack.configs.manifest(cp_stack.household.id, 2)
+    )
+    manifest = parse_runtime_manifest(manifest_to_toml(spec))
+    household = Household(
+        household_id=manifest.household_id,
+        owner=manifest.actors.owner,
+        family=manifest.actors.family,
+        guests=manifest.actors.guests,
+        allowed_chats=manifest.allowed_chats,
+        verified_bindings=manifest.verified_actor_chat_pairs,
+    )
+
+    raw = as_eml(
+        WhatsAppInbound(
+            message_id="synthetic-wa-1",
+            chat_id=PHONE_CHAT,
+            actor_id=PHONE,
+            text="я заберу его в пятницу",
+            display_name=None,
+            instance="synthetic-instance",
+        )
+    )
+    context = trusted_run_context(raw, household)
+
+    # The CHAT the control plane stored is the string ingest produces, so the
+    # chat half of the authorization pair matches a real turn...
+    assert context.chat_id == PHONE_CHAT
+    assert (ADULT, context.chat_id) in manifest.verified_actor_chat_pairs
+    # ...and the string the removed default would have stored does not. This is
+    # the assertion that fails against the first cut of this slice.
+    assert context.chat_id != PHONE
+    assert (ADULT, PHONE) not in manifest.verified_actor_chat_pairs
+    assert PHONE not in household.allowed_chats
+
+    # The ACTOR half is a different contract and this slice does not touch it.
+    # `trusted_run_context` reports the channel sender (`+999…`), so a WhatsApp
+    # binding only authorizes when `channel_bindings.actor_id` IS that sender —
+    # the convention `tests/test_whatsapp.py` encodes and Telegram already
+    # follows by reading `message.from.id` as the actor. The control plane
+    # writes whatever actor onboarding or the owner named, which for these
+    # synthetic households is an internal ID. Asserted here so the gap is
+    # visible and attributed rather than discovered again; closing it is a
+    # decision about what onboarding captures, like M1, not a line to patch.
+    assert context.actor_id == PHONE
+    assert not household.knows_binding(context.actor_id, context.chat_id)
+
+
+def test_a_challenge_cannot_borrow_the_sender_as_its_chat(cp_stack) -> None:
+    """`chat_id` is required, and no longer defaulted from `external_id`.
+
+    Requiring it is the fix rather than deriving it: the control plane does not
+    own WhatsApp's JID format, and a derivation right for a 1:1 thread
+    (`@s.whatsapp.invalid`) is wrong for a group (`@g.us`) — which is the shared
+    conversation this whole slice exists to allow. A guess that answers the
+    chat question from the sender is the conflation C3a removed, rebuilt one
+    layer up.
+    """
+    _provisioned(cp_stack)
+    with cp_stack.database.write() as connection:
+        with pytest.raises(TypeError, match="chat_id"):
+            cp_stack.bindings.issue_challenge(
+                connection,
+                household_id=cp_stack.household.id,
+                channel="whatsapp",
+                external_id=PHONE,
+                actor_id=ADULT,
+                role="adult",
+                issued_by_actor_id=CHANNEL_SELECTION["actor_id"],
+                now=BASE_TIME + 100,
+            )
+        with pytest.raises(BindingError, match="chat ID is required"):
+            cp_stack.bindings.issue_challenge(
+                connection,
+                household_id=cp_stack.household.id,
+                channel="whatsapp",
+                external_id=PHONE,
+                chat_id="   ",
+                actor_id=ADULT,
+                role="adult",
+                issued_by_actor_id=CHANNEL_SELECTION["actor_id"],
+                now=BASE_TIME + 100,
+            )

@@ -34,6 +34,16 @@ answered both questions, and a household therefore could not hold a second
 member on its primary channel at all. Uniqueness stays on the sender, so two
 members may now share one chat.
 
+Neither is derivable from the other, and the caller must supply both. It is
+tempting to treat a WhatsApp 1:1 thread as "the same as the number", and it is
+not: `hermes_cloud/ingest/whatsapp_webhook.py` normalizes the SENDER to
+`+999…` and reports the CHAT as the provider's `remote_jid`,
+`999…@s.whatsapp.net` — and a group is `@g.us`, which is precisely the shared
+conversation this slice exists to allow. `trusted_run_context` authorizes the
+exact pair, by string, so a binding built by copying one field into the other
+is a binding no inbound turn can ever match. Deriving a chat from a sender is
+the conflation this module just removed, wearing a different hat.
+
 What this does NOT yet establish, stated plainly because the column is called
 `verified_at` and would otherwise be read as more than it is: the control plane
 has no sender for telegram or WhatsApp — outbound goes through the gateway and
@@ -328,7 +338,7 @@ class ChannelBindingsRepository(Repository):
         actor_id: str,
         role: str,
         issued_by_actor_id: str,
-        chat_id: str | None = None,
+        chat_id: str,
         now: float | None = None,
         ttl_seconds: float = CHALLENGE_TTL_SECONDS,
     ) -> IssuedChallenge:
@@ -338,8 +348,14 @@ class ChannelBindingsRepository(Repository):
         inbound message against. `chat_id` is the CONVERSATION that member
         speaks in, and it may be one another member already holds: that is the
         arrangement C3a exists to allow, an owner and an adult in the family's
-        one group chat. Omitting it means "the same value", which is the truth
-        for WhatsApp, where a 1:1 thread IS the number.
+        one group chat.
+
+        BOTH are required, and `chat_id` is never defaulted from the sender.
+        An earlier version of this method defaulted it, on the reasoning that a
+        WhatsApp 1:1 thread is the number — see the module docstring for why
+        that is false in this system. The value must be the identifier the
+        channel's own ingest produces, because that is the string
+        authorization compares.
         """
         now = time.time() if now is None else now
         if channel not in CHANNELS:
@@ -348,7 +364,6 @@ class ChannelBindingsRepository(Repository):
             raise BindingError("a challenge cannot confer this role")
         if not external_id.strip():
             raise BindingError("external ID is required")
-        chat_id = external_id if chat_id is None else chat_id
         if not chat_id.strip():
             raise BindingError("chat ID is required")
         if actor_id == issued_by_actor_id:

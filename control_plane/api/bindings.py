@@ -44,12 +44,16 @@ class ChallengeRequest(BaseModel):
     #: The SENDER's identity on the channel — what the gateway will match an
     #: inbound message against.
     external_id: str = Field(min_length=1, max_length=128)
-    #: The CONVERSATION this member speaks in. Absent means "the same as
-    #: `external_id`", which is the truth for WhatsApp, where a 1:1 thread is
-    #: the number. On Telegram it is how an owner puts a second adult into the
+    #: The CONVERSATION this member speaks in — the identifier that channel's
+    #: own ingest produces, which for WhatsApp is the provider's `remote_jid`
+    #: (`999…@s.whatsapp.net`, or `@g.us` for a group) and NOT the `+999…` the
+    #: sender is normalized to. Required, and never defaulted from
+    #: `external_id`: `trusted_run_context` authorizes the exact pair by
+    #: string, so a chat copied from a sender is a binding no inbound turn can
+    #: match. On Telegram this is how an owner puts a second adult into the
     #: family's existing group — the arrangement C3a's schema split allows and
     #: the previous one could not represent at all.
-    chat_id: str | None = Field(default=None, min_length=1, max_length=128)
+    chat_id: str = Field(min_length=1, max_length=128)
     actor_id: str = Field(min_length=1, max_length=128)
 
 
