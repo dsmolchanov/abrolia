@@ -288,6 +288,20 @@ looking at whose row it was.
 `rollout.py` exists so the scheduling can be tested without an HTTP client,
 which is what the endpoint's own shape was preventing.
 
+#### Inventory — C3d tests that reach what they claim to cover
+
+**Files:** `tests/control_plane/test_binding_api.py`,
+`tests/control_plane/test_provisioning_jobs.py`.
+
+**Branches:** `codex/c3d-tests-that-reach-their-path`.
+
+Tests only. Both gaps were confirmed by experiment before being filled, and
+each is recorded beside the case that fills it: deleting
+`schedule_runtime_rollout` from `verify_binding_challenge` left the whole
+suite green, and so did dropping the revision clause from a currency
+checkpoint. A regression that passes when the code it is named for is deleted
+is worse than no regression, because it is counted.
+
 
 ## Track R — Staged rollout (fixed order; runbook §Rollout)
 
