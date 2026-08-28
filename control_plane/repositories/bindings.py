@@ -659,31 +659,55 @@ class ChannelBindingsRepository(Repository):
         external_id: str,
         household_id: str,
     ) -> None:
-        """An identity belongs to at most one household, under either name.
+        """An identity belongs to at most one household, under either name and
+        in whatever spelling holds it.
 
         The gateway resolves a sender across the WHOLE table and answers
         `ambiguous_sender` when two rows match, so binding an identity another
         household already holds does not share a channel — it breaks delivery
         for both, including the one that was there first and did nothing wrong.
 
-        This asked about `external_id` alone. `actor_id` is the same transport
-        identity read by the runtime instead of the gateway, and C3a enforces
-        the two equal on every new row — so today the second predicate can
-        never fire. It is asked anyway, because "they happen to be equal" is
-        not the rule; the rule is that neither name may be held twice, and
-        migration `0010` has already had to delete both halves of a
-        shared-actor pair that legacy rows could hold. Stating it once here
-        means a future write path cannot reintroduce it by relaxing the
-        equality somewhere else.
+        BOTH names are asked about. `actor_id` is the same transport identity
+        read by the runtime instead of the gateway, and C3a enforces the two
+        equal on every new row — so today the second can never fire on its own.
+        It is asked anyway, because "they happen to be equal" is not the rule;
+        the rule is that neither name may be held twice, and migration `0010`
+        has already had to delete both halves of a shared-actor pair that
+        legacy rows could hold.
+
+        And they are compared as IDENTITIES rather than as spellings. The
+        candidate arrives canonical — every caller passes through
+        `_canonical_pair` first — but the ROWS do not: everything written
+        before `control_plane/channels.py` existed was stored as typed, so a
+        household may hold `999511234` where the canonical form of the same
+        person is `+999511234`, and the Telegram equivalent with a padded ID.
+        A string comparison then answers "nobody holds this" for a sender
+        another household already claims, which is the one question this guard
+        is asked. A stored value with no canonical form cannot name an inbound
+        turn at all, so it is compared as written; it still holds the literal
+        string it occupies.
+
+        The scan is the whole channel rather than an indexed lookup, which is
+        affordable because `_reject_when_full` caps what one household may hold
+        and a pilot deployment holds households in the tens. If that stops
+        being true, the fix is a canonical column maintained by the writers —
+        not a return to comparing spellings.
         """
-        held = connection.execute(
-            "SELECT 1 FROM channel_bindings WHERE channel = ?"
-            " AND (external_id = ? OR actor_id = ?)"
-            " AND household_id != ? LIMIT 1",
-            (channel, external_id, external_id, household_id),
-        ).fetchone()
-        if held is not None:
-            raise BindingError("this channel is already bound to another household")
+        rows = connection.execute(
+            "SELECT external_id, actor_id FROM channel_bindings"
+            " WHERE channel = ? AND household_id != ?",
+            (channel, household_id),
+        ).fetchall()
+        for row in rows:
+            for stored in (str(row["external_id"]), str(row["actor_id"])):
+                try:
+                    held = canonical_sender(channel, stored)
+                except ChannelIdentityError:
+                    held = stored
+                if held == external_id:
+                    raise BindingError(
+                        "this channel is already bound to another household"
+                    )
 
     @staticmethod
     def _reject_when_full(connection: sqlite3.Connection, *, household_id: str) -> None:

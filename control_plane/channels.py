@@ -38,7 +38,15 @@ _SYNTHETIC = "synthetic-"
 
 _WHATSAPP_SENDER = re.compile(r"^\+[0-9]{1,31}$")
 _WHATSAPP_CHAT = re.compile(r"^[0-9][0-9-]{0,63}@[a-z0-9.-]{1,64}$")
-_TELEGRAM_ID = re.compile(r"^-?[0-9]{1,31}$")
+#: Telegram sends its IDs as JSON NUMBERS, so `parse_update` renders them with
+#: `str()` and a leading zero can never survive the round trip: `00123` arrives
+#: as `123`. A padded spelling is therefore not a variant of the canonical form
+#: the way a bare WhatsApp number is a variant of `+999…` — it is a value no
+#: inbound turn can carry, which is what `_stripped` already says and what this
+#: pattern now enforces. Refused rather than normalized, because nothing
+#: produces it: a household that typed one gets told, instead of getting a row
+#: that quietly authorizes nobody.
+_TELEGRAM_ID = re.compile(r"^(?:0|-?[1-9][0-9]{0,30})$")
 
 
 class ChannelIdentityError(ValueError):
@@ -61,7 +69,9 @@ def canonical_sender(channel: str, value: str) -> str:
         return candidate
     if channel == "telegram":
         if not _TELEGRAM_ID.fullmatch(text):
-            raise ChannelIdentityError("a Telegram sender is a numeric user ID")
+            raise ChannelIdentityError(
+                "a Telegram sender is a numeric user ID as JSON renders it"
+            )
         return text
     return text
 
@@ -84,7 +94,9 @@ def canonical_chat(channel: str, value: str) -> str:
         return candidate
     if channel == "telegram":
         if not _TELEGRAM_ID.fullmatch(text):
-            raise ChannelIdentityError("a Telegram chat is a numeric chat ID")
+            raise ChannelIdentityError(
+                "a Telegram chat is a numeric chat ID as JSON renders it"
+            )
         return text
     return text
 

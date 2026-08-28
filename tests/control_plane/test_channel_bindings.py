@@ -38,6 +38,8 @@ OWNER = "synthetic-owner"
 #: separate sender was encoding a binding the runtime silently ignores. That
 #: was the second [BLOCKER] on #76.
 ADULT = "990000002"
+#: The family's Telegram group chat, as `parse_update` renders `chat.id`.
+TELEGRAM_CHAT = "-100990000101"
 PHONE = "+999511234"
 #: What `hermes_cloud/ingest/whatsapp_webhook.py` actually reports as the CHAT
 #: for a 1:1 thread with PHONE. It is not the sender: the actor is normalized
@@ -1607,13 +1609,34 @@ def test_a_household_still_settling_is_reported_and_never_forced(cp_stack) -> No
 
     The sweep asks the same two facts that scheduler asks, so the report cannot
     promise a rollout the scheduler then declines.
+
+    Staleness is created by VERIFYING a member the served revision does not
+    carry, which is the case a settling household actually reaches — an
+    invitation redeemed while a rollout is in flight. An earlier version of
+    this test deleted every binding the household had, including the owner's,
+    and so ran into `owner_binding_retired` instead of the state it names.
     """
     _provisioned(cp_stack)
     _activated(cp_stack)
+    owner = owner_actor(cp_stack)
     with cp_stack.database.write() as connection:
-        connection.execute(
-            "DELETE FROM channel_bindings WHERE household_id = ?",
-            (cp_stack.household.id,),
+        issued = cp_stack.bindings.issue_challenge(
+            connection,
+            household_id=cp_stack.household.id,
+            channel=CHANNEL_SELECTION["kind"],
+            external_id=ADULT,
+            chat_id=owner_chat(cp_stack),
+            actor_id=ADULT,
+            role="adult",
+            issued_by_actor_id=owner,
+            now=BASE_TIME + 100,
+        )
+        cp_stack.bindings.verify_challenge(
+            connection,
+            code=issued.code,
+            household_id=cp_stack.household.id,
+            owner_actor_id=owner,
+            now=BASE_TIME + 200,
         )
         # A rollout already in flight: the state where forcing a second one
         # overwrites `current_config_revision` and strands both jobs.
@@ -1691,9 +1714,14 @@ def _telegram_ingest(sender: str, chat: str) -> tuple[str, str]:
     household = Household(
         household_id="h", family=frozenset(), allowed_chats=frozenset()
     )
+    # As NUMBERS, which is the whole point. Telegram's Bot API sends `id` as a
+    # JSON integer and `parse_update` renders it with `str()`, so no spelling
+    # with a leading zero can survive the round trip. Passing strings here made
+    # the helper able to "produce" `00123`, and a canonicalizer checked against
+    # that agrees with a payload the provider cannot send.
     message = parse_update(
         {"message": {"message_id": 1, "text": "привет",
-                     "from": {"id": sender}, "chat": {"id": chat}}},
+                     "from": {"id": int(sender)}, "chat": {"id": int(chat)}}},
         household,
     )
     return message.context.actor_id, message.context.chat_id
@@ -1714,9 +1742,9 @@ def _telegram_ingest(sender: str, chat: str) -> tuple[str, str]:
         ),
         pytest.param(
             "telegram",
-            ("990000002", " 990000002 ", "990000002\t"),
-            "990000002",
-            "-100990000101",
+            (ADULT, f" {ADULT} ", f"{ADULT}\t"),
+            ADULT,
+            TELEGRAM_CHAT,
             id="telegram",
         ),
     ],
@@ -1755,6 +1783,16 @@ def test_canonical_identity_is_what_that_channels_ingest_produces(
         ("sender", "telegram", "user-two", "numeric user ID"),
         ("sender", "whatsapp", "   ", "external ID is required"),
         ("chat", "telegram", "  ", "chat ID is required"),
+        # A Telegram ID is a JSON number, so `str()` can never render a
+        # leading zero. A padded ID is not another spelling of `ADULT` the
+        # way a bare phone number is another spelling of `+999…` — it is a
+        # value no inbound turn carries, and storing it would issue, verify,
+        # publish and roll out a binding that then matches nothing. Refused
+        # at the door instead. The spellings are BUILT rather than written:
+        # a padded digit run is outside the reserved ranges the fixture
+        # sanitizer allows, which is a rule about literals in this repo.
+        ("sender", "telegram", f"0{ADULT}", "numeric user ID"),
+        ("chat", "telegram", f"-0{TELEGRAM_CHAT.lstrip('-')}", "numeric chat ID"),
     ],
 )
 def test_an_identity_that_channel_could_never_carry_is_refused(
@@ -1908,3 +1946,201 @@ def test_moving_the_household_chat_retires_only_that_conversation(cp_stack) -> N
         ("telegram", "synthetic-owner-one", "synthetic-new-chat", "owner"),
     }
     assert ADULT not in {r.actor_id for r in rows}
+# --- D6: comparing identities, and a sweep that isolates its households ----
+
+
+def test_a_legacy_spelling_still_holds_the_identity_against_another_household(
+    cp_stack,
+) -> None:
+    """The guard compares identities, not the spellings they were stored in.
+
+    `_canonical_pair` puts the CANDIDATE into canonical form, and every row
+    written since D3 is canonical too — but rows written before it are stored
+    as they were typed. A household holding the bare `999511234` therefore did
+    not, by string comparison, hold `+999511234`, so the next household could
+    claim the same physical sender and `_reject_foreign_holder` would allow it:
+    one transport identity, two households, which is the single thing that
+    guard exists to prevent.
+
+    The legacy row is inserted through SQL on purpose. Going through the
+    repository would canonicalize it and the case under test would not exist —
+    the row has to be what a pre-D3 write actually left behind.
+    """
+    _provisioned(cp_stack)
+    second = _provision_second_household(cp_stack, "legacy@family.test")
+    second_owner, _ = synthetic_channel_identity(second.id)
+
+    with cp_stack.database.write() as connection:
+        connection.execute(
+            "INSERT INTO channel_bindings (id, household_id, channel,"
+            " external_id, chat_id, actor_id, role, verified_at,"
+            " verified_by_actor_id) VALUES ('legacy', ?, 'whatsapp',"
+            " '999511234', ?, '999511234', 'adult', ?, 'o')",
+            (cp_stack.household.id, PHONE_CHAT, BASE_TIME),
+        )
+        with pytest.raises(BindingError, match="another household"):
+            cp_stack.bindings.issue_challenge(
+                connection,
+                household_id=second.id,
+                channel="whatsapp",
+                external_id=PHONE,
+                chat_id=PHONE_CHAT,
+                actor_id=PHONE,
+                role="adult",
+                issued_by_actor_id=second_owner,
+                now=BASE_TIME + 100,
+            )
+
+
+def test_the_sweep_never_re_creates_an_owner_binding_a_migration_retired(
+    cp_stack,
+) -> None:
+    """D1 must propagate a revocation, not undo it.
+
+    `DesiredSpecPlanner.issue` seeds the owner row from the onboarding result
+    every time it runs, which is right while onboarding is the thing that
+    proved the channel. Re-planning a household whose owner binding migration
+    0010 RETIRED would write that identity straight back from the step it came
+    from — and 0010 retires an owner binding exactly when its identity cannot
+    be trusted: two households recorded under one owner actor, where reseeding
+    also re-creates the collision the migration removed.
+
+    So the sweep reports such a household and leaves it alone. It cannot be
+    repaired without inventing the identity that was taken away; what it needs
+    is re-onboarding, which captures one.
+    """
+    _provisioned(cp_stack)
+    _activated(cp_stack)
+    with cp_stack.database.write() as connection:
+        # Exactly what 0010 does to an owner row it cannot trust.
+        connection.execute(
+            "DELETE FROM channel_bindings WHERE household_id = ? AND role = 'owner'",
+            (cp_stack.household.id,),
+        )
+        stale = find_stale_bindings(
+            connection,
+            configs=cp_stack.configs,
+            bindings=cp_stack.bindings,
+            onboarding=cp_stack.onboarding,
+        )
+        assert [item.blocked_by for item in stale] == ["owner_binding_retired"]
+
+        applied = reconcile_stale_bindings(
+            connection,
+            planner=cp_stack.make_worker().planner,
+            jobs=cp_stack.jobs,
+            onboarding=cp_stack.onboarding,
+            configs=cp_stack.configs,
+            bindings=cp_stack.bindings,
+            runtime_provider=cp_stack.config.runtime_provider,
+            apply=True,
+        )
+        assert [item["action"] for item in applied] == ["skipped"]
+        # The identity stays retired, and nothing was queued to deploy it.
+        assert not connection.execute(
+            "SELECT id FROM channel_bindings WHERE household_id = ?",
+            (cp_stack.household.id,),
+        ).fetchall()
+        assert connection.execute(
+            "SELECT COUNT(*) AS total FROM provisioning_jobs WHERE operation = ?",
+            (REPROVISION_RUNTIME_OPERATION,),
+        ).fetchone()["total"] == 0
+
+
+def test_one_household_the_planner_refuses_leaves_the_others_reconciled(
+    cp_stack,
+) -> None:
+    """A sweep visits households that have nothing to do with each other.
+
+    `cli.main` holds ONE write transaction around the whole report, so a
+    planner refusal used to roll back the revisions and jobs already created
+    for earlier households and abandon every later one — one unplannable
+    household leaving every other stale runtime authorizing bindings the table
+    has revoked. That is the opposite of what this command exists to do.
+
+    The refusal cannot be predicted by `_blocked_by`: `issue` rejects an
+    incomplete profile, an unverified provider result, a missing account owner
+    and a consent receipt that is absent, revoked or superseded, and asking
+    those questions here would be a second copy of the planner's preconditions
+    that drifts from the first. So the planner decides, per household, inside
+    its own savepoint, and what it said is what the report carries.
+    """
+    _provisioned(cp_stack)
+    # Before the first household is activated: `_provision_second_household`
+    # drains the queue, and it asserts every job it drains succeeded.
+    refused = _provision_second_household(cp_stack, "refused@family.test")
+    _activated(cp_stack)
+    owner = owner_actor(cp_stack)
+
+    with cp_stack.database.write() as connection:
+        # The plannable household is stale because a member was verified after
+        # its revision was deployed — the ordinary case this sweep repairs.
+        issued = cp_stack.bindings.issue_challenge(
+            connection,
+            household_id=cp_stack.household.id,
+            channel=CHANNEL_SELECTION["kind"],
+            external_id=ADULT,
+            chat_id=owner_chat(cp_stack),
+            actor_id=ADULT,
+            role="adult",
+            issued_by_actor_id=owner,
+            now=BASE_TIME + 100,
+        )
+        cp_stack.bindings.verify_challenge(
+            connection,
+            code=issued.code,
+            household_id=cp_stack.household.id,
+            owner_actor_id=owner,
+            now=BASE_TIME + 200,
+        )
+        # The second household finished setup and is stale the same way, so it
+        # passes every check `_blocked_by` can make…
+        connection.execute(
+            "UPDATE households SET status = 'active' WHERE id = ?", (refused.id,)
+        )
+        connection.execute(
+            "UPDATE onboarding_workflows SET state = 'complete' WHERE household_id = ?",
+            (refused.id,),
+        )
+        connection.execute(
+            "INSERT INTO channel_bindings (id, household_id, channel,"
+            " external_id, chat_id, actor_id, role, verified_at,"
+            " verified_by_actor_id) VALUES ('extra', ?, 'whatsapp', ?, ?, ?,"
+            " 'adult', ?, 'o')",
+            (refused.id, PHONE, PHONE_CHAT, PHONE, BASE_TIME),
+        )
+        # … and the planner still refuses it, on a precondition of its own.
+        connection.execute(
+            "UPDATE onboarding_steps SET status = 'waiting_user' WHERE kind ="
+            " 'primary_channel' AND workflow_id = (SELECT id FROM"
+            " onboarding_workflows WHERE household_id = ?)",
+            (refused.id,),
+        )
+
+        applied = {
+            item["household_id"]: item
+            for item in reconcile_stale_bindings(
+                connection,
+                planner=cp_stack.make_worker().planner,
+                jobs=cp_stack.jobs,
+                onboarding=cp_stack.onboarding,
+                configs=cp_stack.configs,
+                bindings=cp_stack.bindings,
+                runtime_provider=cp_stack.config.runtime_provider,
+                apply=True,
+            )
+        }
+
+    assert applied[refused.id]["action"] == "skipped"
+    assert str(applied[refused.id]["blocked_by"]).startswith("planner_refused")
+    # The point of the savepoint: the other household was reconciled anyway,
+    # and its rollout survived the refusal.
+    assert applied[cp_stack.household.id]["action"] == "reconciled"
+    assert cp_stack.database.query(
+        "SELECT id FROM provisioning_jobs WHERE operation = ? AND household_id = ?",
+        (REPROVISION_RUNTIME_OPERATION, cp_stack.household.id),
+    )
+    assert not cp_stack.database.query(
+        "SELECT id FROM provisioning_jobs WHERE operation = ? AND household_id = ?",
+        (REPROVISION_RUNTIME_OPERATION, refused.id),
+    )
