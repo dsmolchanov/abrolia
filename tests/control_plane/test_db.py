@@ -49,25 +49,36 @@ def test_migrations_are_ordered_and_idempotent(tmp_path: Path) -> None:
         database.close()
 
 
-def test_the_chat_id_backfill_preserves_what_the_projection_emitted(
+def test_0010_retires_legacy_rows_instead_of_guessing_their_identities(
     tmp_path: Path,
 ) -> None:
-    """C3a acceptance 4: 0010 is behaviour-preserving for rows that exist.
+    """C3a acceptance 4, restated after two rewrites turned out to be wrong.
 
-    Before the split, `provisioning/planner.py` projected the manifest's
-    `chat_id` FROM `external_id`, because onboarding's `primary_channel` step
-    captured the chat and wrote it into the only column there was. After 0010
-    the projection reads `chat_id`, so the backfill has to make those two the
-    same value for every row already stored — otherwise a household that added
-    nobody would get a manifest with a different `config_sha256`, and a changed
-    hash is how this system says something changed.
+    The criterion was "behaviour-preserving": a household that added nobody
+    projects the same manifest. Two backfills were written to satisfy it
+    literally, and both invented identities the schema never recorded —
+    `chat_id = external_id` answered the chat question with a sender, and
+    `external_id = actor_id` assumed every household-local actor name was a
+    transport sender.
 
-    It also leaves `external_id` ALONE. That is deliberate and it is the honest
-    half: for Telegram the column still holds a chat where the gateway means a
-    sender. The gap is not introduced here — reading one column two ways has
-    meant exactly this since 0007 — but after the migration it is nameable, and
-    correcting it needs a user ID onboarding never captured. See M1 of
-    `thoughts/shared/plans/2026-08-27-c3a-sender-identity-and-chat.md`.
+    The second one does not merely produce a wrong row; it ABORTS. Both shapes
+    below are parameterised here because both were live against 0009:
+
+    * one household, one actor, two senders — the arrangement the pre-0010
+      challenge API allowed — collides on
+      `UNIQUE (household_id, channel, external_id)` and takes the whole
+      migration down with it;
+    * two households that both named an adult `synthetic-adult` migrate
+      cleanly and then hold ONE `external_id` between them, which makes
+      `WhatsAppGatewayRouter.route` answer `ambiguous_sender` for both.
+      `_reject_foreign_holder` guards `external_id` across households and has
+      never guarded `actor_id`.
+
+    So the migration retires them. What is preserved is not the row but the
+    HOUSEHOLD's ability to get a correct one: `ensure_owner_binding` re-seeds
+    the owner from the durable onboarding result on the next revision, now
+    reading `actor_id` for the sender and `chat_id` for the chat — which is
+    what a rewrite here could never have produced.
     """
     staged = tmp_path / "migrations"
     staged.mkdir()
@@ -79,66 +90,51 @@ def test_the_chat_id_backfill_preserves_what_the_projection_emitted(
     database = ControlPlaneDatabase(tmp_path / "control-plane.db")
     try:
         database.migrate(staged)
-        assert "chat_id" not in {
-            row["name"]
-            for row in database.query("PRAGMA table_info(channel_bindings)")
-        }
         with database.write() as connection:
-            connection.execute(
-                "INSERT INTO households (id, slug, status, created_at, updated_at)"
-                " VALUES ('h1', 'hh1', 'active', 1, 1)"
-            )
-            # Written the way every row before C3a was: one column, holding the
-            # CHAT, for a Telegram household and a WhatsApp one.
-            for row_id, channel, chat, actor in (
-                ("b1", "telegram", "-100990000101", "990000001"),
-                ("b2", "whatsapp", "+999511234567", "+999511234567"),
+            for household in ("h1", "h2"):
+                connection.execute(
+                    "INSERT INTO households (id, slug, status, created_at,"
+                    " updated_at) VALUES (?, ?, 'active', 1, 1)",
+                    (household, f"hh-{household}"),
+                )
+            for row_id, household, channel, external_id, actor_id in (
+                # The owner shape every live row has: a CHAT in the sender
+                # column, an internal name in the actor column.
+                ("b1", "h1", "telegram", "-100990000101", "synthetic-owner"),
+                # One actor, two senders — this is what aborted the rewrite.
+                ("b2", "h1", "whatsapp", "+999511111", "synthetic-adult"),
+                ("b3", "h1", "whatsapp", "+999511222", "synthetic-adult"),
+                # The same actor name in a second household — this is what
+                # migrated cleanly and then broke gateway routing for both.
+                ("b4", "h2", "whatsapp", "+999511333", "synthetic-adult"),
             ):
                 connection.execute(
                     "INSERT INTO channel_bindings (id, household_id, channel,"
                     " external_id, actor_id, role, verified_at,"
-                    " verified_by_actor_id) VALUES (?, 'h1', ?, ?, ?,"
-                    " 'owner', 1, ?)",
-                    (row_id, channel, chat, actor, actor),
+                    " verified_by_actor_id) VALUES (?, ?, ?, ?, ?, 'adult', 1,"
+                    " 'synthetic-owner')",
+                    (row_id, household, channel, external_id, actor_id),
                 )
             connection.execute(
                 "INSERT INTO channel_binding_challenges (id, household_id,"
                 " channel, external_id, actor_id, role, code_hash,"
                 " issued_by_actor_id, expires_at, attempts, consumed_at,"
-                " created_at) VALUES ('c1', 'h1', 'whatsapp', '+999511234500',"
-                " 'a2', 'adult', 'digest', 'a1', 9e9, 0, NULL, 1)"
+                " created_at) VALUES ('c1', 'h1', 'whatsapp', '+999511444',"
+                " 'synthetic-adult', 'adult', 'digest', 'synthetic-owner',"
+                " 9e9, 0, NULL, 1)"
             )
-        before = database.query(
-            "SELECT external_id, actor_id FROM channel_bindings ORDER BY id"
-        )
-        # What the projection emitted before 0010: `chat_id` read from
-        # `external_id`, because that column held the chat.
-        projected_before = [row["external_id"] for row in before]
-        actors_before = [row["actor_id"] for row in before]
 
+        # It runs at all, which the rewrite did not.
         assert database.migrate() == ["0010_channel_binding_chat_id.sql"]
 
-        rows = database.query(
-            "SELECT external_id, chat_id, actor_id FROM channel_bindings ORDER BY id"
-        )
-        # What the manifest reads now equals what it read then. This is the
-        # whole of acceptance 4: a household that added nobody still hashes to
-        # the same `config_sha256`.
-        assert [row["chat_id"] for row in rows] == projected_before
-        # The SENDER column is realigned onto the identity that answers for it.
-        # It is not projected into the manifest — only `chat_id` is — so this
-        # changes what the gateway matches and nothing the runtime parses. The
-        # Telegram row moves off the chat it should never have held; the
-        # WhatsApp row already agreed and does not move.
-        assert [row["actor_id"] for row in rows] == actors_before
-        assert [row["external_id"] for row in rows] == actors_before
-        assert rows[0]["external_id"] != projected_before[0]
-        assert rows[1]["external_id"] == projected_before[1]
-        # An outstanding invitation survives the migration answerable: dropping
-        # its chat would make it redeem into a binding that speaks nowhere.
-        assert database.query_one(
-            "SELECT chat_id FROM channel_binding_challenges WHERE id = 'c1'"
-        )[0] == "+999511234500"
+        assert database.query("SELECT id FROM channel_bindings") == []
+        # The outstanding invitation goes with them: it names a chat nobody
+        # captured, and a legacy internal-actor challenge could not redeem
+        # anyway now that `_insert` refuses an actor that is not the sender.
+        assert database.query("SELECT id FROM channel_binding_challenges") == []
+        # The households themselves are untouched — this retires bindings, not
+        # families, and the next revision re-seeds the owner's row.
+        assert len(database.query("SELECT id FROM households")) == 2
     finally:
         database.close()
 

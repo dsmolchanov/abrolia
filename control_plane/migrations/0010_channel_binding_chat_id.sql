@@ -31,47 +31,61 @@ ALTER TABLE channel_bindings ADD COLUMN chat_id TEXT;
 -- conflation it exists to remove.
 ALTER TABLE channel_binding_challenges ADD COLUMN chat_id TEXT;
 
--- BACKFILL, and the honest gap in it.
+-- LEGACY ROWS ARE RETIRED, NOT REWRITTEN.
 --
--- Every existing row holds what onboarding's `primary_channel` step captured,
--- which is the CHAT — the planner read it as `chat_id`. Copying it into
--- `chat_id` therefore preserves exactly today's behaviour and is correct for
--- the manifest. It leaves `external_id` holding a chat ID rather than a sender
--- ID, which for Telegram are different values, so a strict-mode gateway lookup
--- against a migrated row matches a chat where it means to match a sender.
+-- Every row written before this migration carries identities that were never
+-- provenanced. `external_id` holds whatever onboarding's `primary_channel`
+-- step captured — the CHAT — and `actor_id` holds a household-local name the
+-- control plane invented. Neither can be turned into the string the channel's
+-- ingest produces, because that string was never recorded. Nothing in the
+-- schema even distinguishes a Telegram user ID from an internal name: there is
+-- no provenance column and never was.
 --
--- That gap is ALREADY LIVE — it is what reading one column two ways has meant
--- since 0007 — and this migration does not widen it. What it changes is that
--- the gap becomes nameable: after this, a Telegram row with
--- `external_id = chat_id` is visibly un-migrated data rather than an ambiguity
--- in the schema. Correcting it needs the owner's Telegram user ID, which
--- onboarding never captured; `reset_from(PRIMARY_CHANNEL)` rewrites the owner
--- binding, and B-07 keeps every household synthetic, so nothing real is
--- stranded by leaving it. See M1 in
--- `thoughts/shared/plans/2026-08-27-c3a-sender-identity-and-chat.md`.
-UPDATE channel_bindings SET chat_id = external_id WHERE chat_id IS NULL;
-UPDATE channel_binding_challenges SET chat_id = external_id WHERE chat_id IS NULL;
-
--- ...and the SENDER column is realigned onto the identity that answers for it.
+-- Two rewrites were tried and both were wrong, which is why this is a DELETE:
 --
--- `external_id` is what the gateway matches an inbound sender against, and
--- `actor_id` is what the runtime authorizes: `build_run_context` is handed
--- `message.from.id` on Telegram and the `+999…` normalized actor on WhatsApp,
--- and `Household.knows_binding` compares that pair by string. They are two
--- readings of ONE identity, so a row where they differ is a row the runtime
--- cannot honour — the binding exists, the revision deploys, and every real
--- message from that member is classified `unknown`.
+--   SET chat_id = external_id   -- answers the chat question with a chat that
+--                                  is really a chat only by accident, and for
+--                                  WhatsApp is the sender, which ingest never
+--                                  reports as a conversation;
+--   SET external_id = actor_id  -- assumes every historical actor was a
+--                                  transport sender. The pre-0010 challenge
+--                                  API let ONE internal actor hold several
+--                                  external IDs, so two such rows collide on
+--                                  `UNIQUE (household_id, channel, external_id)`
+--                                  and the migration ABORTS — reproduced
+--                                  against a 0009 database. Worse is the case
+--                                  that succeeds: two households that both
+--                                  named an adult `synthetic-adult` end up
+--                                  holding one `external_id` between them, and
+--                                  `WhatsAppGatewayRouter.route` answers
+--                                  `ambiguous_sender` for both. Nothing guards
+--                                  `actor_id` across households; only
+--                                  `external_id` was ever checked.
 --
--- Existing rows hold the CHAT in `external_id`, because the planner seeded it
--- from onboarding's `chat_id`. It should have read `actor_id`, which onboarding
--- has captured all along and which becomes `actors.owner` in the manifest. This
--- statement finishes the split the column above started: chat to `chat_id`,
--- sender to `external_id`, each from the field that means it.
+-- A third heuristic would be the fourth guess about identity in this slice.
+-- Guessing is the defect, so this migration stops guessing: rows whose
+-- identities cannot be known are removed, and the household re-establishes
+-- them from a source that does know.
 --
--- The manifest projection does not change. `external_id` is not projected —
--- `chat_id` is, and it was written above — so a household that added nobody
--- still hashes to the same `config_sha256`.
-UPDATE channel_bindings SET external_id = actor_id WHERE external_id <> actor_id;
+-- The cost is small and asymmetric, which is what makes this the safe option
+-- rather than merely the honest one. OWNER rows cost almost nothing:
+-- `DesiredSpecPlanner.issue` calls `ensure_owner_binding` on every revision
+-- and re-seeds them from the durable onboarding result, now reading `actor_id`
+-- for the sender and `chat_id` for the conversation — so the next plan
+-- restores them CORRECTLY, which a rewrite here could not have done. ADULT
+-- rows are not reconstructible: their challenges were consumed, and those
+-- members must be re-invited. Under B-07 every household is synthetic, and
+-- `channel_bindings` had no production writer at all before C3 (#72), so the
+-- set being retired is small and contains no real person's identity.
+--
+-- Outstanding challenges go for the same reason. An invitation issued before
+-- this migration names a chat nobody captured, so redeeming it would write the
+-- very row this statement is removing — and a legacy internal-actor challenge
+-- could not redeem at all, because `_insert` now refuses an actor that is not
+-- the sender. An invitation that cannot produce a usable binding is better
+-- withdrawn than left to fail in someone's hands.
+DELETE FROM channel_bindings;
+DELETE FROM channel_binding_challenges;
 
 -- SQLite cannot add a NOT NULL column to a populated table without inventing a
 -- default, and an empty-string default would be a lie that reads as data. The
