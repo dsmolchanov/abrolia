@@ -11,6 +11,7 @@ from control_plane.models import (
     PrimaryChannelSelection,
     ProviderPublicResult,
     StepKind,
+    synthetic_channel_identity,
 )
 from control_plane.privacy.consent import consent_version_and_sha
 from control_plane.provisioning.contracts import InspectResult, InspectState, ProvisionResult
@@ -48,11 +49,21 @@ WHATSAPP_SELECTION = {
     "member_phone_test_ref": "synthetic-phone:owner-one",
     "privacy_notice_receipt_id": "synthetic-receipt-wa",
 }
-CHANNEL_SELECTION = {
-    "kind": "telegram",
-    "actor_id": "synthetic-owner-actor",
-    "chat_id": "synthetic-family-chat",
-}
+#: No `actor_id`/`chat_id`. The onboarding service derives this household's
+#: channel identity in `_parse_selection`, and a selection that named one was
+#: how every household came to share a single pair (D0). Assertions read the
+#: derived values through `owner_actor` / `owner_chat` below.
+CHANNEL_SELECTION = {"kind": "telegram"}
+
+
+def owner_actor(cp_stack) -> str:
+    """The SENDER this household's owner is bound under."""
+    return synthetic_channel_identity(cp_stack.household.id)[0]
+
+
+def owner_chat(cp_stack) -> str:
+    """The CONVERSATION that household's review surface points at."""
+    return synthetic_channel_identity(cp_stack.household.id)[1]
 
 
 def _manifest(**changes) -> DesiredHouseholdSpecV1:
@@ -316,7 +327,7 @@ def test_verified_inputs_create_encrypted_account_free_manifest(cp_stack) -> Non
     assert cp_stack.account.id.encode() not in spec.canonical_bytes()
     assert cp_stack.account.recovery_email.encode() in spec.canonical_bytes()
     assert cp_stack.account.recovery_email.encode() not in bytes(row["manifest_ciphertext"])
-    assert spec.actors.owner == CHANNEL_SELECTION["actor_id"]
+    assert spec.actors.owner == owner_actor(cp_stack)
     assert spec.consent.authority == "control_plane"
     assert spec.consent.required_purposes == (
         "special_category_content_restriction",

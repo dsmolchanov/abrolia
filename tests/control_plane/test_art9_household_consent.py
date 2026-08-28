@@ -661,7 +661,9 @@ def test_a_retry_asks_the_gate_the_same_question_select_asks(cp_stack, option) -
     try:
         service._assert_email_rollout(
             cp_stack.household.id,
-            service._parse_selection(StepKind.EMAIL, selection),
+            service._parse_selection(
+                StepKind.EMAIL, selection, household_id="synthetic-household"
+            ),
         )
     except InvalidTransition as error:
         refuses = str(error)

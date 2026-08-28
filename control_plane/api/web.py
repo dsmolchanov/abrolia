@@ -214,11 +214,12 @@ def _selection(
                 context, household_id, "whatsapp_linked_device_risk"
             ),
         }
-    return {
-        "kind": option,
-        "actor_id": "synthetic-owner",
-        "chat_id": "synthetic-chat",
-    }
+    # No `actor_id`/`chat_id`: the onboarding service derives the household's
+    # channel identity in `_parse_selection`, which is the one place both select
+    # routes pass through. Sending constants from here was D0 — every household
+    # got the same pair, so `_reject_foreign_holder` refused the second one and
+    # no second family could provision.
+    return {"kind": option}
 
 
 @router.post("/onboarding/select/{kind}")

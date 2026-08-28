@@ -72,6 +72,11 @@ import sqlite3
 import time
 from dataclasses import dataclass
 
+from control_plane.channels import (
+    ChannelIdentityError,
+    canonical_chat,
+    canonical_sender,
+)
 from control_plane.crypto import LookupHasher
 from control_plane.db import new_id
 from control_plane.repositories.base import Repository
@@ -248,9 +253,9 @@ class ChannelBindingsRepository(Repository):
         # Before the lookup, for the same reason as in `issue_challenge`: the
         # query below matches by string, so a padded value would miss the row
         # it means to reconcile and insert a second one beside it.
-        external_id = self._canonical(external_id, "external ID")
-        chat_id = self._canonical(chat_id, "chat ID")
-        actor_id = self._canonical(actor_id, "actor ID")
+        external_id, chat_id, actor_id = self._canonical_pair(
+            channel, external_id=external_id, chat_id=chat_id, actor_id=actor_id
+        )
         existing = connection.execute(
             "SELECT * FROM channel_bindings WHERE household_id = ? AND channel = ?"
             " AND external_id = ?",
@@ -281,9 +286,27 @@ class ChannelBindingsRepository(Repository):
         self._reject_foreign_holder(
             connection, channel=channel, external_id=external_id, household_id=household_id
         )
-        self._retire_superseded(
-            connection, household_id=household_id, channel=channel
-        )
+        # And not by a MEMBER of this household either. Retiring the owner's
+        # own rows below cannot clear this one, and inserting over it would
+        # raise a bare `IntegrityError` from the unique index — a crash where a
+        # refusal belongs.
+        #
+        # Unreachable through the endpoints, deliberately: `issue_challenge`
+        # refuses an actor equal to the issuer, so an adult cannot hold the
+        # owner's identity. It is checked anyway because the previous rule
+        # RESOLVED this case by deleting the adult, and quietly unbinding a
+        # member to make room for the owner is not something that should be
+        # possible to reach by accident.
+        member = connection.execute(
+            "SELECT 1 FROM channel_bindings WHERE household_id = ? AND channel = ?"
+            " AND external_id = ? AND role != 'owner' LIMIT 1",
+            (household_id, channel, external_id),
+        ).fetchone()
+        if member is not None:
+            raise BindingError(
+                "this identity is already bound to another member of the household"
+            )
+        self._retire_superseded(connection, household_id=household_id)
         return self._insert(
             connection,
             household_id=household_id,
@@ -298,7 +321,7 @@ class ChannelBindingsRepository(Repository):
 
     @staticmethod
     def _retire_superseded(
-        connection: sqlite3.Connection, *, household_id: str, channel: str
+        connection: sqlite3.Connection, *, household_id: str
     ) -> None:
         """Establishing an owner binding RETIRES what it replaces.
 
@@ -319,24 +342,53 @@ class ChannelBindingsRepository(Repository):
         off a channel has revoked it, and the table is what the gateway
         believes.
 
-        Adult bindings on the channel now becoming primary go with it. C3a
-        made them REPRESENTABLE — two members may share a chat now — but not
-        CURRENT: they were verified against the arrangement the owner has just
-        replaced, and their `chat_id` is a conversation the household may have
-        left. Carrying them across would authorize an actor in a chat nobody
-        re-attested. Outstanding challenges are dropped for the same reason: a
-        code issued against the old arrangement must not redeem into the new
-        one.
+        What goes with the owner is scoped to the CHAT they are leaving, not to
+        the channel they are arriving on. That is a correction, and both the
+        rule this replaces and the debt plan's description of it were wrong in
+        opposite directions.
+
+        C3 deleted every adult on the channel about to become primary, for a
+        reason that no longer exists: `_reject_unrepresentable_member` refused
+        an adult there at all, so carrying one across built a manifest the
+        projection could not represent. C3a removed that limitation — two
+        members may share a channel and a chat now — so deleting an adult
+        because the owner arrived on their channel revokes a binding nobody
+        superseded and forces a re-invitation for nothing.
+
+        D5 of the debt plan then over-corrected, asking that nothing of any
+        role remain on the channel the household LEFT. That is wrong too. An
+        adult verified in a thread of their own was never re-attested by the
+        owner moving house; a non-primary channel is a supported arrangement,
+        and the owner's departure from it is not a revocation of everybody
+        else's.
+
+        What IS stale is a binding into the conversation the owner has just
+        left. Nobody speaks there for the household any more, so an actor
+        authorized in it is authorized in an abandoned room. That is chat-
+        scoped, so this is: every previous owner chat takes its non-owner
+        bindings with it, and nothing else moves.
+
+        Outstanding challenges are dropped whatever their chat: a code issued
+        against the arrangement that just changed must not redeem into the one
+        that replaced it.
         """
+        # Read before deleting: the chats being abandoned are the ones the
+        # owner rows name, and after the delete there is nothing left to ask.
+        abandoned = connection.execute(
+            "SELECT channel, chat_id FROM channel_bindings"
+            " WHERE household_id = ? AND role = 'owner'",
+            (household_id,),
+        ).fetchall()
         connection.execute(
             "DELETE FROM channel_bindings WHERE household_id = ? AND role = 'owner'",
             (household_id,),
         )
-        connection.execute(
-            "DELETE FROM channel_bindings WHERE household_id = ? AND channel = ?"
-            " AND role != 'owner'",
-            (household_id, channel),
-        )
+        for row in abandoned:
+            connection.execute(
+                "DELETE FROM channel_bindings WHERE household_id = ? AND channel = ?"
+                " AND chat_id = ? AND role != 'owner'",
+                (household_id, row["channel"], row["chat_id"]),
+            )
         connection.execute(
             "DELETE FROM channel_binding_challenges WHERE household_id = ?"
             " AND consumed_at IS NULL",
@@ -381,9 +433,9 @@ class ChannelBindingsRepository(Repository):
         # after: a padded duplicate of a bound sender would otherwise slip past
         # `_reject_foreign_holder` and the already-bound lookup, both of which
         # compare by string, and land as a second row for one identity.
-        external_id = self._canonical(external_id, "external ID")
-        chat_id = self._canonical(chat_id, "chat ID")
-        actor_id = self._canonical(actor_id, "actor ID")
+        external_id, chat_id, actor_id = self._canonical_pair(
+            channel, external_id=external_id, chat_id=chat_id, actor_id=actor_id
+        )
         self._reject_actor_that_is_not_the_sender(
             external_id=external_id, actor_id=actor_id
         )
@@ -540,25 +592,29 @@ class ChannelBindingsRepository(Repository):
     # --- internals -------------------------------------------------------
 
     @staticmethod
-    def _canonical(value: str, field: str) -> str:
-        """The stored identity is the string ingest produces, byte for byte.
+    def _canonical_pair(
+        channel: str, *, external_id: str, chat_id: str, actor_id: str
+    ) -> tuple[str, str, str]:
+        """Put all three identities into the form that channel's ingest emits.
 
-        Every ingest path strips before it reports: `whatsapp_webhook._text`
-        returns `value.strip()`, and Telegram's IDs come out of JSON as bare
-        numbers. So a padded identity is not a variant of the canonical one, it
-        is a value no inbound turn can ever carry — and `knows_binding`
-        compares by string, so `"999…@g.us "` issues, verifies, publishes and
-        rolls out, and then matches nothing.
+        `control_plane/channels.py` owns what canonical means; this translates
+        its refusal into a `BindingError`, because everything else in this
+        module answers a caller that way and the message is safe to show.
 
-        Normalizing rather than refusing is deliberate: the canonical form IS
-        the stripped form, because that is what ingest emits, so stripping
-        stores what the runtime will see instead of rejecting a request whose
-        only fault is a trailing space.
+        The sender rule is applied to `actor_id` as well as `external_id`. They
+        are two readings of one transport identity — enforced equal just below
+        — so canonicalizing only one of them would make the equality check fail
+        on a difference of spelling rather than of identity, which is a refusal
+        the caller could not act on.
         """
-        canonical = value.strip()
-        if not canonical:
-            raise BindingError(f"{field} is required")
-        return canonical
+        try:
+            return (
+                canonical_sender(channel, external_id),
+                canonical_chat(channel, chat_id),
+                canonical_sender(channel, actor_id),
+            )
+        except ChannelIdentityError as error:
+            raise BindingError(str(error)) from error
 
     @staticmethod
     def _reject_actor_that_is_not_the_sender(
@@ -603,10 +659,28 @@ class ChannelBindingsRepository(Repository):
         external_id: str,
         household_id: str,
     ) -> None:
+        """An identity belongs to at most one household, under either name.
+
+        The gateway resolves a sender across the WHOLE table and answers
+        `ambiguous_sender` when two rows match, so binding an identity another
+        household already holds does not share a channel — it breaks delivery
+        for both, including the one that was there first and did nothing wrong.
+
+        This asked about `external_id` alone. `actor_id` is the same transport
+        identity read by the runtime instead of the gateway, and C3a enforces
+        the two equal on every new row — so today the second predicate can
+        never fire. It is asked anyway, because "they happen to be equal" is
+        not the rule; the rule is that neither name may be held twice, and
+        migration `0010` has already had to delete both halves of a
+        shared-actor pair that legacy rows could hold. Stating it once here
+        means a future write path cannot reintroduce it by relaxing the
+        equality somewhere else.
+        """
         held = connection.execute(
-            "SELECT 1 FROM channel_bindings WHERE channel = ? AND external_id = ?"
+            "SELECT 1 FROM channel_bindings WHERE channel = ?"
+            " AND (external_id = ? OR actor_id = ?)"
             " AND household_id != ? LIMIT 1",
-            (channel, external_id, household_id),
+            (channel, external_id, external_id, household_id),
         ).fetchone()
         if held is not None:
             raise BindingError("this channel is already bound to another household")
@@ -637,9 +711,9 @@ class ChannelBindingsRepository(Repository):
         # well as at issue time. `issue_challenge` refuses early so that nobody
         # is handed a code that could not have redeemed; this is the one place
         # that no path can go around, including `ensure_owner_binding`.
-        external_id = self._canonical(external_id, "external ID")
-        chat_id = self._canonical(chat_id, "chat ID")
-        actor_id = self._canonical(actor_id, "actor ID")
+        external_id, chat_id, actor_id = self._canonical_pair(
+            channel, external_id=external_id, chat_id=chat_id, actor_id=actor_id
+        )
         self._reject_actor_that_is_not_the_sender(
             external_id=external_id, actor_id=actor_id
         )

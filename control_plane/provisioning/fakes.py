@@ -81,8 +81,11 @@ class DeterministicFakeProvisioner:
         elif self.kind == "channel":
             public = {
                 "channel": option,
-                "actor_id": selection.get("actor_id", "synthetic-owner"),
-                "chat_id": selection.get("chat_id", "synthetic-chat"),
+                # No defaults. These arrive derived per household, and a
+                # constant fallback would silently rebuild the collision that
+                # stopped a second household provisioning at all (D0).
+                "actor_id": selection["actor_id"],
+                "chat_id": selection["chat_id"],
                 "test_receipt_id": _ref("receipt", key),
             }
         else:
