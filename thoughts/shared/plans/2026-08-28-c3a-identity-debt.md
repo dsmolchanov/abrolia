@@ -258,6 +258,94 @@ conversation — including on the channel it moved off — are untouched.
 
 ---
 
+## D6. What the #77 review found and the merge did not fix
+
+#77 merged with four [BLOCKER] findings open, in the same shape C3a did: the
+findings were valid, and merging is not answering them. They are one class —
+an identity compared as a spelling — plus the sweep D1 introduced not being
+isolated from itself. Fixed together because a batch is one review generation
+and the two halves of the identity defect live in two files.
+
+**Telegram IDs are JSON numbers.** `canonical_sender`/`canonical_chat` accepted
+a zero-padded ID and returned it unchanged, but `parse_update` renders
+`message.from.id` with `str()`, so a leading zero cannot survive the round
+trip. The value issues, verifies, publishes a revision and rolls out, and then
+matches no inbound turn — the failure mode `AGENTS.repo-invariants.md` names as
+the expensive one, because every layer the control plane can see reports
+success. Refused now, which is what the module's own `_stripped` docstring
+already claimed. The test helper was passing those IDs into `parse_update` as
+strings, which is how a payload the provider cannot send came to look
+canonical.
+
+**`_reject_foreign_holder` compared spellings.** The candidate is canonicalized
+before the check and the ROWS are not, so a household holding the bare
+`999511234` did not, by string comparison, hold `+999511234`, and the next
+household could claim the same physical sender. It canonicalizes each stored
+value — both `external_id` and the `actor_id` D4 added — before comparing, and
+falls back to the literal string for a value with no canonical form, which
+claims only itself.
+
+**The sweep re-created owners a migration retired.** `DesiredSpecPlanner.issue`
+seeds the owner row from the onboarding result on every run, so re-planning a
+household whose owner binding `0010` retired wrote that identity straight back
+from the step it came from — and `0010` retires an owner binding exactly when
+its identity cannot be trusted. For the shape it retires, two households under
+one owner actor, reseeding also re-created the collision, whereupon the guard
+above refused and took the whole sweep down with it. A household with no
+verified owner binding is now reported `owner_binding_retired` and left alone:
+it cannot be repaired without inventing the identity that was taken away, and
+what it needs is re-onboarding.
+
+**One household's refusal took the others with it.** `cli.main` holds a single
+write transaction around the sweep, so a planner refusal rolled back the
+rollouts already scheduled for earlier households and abandoned every later
+one — the exact opposite of what the command exists to do. Each household now
+plans inside its own `SAVEPOINT`, and the planner's own refusal text becomes
+that household's `blocked_by`. Its preconditions are deliberately NOT copied
+into `_blocked_by`: `issue` refuses on an incomplete profile, an unverified
+provider result, a missing account owner and a consent receipt that is absent,
+revoked or superseded, and a second copy of that list would drift from the
+first.
+
+**Argued rather than implemented: "capture transport identities instead of
+deriving them".** There are no verified transport values for
+`_parse_selection` to replace. `PrimaryChannelSelection` validates both
+identities through `_require_synthetic_actor_or_chat`, so under B-07 the only
+identities this deployment may hold are synthetic, and what D0 replaced were
+shared CONSTANTS that matched real ingest exactly as badly. The offered
+remediation — refuse the selection until a real transport identity exists —
+means no household can be onboarded at all. `control_plane/channels.py`
+already states the adjudication: the synthetic namespace is a legitimate
+identity everywhere a real one will later go, and it has no transport form to
+canonicalize into. Removing the gate is B-07's, as "Deliberately not here"
+says.
+
+**Review round 2 — the invariant, not the instance.** Two findings, both
+correct, and both cases where the first pass fixed one side of a rule.
+
+The cross-household guard compared canonically while the three same-household
+lookups — `issue_challenge`, `verify_challenge` and the owner row
+`ensure_owner_binding` reconciles — still compared strings, so a household
+holding the bare spelling could be handed a SECOND row for one transport
+sender: a duplicate actor in the manifest, and binding and revision capacity
+spent on it. `_holders` is now the one lookup all four use, and the case that
+is not about duplication is covered too — an owner claiming an identity a
+member holds was silently unbinding that member, because the exact-string
+`member` check could not see a legacy row.
+
+The dry run reported `would_reconcile` for a household the apply run then
+refused, because only the apply branch reached the planner. That breaks the
+promise this report makes — the branch it describes is the branch the apply
+run takes — so the planner now runs in both modes, inside a savepoint the dry
+run always rolls back, including the `config_revisions` row `issue` writes to
+answer the question.
+
+**Left as debt.** A legacy row whose spelling is not canonical can never match
+ingest, so it authorizes nobody while still counting as a verified binding in
+the table and in the manifest projection. The guard closes the cross-household
+hole it opened; retiring the dead row itself is a lifecycle question, D5's
+shape rather than this one's.
+
 ## Deliberately not here
 
 * **A sender-to-internal-actor mapping.** Several #76 findings pointed at it,
@@ -307,9 +395,31 @@ deleted on merge, so no step but the first is ever applicable.
 **Files:** `control_plane/api/web.py`, `control_plane/models.py`,
 `control_plane/onboarding/service.py`,
 `control_plane/web/static/onboarding.js`, `control_plane/provisioning/fakes.py`,
+`control_plane/channels.py`, `control_plane/cli.py`,
+`control_plane/provisioning/rollout.py`,
+`control_plane/repositories/bindings.py`,
 `tests/control_plane/test_api.py`, `tests/control_plane/test_manifest.py`,
 `tests/control_plane/test_art9_household_consent.py`,
+`tests/control_plane/test_binding_api.py`,
 `tests/control_plane/test_channel_bindings.py`.
+
+**This step declares three slices, because the branch carries three.** The
+plan asked for four separate branches so these would ship as small PRs; what
+happened instead is that #78 (D1) and #79 (D3) were merged INTO
+`codex/d0-per-household-channel-identity` rather than into `main`, so the
+diff #77 presents is D0 + D1 + D3 together. The scope gate then failed
+correctly: `control_plane/channels.py`, `cli.py`, `provisioning/rollout.py`,
+`repositories/bindings.py` and `tests/control_plane/test_binding_api.py` are
+declared by the D1 and D3 steps, and another step declaring a path is
+explicitly not enough — the branch's own step must.
+
+Restating the union here is the honest description of what is being reviewed,
+in the shape `2026-08-23-go-live-checklist.md` already uses for a branch that
+carried two slices ("Inventory — C1 + C2"). The D1 and D3 steps keep their own
+`**Branches:**` lines, which name branches this one is not; exactly one step
+claims this branch, which is what the gate requires. Nothing further may be
+stacked onto it: each merge into this branch moves the head, and a moved head
+restarts the review generation the gate is counting.
 
 `control_plane/onboarding/service.py` was added to this inventory during
 implementation. `_parse_selection` is the one place BOTH select routes pass
@@ -371,3 +481,17 @@ The inventory held. D4 turned out to be one predicate and D5 one scope change,
 both inside the file this named — which is what a correctly scoped item looks
 like, and worth noting beside D0, D1 and D3, where implementation moved the
 file list every time.
+
+## Inventory — D6 identity comparison and sweep isolation
+
+**Files:** `control_plane/channels.py`,
+`control_plane/provisioning/rollout.py`,
+`control_plane/repositories/bindings.py`,
+`tests/control_plane/test_channel_bindings.py`.
+
+Narrower than any item before it, and that is the point: this fixes findings
+against code the four earlier items already placed, so it moves no file they
+did not. `control_plane/cli.py` is NOT here — the savepoint belongs beside the
+loop it isolates, and the command that calls it needs no change to benefit.
+
+**Branches:** `codex/d6-identity-comparison-and-sweep-isolation`.
