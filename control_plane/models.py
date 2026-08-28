@@ -32,6 +32,36 @@ _UUID_TEXT_PATTERN = (
 )
 
 
+def synthetic_channel_identity(household_id: str) -> tuple[str, str]:
+    """The primary channel's (sender, conversation) pair for ONE household.
+
+    These are two names the runtime compares by string:
+    `actor_id` is what `hermes_cloud/channels/telegram.py` reads out of
+    `message.from.id` and what WhatsApp ingest reports as the `+999…` actor;
+    `chat_id` is the conversation. Onboarding is where they enter the system,
+    and it handed every household the SAME two constants — so
+    `_reject_foreign_holder` refused the second household's owner binding and
+    no second family could provision at all. Reproduced 2026-08-28; see D0 of
+    `thoughts/shared/plans/2026-08-28-c3a-identity-debt.md`.
+
+    Derived from the household rather than chosen, for two reasons. Unique, so
+    two households never claim one identity — which the gateway would answer
+    `ambiguous_sender` for, breaking delivery for both. And SERVER-OWNED, so a
+    client cannot name an identity that is not its own: the browser used to
+    mint these and post them, and every value it sent satisfied the synthetic
+    pattern, including another household's.
+
+    The two differ from each other, which C3a requires: a sender is not the
+    conversation it speaks in, and a fixture that passes one value for both
+    cannot notice a consumer reading the wrong column.
+
+    Still unmistakably synthetic. B-07 keeps real transport identities out
+    until an explicit gate, and this is the shape a real one will replace —
+    a substitution, not a redesign.
+    """
+    return f"synthetic-owner.{household_id}", f"synthetic-chat.{household_id}"
+
+
 def _require_synthetic_actor_or_chat(value: str) -> str:
     if not _SYNTHETIC_ACTOR_OR_CHAT.fullmatch(value):
         raise ValueError("Phase 1 actor and chat IDs must use the synthetic- namespace")

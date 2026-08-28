@@ -237,7 +237,9 @@ if (page === "onboarding") {
     }
     if (option === "shared_abrolia") selection = {kind: option, member_phone_test_ref: "synthetic-phone:owner", privacy_notice_receipt_id: crypto.randomUUID()};
     if (option === "dedicated_number") selection = {kind: option, phone_test_ref: "synthetic-phone:owner", privacy_notice_receipt_id: crypto.randomUUID(), linked_device_risk_receipt_id: crypto.randomUUID()};
-    if (["telegram", "whatsapp", "web"].includes(option)) selection = {kind: option, actor_id: "synthetic-owner", chat_id: "synthetic-chat"};
+    // The server derives this household's channel identity; the browser sending
+    // one meant every household shared it, and a client could name another's.
+    if (["telegram", "whatsapp", "web"].includes(option)) selection = {kind: option};
     command(`/api/v1/onboarding/steps/${kind}/select`, selection);
   }));
   const domainInput = document.querySelector('input[name="domain"]');

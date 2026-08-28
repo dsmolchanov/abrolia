@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 from urllib.parse import urlsplit
 
 import pytest
 
+from control_plane.models import synthetic_channel_identity
 from control_plane.privacy.consent import consent_version_and_sha, consent_version_and_text
 from control_plane.repositories.auth import InvalidCredential
 
@@ -272,27 +274,47 @@ def test_synthetic_selection_boundaries_fail_closed_at_api(api_harness) -> None:
         world.household.id
     ).version
 
-    unsafe_identities = (
-        {"kind": "telegram", "actor_id": "real-owner", "chat_id": "synthetic-chat"},
-        {"kind": "telegram", "actor_id": "synthetic-owner", "chat_id": "external-chat"},
+    # A caller cannot name a channel identity, safe or otherwise. The gate
+    # used to be a validator that refused non-synthetic values, which was the
+    # right shape while the browser minted them and posted them — and it was
+    # also how every household came to share one pair, because the value the
+    # client sent was a constant (D0).
+    #
+    # The identity is now derived from the household in `_parse_selection`, the
+    # one place both select routes pass through, so a submitted value is not
+    # rejected but IGNORED. That is the stronger property and it is what is
+    # asserted here: whatever is posted, what lands is this household's own.
+    unsafe = {
+        "kind": "telegram",
+        "actor_id": "real-owner",
+        "chat_id": "external-chat",
+    }
+    response = api_harness.client.post(
+        "/api/v1/onboarding/steps/primary_channel/select",
+        headers=_command_headers(
+            api_harness, version=version, key="unsafe-channel-id"
+        ),
+        json=unsafe,
     )
-    for offset, unsafe in enumerate(unsafe_identities, start=1):
-        response = api_harness.client.post(
-            "/api/v1/onboarding/steps/primary_channel/select",
-            headers=_command_headers(
-                api_harness,
-                version=version,
-                key=f"unsafe-channel-id-{offset}",
-            ),
-            json=unsafe,
-        )
-        assert response.status_code == 422
-        assert response.json() == {"detail": "invalid synthetic selection"}
-        assert unsafe["actor_id"] not in response.text
-        assert unsafe["chat_id"] not in response.text
-    assert api_harness.container.onboarding_repository.snapshot(
-        world.household.id
-    ).version == version
+    assert response.status_code == 200
+    assert unsafe["actor_id"] not in response.text
+    assert unsafe["chat_id"] not in response.text
+    assert api_harness.container.worker.run_once().status == "succeeded"
+
+    expected_actor, expected_chat = synthetic_channel_identity(world.household.id)
+    result = api_harness.container.onboarding_repository.result(
+        api_harness.container.onboarding_repository.workflow_for_household(
+            world.household.id
+        ).id,
+        "primary_channel",
+    )
+    stored = json.dumps(result)
+    assert unsafe["actor_id"] not in stored and unsafe["chat_id"] not in stored
+    assert expected_actor in stored and expected_chat in stored
+    # Still inside the synthetic namespace B-07 gates on: derivation replaced
+    # the validator, it did not relax what the validator was protecting.
+    assert expected_actor.startswith("synthetic-")
+    assert expected_chat.startswith("synthetic-")
 
 
 def test_auth_and_validation_errors_never_echo_submitted_credentials(api_harness) -> None:

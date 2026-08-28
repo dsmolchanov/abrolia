@@ -19,6 +19,7 @@ from control_plane.models import (
     StepKind,
     StepStatus,
     WhatsAppSelection,
+    synthetic_channel_identity,
 )
 from control_plane.onboarding.contracts import (
     CommandContext,
@@ -240,7 +241,9 @@ class OnboardingService:
             )
             return CommandResult(snapshot)
 
-    def _parse_selection(self, kind: StepKind, selection: dict[str, Any]) -> dict[str, Any]:
+    def _parse_selection(
+        self, kind: StepKind, selection: dict[str, Any], *, household_id: str
+    ) -> dict[str, Any]:
         adapters = {
             StepKind.EMAIL: TypeAdapter(EmailSelection),
             StepKind.WHATSAPP: TypeAdapter(WhatsAppSelection),
@@ -248,6 +251,19 @@ class OnboardingService:
         }
         if kind not in adapters:
             raise InvalidTransition(f"{kind.value} is not a selectable user step")
+        if kind is StepKind.PRIMARY_CHANNEL:
+            # The channel identity is DERIVED here and whatever the caller sent
+            # is discarded. Both select routes reach this method, so this is the
+            # one place that decides, and neither the browser nor an API client
+            # can name an identity: every value they could send satisfies the
+            # synthetic pattern, including the one belonging to somebody else.
+            #
+            # Overriding rather than refusing a mismatch is deliberate. There is
+            # no legitimate client-supplied value to preserve — the field was
+            # never the caller's to choose — so a refusal would only convert a
+            # stale client into an error where a correct value is available.
+            actor_id, chat_id = synthetic_channel_identity(household_id)
+            selection = {**selection, "actor_id": actor_id, "chat_id": chat_id}
         return adapters[kind].validate_python(
             selection,
             context={"allow_real_email_domains": self.allow_real_email_domains},
@@ -522,7 +538,7 @@ class OnboardingService:
         now: float | None = None,
     ) -> CommandResult:
         now = time.time() if now is None else now
-        parsed = self._parse_selection(kind, selection)
+        parsed = self._parse_selection(kind, selection, household_id=household_id)
         route = f"/api/v1/onboarding/steps/{kind.value}/select"
         request_sha = self._request_sha(parsed)
         with self.onboarding.db.write() as connection:
@@ -828,7 +844,7 @@ class OnboardingService:
         now: float | None,
     ) -> CommandResult:
         now = time.time() if now is None else now
-        parsed = self._parse_selection(kind, selection)
+        parsed = self._parse_selection(kind, selection, household_id=household_id)
         route = f"/api/v1/onboarding/steps/{kind.value}/retry"
         request_sha = self._request_sha(parsed)
         with self.onboarding.db.write() as connection:

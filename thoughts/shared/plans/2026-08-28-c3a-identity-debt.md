@@ -229,9 +229,21 @@ role remains on the channel it left.
 ## Inventory — D0 primary-channel identity
 
 **Files:** `control_plane/api/web.py`, `control_plane/models.py`,
+`control_plane/onboarding/service.py`,
 `control_plane/web/static/onboarding.js`, `control_plane/provisioning/fakes.py`,
-`tests/control_plane/test_onboarding_state.py`,
-`tests/control_plane/test_channel_bindings.py`, `tests/test_gateway_routing.py`.
+`tests/control_plane/test_api.py`, `tests/control_plane/test_manifest.py`,
+`tests/control_plane/test_art9_household_consent.py`,
+`tests/control_plane/test_channel_bindings.py`.
+
+`control_plane/onboarding/service.py` was added to this inventory during
+implementation. `_parse_selection` is the one place BOTH select routes pass
+through — the web form and `/api/v1/onboarding/steps/{kind}/select` — so it is
+the only seam where the identity can be owned by the server rather than
+supplied by the caller. Deriving it in `web.py` alone would have left the JSON
+route minting its own, which is the same defect with one fewer client.
+`tests/test_gateway_routing.py` and `tests/control_plane/test_onboarding_state.py`
+turned out not to need changes; the routing assertion lives with the
+two-household case in `test_channel_bindings.py`.
 
 **Branches:** `codex/d0-per-household-channel-identity`.
 
