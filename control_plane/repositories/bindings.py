@@ -256,11 +256,10 @@ class ChannelBindingsRepository(Repository):
         external_id, chat_id, actor_id = self._canonical_pair(
             channel, external_id=external_id, chat_id=chat_id, actor_id=actor_id
         )
-        existing = connection.execute(
-            "SELECT * FROM channel_bindings WHERE household_id = ? AND channel = ?"
-            " AND external_id = ?",
-            (household_id, channel, external_id),
-        ).fetchone()
+        holders = self._holders(connection, channel=channel, external_id=external_id)
+        existing = next(
+            (row for row in holders if row["household_id"] == household_id), None
+        )
         if (
             existing is not None
             and existing["role"] == "owner"
@@ -297,12 +296,7 @@ class ChannelBindingsRepository(Repository):
         # RESOLVED this case by deleting the adult, and quietly unbinding a
         # member to make room for the owner is not something that should be
         # possible to reach by accident.
-        member = connection.execute(
-            "SELECT 1 FROM channel_bindings WHERE household_id = ? AND channel = ?"
-            " AND external_id = ? AND role != 'owner' LIMIT 1",
-            (household_id, channel, external_id),
-        ).fetchone()
-        if member is not None:
+        if existing is not None and existing["role"] != "owner":
             raise BindingError(
                 "this identity is already bound to another member of the household"
             )
@@ -457,15 +451,20 @@ class ChannelBindingsRepository(Repository):
         # reported room to spare. With this refusal a verification can only
         # follow a binding that did not exist, so revisions are bounded by
         # MAX_BINDINGS.
-        held = connection.execute(
-            "SELECT actor_id FROM channel_bindings WHERE household_id = ?"
-            " AND channel = ? AND external_id = ?",
-            (household_id, channel, external_id),
-        ).fetchone()
+        held = next(
+            (
+                row
+                for row in self._holders(
+                    connection, channel=channel, external_id=external_id
+                )
+                if row["household_id"] == household_id
+            ),
+            None,
+        )
         if held is not None:
             raise BindingError(
                 "this channel is already bound to that member"
-                if held["actor_id"] == actor_id
+                if self._as_identity(channel, held["actor_id"]) == actor_id
                 else "this channel is already bound to another member"
             )
         open_challenges = connection.execute(
@@ -554,25 +553,38 @@ class ChannelBindingsRepository(Repository):
             external_id=row["external_id"],
             household_id=row["household_id"],
         )
-        existing = connection.execute(
-            "SELECT * FROM channel_bindings WHERE household_id = ? AND channel = ?"
-            " AND external_id = ?",
-            (row["household_id"], row["channel"], row["external_id"]),
-        ).fetchone()
+        existing = next(
+            (
+                held
+                for held in self._holders(
+                    connection,
+                    channel=row["channel"],
+                    external_id=row["external_id"],
+                )
+                if held["household_id"] == row["household_id"]
+            ),
+            None,
+        )
         if existing is not None:
             # The ID is already bound in THIS household. Re-verifying is not an
             # error — a family re-runs the flow after losing track of it — but
             # it must not silently move the binding to a different actor, which
             # would hand one person's channel to another without either being
             # told.
-            if existing["actor_id"] != row["actor_id"]:
+            if (
+                self._as_identity(row["channel"], existing["actor_id"])
+                != row["actor_id"]
+            ):
                 raise BindingError("this channel is already bound to another member")
             # Nor may it silently move the CONVERSATION. Two challenges naming
             # one sender and two chats are two different bindings; answering
             # the second by returning the first would report a change that did
             # not happen, and the household's review surface is derived from a
             # chat_id.
-            if existing["chat_id"] != row["chat_id"]:
+            if (
+                self._as_identity(row["channel"], existing["chat_id"], chat=True)
+                != row["chat_id"]
+            ):
                 raise BindingError(
                     "this sender is already bound in a different conversation"
                 )
@@ -652,7 +664,65 @@ class ChannelBindingsRepository(Repository):
             )
 
     @staticmethod
+    def _as_identity(channel: str, value: object, *, chat: bool = False) -> str:
+        """The canonical form of a STORED value, or the value as written.
+
+        Rows predating `control_plane/channels.py` hold spellings rather than
+        canonical identities, and a stored value with no canonical form at all
+        cannot name an inbound turn — so it claims only itself, and comparing
+        it literally is the honest answer rather than a fallback.
+        """
+        canonicalize = canonical_chat if chat else canonical_sender
+        try:
+            return canonicalize(channel, str(value))
+        except ChannelIdentityError:
+            return str(value)
+
+    @classmethod
+    def _holders(
+        cls, connection: sqlite3.Connection, *, channel: str, external_id: str
+    ) -> list[sqlite3.Row]:
+        """Every row on this channel that IS this identity, in any spelling.
+
+        ONE lookup for all four consumers — the cross-household guard, the
+        already-bound refusals in `issue_challenge` and `verify_challenge`, and
+        the owner row `ensure_owner_binding` reconciles. Each of those used its
+        own exact-string `WHERE external_id = ?`, and a household holding the
+        bare `999511234` therefore did not, to any of them, hold `+999511234`:
+        the guard let another household claim it, and the three same-household
+        lookups missed a row that was right there, so redeeming a challenge
+        wrote a SECOND row for one transport sender — a duplicate actor in the
+        manifest, and binding and revision capacity spent on it.
+
+        `actor_id` is matched as well as `external_id` because they are two
+        readings of one identity. C3a enforces them equal on every new row, so
+        the second predicate cannot fire on its own today; it is asked because
+        the rule is that neither name may be held twice, and `0010` has already
+        had to delete both halves of a shared-actor pair legacy rows could
+        hold.
+
+        The scan is the whole channel rather than an indexed lookup, which is
+        affordable because `_reject_when_full` caps what one household may hold
+        and a pilot deployment holds households in the tens. If that stops
+        being true, the fix is a canonical column maintained by the writers —
+        not a return to comparing spellings.
+        """
+        rows = connection.execute(
+            "SELECT * FROM channel_bindings WHERE channel = ?", (channel,)
+        ).fetchall()
+        return [
+            row
+            for row in rows
+            if external_id
+            in (
+                cls._as_identity(channel, row["external_id"]),
+                cls._as_identity(channel, row["actor_id"]),
+            )
+        ]
+
+    @classmethod
     def _reject_foreign_holder(
+        cls,
         connection: sqlite3.Connection,
         *,
         channel: str,
@@ -665,24 +735,13 @@ class ChannelBindingsRepository(Repository):
         `ambiguous_sender` when two rows match, so binding an identity another
         household already holds does not share a channel — it breaks delivery
         for both, including the one that was there first and did nothing wrong.
-
-        This asked about `external_id` alone. `actor_id` is the same transport
-        identity read by the runtime instead of the gateway, and C3a enforces
-        the two equal on every new row — so today the second predicate can
-        never fire. It is asked anyway, because "they happen to be equal" is
-        not the rule; the rule is that neither name may be held twice, and
-        migration `0010` has already had to delete both halves of a
-        shared-actor pair that legacy rows could hold. Stating it once here
-        means a future write path cannot reintroduce it by relaxing the
-        equality somewhere else.
         """
-        held = connection.execute(
-            "SELECT 1 FROM channel_bindings WHERE channel = ?"
-            " AND (external_id = ? OR actor_id = ?)"
-            " AND household_id != ? LIMIT 1",
-            (channel, external_id, external_id, household_id),
-        ).fetchone()
-        if held is not None:
+        if any(
+            row["household_id"] != household_id
+            for row in cls._holders(
+                connection, channel=channel, external_id=external_id
+            )
+        ):
             raise BindingError("this channel is already bound to another household")
 
     @staticmethod
