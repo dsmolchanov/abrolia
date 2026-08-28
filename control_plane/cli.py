@@ -28,6 +28,7 @@ from control_plane.db import ControlPlaneDatabase, ProcessAlreadyRunning
 from control_plane.observability import StructuredLogger
 from control_plane.privacy.consent import CONSENT_TEXTS
 from control_plane.privacy.withdraw import ConsentNotHeld
+from control_plane.provisioning.rollout import reconcile_stale_bindings
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -45,6 +46,15 @@ def _parser() -> argparse.ArgumentParser:
     dry_run = commands.add_parser("dry-run", help="drain fake providers without Fly writes")
     dry_run.add_argument("--limit", type=int, default=100)
     commands.add_parser("retention", help="run the daily retention sweep")
+    reconcile_bindings = commands.add_parser(
+        "reconcile-bindings",
+        help="re-plan households whose runtime serves a stale binding set",
+    )
+    reconcile_bindings.add_argument(
+        "--apply",
+        action="store_true",
+        help="schedule the rollouts instead of only reporting them",
+    )
     commands.add_parser(
         "runtime-health", help="reconcile dedicated runtime readiness receipts"
     )
@@ -376,6 +386,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "reconcile":
             result = active.worker.reconcile(args.job_id)
             print(json.dumps(result.__dict__, sort_keys=True))
+            return 0
+        if args.command == "reconcile-bindings":
+            # Dry run by default: this schedules real deployments for
+            # households nobody asked about, and the operator should read what
+            # it would do before it does it.
+            with active.database.write() as connection:
+                report = reconcile_stale_bindings(
+                    connection,
+                    planner=active.planner,
+                    jobs=active.jobs,
+                    onboarding=active.onboarding_repository,
+                    configs=active.configs,
+                    bindings=active.bindings,
+                    runtime_provider=active.config.runtime_provider,
+                    apply=args.apply,
+                )
+            print(json.dumps(list(report), sort_keys=True))
             return 0
         if args.command == "retention":
             result = active.retention.run()
