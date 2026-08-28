@@ -34,7 +34,16 @@ answered both questions, and a household therefore could not hold a second
 member on its primary channel at all. Uniqueness stays on the sender, so two
 members may now share one chat.
 
-Neither is derivable from the other, and the caller must supply both. It is
+A binding names THREE things and only two of them are free. `actor_id` is the
+identity the RUNTIME authorizes — `build_run_context` is handed
+`message.from.id` on Telegram and the `+999…` actor on WhatsApp — and
+`external_id` is the identity the GATEWAY routes by. Both are the transport
+sender, so they must be the same value, and `_reject_actor_that_is_not_the_sender`
+refuses a binding where they differ rather than publishing one the runtime will
+never honour. Only `chat_id` is genuinely independent.
+
+Neither `external_id` nor `chat_id` is derivable from the other, and the caller
+must supply both. It is
 tempting to treat a WhatsApp 1:1 thread as "the same as the number", and it is
 not: `hermes_cloud/ingest/whatsapp_webhook.py` normalizes the SENDER to
 `+999…` and reports the CHAT as the provider's `remote_jid`,
@@ -366,6 +375,9 @@ class ChannelBindingsRepository(Repository):
             raise BindingError("external ID is required")
         if not chat_id.strip():
             raise BindingError("chat ID is required")
+        self._reject_actor_that_is_not_the_sender(
+            external_id=external_id, actor_id=actor_id
+        )
         if actor_id == issued_by_actor_id:
             raise BindingError("a challenge cannot rebind its issuer")
         # Refusing here as well as at verification is not redundant: an owner
@@ -519,6 +531,41 @@ class ChannelBindingsRepository(Repository):
     # --- internals -------------------------------------------------------
 
     @staticmethod
+    def _reject_actor_that_is_not_the_sender(
+        *, external_id: str, actor_id: str
+    ) -> None:
+        """A published binding must authorize the pair channel ingest produces.
+
+        `actor_id` is not a name this system is free to choose. Every channel's
+        ingest derives the actor from the TRANSPORT SENDER — Telegram reads
+        `message.from.id` (`hermes_cloud/channels/telegram.py:264`), WhatsApp
+        reports the `+999…` normalized sender — and `Household.knows_binding`
+        compares the resulting `(actor, chat)` pair by string. The gateway
+        meanwhile resolves a household from `external_id`, which is the same
+        sender seen at the other end of the wire. Two columns, one identity.
+
+        Letting them differ produced a binding that succeeded at every layer
+        that could see it and failed at the only one that mattered: the row was
+        written, the revision was published, the rollout was scheduled, and then
+        every real inbound turn from that member was classified `unknown` and
+        got no family capabilities. Nothing reported it, because nothing in the
+        control plane can see an authorization that never happens.
+
+        Refusing here is the same remedy C3 chose for the chat conflation:
+        refuse where somebody asks, rather than write a row whose failure
+        surfaces somewhere nobody is watching. Translating a sender into an
+        internal actor would be the alternative, and it is a real design — a
+        verified sender-to-actor mapping carried through the manifest — that
+        this code does not have and must not pretend to.
+        """
+        if actor_id != external_id:
+            raise BindingError(
+                "a member's actor must be the identity their channel sends"
+                " from — the runtime authorizes the sender, so a binding under"
+                " any other name would never match a message"
+            )
+
+    @staticmethod
     def _reject_foreign_holder(
         connection: sqlite3.Connection,
         *,
@@ -556,6 +603,13 @@ class ChannelBindingsRepository(Repository):
         verified_at: float,
         verified_by_actor_id: str,
     ) -> BindingRecord:
+        # Every write passes here, so the identity invariant is checked here as
+        # well as at issue time. `issue_challenge` refuses early so that nobody
+        # is handed a code that could not have redeemed; this is the one place
+        # that no path can go around, including `ensure_owner_binding`.
+        self._reject_actor_that_is_not_the_sender(
+            external_id=external_id, actor_id=actor_id
+        )
         self._reject_when_full(connection, household_id=household_id)
         row_id = new_id()
         # `external_id_hmac` stays NULL, and that is a KNOWN GAP rather than an

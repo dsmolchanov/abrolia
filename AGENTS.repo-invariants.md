@@ -432,3 +432,56 @@ makes a review loop unable to terminate.
   `CUT_EMAIL_OPTIONS` is keyed by selection kind and by provider name because
   those are the two vocabularies, and two hand-written maps would drift into an
   option cut from one and not the other.
+
+
+### A stored identity is the string the channel's ingest actually produces
+
+- **No row in `channel_bindings` may name an identity the runtime will not
+  recognise. `actor_id` and `external_id` are two readings of ONE value — the
+  transport sender — and must be equal; `chat_id` is the conversation that
+  channel's ingest reports, and is never derived from either.** Enforced by
+  `ChannelBindingsRepository._reject_actor_that_is_not_the_sender`, called from
+  `_insert` so no write path can go around it and from `issue_challenge` so
+  nobody is handed a code that could not have redeemed, and by
+  `tests/control_plane/test_channel_bindings.py::test_a_bound_whatsapp_member_is_authorized_by_a_real_inbound_turn`,
+  which drives a webhook-shaped inbound through `as_eml` and
+  `trusted_run_context` and asserts BOTH halves of the resulting pair match
+  the binding the control plane wrote.
+
+  Recorded after this class arrived twice in two review rounds on one pull
+  request. First the CHAT half: `issue_challenge` defaulted `chat_id` to
+  `external_id`, documented as "the truth for WhatsApp, where a 1:1 thread IS
+  the number". Then the ACTOR half: the control plane invented internal actor
+  names (`synthetic-second-adult`) while `DesiredSpecPlanner.issue` seeded the
+  sender column from onboarding's `chat_id`. They are one missing rule, not two
+  findings.
+
+  What makes this class expensive is that every layer the control plane can see
+  reports success. The row is written, the revision is published, the rollout is
+  scheduled, the endpoint answers 200 — and then every real inbound turn from
+  that member is classified `unknown` and gets no family capabilities. Nothing
+  reports it, because nothing in the control plane can observe an authorization
+  that never happens. Only a test that goes through the real ingest can.
+
+  The identities are not the control plane's to choose. `hermes_cloud/channels/
+  telegram.py` builds its context from `message.from.id` and `message.chat.id`;
+  `hermes_cloud/ingest/whatsapp_webhook.py` normalizes the sender to `+999…`
+  and reports the conversation as the provider's `remote_jid`
+  (`…@s.whatsapp.net`, or `@g.us` for a group). `Household.knows_binding`
+  compares the resulting pair BY STRING. So a value that is plausible, or
+  derivable, or "the same number", is not thereby the right value.
+
+  Deriving one identity from another is the specific temptation, and it has now
+  produced both instances. It looks safe whenever the two coincide in the case
+  in front of you and it is wrong in the case you did not picture: the WhatsApp
+  1:1 thread whose JID is not its number, the group whose suffix is `@g.us`, the
+  Telegram chat that is not its member's user ID. Where a real mapping is
+  genuinely needed — one person holding one identity across channels — that is a
+  verified sender-to-actor mapping carried through the manifest, a design this
+  code does not have. Until it exists, the binding is REFUSED rather than
+  written under a name the runtime cannot honour.
+
+  A consequence worth stating because it looks like a regression and is not:
+  one human reachable on two channels is two members of `actors.family`. The
+  system has no cross-channel notion of a person, and the internal actor names
+  made it look as though it did.

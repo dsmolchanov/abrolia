@@ -801,7 +801,7 @@ def test_the_export_carries_the_household_s_channel_bindings(cp_stack) -> None:
             connection,
             household_id=hid,
             channel="telegram",
-            external_id="synthetic-owner-chat",
+            external_id="synthetic-owner",
             chat_id="synthetic-owner-chat",
             actor_id="synthetic-owner",
             now=BASE_TIME,
@@ -814,7 +814,7 @@ def test_the_export_carries_the_household_s_channel_bindings(cp_stack) -> None:
             # holds — the C3a arrangement. Both values must reach the subject.
             external_id="synthetic-adult-sender",
             chat_id="synthetic-owner-chat",
-            actor_id="synthetic-adult",
+            actor_id="synthetic-adult-sender",
             role="adult",
             issued_by_actor_id="synthetic-owner",
             now=BASE_TIME,
@@ -842,7 +842,7 @@ def test_the_export_carries_the_household_s_channel_bindings(cp_stack) -> None:
     assert [
         (b["channel"], b["external_id"], b["chat_id"], b["role"]) for b in bindings
     ] == [
-        ("telegram", "synthetic-owner-chat", "synthetic-owner-chat", "owner"),
+        ("telegram", "synthetic-owner", "synthetic-owner-chat", "owner"),
         ("telegram", "synthetic-adult-sender", "synthetic-owner-chat", "adult"),
     ]
     assert bindings[1]["verified_by_actor_id"] == "synthetic-owner"

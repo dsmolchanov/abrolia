@@ -137,23 +137,31 @@ class DesiredSpecPlanner:
         # manifest considered fully bound. Seeding the owner's row here from
         # the onboarding step that already proved the channel makes the two
         # agree by construction: everything below reads the table.
-        # `external_id` is the SENDER and `chat_id` is the CONVERSATION since
-        # C3a split them (0010). Onboarding's `primary_channel` step captures
-        # only the chat — `PrimaryChannelSelection` has no field for a Telegram
-        # user ID and never had one — so the owner's row is seeded with the two
-        # equal, which is exactly what the 0010 backfill writes for the rows
-        # that already exist and preserves today's behaviour byte for byte.
+        # THREE names, and each comes from the field that means it.
         #
-        # For WhatsApp that is simply true: a 1:1 thread IS the number. For
-        # Telegram it leaves the owner's sender identity holding a chat ID,
-        # which is the gap M1 of the C3a plan names and deliberately leaves for
-        # a later slice — it is the gap that has been live since 0007, not one
-        # introduced here, and B-07 keeps every household synthetic meanwhile.
+        # `external_id` is the SENDER — what the gateway matches an inbound
+        # message against — and it is seeded from `actor_id`, NOT from
+        # `chat_id`. This was the other half of the same defect: the sender
+        # column held a conversation, so a strict-mode gateway lookup matched a
+        # chat where it meant to match a sender.
+        #
+        # M1 of the C3a plan called that gap uncorrectable, on the grounds that
+        # it "needs the owner's Telegram user ID, which onboarding never
+        # captured". That premise is false and the plan is corrected: onboarding
+        # DOES capture it. `PrimaryChannelSelection.actor_id` becomes
+        # `actors.owner`, and `actors.owner` is compared against
+        # `message.from.id` (`hermes_cloud/channels/telegram.py:264`) and
+        # against the `+999…` actor WhatsApp ingest reports. It IS the transport
+        # sender identity; the planner was reading the wrong field.
+        #
+        # The manifest projection is unaffected — `external_id` is not projected
+        # at all, `chat_id` is — so this changes what the GATEWAY matches and
+        # nothing the runtime parses.
         self.bindings.ensure_owner_binding(
             connection,
             household_id=household_id,
             channel=primary,
-            external_id=chat_id,
+            external_id=actor_id,
             chat_id=chat_id,
             actor_id=actor_id,
         )

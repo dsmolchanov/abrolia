@@ -241,9 +241,21 @@ plan changes is that the gap becomes *nameable*: after the migration a row with
 `external_id == chat_id` on Telegram is visibly un-migrated data, not an
 ambiguity in the schema.
 
-Correcting those values needs the owner's Telegram user ID, which onboarding
+**Correction, 2026-08-28 (second Codex `[BLOCKER]` on #76).** The paragraph
+below is wrong, and its wrongness is what left the sender column holding a
+chat. Onboarding DOES capture the owner's sender identity: it is
+`PrimaryChannelSelection.actor_id`, which becomes `actors.owner` and is exactly
+what `message.from.id` is compared against (`telegram.py:264`). The planner was
+reading `chat_id` where `actor_id` was sitting beside it. So there is no gap to
+defer — `external_id` is seeded from `actor_id`, 0010 realigns the rows that
+exist, and the invariant is recorded in `AGENTS.repo-invariants.md`. Neither
+option below is needed. They are left in place because the reasoning that
+produced them is the reasoning to distrust: a value the code cannot see is not
+the same as a value the code never captured.
+
+~~Correcting those values needs the owner's Telegram user ID, which onboarding
 never captured. Two ways to get it, both out of scope here and recorded so the
-choice is deliberate:
+choice is deliberate:~~
 
 1. **Re-onboard.** `reset_from(PRIMARY_CHANNEL)` already retires and rewrites
    the owner binding (`_retire_superseded`), so an owner who re-runs the step
@@ -339,7 +351,8 @@ must be true, each naming the test that proves it:
 `tests/control_plane/test_channel_bindings.py`,
 `tests/control_plane/test_binding_api.py`, `tests/control_plane/test_db.py`,
 `tests/control_plane/test_export_delete.py`, `tests/test_runcontext.py`,
-`tests/test_gateway_routing.py`, `tests/test_feature_flags.py`.
+`tests/test_gateway_routing.py`, `tests/test_feature_flags.py`,
+`AGENTS.repo-invariants.md`.
 
 **Branches:** `codex/c3a-sender-identity-and-chat`.
 

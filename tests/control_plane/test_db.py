@@ -90,16 +90,16 @@ def test_the_chat_id_backfill_preserves_what_the_projection_emitted(
             )
             # Written the way every row before C3a was: one column, holding the
             # CHAT, for a Telegram household and a WhatsApp one.
-            for row_id, channel, value in (
-                ("b1", "telegram", "-100990000101"),
-                ("b2", "whatsapp", "+999511234567"),
+            for row_id, channel, chat, actor in (
+                ("b1", "telegram", "-100990000101", "990000001"),
+                ("b2", "whatsapp", "+999511234567", "+999511234567"),
             ):
                 connection.execute(
                     "INSERT INTO channel_bindings (id, household_id, channel,"
                     " external_id, actor_id, role, verified_at,"
-                    " verified_by_actor_id) VALUES (?, 'h1', ?, ?, 'a1',"
-                    " 'owner', 1, 'a1')",
-                    (row_id, channel, value),
+                    " verified_by_actor_id) VALUES (?, 'h1', ?, ?, ?,"
+                    " 'owner', 1, ?)",
+                    (row_id, channel, chat, actor, actor),
                 )
             connection.execute(
                 "INSERT INTO channel_binding_challenges (id, household_id,"
@@ -108,22 +108,32 @@ def test_the_chat_id_backfill_preserves_what_the_projection_emitted(
                 " created_at) VALUES ('c1', 'h1', 'whatsapp', '+999511234500',"
                 " 'a2', 'adult', 'digest', 'a1', 9e9, 0, NULL, 1)"
             )
-        projected_before = [
-            row["external_id"]
-            for row in database.query(
-                "SELECT external_id FROM channel_bindings ORDER BY id"
-            )
-        ]
+        before = database.query(
+            "SELECT external_id, actor_id FROM channel_bindings ORDER BY id"
+        )
+        # What the projection emitted before 0010: `chat_id` read from
+        # `external_id`, because that column held the chat.
+        projected_before = [row["external_id"] for row in before]
+        actors_before = [row["actor_id"] for row in before]
 
         assert database.migrate() == ["0010_channel_binding_chat_id.sql"]
 
         rows = database.query(
-            "SELECT external_id, chat_id FROM channel_bindings ORDER BY id"
+            "SELECT external_id, chat_id, actor_id FROM channel_bindings ORDER BY id"
         )
-        # What the manifest now reads equals what it used to read.
+        # What the manifest reads now equals what it read then. This is the
+        # whole of acceptance 4: a household that added nobody still hashes to
+        # the same `config_sha256`.
         assert [row["chat_id"] for row in rows] == projected_before
-        # And the sender column is untouched, gap and all.
-        assert [row["external_id"] for row in rows] == projected_before
+        # The SENDER column is realigned onto the identity that answers for it.
+        # It is not projected into the manifest — only `chat_id` is — so this
+        # changes what the gateway matches and nothing the runtime parses. The
+        # Telegram row moves off the chat it should never have held; the
+        # WhatsApp row already agreed and does not move.
+        assert [row["actor_id"] for row in rows] == actors_before
+        assert [row["external_id"] for row in rows] == actors_before
+        assert rows[0]["external_id"] != projected_before[0]
+        assert rows[1]["external_id"] == projected_before[1]
         # An outstanding invitation survives the migration answerable: dropping
         # its chat would make it redeem into a binding that speaks nowhere.
         assert database.query_one(

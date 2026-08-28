@@ -52,6 +52,27 @@ ALTER TABLE channel_binding_challenges ADD COLUMN chat_id TEXT;
 UPDATE channel_bindings SET chat_id = external_id WHERE chat_id IS NULL;
 UPDATE channel_binding_challenges SET chat_id = external_id WHERE chat_id IS NULL;
 
+-- ...and the SENDER column is realigned onto the identity that answers for it.
+--
+-- `external_id` is what the gateway matches an inbound sender against, and
+-- `actor_id` is what the runtime authorizes: `build_run_context` is handed
+-- `message.from.id` on Telegram and the `+999…` normalized actor on WhatsApp,
+-- and `Household.knows_binding` compares that pair by string. They are two
+-- readings of ONE identity, so a row where they differ is a row the runtime
+-- cannot honour — the binding exists, the revision deploys, and every real
+-- message from that member is classified `unknown`.
+--
+-- Existing rows hold the CHAT in `external_id`, because the planner seeded it
+-- from onboarding's `chat_id`. It should have read `actor_id`, which onboarding
+-- has captured all along and which becomes `actors.owner` in the manifest. This
+-- statement finishes the split the column above started: chat to `chat_id`,
+-- sender to `external_id`, each from the field that means it.
+--
+-- The manifest projection does not change. `external_id` is not projected —
+-- `chat_id` is, and it was written above — so a household that added nobody
+-- still hashes to the same `config_sha256`.
+UPDATE channel_bindings SET external_id = actor_id WHERE external_id <> actor_id;
+
 -- SQLite cannot add a NOT NULL column to a populated table without inventing a
 -- default, and an empty-string default would be a lie that reads as data. The
 -- column is therefore nullable in the schema and required by a trigger, the

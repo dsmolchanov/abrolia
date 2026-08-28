@@ -43,7 +43,7 @@ def _seed_owner(
             channel="telegram",
             external_id=external_id,
             chat_id=external_id,
-            actor_id=actor_id,
+            actor_id=external_id,
         )
 
 
@@ -53,7 +53,7 @@ def test_both_routes_gate_like_every_other_private_mutation(api_harness) -> None
     api_harness.authenticate(world)
     _seed_owner(api_harness, world.household.id)
     origin_only = {"Origin": api_harness.config.public_origin}
-    body = {"channel": "telegram", "external_id": SENDER, "chat_id": CHAT, "actor_id": ADULT}
+    body = {"channel": "telegram", "external_id": SENDER, "chat_id": CHAT, "actor_id": SENDER}
 
     for path, payload in ((CHALLENGES, body), (VERIFY, {"code": "whatever"})):
         assert api_harness.client.post(path, json=payload).status_code == 403
@@ -78,7 +78,7 @@ def test_a_household_without_an_owner_binding_cannot_acquire_a_second_member(
     api_harness.authenticate(world)
     response = api_harness.client.post(
         CHALLENGES,
-        json={"channel": "telegram", "external_id": SENDER, "chat_id": CHAT, "actor_id": ADULT},
+        json={"channel": "telegram", "external_id": SENDER, "chat_id": CHAT, "actor_id": SENDER},
         headers=api_harness.mutation_headers,
     )
     assert response.status_code == 409
@@ -93,7 +93,7 @@ def test_the_code_is_returned_once_and_never_written_down(api_harness, caplog) -
     with caplog.at_level("DEBUG"):
         response = api_harness.client.post(
             CHALLENGES,
-            json={"channel": "telegram", "external_id": SENDER, "chat_id": CHAT, "actor_id": ADULT},
+            json={"channel": "telegram", "external_id": SENDER, "chat_id": CHAT, "actor_id": SENDER},
             headers=api_harness.mutation_headers,
         )
     assert response.status_code == 200
@@ -113,7 +113,7 @@ def test_a_wrong_code_is_refused_and_writes_nothing(api_harness) -> None:
     _seed_owner(api_harness, world.household.id)
     api_harness.client.post(
         CHALLENGES,
-        json={"channel": "telegram", "external_id": SENDER, "chat_id": CHAT, "actor_id": ADULT},
+        json={"channel": "telegram", "external_id": SENDER, "chat_id": CHAT, "actor_id": SENDER},
         headers=api_harness.mutation_headers,
     )
 
@@ -140,12 +140,12 @@ def test_an_owner_cannot_bind_an_id_another_household_holds(api_harness) -> None
             channel="telegram",
             external_id=SENDER,
             chat_id=CHAT,
-            actor_id="synthetic-other-owner",
+            actor_id=SENDER,
         )
 
     response = api_harness.client.post(
         CHALLENGES,
-        json={"channel": "telegram", "external_id": SENDER, "chat_id": CHAT, "actor_id": ADULT},
+        json={"channel": "telegram", "external_id": SENDER, "chat_id": CHAT, "actor_id": SENDER},
         headers=api_harness.mutation_headers,
     )
     assert response.status_code == 409
@@ -167,7 +167,7 @@ def test_an_unprovisionable_household_is_declined_not_broken(api_harness) -> Non
             "channel": "whatsapp",
             "external_id": WA_SENDER,
             "chat_id": WA_CHAT,
-            "actor_id": ADULT,
+            "actor_id": WA_SENDER,
         },
         headers=api_harness.mutation_headers,
     )
@@ -222,7 +222,7 @@ def test_a_challenge_cannot_be_redeemed_from_another_household(api_harness) -> N
             channel="whatsapp",
             external_id="+999511234567",
             chat_id="+999511234567",
-            actor_id=ADULT,
+            actor_id="+999511234567",
             role="adult",
             issued_by_actor_id="synthetic-owner",
         )
@@ -253,7 +253,7 @@ def test_both_binding_routes_bound_the_body_before_parsing_it(api_harness) -> No
                 "channel": "whatsapp",
                 "external_id": huge,
                 "chat_id": WA_CHAT,
-                "actor_id": ADULT,
+                "actor_id": huge,
             },
         ),
         (VERIFY, {"code": huge}),
@@ -297,7 +297,7 @@ def test_only_the_owner_may_attest_a_binding(api_harness) -> None:
                 "channel": "whatsapp",
                 "external_id": WA_SENDER,
                 "chat_id": WA_CHAT,
-                "actor_id": ADULT,
+                "actor_id": WA_SENDER,
             },
         ),
         (VERIFY, {"code": "anything"}),
@@ -316,7 +316,7 @@ def test_only_the_owner_may_attest_a_binding(api_harness) -> None:
             "channel": "whatsapp",
             "external_id": WA_SENDER,
             "chat_id": WA_CHAT,
-            "actor_id": ADULT,
+            "actor_id": WA_SENDER,
         },
         headers=api_harness.mutation_headers,
     )
@@ -340,7 +340,7 @@ def test_repeated_verification_cannot_grow_the_revision_history(api_harness) -> 
         "channel": "whatsapp",
         "external_id": WA_SENDER,
         "chat_id": WA_CHAT,
-        "actor_id": ADULT,
+        "actor_id": WA_SENDER,
     }
 
     # Bind the tuple through the repository, which does not replan — the point
@@ -352,7 +352,7 @@ def test_repeated_verification_cannot_grow_the_revision_history(api_harness) -> 
             channel="whatsapp",
             external_id="+999511234567",
             chat_id="+999511234567",
-            actor_id=ADULT,
+            actor_id="+999511234567",
             role="adult",
             issued_by_actor_id="synthetic-owner",
         )
@@ -410,7 +410,7 @@ def test_the_endpoint_carries_a_chat_alongside_the_sender(api_harness) -> None:
             "channel": "telegram",
             "external_id": "synthetic-adult-sender",
             "chat_id": "synthetic-owner-chat",
-            "actor_id": ADULT,
+            "actor_id": "synthetic-adult-sender",
         },
         headers=api_harness.mutation_headers,
     )
@@ -449,8 +449,8 @@ def test_a_challenge_without_a_chat_is_refused_rather_than_guessed(
         CHALLENGES,
         json={
             "channel": "whatsapp",
-            "external_id": "+999511234567",
-            "actor_id": ADULT,
+            "external_id": WA_SENDER,
+            "actor_id": WA_SENDER,
         },
         headers=api_harness.mutation_headers,
     )
