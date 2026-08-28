@@ -1171,3 +1171,80 @@ def test_a_challenge_cannot_borrow_the_sender_as_its_chat(cp_stack) -> None:
                 issued_by_actor_id=CHANNEL_SELECTION["actor_id"],
                 now=BASE_TIME + 100,
             )
+
+
+def test_a_padded_identity_is_stored_as_the_string_ingest_produces(
+    cp_stack,
+) -> None:
+    """Whitespace is not a variant of an identity; it is a different string.
+
+    `Household.knows_binding` compares by string and every ingest path strips
+    before it reports — `whatsapp_webhook._text` returns `value.strip()`. So a
+    binding stored as `"999…@g.us "` issues, verifies, publishes a revision and
+    schedules a rollout, and then matches nothing: another arrangement that
+    succeeds at every layer the control plane can see and fails at the only one
+    that matters.
+
+    Canonicalizing happens BEFORE the uniqueness checks, which is the half that
+    is easy to get wrong. `_reject_foreign_holder` and the already-bound lookup
+    both compare by string, so a padded duplicate of a bound sender would slip
+    past them and land as a second row for one identity.
+    """
+    _provisioned(cp_stack)
+    owner = CHANNEL_SELECTION["actor_id"]
+    chat = CHANNEL_SELECTION["chat_id"]
+
+    with cp_stack.database.write() as connection:
+        issued = cp_stack.bindings.issue_challenge(
+            connection,
+            household_id=cp_stack.household.id,
+            channel=CHANNEL_SELECTION["kind"],
+            external_id=f"  {ADULT}\n",
+            chat_id=f"\t{chat} ",
+            actor_id=f" {ADULT}  ",
+            role="adult",
+            issued_by_actor_id=owner,
+            now=BASE_TIME + 100,
+        )
+        binding = cp_stack.bindings.verify_challenge(
+            connection,
+            code=issued.code,
+            household_id=cp_stack.household.id,
+            owner_actor_id=owner,
+            now=BASE_TIME + 200,
+        )
+        # Stored canonical, so the row says what ingest will say.
+        assert (binding.external_id, binding.chat_id, binding.actor_id) == (
+            ADULT, chat, ADULT,
+        )
+        # And the padded form is not a second identity: re-inviting the same
+        # sender with different padding is refused as already bound, not
+        # written beside it.
+        with pytest.raises(BindingError, match="already bound"):
+            cp_stack.bindings.issue_challenge(
+                connection,
+                household_id=cp_stack.household.id,
+                channel=CHANNEL_SELECTION["kind"],
+                external_id=f"{ADULT} ",
+                chat_id=chat,
+                actor_id=f"{ADULT} ",
+                role="adult",
+                issued_by_actor_id=owner,
+                now=BASE_TIME + 300,
+            )
+        # An identity that is only whitespace is nothing at all.
+        for field, kwargs in (
+            ("external ID", {"external_id": "   ", "chat_id": chat}),
+            ("chat ID", {"external_id": "990000007", "chat_id": "  "}),
+        ):
+            with pytest.raises(BindingError, match=f"{field} is required"):
+                cp_stack.bindings.issue_challenge(
+                    connection,
+                    household_id=cp_stack.household.id,
+                    channel=CHANNEL_SELECTION["kind"],
+                    actor_id=kwargs["external_id"],
+                    role="adult",
+                    issued_by_actor_id=owner,
+                    now=BASE_TIME + 400,
+                    **kwargs,
+                )

@@ -113,9 +113,27 @@ DELETE FROM channel_bindings AS doomed
 -- it is read into `chat_id` before the sender overwrites it; SQLite evaluates
 -- every right-hand side against the original row, so the order of the
 -- assignments below does not matter.
+--
+-- `external_id_hmac` is cleared in the same statement, and that is the point
+-- of including it rather than an afterthought. It is a keyed digest OF THE
+-- COLUMN BESIDE IT, so rewriting the sender without touching the digest leaves
+-- two representations of what is supposed to be one transport string. The
+-- strict branch of `WhatsAppGatewayRouter.route` searches by digest alone, so
+-- a stale one is worse than a missing one: it does not merely fail to find the
+-- repaired row, it goes on matching the OLD value — routing under an identity
+-- this migration just retired.
+--
+-- Recomputing is not available here. The digest is keyed with the relay key,
+-- which the control plane does not hold and has no path to; that is C5's, and
+-- M2 of the plan says so. NULL is the honest answer and the documented state —
+-- `_insert` writes NULL for the same reason, pinned by
+-- `test_hmac_column_stays_null_until_c5_provisions_the_key` — and it fails
+-- closed, because a strict-mode lookup then finds nothing rather than finding
+-- the wrong household.
 UPDATE channel_bindings
    SET chat_id = external_id,
-       external_id = actor_id
+       external_id = actor_id,
+       external_id_hmac = NULL
  WHERE chat_id IS NULL;
 
 -- SQLite cannot add a NOT NULL column to a populated table without inventing a

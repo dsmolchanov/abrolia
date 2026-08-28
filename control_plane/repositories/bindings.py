@@ -245,6 +245,12 @@ class ChannelBindingsRepository(Repository):
         left, which is where cards, approvals and digests appear.
         """
         now = time.time() if now is None else now
+        # Before the lookup, for the same reason as in `issue_challenge`: the
+        # query below matches by string, so a padded value would miss the row
+        # it means to reconcile and insert a second one beside it.
+        external_id = self._canonical(external_id, "external ID")
+        chat_id = self._canonical(chat_id, "chat ID")
+        actor_id = self._canonical(actor_id, "actor ID")
         existing = connection.execute(
             "SELECT * FROM channel_bindings WHERE household_id = ? AND channel = ?"
             " AND external_id = ?",
@@ -371,10 +377,13 @@ class ChannelBindingsRepository(Repository):
             raise BindingError("unknown channel")
         if role not in CHALLENGE_ROLES:
             raise BindingError("a challenge cannot confer this role")
-        if not external_id.strip():
-            raise BindingError("external ID is required")
-        if not chat_id.strip():
-            raise BindingError("chat ID is required")
+        # Canonicalized BEFORE the uniqueness and ownership checks below, not
+        # after: a padded duplicate of a bound sender would otherwise slip past
+        # `_reject_foreign_holder` and the already-bound lookup, both of which
+        # compare by string, and land as a second row for one identity.
+        external_id = self._canonical(external_id, "external ID")
+        chat_id = self._canonical(chat_id, "chat ID")
+        actor_id = self._canonical(actor_id, "actor ID")
         self._reject_actor_that_is_not_the_sender(
             external_id=external_id, actor_id=actor_id
         )
@@ -531,6 +540,27 @@ class ChannelBindingsRepository(Repository):
     # --- internals -------------------------------------------------------
 
     @staticmethod
+    def _canonical(value: str, field: str) -> str:
+        """The stored identity is the string ingest produces, byte for byte.
+
+        Every ingest path strips before it reports: `whatsapp_webhook._text`
+        returns `value.strip()`, and Telegram's IDs come out of JSON as bare
+        numbers. So a padded identity is not a variant of the canonical one, it
+        is a value no inbound turn can ever carry — and `knows_binding`
+        compares by string, so `"999…@g.us "` issues, verifies, publishes and
+        rolls out, and then matches nothing.
+
+        Normalizing rather than refusing is deliberate: the canonical form IS
+        the stripped form, because that is what ingest emits, so stripping
+        stores what the runtime will see instead of rejecting a request whose
+        only fault is a trailing space.
+        """
+        canonical = value.strip()
+        if not canonical:
+            raise BindingError(f"{field} is required")
+        return canonical
+
+    @staticmethod
     def _reject_actor_that_is_not_the_sender(
         *, external_id: str, actor_id: str
     ) -> None:
@@ -607,6 +637,9 @@ class ChannelBindingsRepository(Repository):
         # well as at issue time. `issue_challenge` refuses early so that nobody
         # is handed a code that could not have redeemed; this is the one place
         # that no path can go around, including `ensure_owner_binding`.
+        external_id = self._canonical(external_id, "external ID")
+        chat_id = self._canonical(chat_id, "chat ID")
+        actor_id = self._canonical(actor_id, "actor ID")
         self._reject_actor_that_is_not_the_sender(
             external_id=external_id, actor_id=actor_id
         )
