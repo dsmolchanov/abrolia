@@ -592,8 +592,40 @@ def test_verifying_over_http_deploys_the_revision_it_reports(api_harness) -> Non
     while (result := api_harness.container.worker.run_once()) is not None:
         assert result.status in {"succeeded", "cancelled"}, result
 
+    # The runtime then CLAIMS its token and ACTIVATES the revision, which is
+    # the half that makes the endpoint's answer true.
+    #
+    # Stopping at the worker is not enough, and the reason is easy to miss:
+    # `schedule_runtime_rollout` writes `current_config_revision` when it
+    # queues the job, and `_settle_runtime_ready` marks the job succeeded
+    # right after launch. So the revision and manifest assertions below hold
+    # even if claiming or activation is broken or never happens — the
+    # household would sit at `provisioning` forever, serving N-1, while every
+    # assertion passed.
+    active = api_harness.container
+    household = active.households.get(world.household.id)
+    assert household.status == "provisioning"
+    raw_token = active.secret_sink.get(
+        household.runtime_ref, "HERMES_BOOTSTRAP_TOKEN"
+    )
+    assert raw_token is not None
+    binding = {
+        "household_id": world.household.id,
+        "runtime_ref": household.runtime_ref,
+        "config_revision": reported,
+    }
+    active.bootstrap.claim(raw_token, **binding)
+    active.bootstrap.activate(
+        raw_token,
+        **binding,
+        activated_sha256=active.configs.manifest(
+            world.household.id, reported
+        )["config_sha256"],
+    )
+
     # And the household is serving what the endpoint said it would.
-    household = api_harness.container.households.get(world.household.id)
+    household = active.households.get(world.household.id)
+    assert household.status == "active", "activation never completed"
     assert household.current_config_revision == reported
     # The onboarding page is untouched: a family that finished setup months ago
     # must not be shown as mid-setup because somebody added an adult.

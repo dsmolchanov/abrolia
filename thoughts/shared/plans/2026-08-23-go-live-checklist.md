@@ -312,14 +312,18 @@ test. Running every case twice pinned nothing the single run did not, measured
 by deleting each clause and counting failures.
 
 The fourth checkpoint — `_runtime_projection_is_current`, during reconcile —
-is not covered, and that is a FINDING rather than an omission. Its revision
-clause changes no outcome: with it removed the job is resumed and the next
-checkpoint cancels it for the same staleness. The only thing it uniquely
-controls is whether reconcile re-enters the provider for a revision nobody is
-serving. A test can pin that, by asserting provider call counts, and doing so
-costs more machinery than the clause is worth defending. Recorded here so the
-next reader knows it was measured rather than missed — and so that anyone
-simplifying that predicate knows what they would be giving up.
+IS covered, after a round trip worth recording. It was dropped on the grounds
+that its revision clause changes no outcome, which is true and measured: with
+the clause removed the job is resumed and the next checkpoint cancels it for
+the same staleness. Review pointed out what that reasoning missed, and it was
+right — the clause is what stops reconcile RE-ENTERING THE PROVIDER for a
+revision nobody is serving, and repeating external work is the thing a
+currency guard exists to prevent. Status is the wrong assertion for it;
+provider call count is the right one.
+
+The lesson is narrower than "cover everything": a guard whose absence changes
+no observable outcome may still be the only thing preventing an external side
+effect, and outcome-shaped assertions cannot see that.
 
 
 ## Track R — Staged rollout (fixed order; runbook §Rollout)
