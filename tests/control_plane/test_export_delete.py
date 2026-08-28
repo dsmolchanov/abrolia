@@ -802,14 +802,18 @@ def test_the_export_carries_the_household_s_channel_bindings(cp_stack) -> None:
             household_id=hid,
             channel="telegram",
             external_id="synthetic-owner-chat",
+            chat_id="synthetic-owner-chat",
             actor_id="synthetic-owner",
             now=BASE_TIME,
         )
         issued = cp_stack.bindings.issue_challenge(
             connection,
             household_id=hid,
-            channel="whatsapp",
-            external_id="+999511234567",
+            channel="telegram",
+            # A sender of their own, in the conversation the owner already
+            # holds — the C3a arrangement. Both values must reach the subject.
+            external_id="synthetic-adult-sender",
+            chat_id="synthetic-owner-chat",
             actor_id="synthetic-adult",
             role="adult",
             issued_by_actor_id="synthetic-owner",
@@ -832,9 +836,14 @@ def test_the_export_carries_the_household_s_channel_bindings(cp_stack) -> None:
     ).export(cp_stack.account.id, hid)
     bindings = document["channel_bindings"]
 
-    assert [(b["channel"], b["external_id"], b["role"]) for b in bindings] == [
-        ("telegram", "synthetic-owner-chat", "owner"),
-        ("whatsapp", "+999511234567", "adult"),
+    # Both columns, because since C3a they answer different questions: the
+    # subject's own identity on the channel, and the conversation they were
+    # bound in. Returning one would omit half of what is held about them.
+    assert [
+        (b["channel"], b["external_id"], b["chat_id"], b["role"]) for b in bindings
+    ] == [
+        ("telegram", "synthetic-owner-chat", "synthetic-owner-chat", "owner"),
+        ("telegram", "synthetic-adult-sender", "synthetic-owner-chat", "adult"),
     ]
     assert bindings[1]["verified_by_actor_id"] == "synthetic-owner"
 

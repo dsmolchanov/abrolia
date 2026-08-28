@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from control_plane.db import ControlPlaneDatabase
+from control_plane.db import MIGRATIONS_DIR, ControlPlaneDatabase
 from hermes_cloud.core.db import Database as RuntimeDatabase
 
 
@@ -37,6 +37,7 @@ def test_migrations_are_ordered_and_idempotent(tmp_path: Path) -> None:
             "0007_channel_bindings.sql",
             "0008_runtime_health_ownership.sql",
             "0009_channel_binding_challenges.sql",
+            "0010_channel_binding_chat_id.sql",
         ]
         assert database.migrate() == []
         assert database.pragma() == {
@@ -44,6 +45,90 @@ def test_migrations_are_ordered_and_idempotent(tmp_path: Path) -> None:
             "synchronous": 2,
             "foreign_keys": 1,
         }
+    finally:
+        database.close()
+
+
+def test_the_chat_id_backfill_preserves_what_the_projection_emitted(
+    tmp_path: Path,
+) -> None:
+    """C3a acceptance 4: 0010 is behaviour-preserving for rows that exist.
+
+    Before the split, `provisioning/planner.py` projected the manifest's
+    `chat_id` FROM `external_id`, because onboarding's `primary_channel` step
+    captured the chat and wrote it into the only column there was. After 0010
+    the projection reads `chat_id`, so the backfill has to make those two the
+    same value for every row already stored — otherwise a household that added
+    nobody would get a manifest with a different `config_sha256`, and a changed
+    hash is how this system says something changed.
+
+    It also leaves `external_id` ALONE. That is deliberate and it is the honest
+    half: for Telegram the column still holds a chat where the gateway means a
+    sender. The gap is not introduced here — reading one column two ways has
+    meant exactly this since 0007 — but after the migration it is nameable, and
+    correcting it needs a user ID onboarding never captured. See M1 of
+    `thoughts/shared/plans/2026-08-27-c3a-sender-identity-and-chat.md`.
+    """
+    staged = tmp_path / "migrations"
+    staged.mkdir()
+    for script in sorted(MIGRATIONS_DIR.glob("*.sql")):
+        if script.name.startswith("0010"):
+            break
+        (staged / script.name).write_text(script.read_text(encoding="utf-8"))
+
+    database = ControlPlaneDatabase(tmp_path / "control-plane.db")
+    try:
+        database.migrate(staged)
+        assert "chat_id" not in {
+            row["name"]
+            for row in database.query("PRAGMA table_info(channel_bindings)")
+        }
+        with database.write() as connection:
+            connection.execute(
+                "INSERT INTO households (id, slug, status, created_at, updated_at)"
+                " VALUES ('h1', 'hh1', 'active', 1, 1)"
+            )
+            # Written the way every row before C3a was: one column, holding the
+            # CHAT, for a Telegram household and a WhatsApp one.
+            for row_id, channel, value in (
+                ("b1", "telegram", "-100990000101"),
+                ("b2", "whatsapp", "+999511234567"),
+            ):
+                connection.execute(
+                    "INSERT INTO channel_bindings (id, household_id, channel,"
+                    " external_id, actor_id, role, verified_at,"
+                    " verified_by_actor_id) VALUES (?, 'h1', ?, ?, 'a1',"
+                    " 'owner', 1, 'a1')",
+                    (row_id, channel, value),
+                )
+            connection.execute(
+                "INSERT INTO channel_binding_challenges (id, household_id,"
+                " channel, external_id, actor_id, role, code_hash,"
+                " issued_by_actor_id, expires_at, attempts, consumed_at,"
+                " created_at) VALUES ('c1', 'h1', 'whatsapp', '+999511234500',"
+                " 'a2', 'adult', 'digest', 'a1', 9e9, 0, NULL, 1)"
+            )
+        projected_before = [
+            row["external_id"]
+            for row in database.query(
+                "SELECT external_id FROM channel_bindings ORDER BY id"
+            )
+        ]
+
+        assert database.migrate() == ["0010_channel_binding_chat_id.sql"]
+
+        rows = database.query(
+            "SELECT external_id, chat_id FROM channel_bindings ORDER BY id"
+        )
+        # What the manifest now reads equals what it used to read.
+        assert [row["chat_id"] for row in rows] == projected_before
+        # And the sender column is untouched, gap and all.
+        assert [row["external_id"] for row in rows] == projected_before
+        # An outstanding invitation survives the migration answerable: dropping
+        # its chat would make it redeem into a binding that speaks nowhere.
+        assert database.query_one(
+            "SELECT chat_id FROM channel_binding_challenges WHERE id = 'c1'"
+        )[0] == "+999511234500"
     finally:
         database.close()
 

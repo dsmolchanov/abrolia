@@ -41,7 +41,15 @@ class ChallengeRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     channel: str = Field(min_length=1, max_length=32)
+    #: The SENDER's identity on the channel — what the gateway will match an
+    #: inbound message against.
     external_id: str = Field(min_length=1, max_length=128)
+    #: The CONVERSATION this member speaks in. Absent means "the same as
+    #: `external_id`", which is the truth for WhatsApp, where a 1:1 thread is
+    #: the number. On Telegram it is how an owner puts a second adult into the
+    #: family's existing group — the arrangement C3a's schema split allows and
+    #: the previous one could not represent at all.
+    chat_id: str | None = Field(default=None, min_length=1, max_length=128)
     actor_id: str = Field(min_length=1, max_length=128)
 
 
@@ -83,6 +91,7 @@ async def issue_binding_challenge(
                 household_id=current.household.id,
                 channel=payload.channel,
                 external_id=payload.external_id,
+                chat_id=payload.chat_id,
                 actor_id=payload.actor_id,
                 role="adult",
                 issued_by_actor_id=owner,

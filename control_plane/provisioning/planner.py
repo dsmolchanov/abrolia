@@ -137,11 +137,24 @@ class DesiredSpecPlanner:
         # manifest considered fully bound. Seeding the owner's row here from
         # the onboarding step that already proved the channel makes the two
         # agree by construction: everything below reads the table.
+        # `external_id` is the SENDER and `chat_id` is the CONVERSATION since
+        # C3a split them (0010). Onboarding's `primary_channel` step captures
+        # only the chat — `PrimaryChannelSelection` has no field for a Telegram
+        # user ID and never had one — so the owner's row is seeded with the two
+        # equal, which is exactly what the 0010 backfill writes for the rows
+        # that already exist and preserves today's behaviour byte for byte.
+        #
+        # For WhatsApp that is simply true: a 1:1 thread IS the number. For
+        # Telegram it leaves the owner's sender identity holding a chat ID,
+        # which is the gap M1 of the C3a plan names and deliberately leaves for
+        # a later slice — it is the gap that has been live since 0007, not one
+        # introduced here, and B-07 keeps every household synthetic meanwhile.
         self.bindings.ensure_owner_binding(
             connection,
             household_id=household_id,
             channel=primary,
             external_id=chat_id,
+            chat_id=chat_id,
             actor_id=actor_id,
         )
         bound = self.bindings.verified(connection, household_id=household_id)
@@ -175,7 +188,7 @@ class DesiredSpecPlanner:
                 ChannelBindingV1(
                     channel=binding.channel,
                     actor_id=binding.actor_id,
-                    chat_id=binding.external_id,
+                    chat_id=binding.chat_id,
                     # Only the owner's binding came from a provider result, so
                     # only it carries that provider's reference. An adult
                     # verified by challenge has no provider row to point at,

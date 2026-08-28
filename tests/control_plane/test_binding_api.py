@@ -33,6 +33,7 @@ def _seed_owner(
             household_id=household_id,
             channel="telegram",
             external_id=external_id,
+            chat_id=external_id,
             actor_id=actor_id,
         )
 
@@ -129,6 +130,7 @@ def test_an_owner_cannot_bind_an_id_another_household_holds(api_harness) -> None
             household_id=other.household.id,
             channel="telegram",
             external_id=CHAT,
+            chat_id=CHAT,
             actor_id="synthetic-other-owner",
         )
 
@@ -147,8 +149,9 @@ def test_an_unprovisionable_household_is_declined_not_broken(api_harness) -> Non
     world = api_harness.create_principal()
     api_harness.authenticate(world)
     _seed_owner(api_harness, world.household.id)
-    # A NON-primary channel, so the request gets past the primary-channel
-    # refusal and actually reaches the planner, which is what is under test.
+    # Any channel reaches the planner now — C3a removed the primary-channel
+    # refusal this comment used to route around — and the planner is what is
+    # under test.
     issued = api_harness.client.post(
         CHALLENGES,
         json={"channel": "whatsapp", "external_id": "+999511234567", "actor_id": ADULT},
@@ -345,3 +348,63 @@ def test_repeated_verification_cannot_grow_the_revision_history(api_harness) -> 
     # nor a single extra revision.
     assert len(challenges) == 1
     assert len(revisions_after) == revisions_before
+
+
+def test_the_endpoint_carries_a_chat_alongside_the_sender(api_harness) -> None:
+    """C3a's HTTP half: an owner can put a member into an existing conversation.
+
+    `external_id` is the SENDER the gateway will match; `chat_id` is where that
+    member speaks. Sending both is how a second adult joins the family's own
+    Telegram group, which the pre-C3a store could not represent at all — the
+    chat was the only identity a binding had, so it collided with the owner's.
+    """
+    world = api_harness.create_principal()
+    api_harness.authenticate(world)
+    _seed_owner(api_harness, world.household.id)
+
+    issued = api_harness.client.post(
+        CHALLENGES,
+        json={
+            "channel": "telegram",
+            "external_id": "synthetic-adult-sender",
+            "chat_id": "synthetic-owner-chat",
+            "actor_id": ADULT,
+        },
+        headers=api_harness.mutation_headers,
+    )
+    assert issued.status_code == 200
+    challenge = api_harness.container.database.query(
+        "SELECT external_id, chat_id FROM channel_binding_challenges"
+    )[0]
+    assert (challenge["external_id"], challenge["chat_id"]) == (
+        "synthetic-adult-sender",
+        "synthetic-owner-chat",
+    )
+
+
+def test_a_challenge_without_a_chat_means_the_sender_is_the_chat(api_harness) -> None:
+    """Omitting `chat_id` is the WhatsApp truth, not a missing field.
+
+    A 1:1 WhatsApp thread IS the number, so the two values coincide there —
+    which is exactly what the 0010 backfill writes for every row that already
+    existed. Requiring the field would make every WhatsApp invitation repeat
+    the number to say nothing new.
+    """
+    world = api_harness.create_principal()
+    api_harness.authenticate(world)
+    _seed_owner(api_harness, world.household.id)
+
+    response = api_harness.client.post(
+        CHALLENGES,
+        json={
+            "channel": "whatsapp",
+            "external_id": "+999511234567",
+            "actor_id": ADULT,
+        },
+        headers=api_harness.mutation_headers,
+    )
+    assert response.status_code == 200
+    challenge = api_harness.container.database.query(
+        "SELECT external_id, chat_id FROM channel_binding_challenges"
+    )[0]
+    assert challenge["chat_id"] == challenge["external_id"] == "+999511234567"

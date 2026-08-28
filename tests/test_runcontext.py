@@ -55,7 +55,10 @@ HOUSEHOLD_ID = "11111111-1111-4111-8111-111111111111"
 
 
 def versioned_manifest(
-    *, verified: bool = True, fallback: str = "owner@example.test"
+    *,
+    verified: bool = True,
+    fallback: str = "owner@example.test",
+    extra_bindings: str = "",
 ) -> str:
     body = f'''\
 schema_version = 1
@@ -86,7 +89,7 @@ channel = "web"
 actor_id = "{PARENT}"
 chat_id = "web-parent"
 verified = true
-
+{extra_bindings}
 [email]
 agent_inbox = "family@abrolia.test"
 fallback = "{fallback}"
@@ -415,9 +418,122 @@ def test_versioned_manifest_requires_primary_binding_and_distinct_fallback(
 ) -> None:
     path = tmp_path / "household.toml"
     path.write_text(versioned_manifest(verified=False), encoding="utf-8")
-    with pytest.raises(ManifestError, match="no verified binding"):
+    with pytest.raises(ManifestError, match="no verified owner binding"):
         load_runtime_manifest(path)
 
     path.write_text(versioned_manifest(fallback="FAMILY@ABROLIA.TEST"), encoding="utf-8")
     with pytest.raises(ManifestError, match="must not equal"):
         load_runtime_manifest(path)
+
+
+# --- C3a: the sender's identity is not the chat it speaks in ------------------
+
+
+def test_two_members_share_the_primary_chat_and_the_owner_designates_it(
+    tmp_path: Path,
+) -> None:
+    """The arrangement `channel_bindings` could not represent before C3a.
+
+    Two members on the primary channel with two sender identities and ONE
+    conversation. The parser used to require exactly one distinct chat among
+    the verified primary-channel bindings, so this manifest was refused with
+    `channels.primary: multiple chats` — which is what made "a household cannot
+    have a second member on its primary channel" a property of the schema
+    rather than of the feature.
+
+    The review surface is now DESIGNATED by `actors.owner` instead of deduced
+    by counting, so it stays singular while the set of conversations the
+    household is reachable in does not have to.
+    """
+    path = tmp_path / "household.toml"
+    path.write_text(
+        versioned_manifest(
+            extra_bindings=f'''
+[[channel_bindings]]
+channel = "telegram"
+actor_id = "{PARENT}"
+chat_id = "{CHAT}"
+verified = true
+'''
+        ),
+        encoding="utf-8",
+    )
+
+    manifest = load_runtime_manifest(path)
+    household = load_household(path)
+
+    assert manifest.primary_chat_id == CHAT
+    # `allowed_chats` widens — it is now every verified chat rather than
+    # effectively one — and the pair check is what keeps that from widening
+    # authorization with it.
+    assert manifest.allowed_chats == frozenset({CHAT, "web-parent"})
+    assert manifest.verified_actor_chat_pairs == frozenset({
+        (OWNER, CHAT), (PARENT, CHAT), (PARENT, "web-parent"),
+    })
+    assert build_run_context(
+        household=household, actor_id=PARENT, chat_id=CHAT
+    ).role == ROLE_FAMILY
+    assert build_run_context(
+        household=household, actor_id=OWNER, chat_id="web-parent"
+    ).role == ROLE_UNKNOWN, "the owner is not authorized in a chat they never spoke in"
+
+
+def test_a_second_owner_binding_on_the_primary_channel_is_refused(
+    tmp_path: Path,
+) -> None:
+    """Exactly one, not at least one.
+
+    Designating the review surface by owner only removes the ambiguity if the
+    owner has ONE primary-channel binding. Two would put cards, approvals and
+    digests in whichever chat the parser happened to reach first — the same
+    failure the old chat-counting rule existed to prevent, arriving by a
+    different route.
+    """
+    path = tmp_path / "household.toml"
+    path.write_text(
+        versioned_manifest(
+            extra_bindings=f'''
+[[channel_bindings]]
+channel = "telegram"
+actor_id = "{OWNER}"
+chat_id = "-100990000202"
+verified = true
+'''
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ManifestError, match="multiple owner bindings"):
+        load_runtime_manifest(path)
+
+
+def test_a_primary_channel_bound_only_by_a_non_owner_is_refused(
+    tmp_path: Path,
+) -> None:
+    """A household whose owner is reachable nowhere on its own primary channel
+    has no review surface, and inventing one from another member's chat would
+    put the family's approvals in that member's conversation."""
+    path = tmp_path / "household.toml"
+    body = versioned_manifest().replace(
+        f'''[[channel_bindings]]
+channel = "telegram"
+actor_id = "{OWNER}"''',
+        f'''[[channel_bindings]]
+channel = "telegram"
+actor_id = "{PARENT}"''',
+    )
+    # The manifest is hashed over its own text, so it has to be re-stamped
+    # after the substitution or it fails on the hash instead of the rule.
+    body = _restamped(body)
+    path.write_text(body, encoding="utf-8")
+    with pytest.raises(ManifestError, match="no verified owner binding"):
+        load_runtime_manifest(path)
+
+
+def _restamped(body: str) -> str:
+    stripped = "\n".join(
+        line for line in body.split("\n") if not line.startswith("config_sha256 = ")
+    )
+    digest = compute_config_sha256(stripped)
+    return stripped.replace(
+        "schema_version = 1\n", f'schema_version = 1\nconfig_sha256 = "{digest}"\n'
+    )

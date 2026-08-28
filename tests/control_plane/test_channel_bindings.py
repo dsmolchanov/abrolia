@@ -15,6 +15,10 @@ from tests.control_plane.conftest import BASE_TIME
 
 OWNER = "synthetic-owner"
 ADULT = "synthetic-second-adult"
+#: A SENDER identity, not a chat. The distinction is the whole of C3a: on
+#: Telegram a user ID and a chat ID are different values, and before the split
+#: one column had to be both.
+ADULT_SENDER = "synthetic-second-adult-sender"
 PHONE = "+999511234567"
 
 
@@ -145,6 +149,7 @@ def test_an_external_id_bound_elsewhere_is_refused_at_issue_and_at_verify(
             household_id=second_household,
             channel="whatsapp",
             external_id=PHONE,
+            chat_id=PHONE,
             actor_id="synthetic-other-owner",
             now=BASE_TIME,
         )
@@ -162,6 +167,7 @@ def test_an_external_id_bound_elsewhere_is_refused_at_issue_and_at_verify(
             household_id=second_household,
             channel="whatsapp",
             external_id=PHONE,
+            chat_id=PHONE,
             actor_id="synthetic-other-owner",
             now=BASE_TIME,
         )
@@ -327,65 +333,139 @@ def test_the_owners_binding_is_seeded_into_the_table_planning_writes_it(
     ]
 
 
-def test_an_adult_on_the_primary_channel_is_refused_because_the_store_cannot_hold_one(
+def test_two_members_share_one_chat_and_the_revision_still_starts(
     cp_stack,
 ) -> None:
-    """The limit C3 stops at, and the reason, both pinned.
+    """C3a's whole point, as one case: the arrangement the store could not hold.
 
-    `channel_bindings.external_id` answers two questions at once: the gateway
-    matches it against a SENDER, the planner projects it as the manifest's
-    `chat_id`. For the owner they coincide. For a second adult on that channel
-    they cannot — the household's chat collides with the owner's row under
-    `UNIQUE (household_id, channel, external_id)`, and an identity of their own
-    makes the projection emit two verified chats for the primary channel, which
-    the runtime refuses outright.
+    This replaces `test_an_adult_on_the_primary_channel_is_refused_because_
+    the_store_cannot_hold_one`, deleted rather than skipped. That test
+    documented a limitation, and a test that documents a limitation must die
+    with the limitation — leaving it skipped would keep asserting that the
+    refusal is the correct behaviour.
 
-    So it is refused where someone asks for it, rather than written and left to
-    fail at a deployment nobody is watching.
+    An owner and an adult with DISTINCT sender identities in the SAME Telegram
+    chat. Before the split that was two impossible shapes and no third option:
+    the household's chat collided with the owner's row under `UNIQUE
+    (household_id, channel, external_id)`, and an identity of their own made
+    the projection emit two verified chats for the primary channel, which the
+    runtime refused with `channels.primary: multiple chats`.
+
+    It is round-tripped through the REAL runtime parser and not asserted
+    against `DesiredHouseholdSpecV1` alone. A manifest has two contracts, and
+    checking only the control plane's is exactly how an unstartable revision
+    looked green in C3.
     """
     _provisioned(cp_stack)
-    # The household's own chat is already bound to the owner, so that shape is
-    # now refused before a code exists at all.
-    with (
-        cp_stack.database.write() as connection,
-        pytest.raises(BindingError, match="already bound to another member"),
-    ):
-        cp_stack.bindings.issue_challenge(
-                connection,
-                household_id=cp_stack.household.id,
-                channel=CHANNEL_SELECTION["kind"],
-                external_id=CHANNEL_SELECTION["chat_id"],
-                actor_id=ADULT,
-                role="adult",
-                issued_by_actor_id=CHANNEL_SELECTION["actor_id"],
-                now=BASE_TIME + 100,
-            )
+    household_chat = CHANNEL_SELECTION["chat_id"]
 
-    # A chat of their own reaches verification, and is refused there because
-    # the manifest could not hold it.
-    for external_id in ("synthetic-a-chat-of-their-own",):
-        with cp_stack.database.write() as connection:
+    with cp_stack.database.write() as connection:
+        issued = cp_stack.bindings.issue_challenge(
+            connection,
+            household_id=cp_stack.household.id,
+            channel=CHANNEL_SELECTION["kind"],
+            # A sender of their own — a Telegram user ID is not a chat ID —
+            # speaking in the chat the household already has.
+            external_id=ADULT_SENDER,
+            chat_id=household_chat,
+            actor_id=ADULT,
+            role="adult",
+            issued_by_actor_id=CHANNEL_SELECTION["actor_id"],
+            now=BASE_TIME + 100,
+        )
+        binding = cp_stack.bindings.verify_challenge(
+            connection,
+            code=issued.code,
+            household_id=cp_stack.household.id,
+            owner_actor_id=CHANNEL_SELECTION["actor_id"],
+            now=BASE_TIME + 200,
+        )
+        cp_stack.make_worker().planner.issue(
+            connection, household_id=cp_stack.household.id
+        )
+
+    # The row says both things, and says them separately.
+    assert (binding.external_id, binding.chat_id) == (ADULT_SENDER, household_chat)
+
+    spec = DesiredHouseholdSpecV1.model_validate(
+        cp_stack.configs.manifest(cp_stack.household.id, 2)
+    )
+    assert spec.actors.family == (CHANNEL_SELECTION["actor_id"], ADULT)
+
+    runtime = parse_runtime_manifest(manifest_to_toml(spec))
+    # Two members, one conversation, one review surface — and the review
+    # surface is the OWNER's chat because that is what designates it now,
+    # rather than the manifest happening to carry exactly one chat.
+    assert runtime.primary_chat_id == household_chat
+    assert runtime.verified_actor_chat_pairs == frozenset({
+        (CHANNEL_SELECTION["actor_id"], household_chat),
+        (ADULT, household_chat),
+    })
+
+
+def test_relaxing_uniqueness_did_not_relax_the_pair_check(cp_stack) -> None:
+    """Cross-pair denial, which is the property most likely to be lost here.
+
+    `chat_id` stopped being part of any unique key, so the store no longer
+    objects to a member in a second conversation. Authorization must, and it is
+    a PAIR that authorizes: an actor verified in one chat is not verified in
+    another, and the owner is not authorized in the adult's private thread just
+    because they own the household.
+    """
+    _provisioned(cp_stack)
+    household_chat = CHANNEL_SELECTION["chat_id"]
+    owner = CHANNEL_SELECTION["actor_id"]
+
+    with cp_stack.database.write() as connection:
+        for external_id, chat_id in (
+            (ADULT_SENDER, household_chat),
+            # The same adult, a second binding, a private thread of their own.
+            ("+999511234567", "+999511234567"),
+        ):
             issued = cp_stack.bindings.issue_challenge(
                 connection,
                 household_id=cp_stack.household.id,
-                channel=CHANNEL_SELECTION["kind"],
+                channel=(
+                    CHANNEL_SELECTION["kind"] if chat_id == household_chat
+                    else "whatsapp"
+                ),
                 external_id=external_id,
+                chat_id=chat_id,
                 actor_id=ADULT,
                 role="adult",
-                issued_by_actor_id=CHANNEL_SELECTION["actor_id"],
+                issued_by_actor_id=owner,
                 now=BASE_TIME + 100,
             )
-            with pytest.raises(BindingError, match="primary"):
-                cp_stack.bindings.verify_challenge(
-                    connection,
-                    code=issued.code,
-                    household_id=cp_stack.household.id,
-                    owner_actor_id=CHANNEL_SELECTION["actor_id"],
-                    now=BASE_TIME + 200,
-                )
-            assert cp_stack.database.query(
-                "SELECT id FROM channel_bindings WHERE actor_id = ?", (ADULT,)
-            ) == []
+            cp_stack.bindings.verify_challenge(
+                connection,
+                code=issued.code,
+                household_id=cp_stack.household.id,
+                owner_actor_id=owner,
+                now=BASE_TIME + 200,
+            )
+        cp_stack.make_worker().planner.issue(
+            connection, household_id=cp_stack.household.id
+        )
+
+    spec = DesiredHouseholdSpecV1.model_validate(
+        cp_stack.configs.manifest(cp_stack.household.id, 2)
+    )
+    runtime = parse_runtime_manifest(manifest_to_toml(spec))
+
+    # `Household.knows_binding` is a membership test on exactly this set, and
+    # `tests/test_runcontext.py` exercises the denial through it. What belongs
+    # HERE is that the projection still produces pairs and not a widened chat
+    # allowlist — the pair is the only thing standing between "chat_id may now
+    # repeat" and "any known actor is authorized in any known chat".
+    assert runtime.verified_actor_chat_pairs == frozenset({
+        (owner, household_chat),
+        (ADULT, household_chat),
+        (ADULT, "+999511234567"),
+    })
+    assert (owner, "+999511234567") not in runtime.verified_actor_chat_pairs
+    # `allowed_chats` widened, exactly as the plan said it would. It is now the
+    # weaker check, and nothing authorizes from it while pairs are present.
+    assert runtime.allowed_chats == frozenset({household_chat, "+999511234567"})
 
 
 def test_an_adult_on_another_channel_is_bound_and_the_runtime_can_start_it(
@@ -475,11 +555,13 @@ def test_reprovisioning_the_primary_channel_retires_what_it_replaces(
         cp_stack.bindings.ensure_owner_binding(
             connection, household_id=hid, channel="telegram",
             external_id="synthetic-chat-one", actor_id=OWNER, now=BASE_TIME,
+            chat_id="synthetic-chat-one",
         )
         # Re-onboarded onto a different chat on the same channel.
         cp_stack.bindings.ensure_owner_binding(
             connection, household_id=hid, channel="telegram",
             external_id="synthetic-chat-two", actor_id=OWNER, now=BASE_TIME + 10,
+            chat_id="synthetic-chat-two",
         )
         rows = cp_stack.bindings.verified(connection, household_id=hid)
 
@@ -492,6 +574,7 @@ def test_reprovisioning_the_primary_channel_retires_what_it_replaces(
         cp_stack.bindings.ensure_owner_binding(
             connection, household_id=hid, channel="whatsapp",
             external_id=PHONE, actor_id=OWNER, now=BASE_TIME + 20,
+            chat_id=PHONE,
         )
     remaining = cp_stack.database.query(
         "SELECT channel, external_id FROM channel_bindings WHERE household_id = ?",
@@ -514,6 +597,7 @@ def test_reprovisioning_drops_outstanding_challenges_and_dependent_adults(
         cp_stack.bindings.ensure_owner_binding(
             connection, household_id=hid, channel="telegram",
             external_id="synthetic-chat-one", actor_id=OWNER, now=BASE_TIME,
+            chat_id="synthetic-chat-one",
         )
         issued = cp_stack.bindings.issue_challenge(
             connection, household_id=hid, channel="whatsapp", external_id=PHONE,
@@ -533,6 +617,7 @@ def test_reprovisioning_drops_outstanding_challenges_and_dependent_adults(
         cp_stack.bindings.ensure_owner_binding(
             connection, household_id=hid, channel="whatsapp",
             external_id="+999511230000", actor_id=OWNER, now=BASE_TIME + 20,
+            chat_id="+999511230000",
         )
         rows = cp_stack.bindings.verified(connection, household_id=hid)
         # The outstanding code no longer redeems.
@@ -608,6 +693,7 @@ def test_seeding_reconciles_role_and_actor_not_just_the_tuple(cp_stack) -> None:
         cp_stack.bindings.ensure_owner_binding(
             connection, household_id=hid, channel="telegram",
             external_id="synthetic-chat-one", actor_id=OWNER, now=BASE_TIME,
+            chat_id="synthetic-chat-one",
         )
         issued = cp_stack.bindings.issue_challenge(
             connection, household_id=hid, channel="whatsapp", external_id=PHONE,
@@ -621,6 +707,7 @@ def test_seeding_reconciles_role_and_actor_not_just_the_tuple(cp_stack) -> None:
         cp_stack.bindings.ensure_owner_binding(
             connection, household_id=hid, channel="whatsapp",
             external_id=PHONE, actor_id=OWNER, now=BASE_TIME + 10,
+            chat_id=PHONE,
         )
         rows = cp_stack.bindings.verified(connection, household_id=hid)
 
@@ -633,6 +720,7 @@ def test_seeding_reconciles_role_and_actor_not_just_the_tuple(cp_stack) -> None:
         cp_stack.bindings.ensure_owner_binding(
             connection, household_id=hid, channel="whatsapp",
             external_id=PHONE, actor_id="synthetic-owner-renamed", now=BASE_TIME + 20,
+            chat_id=PHONE,
         )
         rows = cp_stack.bindings.verified(connection, household_id=hid)
 
@@ -657,6 +745,7 @@ def test_a_household_cannot_grow_challenges_or_bindings_without_end(
         cp_stack.bindings.ensure_owner_binding(
             connection, household_id=hid, channel="telegram",
             external_id="synthetic-chat", actor_id=OWNER, now=BASE_TIME,
+            chat_id="synthetic-chat",
         )
         for index in range(MAX_OPEN_CHALLENGES):
             cp_stack.bindings.issue_challenge(
@@ -709,6 +798,7 @@ def test_redeeming_one_invitation_leaves_the_others_standing(cp_stack) -> None:
         cp_stack.bindings.ensure_owner_binding(
             connection, household_id=hid, channel="telegram",
             external_id="synthetic-chat", actor_id=OWNER, now=BASE_TIME,
+            chat_id="synthetic-chat",
         )
         first = cp_stack.bindings.issue_challenge(
             connection, household_id=hid, channel="whatsapp",
@@ -729,6 +819,7 @@ def test_redeeming_one_invitation_leaves_the_others_standing(cp_stack) -> None:
         cp_stack.bindings.ensure_owner_binding(
             connection, household_id=hid, channel="telegram",
             external_id="synthetic-chat", actor_id=OWNER, now=BASE_TIME + 2,
+            chat_id="synthetic-chat",
         )
         # The second invitation is still redeemable.
         bound = cp_stack.bindings.verify_challenge(
@@ -749,6 +840,7 @@ def test_redeeming_one_invitation_leaves_the_others_standing(cp_stack) -> None:
         cp_stack.bindings.ensure_owner_binding(
             connection, household_id=hid, channel="telegram",
             external_id="synthetic-a-different-chat", actor_id=OWNER,
+            chat_id="synthetic-a-different-chat",
             now=BASE_TIME + 5,
         )
         with pytest.raises(BindingError, match="invalid or expired"):
