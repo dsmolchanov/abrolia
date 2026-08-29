@@ -248,10 +248,12 @@ settling at launch would strand bindings with no job to retire them.
 
 #### Manual Verification
 
-- [ ] Against a database migrated from `0010` with an active household, confirm
+- [x] Against a database migrated from `0010` with an active household, confirm
       `route()` resolves its owner's sender before and after the migration —
       the deny must not black out existing households. (Automated in Phase 1's
       migration test; repeated here by hand because a mistake is an outage.)
+      **Confirmed by the operator 2026-08-29.** Ticked on their word, not on a
+      check this session ran.
 
 ---
 
