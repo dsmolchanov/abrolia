@@ -84,6 +84,13 @@ class Config:
     telegram_token: str | None = field(repr=False)
     email_provider: str = "synthetic"
     email_address: str = ""
+    #: Where the family is written to when the primary channel refuses a
+    #: message. It comes from the manifest and from nowhere else: an
+    #: environment variable would be a second place to state the family's own
+    #: address, and the control plane is the one that knows which account is
+    #: the fallback owner. No manifest means no fallback, which fails closed
+    #: to sending nothing.
+    email_fallback: str = ""
     email_identity_id: str | None = None
     email_binding_revision: int | None = None
     email_secret_names: tuple[str, ...] = ()
@@ -161,6 +168,7 @@ def load_config(
         if manifest_email is not None
         else (source.get(ENV_EMAIL_ADDRESS) or "").strip()
     )
+    email_fallback = manifest_email.fallback if manifest_email is not None else ""
     email_identity_id = (
         manifest_email.provider_binding_ref
         if manifest_email is not None
@@ -211,6 +219,7 @@ def load_config(
             else (source.get(ENV_EMAIL_PROVIDER) or "synthetic").strip()
         ),
         email_address=email_address,
+        email_fallback=email_fallback,
         email_identity_id=email_identity_id,
         email_binding_revision=(
             manifest.config_revision

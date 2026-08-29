@@ -251,3 +251,27 @@ def test_a_mailbox_that_is_an_owners_own_address_is_refused_at_selection(
         "SELECT id FROM email_identities WHERE household_id = ?",
         (cp_stack.household.id,),
     )
+
+
+def test_the_manifest_fallback_is_the_address_of_the_account_the_row_names(
+    cp_stack,
+) -> None:
+    """The runtime's copy is a projection, and this is what keeps it one.
+
+    C4b reads `email.fallback` from the manifest, because the runtime holds no
+    control-plane table. That makes the manifest a SECOND place the fallback
+    appears, and the only thing that keeps the two from drifting is that the
+    planner writes both from one account in one transaction. Asserted here
+    rather than assumed, because the whole C3a debt plan is what happens when
+    a projection is allowed to drift from its source.
+    """
+    spec = _provisioned(cp_stack)
+    pref = cp_stack.channel_prefs.get_household(cp_stack.household.id)
+
+    assert pref is not None
+    named = cp_stack.accounts.get(pref.fallback_account_id)
+    assert named is not None
+    assert spec.email.fallback == named.recovery_email
+    # And the runtime refuses the pairing the control plane refuses, so the
+    # invariant holds on both sides of the manifest.
+    assert spec.email.agent_inbox.casefold() != spec.email.fallback.casefold()
