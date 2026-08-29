@@ -57,10 +57,12 @@ from control_plane.provisioning.contracts import (
     ProviderRegistry,
     ProviderRejected,
     ProviderWaiting,
+    ProvisioningError,
     ProvisionResult,
     SecretSink,
 )
 from control_plane.provisioning.planner import DesiredSpecPlanner
+from control_plane.provisioning.secrets import SecretInstallError
 from control_plane.repositories.configs import ConfigRepository
 from control_plane.repositories.households import HouseholdsRepository
 from control_plane.repositories.jobs import (
@@ -521,6 +523,10 @@ class ProvisioningWorker:
                 job, request, "failed", "runtime_ref_invalid"
             )
         token = self.configs.token_hasher.digest(f"runtime-dsar:{runtime_ref}")
+        # Locally, matching `runtime_client`'s lazy import: this module does
+        # not pay for `httpx` unless a runtime is actually being talked to.
+        import httpx
+
         try:
             # The withdrawn generation goes with the request so the runtime can
             # tell a stop meant for the revision it is serving from one left
@@ -539,7 +545,21 @@ class ProvisioningWorker:
                 content=json.dumps({"receipt_ids": receipt_ids}).encode("utf-8"),
                 timeout=10.0,
             )
-        except Exception:
+        except (
+            httpx.TimeoutException,
+            httpx.TransportError,
+            # The socket layer's own, which `_run_once` already treats as
+            # transport conditions a few methods above. A raw `ConnectionError`
+            # reaches here when something below httpx fails.
+            TimeoutError,
+            ConnectionError,
+        ):
+            # NAMED, because the handler's answer is "come back to this". A
+            # broad catch here reports a programming error as an unreachable
+            # runtime and the reclaimer resends the revocation forever — the
+            # bug never surfaces and the work never completes. The same two
+            # exceptions `runtimes/chat_client.py` and `privacy/runtime.py`
+            # already name.
             return WorkResult(job.id, "outcome_unknown", "runtime_unreachable")
         # 410 is "already deleted": nothing left to stop, so the withdrawal is
         # satisfied exactly as it is by a 200. Both must SETTLE — an unsettled
@@ -1823,7 +1843,13 @@ class ProvisioningWorker:
                         )
         try:
             inspected = provider.deprovision(exact_ref)
-        except Exception:
+        except ProvisioningError:
+            # The provider contract's own failures: `FlyRuntimeProvisioner`
+            # raises `OutcomeUnknown` for a transport failure and
+            # `ProviderRejected` for a refusal, both subclasses. A provider
+            # raising anything else is not reporting a provider condition, it
+            # is broken — and recording that as an unknown deprovision leaves
+            # the resource retried forever with nothing to find.
             inspected = None
         if current is not None and resource_id is not None:
             with self.jobs.db.write() as connection:
@@ -2486,7 +2512,9 @@ class ProvisioningWorker:
             )
         try:
             inspected = provider.deprovision(result.external_ref)
-        except Exception:
+        except ProvisioningError:
+            # See `_cleanup_cancelled_result`: the provider contract's own
+            # failures, and nothing else.
             inspected = None
         if inspected is not None and inspected.state is InspectState.ABSENT:
             with self.jobs.db.write() as connection:
@@ -3061,7 +3089,12 @@ class ProvisioningWorker:
             self.secret_sink.install(
                 prepared.external_ref, SecretMaterial.from_mapping(merged)
             )
-        except Exception:
+        except (SecretInstallError, ProvisioningError):
+            # `FlySecretSink.install` raises `SecretInstallError`. A broad
+            # catch also swallowed a `TypeError` from building the material
+            # above and reported it as `secret_install_unknown`, which is a
+            # retryable outcome — so a mistake in the mapping became a runtime
+            # that never launches and a job that never settles.
             install_failed = True
         finally:
             for value in merged.values():

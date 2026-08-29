@@ -40,7 +40,7 @@ from control_plane.provisioning.fakes import (
     DryRunRuntimeProvisioner,
 )
 from control_plane.provisioning.manifest_toml import manifest_to_toml
-from control_plane.provisioning.secrets import InMemorySecretSink
+from control_plane.provisioning.secrets import InMemorySecretSink, SecretInstallError
 
 BASE_TIME = 1_800_000_000.0
 _RESTRICTION_VERSION, _RESTRICTION_SHA = consent_version_and_sha(
@@ -1481,7 +1481,7 @@ def test_runtime_secret_install_unknown_reconciles_without_blind_machine_launch(
             if not self.failed:
                 self.failed = True
                 material.clear()
-                raise RuntimeError("synthetic secret sink response lost")
+                raise SecretInstallError("synthetic secret sink response lost")
             super().install(runtime_ref, material)
 
     provider = SplitRuntimeProvisioner(calls)
@@ -1563,7 +1563,7 @@ def test_superseded_runtime_reconcile_absent_resolves_without_recreate(cp_stack)
             del runtime_ref
             calls.append("stage-secret")
             material.clear()
-            raise RuntimeError("synthetic secret install response loss")
+            raise SecretInstallError("synthetic secret install response loss")
 
     provider = AbsentRuntime(calls)
     registry = ProviderRegistry()
@@ -2647,3 +2647,48 @@ def test_erasure_can_settle_a_runtime_job_whose_revision_is_still_active(
         " AND status IN ('running', 'outcome_unknown')",
         (cp_stack.household.id,),
     )["total"] == 0, "privacy/delete.py would still see this as unresolved"
+
+
+def test_a_programming_error_on_a_retry_path_is_loud_rather_than_retried(
+    cp_stack,
+) -> None:
+    """C6b, as one test for the class rather than four for the instances.
+
+    A broad `except` around an operation whose answer is "come back to this"
+    converts a programming error into a silent, permanent retry: the bug never
+    surfaces, the work never completes, and the queue grows. Three defects in
+    the C5 gateway slices were exactly this, and none of them failed where they
+    happened — each was found by a test disagreeing about a count.
+
+    `secret_sink.install` is the representative: a `TypeError` from building
+    the material used to be reported as `secret_install_unknown`, which is
+    retryable, so a mistake in the mapping became a runtime that never launches
+    and a job that never settles.
+
+    That the guard still catches what it is FOR — the opposite mistake, and
+    just as quiet — is held by
+    `test_runtime_secret_install_unknown_reconciles_without_blind_machine_launch`,
+    whose double now raises `SecretInstallError` rather than a bare
+    `RuntimeError`. That change is the point in miniature: a double raising any
+    exception was asserting that ANY exception means "retry".
+    """
+    from control_plane.provisioning.secrets import InMemorySecretSink
+
+    class _Broken(InMemorySecretSink):
+        def install(self, runtime_ref, material):
+            raise TypeError("a mapping was built wrong")
+
+    _queue_rollout_job(cp_stack)
+    worker = cp_stack.make_worker(
+        providers=_runtime_registry(), secret_sink=_Broken(), now=BASE_TIME + 500
+    )
+    with pytest.raises(TypeError, match="a mapping was built wrong"):
+        worker.run_once()
+
+    # And nothing was recorded as retryable on the way out: a job left
+    # `outcome_unknown` here is the silent retry this exists to prevent.
+    assert cp_stack.database.query_one(
+        "SELECT COUNT(*) AS total FROM provisioning_jobs WHERE household_id = ?"
+        " AND error_code = 'secret_install_unknown'",
+        (cp_stack.household.id,),
+    )["total"] == 0

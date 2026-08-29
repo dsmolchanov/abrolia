@@ -640,6 +640,44 @@ incident the switch was thrown to contain.
 
 **Branches:** `codex/c5d-gateway-entrypoint`.
 
+#### Inventory — C6b a retry path catches only what it is prepared for
+
+**Files:** `control_plane/provisioning/worker.py`,
+`tests/control_plane/test_provisioning_jobs.py`,
+`tests/control_plane/test_provision_dry_run.py`.
+
+Deferred from C6a, which said auditing it there would be a second change
+hiding inside the first.
+
+Three defects in the C5 gateway slices were one shape: **a broad `except`
+around an operation whose answer is "come back to this" converts a programming
+error into a silent, permanent retry.** A `NameError` became
+`lookup_unavailable`; a `TypeError` from a missed call site became
+`runtime_unavailable`; both were found by a test disagreeing about a count
+rather than by anything raising.
+
+Not "broad excepts are bad" — the one guarding telemetry at `worker.py:273` is
+correct and says so. The damage is the combination: catch everything, then
+answer *try again later*.
+
+Four sites in `ProvisioningWorker`, found by classifying every `except
+Exception` in the file by what its handler DOES: the consent revoke
+(`httpx` transport errors plus the socket layer's own, matching what `_run_once`
+already treats as transport a few methods above), two `provider.deprovision`
+calls (`ProvisioningError` — the Fly provider already wraps its transport
+failures into `OutcomeUnknown` and `ProviderRejected`), and `secret_sink.install`
+(`SecretInstallError`).
+
+Three test doubles were raising bare `RuntimeError` to mean "the sink did not
+answer", which was asserting that ANY exception means retry — the behaviour
+being removed. They now raise what the real sink raises.
+
+The other sixty-six `except Exception` in the tree are deliberately untouched:
+most are a different shape, and folding them in would make the rule harder to
+see rather than easier.
+
+**Branches:** `codex/c6b-named-failures-on-retry-paths`.
+
 #### Inventory — C6a a successful activation is not a stale projection
 
 **Files:** `control_plane/provisioning/worker.py`,

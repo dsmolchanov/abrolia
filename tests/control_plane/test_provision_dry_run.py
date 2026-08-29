@@ -37,7 +37,7 @@ from control_plane.onboarding.provision import (
 )
 from control_plane.privacy.consent import consent_version_and_sha
 from control_plane.provisioning.fly import FlyRuntimeProvisioner
-from control_plane.provisioning.secrets import InMemorySecretSink
+from control_plane.provisioning.secrets import InMemorySecretSink, SecretInstallError
 from control_plane.provisioning.worker import requires_current_content_restriction
 from tests.control_plane.conftest import BASE_TIME
 
@@ -433,7 +433,10 @@ class _BrokenSecretSink(InMemorySecretSink):
 
     def install(self, runtime_ref, material):
         if self.fail:
-            raise RuntimeError("secret install outcome unknown")
+            # What `FlySecretSink.install` actually raises. A double that
+            # raised a bare `RuntimeError` was asserting that ANY exception
+            # means "retry", which is the behaviour C6b removes.
+            raise SecretInstallError("secret install outcome unknown")
         return super().install(runtime_ref, material)
 
 
