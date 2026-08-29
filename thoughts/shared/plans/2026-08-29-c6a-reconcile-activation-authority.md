@@ -67,19 +67,9 @@ an orphan" are different questions.** They diverge in exactly one case: the job
 is stale BECAUSE IT SUCCEEDED. Every place that answers the second with the
 first must first ask whether the revision activated.
 
-**J2 — Activation is the authority on whether a revision is serving, AND the
-household must still exist to serve it.** An active revision alone is not
-enough: erasure is a different lifecycle. `DeletionService` moves the household
-to `deleting` and deletes its runtime without superseding
-`config_revisions`, so the revision row still reads `active` while nothing is
-serving. Since every guard below declines to settle a serving job, reading the
-revision alone would leave an `outcome_unknown` runtime job unresolvable — and
-`privacy/delete.py` treats exactly those as unresolved, so the erasure would be
-blocked for good.
+**J2 — Activation is the authority on whether a revision is serving, and the
+household must still exist to serve it.**
 
-A deletion that cannot finish is worse than the teardown this slice prevents:
-one is a runtime nobody meant to destroy, the other is a person's data that
-cannot be removed.
 `config_revisions.status = 'active'` has one writer,
 `BootstrapService.activate`, and it supersedes the previous row in the same
 transaction. The worker's own bookkeeping — `job_status`, `settled_at`, the
@@ -87,6 +77,18 @@ presence of an unused bootstrap token — is a record of what the worker
 observed, and each can be stale or absent for reasons that say nothing about
 whether the runtime is serving. Three defects in #86 were this same
 substitution.
+
+An active revision alone is not enough, though, and the review found the case:
+**erasure is a different lifecycle.** `DeletionService` moves the household to
+`deleting` and deletes its runtime WITHOUT superseding `config_revisions`, so
+the revision row still reads `active` while nothing is serving. Since every
+guard below declines to settle a serving job, reading the revision alone left
+an `outcome_unknown` runtime job unresolvable — and `privacy/delete.py` treats
+exactly those as unresolved, so the erasure was blocked for good.
+
+A deletion that cannot finish is worse than the teardown this slice prevents.
+One is a runtime nobody meant to destroy; the other is a person's data that
+cannot be removed, which has no operator workaround.
 
 **J3 — No terminal outcome may contradict a serving revision.** A job whose
 revision is active is not `failed` and not `cancelled`. Durable history and the
@@ -125,6 +127,8 @@ reported instance:
   from #86, exercised by a caller that reports a status alone.
 * A genuinely superseded job — revision not active, provider READY — still
   reaches cleanup, so the fix does not disable the branch it guards.
+* A household being erased settles its runtime job, so nothing
+  `privacy/delete.py` reads as unresolved is left behind.
 * Full suite green, ruff and sanitizer clean.
 
 ## Deliberately not here
