@@ -8,6 +8,8 @@ endpoints rather than the repository — the repository's own rules are proven i
 
 from __future__ import annotations
 
+from control_plane.models import ProfileInput
+
 CHALLENGES = "/api/v1/household/bindings/challenges"
 VERIFY = "/api/v1/household/bindings/verify"
 
@@ -458,3 +460,185 @@ def test_a_challenge_without_a_chat_is_refused_rather_than_guessed(
     assert api_harness.container.database.query(
         "SELECT id FROM channel_binding_challenges"
     ) == []
+
+
+# --- C3d: a regression that reaches the path it is named for ---------------
+
+from control_plane.models import StepKind, synthetic_channel_identity  # noqa: E402
+from control_plane.onboarding.contracts import CommandContext  # noqa: E402
+from control_plane.provisioning.worker import (  # noqa: E402
+    REPROVISION_RUNTIME_OPERATION,
+)
+from tests.control_plane.conftest import BASE_TIME  # noqa: E402
+from tests.control_plane.test_manifest import (  # noqa: E402
+    CHANNEL_SELECTION,
+    EMAIL_SELECTION,
+    WHATSAPP_SELECTION,
+)
+
+
+def _finish_onboarding(api_harness, world) -> None:
+    """Drive the household to a settled, active state.
+
+    The PRECONDITION, not the subject. It goes through the service rather than
+    HTTP because what this file has to exercise over HTTP is the binding
+    endpoint; putting onboarding through the client too would make the test
+    about onboarding's routes instead.
+    """
+    container = api_harness.container
+    sequence = iter(range(1, 500))
+
+    def context() -> CommandContext:
+        index = next(sequence)
+        return CommandContext(
+            account_id=world.account.id,
+            session_id=world.session.id,
+            request_id=f"synthetic-request-{index}",
+            idempotency_key=f"synthetic-key-{index}",
+            expected_version=container.onboarding_repository.workflow_for_household(
+                world.household.id
+            ).version,
+        )
+
+    def drain() -> None:
+        while (result := container.worker.run_once()) is not None:
+            assert result.status in {"succeeded", "cancelled"}, result
+
+    container.onboarding.save_profile(
+        world.household.id,
+        ProfileInput.model_validate({
+            "first_name": "Test", "last_name": "Family", "family_language": "en",
+            "timezone": "Europe/Prague", "country_code": "DE",
+            "residency_mode": "eu-app",
+        }),
+        context=context(),
+        now=BASE_TIME + 1,
+    )
+    drain()
+    for offset, (kind, selection) in enumerate((
+        (StepKind.EMAIL, EMAIL_SELECTION),
+        (StepKind.WHATSAPP, WHATSAPP_SELECTION),
+        (StepKind.PRIMARY_CHANNEL, CHANNEL_SELECTION),
+    ), start=2):
+        container.onboarding.select(
+            world.household.id, kind, selection,
+            context=context(), now=BASE_TIME + offset,
+        )
+        drain()
+    # Activation runs through the runtime's bootstrap, which this harness does
+    # not host. These two writes are what it performs.
+    with container.database.write() as connection:
+        connection.execute(
+            "UPDATE households SET status = 'active' WHERE id = ?",
+            (world.household.id,),
+        )
+        connection.execute(
+            "UPDATE onboarding_workflows SET state = 'complete' WHERE household_id = ?",
+            (world.household.id,),
+        )
+
+
+def test_verifying_over_http_deploys_the_revision_it_reports(api_harness) -> None:
+    """C3d: the rollout regression that existed did not reach this path.
+
+    `test_verifying_a_binding_schedules_the_rollout_and_leaves_onboarding_alone`
+    asserts the right things by calling the repository, the planner and
+    `schedule_runtime_rollout` directly. Deleting the scheduling call from
+    `verify_binding_challenge` leaves the entire suite green — verified — so
+    the endpoint's own duty to deploy what it reports was covered by nothing.
+
+    This goes through the authenticated endpoint and then runs the worker, so
+    the assertion is about the seam that was untested: the endpoint answers
+    revision N, and revision N is what the household is actually serving.
+    """
+    world = api_harness.create_principal("c3d-owner@family.test")
+    api_harness.authenticate(world)
+    _finish_onboarding(api_harness, world)
+
+    before = api_harness.container.households.get(
+        world.household.id
+    ).current_config_revision
+
+    issued = api_harness.client.post(
+        CHALLENGES,
+        json={
+            "channel": "whatsapp",
+            "external_id": WA_SENDER,
+            "chat_id": WA_CHAT,
+            "actor_id": WA_SENDER,
+        },
+        headers=api_harness.mutation_headers,
+    )
+    assert issued.status_code == 200
+
+    verified = api_harness.client.post(
+        VERIFY,
+        json={"code": issued.json()["code"]},
+        headers=api_harness.mutation_headers,
+    )
+    assert verified.status_code == 200
+    reported = verified.json()["config_revision"]
+    assert reported == before + 1
+
+    # The endpoint scheduled the deployment, not merely the plan.
+    job = api_harness.container.database.query_one(
+        "SELECT desired_revision FROM provisioning_jobs"
+        " WHERE household_id = ? AND operation = ?",
+        (world.household.id, REPROVISION_RUNTIME_OPERATION),
+    )
+    assert job is not None, "the endpoint reported a revision it never deployed"
+    assert job["desired_revision"] == reported
+
+    while (result := api_harness.container.worker.run_once()) is not None:
+        assert result.status in {"succeeded", "cancelled"}, result
+
+    # The runtime then CLAIMS its token and ACTIVATES the revision, which is
+    # the half that makes the endpoint's answer true.
+    #
+    # Stopping at the worker is not enough, and the reason is easy to miss:
+    # `schedule_runtime_rollout` writes `current_config_revision` when it
+    # queues the job, and `_settle_runtime_ready` marks the job succeeded
+    # right after launch. So the revision and manifest assertions below hold
+    # even if claiming or activation is broken or never happens — the
+    # household would sit at `provisioning` forever, serving N-1, while every
+    # assertion passed.
+    active = api_harness.container
+    household = active.households.get(world.household.id)
+    assert household.status == "provisioning"
+    raw_token = active.secret_sink.get(
+        household.runtime_ref, "HERMES_BOOTSTRAP_TOKEN"
+    )
+    assert raw_token is not None
+    binding = {
+        "household_id": world.household.id,
+        "runtime_ref": household.runtime_ref,
+        "config_revision": reported,
+    }
+    active.bootstrap.claim(raw_token, **binding)
+    active.bootstrap.activate(
+        raw_token,
+        **binding,
+        activated_sha256=active.configs.manifest(
+            world.household.id, reported
+        )["config_sha256"],
+    )
+
+    # And the household is serving what the endpoint said it would.
+    household = active.households.get(world.household.id)
+    assert household.status == "active", "activation never completed"
+    assert household.current_config_revision == reported
+    # The onboarding page is untouched: a family that finished setup months ago
+    # must not be shown as mid-setup because somebody added an adult.
+    assert (
+        api_harness.container.onboarding_repository.workflow_for_household(
+            world.household.id
+        ).state
+        == "complete"
+    )
+    # The member the whole flow existed for is in the served manifest.
+    manifest = api_harness.container.configs.manifest(
+        world.household.id, household.current_config_revision
+    )
+    owner_actor, _ = synthetic_channel_identity(world.household.id)
+    actors = {b["actor_id"] for b in manifest["channel_bindings"]}
+    assert actors == {owner_actor, WA_SENDER}

@@ -1871,3 +1871,246 @@ def test_a_rollout_job_leaves_the_onboarding_workflow_where_it_found_it(
     )
     assert household["status"] == "provisioning"
     assert household["current_config_revision"] == planned.revision.revision
+
+
+# --- C3d: the currency guards, run rather than described -------------------
+
+
+def _runtime_registry(*, on_prepare=None, on_launch=None, behavior=None):
+    """A runtime provider that can change the world between checkpoints.
+
+    The guards sit BETWEEN provider calls, so a test that only sets up state
+    beforehand never reaches them: the job is stale from the start and is
+    refused earlier, for a different reason. Making the provider itself mutate
+    is what puts the staleness where the guard is.
+    """
+    from control_plane.provisioning.contracts import ProviderRegistry
+    from control_plane.provisioning.fakes import (
+        DeterministicFakeProvisioner,
+        DryRunRuntimeProvisioner,
+    )
+
+    class _Mutating(DryRunRuntimeProvisioner):
+        def __init__(self) -> None:
+            super().__init__()
+            if behavior is not None:
+                self.behavior = behavior
+
+        def inspect(self, stable_ref):
+            # A runtime reference is a dict and the base fake indexes by a
+            # hashable key. `deprovision_runtime` already unwraps it the same
+            # way; reconcile is the path that needs `inspect` to as well.
+            if isinstance(stable_ref, dict):
+                stable_ref = (
+                    stable_ref.get("runtime_ref") or stable_ref.get("app_ref") or ""
+                )
+            return super().inspect(stable_ref)
+
+        #: Whether the worker got as far as launching. This is how each case
+        #: pins the checkpoint it names rather than merely observing that the
+        #: job failed somewhere.
+        launched = False
+
+        def prepare(self, intent, idempotency_key):
+            result = super().ensure(intent, idempotency_key)
+            if on_prepare is not None:
+                on_prepare()
+            return result
+
+        def launch(self, request, prepared, idempotency_key):
+            type(self).launched = True
+            if on_launch is not None:
+                on_launch()
+            return prepared
+
+    registry = ProviderRegistry()
+    registry.register("fake-email", DeterministicFakeProvisioner("email"))
+    registry.register("fake-whatsapp", DeterministicFakeProvisioner("whatsapp"))
+    registry.register("fake-channel", DeterministicFakeProvisioner("channel"))
+    registry.register("fake-cleanup", DeterministicFakeProvisioner("cleanup"))
+    registry.register("dry-run-runtime", _Mutating())
+    return registry
+
+
+def _make_stale(connection, cp_stack, field: str) -> None:
+    """Make the household disagree with the job the worker is mid-way through."""
+    if field == "revision":
+        connection.execute(
+            "UPDATE households SET current_config_revision ="
+            " current_config_revision + 5 WHERE id = ?",
+            (cp_stack.household.id,),
+        )
+    else:
+        connection.execute(
+            "UPDATE households SET runtime_ref = ? WHERE id = ?",
+            ("synthetic-runtime:somebody-else", cp_stack.household.id),
+        )
+
+
+def _queue_rollout_job(cp_stack):
+    """Leave one re-provisioning runtime job leasable.
+
+    The rollout operation rather than onboarding's, because the clauses under
+    test are shared code and the rollout path is the one with least coverage
+    elsewhere. What differs BETWEEN the two operations is
+    `_workflow_states_for`, and that has its own test.
+    """
+    from control_plane.provisioning.rollout import schedule_runtime_rollout
+
+    _advance_to_runtime(cp_stack)
+    with cp_stack.database.write() as connection:
+        connection.execute(
+            "UPDATE households SET status = 'active' WHERE id = ?",
+            (cp_stack.household.id,),
+        )
+        connection.execute(
+            "UPDATE onboarding_workflows SET state = 'complete' WHERE household_id = ?",
+            (cp_stack.household.id,),
+        )
+        for row in connection.execute(
+            "SELECT id FROM provisioning_jobs WHERE kind = 'runtime'"
+            " AND status IN ('pending', 'running')"
+        ).fetchall():
+            connection.execute(
+                "UPDATE provisioning_jobs SET status = 'cancelled' WHERE id = ?",
+                (row["id"],),
+            )
+        planned = cp_stack.make_worker().planner.issue(
+            connection, household_id=cp_stack.household.id
+        )
+        schedule_runtime_rollout(
+            connection,
+            jobs=cp_stack.jobs,
+            onboarding=cp_stack.onboarding,
+            household_id=cp_stack.household.id,
+            planned=planned,
+            runtime_provider="dry-run-runtime",
+            now=BASE_TIME + 400,
+        )
+
+
+@pytest.mark.parametrize(
+    ("checkpoint", "field"),
+    [
+        ("bootstrap", "revision"),
+        ("launch", "revision"),
+        ("launch", "runtime_ref"),
+        ("settle", "revision"),
+        ("settle", "runtime_ref"),
+    ],
+)
+def test_every_runtime_checkpoint_refuses_work_that_stopped_being_current(
+    cp_stack, checkpoint, field
+) -> None:
+    """C3d: the guards are RUN here, and each is reached in flight.
+
+    `test_the_currency_guard_answers_per_operation_and_still_refuses_stale_work`
+    calls `_workflow_states_for` against a fake job object and nothing else, so
+    no checkpoint executes. Dropping the revision clause from a checkpoint
+    leaves the whole suite green — verified before this was written.
+
+    One case per (checkpoint, field it reads). Deliberately not dense: the
+    bootstrap checkpoint does not read `runtime_ref`, so asserting it refuses a
+    stale one would assert something untrue.
+
+    The fourth checkpoint runs in
+    `test_reconcile_refuses_a_runtime_job_whose_revision_moved_on`, which needs
+    a different setup and a different assertion — see there.
+    """
+    hooks = {"on_prepare": None, "on_launch": None}
+
+    def write_stale() -> None:
+        with cp_stack.database.write() as connection:
+            _make_stale(connection, cp_stack, field)
+
+    if checkpoint == "bootstrap":
+        hooks["on_prepare"] = write_stale
+    elif checkpoint == "settle":
+        hooks["on_launch"] = write_stale
+
+    _queue_rollout_job(cp_stack)
+    worker = cp_stack.make_worker(
+        providers=_runtime_registry(**hooks), now=BASE_TIME + 500
+    )
+
+    if checkpoint == "launch":
+        # Between the bootstrap checkpoint and the launch one, the only call
+        # outside a transaction is installing the secret material.
+        #
+        # Wrapping `issue_bootstrap` instead does NOT work, and the reason is
+        # worth recording: the worker writes `households.runtime_ref` a few
+        # lines later in the SAME transaction, so a mutation made there is
+        # overwritten before the guard reads it. The test looked like it had
+        # found a missing check; it had found its own injection being undone.
+        install = worker.secret_sink.install
+
+        def installing(*args, **kwargs):
+            result = install(*args, **kwargs)
+            write_stale()
+            return result
+
+        worker.secret_sink.install = installing
+
+    result = worker.run_once()
+
+    assert result is not None
+    assert result.status != "succeeded", (
+        f"the {checkpoint} checkpoint let {field} go stale without refusing"
+    )
+
+    # WHICH checkpoint refused, not merely that one did. Asserting only that
+    # the job failed is too weak, and this was measured: with the bootstrap
+    # clause deleted the job runs on and the LAUNCH checkpoint catches the same
+    # staleness, so the status is identical while the clause is gone. Each
+    # phase leaves a different mark, and the mark is the assertion.
+    tokens = cp_stack.database.query(
+        "SELECT id FROM bootstrap_tokens WHERE household_id = ?",
+        (cp_stack.household.id,),
+    )
+    launched = worker.providers.get("dry-run-runtime").launched
+    if checkpoint == "bootstrap":
+        assert not tokens, "refused after issuing a token, so a later guard caught it"
+        assert not launched
+    elif checkpoint == "launch":
+        assert tokens, "refused before the token, so the bootstrap guard caught it"
+        assert not launched, "reached launch, so the settle guard caught it"
+    else:
+        assert launched, "never launched, so an earlier guard caught it"
+
+
+def test_reconcile_refuses_a_runtime_job_whose_revision_moved_on(cp_stack) -> None:
+    """The fourth checkpoint: `_runtime_projection_is_current`, during reconcile.
+
+    The other three sit inside a phase and are reached by mutating between
+    provider calls. This one is asked when an `outcome_unknown` job is picked
+    back up, so it needs a job that actually ended that way — the provider
+    accepts, then the connection ends, which is the state reconcile exists for.
+
+    The assertion is about the PROVIDER, not the job's status, and that
+    distinction is the whole of this case. Status proves nothing here: with the
+    clause removed the job is resumed and the bootstrap checkpoint cancels it
+    moments later for the same staleness, so the outcome is `cancelled` either
+    way — measured, not assumed.
+
+    What the clause uniquely prevents is reconcile RE-ENTERING THE PROVIDER for
+    a revision the household has already left. Repeating external work is the
+    thing a currency guard exists to stop, which is why this is worth pinning
+    even though nothing downstream can tell the difference.
+    """
+    _queue_rollout_job(cp_stack)
+    worker = cp_stack.make_worker(
+        providers=_runtime_registry(behavior="unknown"), now=BASE_TIME + 500
+    )
+    unknown = worker.run_once()
+    assert unknown is not None and unknown.status == "outcome_unknown"
+
+    provider = worker.providers.get("dry-run-runtime")
+    assert provider.ensure_calls == 1
+
+    with cp_stack.database.write() as connection:
+        _make_stale(connection, cp_stack, "revision")
+
+    assert worker.reconcile(unknown.job_id).status != "succeeded"
+    assert provider.ensure_calls == 1, (
+        "reconcile re-entered the provider for a revision nobody is serving"
+    )

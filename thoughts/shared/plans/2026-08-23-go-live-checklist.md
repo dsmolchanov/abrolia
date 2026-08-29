@@ -155,8 +155,26 @@ Ordered slices:
   stale revision or runtime ref; drop the revision clause from any of them and
   nothing fails. Needs one authenticated HTTP regression carrying a
   secondary-channel binding through worker, claim and activation, and a
-  parameterized worker regression over both operations × both stale fields ×
-  all four checkpoints.
+  parameterized worker regression over the checkpoints and the fields each one
+  actually reads.
+
+  **Scope narrowed 2026-08-28, by measurement.** This first asked for "both
+  operations × both stale fields × all four checkpoints". Two thirds of that
+  matrix pins nothing, and deleting each clause and counting failures is how
+  that was established rather than argued:
+
+  * the two operations exercise the same clauses. What differs between them is
+    `_workflow_states_for`, which has its own test, so every case ran twice and
+    failed twice for one cause;
+  * the checkpoints do not all read both fields. The bootstrap checkpoint and
+    the reconcile predicate never read `runtime_ref`, so a case asserting they
+    refuse a stale one would assert something untrue — and for reconcile there
+    is no expected reference to compare against at all until the provider has
+    answered.
+
+  What is required is one case per (checkpoint, field that checkpoint reads),
+  which is five plus the reconcile case. Every clause is then pinned by exactly
+  one case.
 
 - [ ] **C4. Make preferences real.** Production write path (API/onboarding);
   consumer that routes replies/fallbacks; self-contained agent-inbox rejection
@@ -287,6 +305,43 @@ looking at whose row it was.
 `worker.py` is the consolidation of four currency checks into one answer;
 `rollout.py` exists so the scheduling can be tested without an HTTP client,
 which is what the endpoint's own shape was preventing.
+
+#### Inventory — C3d tests that reach what they claim to cover
+
+**Files:** `tests/control_plane/test_binding_api.py`,
+`tests/control_plane/test_provisioning_jobs.py`.
+
+**Branches:** `codex/c3d-tests-that-reach-their-path`.
+
+Tests only. Both gaps were confirmed by experiment before being filled:
+deleting `schedule_runtime_rollout` from `verify_binding_challenge` left the
+whole suite green, and so did dropping the revision clause from a currency
+checkpoint. A regression that passes when the code it is named for is deleted
+is worse than no regression, because it is counted.
+
+**Scope narrowed from what this item asked for, deliberately.** C3d says "both
+operations × both stale fields × all four checkpoints". What shipped is one
+case per (checkpoint, field that checkpoint reads), for one operation — five
+cases where the dense matrix would be twelve.
+
+The two operations were dropped because the clauses under test are shared
+code; what differs between them is `_workflow_states_for`, which has its own
+test. Running every case twice pinned nothing the single run did not, measured
+by deleting each clause and counting failures.
+
+The fourth checkpoint — `_runtime_projection_is_current`, during reconcile —
+IS covered, after a round trip worth recording. It was dropped on the grounds
+that its revision clause changes no outcome, which is true and measured: with
+the clause removed the job is resumed and the next checkpoint cancels it for
+the same staleness. Review pointed out what that reasoning missed, and it was
+right — the clause is what stops reconcile RE-ENTERING THE PROVIDER for a
+revision nobody is serving, and repeating external work is the thing a
+currency guard exists to prevent. Status is the wrong assertion for it;
+provider call count is the right one.
+
+The lesson is narrower than "cover everything": a guard whose absence changes
+no observable outcome may still be the only thing preventing an external side
+effect, and outcome-shaped assertions cannot see that.
 
 
 ## Track R — Staged rollout (fixed order; runbook §Rollout)
