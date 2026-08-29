@@ -36,16 +36,20 @@ makes a review loop unable to terminate.
 
 ### Merge authorisation comes only from a verified current-head verdict
 
-- **No `exit 0` in `.github/workflows/codex-review-window.yml` may be reached
-  except from a Codex signal bound to the CURRENT head commit and verified to
-  carry no P0/P1 marker.** There are exactly two such paths, and the count
-  itself is asserted. Absence of a verdict, absence of a severity marker in a
-  comment that is not the verdict, a verdict for another head, a signal from any
-  account other than the Codex bot, a repository-wide opt-out, and any GitHub
-  API failure are all NOT authorisations. Enforced by
-  `tests/test_gate_workflow.py` (static invariants, including the exit-0 count)
-  and `tests/test_gate_behavior.py` (executes the script against a stubbed
-  GitHub API and asserts the exit code on every path).
+- **No `exit 0` in the codex-review-window gate may be reached except from a
+  Codex signal bound to the CURRENT head commit and verified to carry no
+  BLOCKING marker.** What counts as blocking is round-budgeted since gate v2
+  (fleet policy, 2026-08-29): any P0/P1/[BLOCKER] for the first three
+  completed review generations, P0 only afterwards — P1s on a budget-exceeded
+  round keep their badges and are batch-fixed, but no longer decide the check.
+  Absence of a verdict, absence of a severity marker in a comment that is not
+  the verdict, a verdict for another head, a signal from any account other
+  than the Codex bot, a repository-wide opt-out, and any GitHub API failure
+  are all NOT authorisations, on every round. The gate body and its
+  executable tests live in `dsmolchanov/codex-review-gate` (this repository
+  carries only the pinned calling stub); the exit-0 count, the fail-closed
+  paths, and the round-budget behavior are asserted there by
+  `tests/test_gate_workflow.py` and `tests/test_gate_behavior.py`.
 
   Recorded after three instances of this class arrived in a single review, plus
   a fourth found by the tests themselves: a marker-absence predicate that read

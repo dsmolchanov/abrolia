@@ -35,7 +35,10 @@ On a **follow-up** review, do two things and only these two: state explicitly,
 for each finding in the earlier inventory, whether it is now fixed or still
 open; and inspect the causal impact cone of the fix — the changed symbols'
 callers, schemas, permissions, migrations, and deployment configuration — for
-regressions the fix introduced.
+regressions the fix introduced. When the review request names a commit range,
+review that range for new findings — and still report status for every prior
+finding, re-emitting each still-open P0/P1 with its severity badge, so an
+unresolved finding never disappears behind a clean delta.
 
 ## Severity
 
@@ -55,6 +58,11 @@ Mark the following as **P2 `[NIT]`**:
 - Anything the existing linter would catch (let CI handle it).
 - A mismatch between the implementation and the *narrative* of a plan —
   approach, naming, ordering, or design notes. Report it; do not block on it.
+
+On a round past the review budget — the review request says so when it applies —
+keep P1 badges on P1 findings and list them under a `Non-blocking notes`
+heading: they stay in scope for the Auto-fix batch pass, but only P0 decides
+the merge on that round.
 
 ### Plan applicability
 
@@ -171,19 +179,31 @@ fix.
 
 ## Merge gate
 
-CI and the `codex-review-window` check are hard merge gates. Codex review is
-**not advisory** — the check fails while the Codex verdict for the current head
-commit reports P1 `[BLOCKER]` findings, and it also fails when no verdict
-arrives at all. Absence of a verdict is not approval, so a missing,
-quota-blocked, or unparseable verdict holds the merge. The remedy for those is to
-restore the reviewer and re-run the job, never to push a commit hoping to shake a
-verdict loose.
+Whether the `codex-review-window` check holds the merge is a branch-protection
+decision made per repository lane.
 
-The gate answers that one question and nothing else. It counts no fix
-generations, enforces no diff budget, and accepts no waiver command. What keeps
-the loop short is upstream of it: the two open-ended P1 classes are gone from the
-severity list above, and the review is asked for one complete inventory rather
-than a finding at a time. Those reduce rounds; they do not cap them.
+**Prod lane** (the default): CI and the `codex-review-window` check are hard
+merge gates. Codex review is **not advisory** — the check fails while the Codex
+verdict for the current head commit reports blocking findings, and it also
+fails when no verdict arrives at all. Absence of a verdict is not approval, so
+a missing, quota-blocked, or unparseable verdict holds the merge. The remedy
+for those is to restore the reviewer and re-run the job, never to push a commit
+hoping to shake a verdict loose.
+
+**Fast lane** (repositories carrying the `review-lane-fast` topic): the check
+runs and posts findings, but branch protection does not wait for it — green CI
+merges via auto-merge. Findings that arrive while the PR is open get one batch
+Auto-fix pass, best-effort; findings that land after auto-merge completes are
+not revisited on that PR — the weekly trunk review catches them.
+
+The gate counts **completed review generations**, statelessly, from head-bound
+Codex verdicts — never from its own request comments, which prove only that a
+request was posted. Re-review rounds are scoped to the commit range since the
+last completed verdict, with still-open findings re-emitted. After three
+completed full rounds, only P0 findings hold the merge: P1s keep their badges —
+they stay in scope for the Auto-fix batch pass — but no longer decide the
+check. The gate still enforces no diff budget and accepts no waiver command,
+and an unknown verdict fails on every round.
 
 **A human stops automation by applying the `needs-human` label.** No new Auto-fix
 session starts while it is present, and removing it is a deliberate decision to
