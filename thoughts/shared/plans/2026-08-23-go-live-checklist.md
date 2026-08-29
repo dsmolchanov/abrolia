@@ -335,6 +335,59 @@ that assumed one binding per actor, the seeding that matched a tuple without
 looking at whose row it was.
 
 
+#### Inventory — C4b the fallback consumer
+
+**Files:** `hermes_cloud/channels/fallback.py`,
+`hermes_cloud/channels/telegram.py`, `hermes_cloud/cli.py`,
+`hermes_cloud/core/config.py`, `hermes_cloud/execute/email_send.py`,
+`tests/control_plane/test_channel_preferences.py`,
+`tests/test_config_and_cli.py`, `tests/test_primary_unavailable.py`.
+
+The design question C4a left open is answered by what was already there:
+`manifest.email.fallback` has carried the owner's contact address since the
+first revision, and `parse_runtime_manifest` already refuses
+`agent_inbox == fallback`. So the preference reaches the runtime as a manifest
+projection, the planner writes both halves from one account in one
+transaction, and a control-plane case asserts they agree — a projection that
+may drift is the whole C3a debt plan.
+
+`hermes_cloud/cli.py` is the ONE place the family-facing transport is built,
+which is why the fallback is a decorator installed there: the pipeline, the
+scheduler and the CLI reach the family from 28 call sites, and a branch at
+each would be 28 chances to forget.
+
+`hermes_cloud/execute/email_send.py` gains `send_notice` rather than a second
+egress: the outgoing-mail kill switch, the binding checks and the send store
+all apply to a notice, and the approval id is a named constant so nothing
+downstream reads a system message as something a person agreed to.
+
+`tests/control_plane/test_channel_preferences.py` is shared with C4a's step
+above, and declared by both for the reason the gate exists — a path declared
+only by another step is still undeclared by this one.
+
+`hermes_cloud/channels/telegram.py` joined during review, and it is the more
+interesting of the two findings this slice drew. `TransportError` was raised
+for every HTTP answer, so a 429 rate limit and a 5xx outage looked exactly
+like a blocked bot; the fallback would have written "we could not reach you"
+about messages that arrive a second later, and the worker's retry would have
+repeated it. The channel now says which it was, and the decorator writes only
+on a definitive refusal.
+
+**Deliberately not fixed: routing WhatsApp and web through the fallback.**
+The finding is right that the production image runs
+`hermes_cloud.runtime.service` and that `_pipeline` — where the decorator is
+installed — is the CLI's. What it does not account for is that the deployed
+runtime builds NO channel transport at all: it serves HTTP, answers web chat
+inside the request, and runs the inbound Nerve and Gmail workers. There is no
+primary-channel send there to fall back from, and "route each supported
+primary sender" would mean building the outbound delivery path — which is
+C5's relay work and Track R's staged rollout, not this slice. What C4b can
+enforce, and does, is that the path cannot be added without the fallback:
+`test_no_family_transport_is_built_without_the_fallback_around_it` fails the
+day a transport is constructed anywhere that does not wrap it.
+
+**Branches:** `codex/c4b-fallback-consumer`.
+
 #### Inventory — C4a preferences writer
 
 **Files:** `AGENTS.repo-invariants.md`,
