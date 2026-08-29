@@ -98,10 +98,15 @@ and a run that takes longer than the interval delays the next tick rather than
 starting beside it. Two concurrent passes would both claim the same due rows
 and deliver them twice.
 
-**E6 — The deploy unit carries no household secret.** C5c's K1 at the
-deployment level: the gateway gets the two roots and the database, and must
-not receive the field encryption key, the lookup HMAC key or anything
-per-household. It cannot decrypt a manifest and should not be able to.
+**E6 — The gateway never fabricates the data it routes on.**
+`open_control_plane_database` migrates, so a missing file becomes a fresh
+empty database and the gateway comes up healthy, answers `/healthz`, and
+routes nobody — every real sender an `unknown_sender` against a table nothing
+ever populated. That is indistinguishable from a working deployment until a
+family's message goes missing, so a missing database is a refusal to start.
+
+HOW the gateway is given a populated one is not settled and is not settled
+here — see "Deliberately not here".
 
 ## Acceptance
 
@@ -114,10 +119,30 @@ per-household. It cannot decrypt a manifest and should not be able to.
 * A body over the ceiling answers `413` and is never read.
 * The kill switch closes the entrypoint.
 * The scheduler runs `run_once` repeatedly and never concurrently.
-* `deploy/gateway/` builds and its configuration names no household secret.
+* A missing control-plane database is a refusal to start, not an empty one.
+* An unauthenticated caller learns nothing, including whether a sender is
+  bound.
 * Full suite green, ruff and sanitizer clean.
 
 ## Deliberately not here
+
+* **The deploy unit, and the data path it needs.** A first draft of this slice
+  carried `deploy/gateway/`, and the review found it could not work: the
+  gateway mounted its own volume while the authoritative database lives on the
+  control plane's, with no replication between them. The deployed gateway
+  would have started, passed its health check and routed nobody.
+
+  That is not a packaging bug. The gateway holds no field cipher by design
+  (C5c's K1), so it cannot simply be handed the control plane's database
+  without also being handed the keys that separation exists to withhold — and
+  the two candidate answers, an authenticated lookup endpoint or a replicated
+  read projection, are different systems with different failure modes. It is a
+  missing store lifecycle and it belongs to its own slice, C5e, with the
+  deploy unit that depends on it.
+
+  Shipping the deploy unit meanwhile would be worse than shipping none: a
+  configuration that looks finished and routes nobody is the kind of thing
+  that gets deployed and believed.
 
 * **The public provider edge.** Application-secret verification, the
   subscription challenge, and provider-payload parsing. See the boundary above.

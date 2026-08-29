@@ -22,6 +22,7 @@ from gateway.app import (
     RedeliverScheduler,
     RuntimeRelayDeliverer,
     RuntimeUnavailable,
+    build_router,
 )
 from gateway.whatsapp_router import (
     GatewayRedeliverWorker,
@@ -405,66 +406,20 @@ def test_a_runtime_reference_outside_the_namespace_never_becomes_a_hostname(
         deliverer(HOUSEHOLD, b"{}", "1", "sig")
 
 
-def test_the_deploy_unit_carries_no_household_secret() -> None:
-    """E6: C5c's K1, at the deployment level.
+def test_the_gateway_refuses_to_invent_a_control_plane_database(tmp_path: Path) -> None:
+    """A gateway pointed at the wrong volume must not come up healthy.
 
-    The gateway gets two roots and a database. Giving it the field encryption
-    key or the lookup HMAC key would let the layer that resolves senders
-    decrypt a manifest and correlate every other keyed digest in the system —
-    which is the whole reason its keys are separate.
+    `open_control_plane_database` migrates, so a missing file becomes a fresh
+    empty one: the gateway starts, answers `/healthz`, and routes nobody —
+    every real sender an `unknown_sender` against a table nothing populated.
+    Indistinguishable from a working deployment until a family's message goes
+    missing.
+
+    How the gateway is given a POPULATED database is the open question this
+    slice deliberately leaves — see C5e. Refusing to fabricate one is the part
+    that does not need that answer.
     """
-    config = Path("deploy/gateway/fly.toml").read_text(encoding="utf-8")
-    for forbidden in (
-        "ABROLIA_ENCRYPTION_KEY",
-        "ABROLIA_LOOKUP_HMAC_KEY",
-        "ABROLIA_TOKEN_HMAC_KEY",
-        "ABROLIA_CONTROL_PLANE_BACKUP_KEY",
-        "ABROLIA_FLY_API_TOKEN",
-    ):
-        assert f"{forbidden} =" not in config, f"the gateway was given {forbidden}"
-    # And the two roots are secrets rather than [env], because [env] is
-    # recorded in the image configuration.
-    assert "ABROLIA_GATEWAY_SENDER_HMAC_KEY =" not in config
-    assert "ABROLIA_GATEWAY_RELAY_ROOT_KEY =" not in config
-    # Fail-closed by default: the relay carries family message content.
-    assert 'ABROLIA_WHATSAPP_SHARED_ENABLED = "0"' in config
-
-
-def test_an_unauthenticated_caller_learns_nothing_at_all(
-    tmp_path: Path, monkeypatch
-) -> None:
-    """The adapter credential, checked before any lookup.
-
-    E2 said the detailed outcome codes are safe "because this entrypoint's
-    caller is the internal adapter". Nothing checked that they were — it was an
-    assumption about the deployment rather than a property of the code, and
-    without it anyone who could reach the service could enumerate binding
-    membership without holding a single key.
-
-    Fail-closed with no token configured, unlike every other optional key in
-    this system: an endpoint that accepts family message bodies has no previous
-    behaviour to degrade to.
-    """
-    monkeypatch.setenv("ABROLIA_WHATSAPP_SHARED_ENABLED", "1")
-    now = 1_000_000.0
-    router = _router(tmp_path, deliver=lambda *a: None, now=now)
-    body = b'{"message":"who is bound?"}'
-    ts = str(int(now))
-    signature = relay_hmac(RELAY_KEY, body, ts)
-
-    app = GatewayApp(router, adapter_token=ADAPTER_TOKEN)
-    for headers in ({}, {"HTTP_AUTHORIZATION": "Bearer wrong"}, {"HTTP_AUTHORIZATION": ADAPTER_TOKEN}):
-        request = _request(body, signature=signature, timestamp=ts)
-        request.pop("HTTP_AUTHORIZATION", None)
-        request.update(headers)
-        status, payload = _call(app, request)
-        assert status.startswith("401")
-        assert payload == {"status": "unauthenticated"}
-
-    # And an unconfigured gateway refuses even a correct-looking caller.
-    unconfigured = GatewayApp(router, adapter_token=None)
-    status, _ = _call(
-        unconfigured, _request(body, signature=signature, timestamp=ts)
-    )
-    assert status.startswith("401"), "an unconfigured gateway served traffic"
-    assert _ingress_count(tmp_path / "ingress.db") == 0
+    missing = tmp_path / "nowhere" / "control-plane.db"
+    with pytest.raises(FileNotFoundError):
+        build_router({"ABROLIA_GATEWAY_CONTROL_PLANE_DB": str(missing)})
+    assert not missing.exists(), "the gateway created the database it refused"

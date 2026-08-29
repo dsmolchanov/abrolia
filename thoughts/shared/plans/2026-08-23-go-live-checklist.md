@@ -242,7 +242,18 @@ Ordered slices:
     that should start failing here. Until this lands every binding is invisible
     to a strict-mode gateway, and C5b's `relay_key_absent` is the outcome that
     waits for it.
-  - [x] **C5d. Something calls the gateway.** *Done — see the inventory below.* `handle_webhook` has no caller
+  - [x] **C5d. Something calls the gateway.** *Done — see the inventory below.*
+  - [ ] **C5e. Something the gateway can read bindings from.** The deploy unit
+    and the store lifecycle it needs. A gateway on its own Fly volume opens a
+    database the control plane never wrote to, so it starts, passes its health
+    check and routes nobody — every real sender an `unknown_sender`. It holds
+    no field cipher by design (C5c's K1), so it cannot simply be given the
+    control plane's database without the keys that separation exists to
+    withhold. The two candidate answers — an authenticated lookup endpoint, or
+    a replicated read projection — are different systems with different failure
+    modes, which is why this is a slice and not a patch. C5d refuses to start
+    on a missing database rather than inventing an empty one, which is the part
+    that does not need this answer. `handle_webhook` has no caller
     outside tests and there is no `deploy/gateway/`. The HTTP entrypoint and
     its narrow deploy unit, plus whatever schedules C5b's worker — which C5b
     deliberately left uncalled rather than inventing a scheduler for a process
@@ -593,8 +604,7 @@ implementations of one keyed comparison is precisely the C5a defect.
 
 #### Inventory — C5d something calls the gateway
 
-**Files:** `gateway/app.py`, `pyproject.toml`, `deploy/gateway/Dockerfile`,
-`deploy/gateway/fly.toml`, `tests/test_gateway_app.py`.
+**Files:** `gateway/app.py`, `pyproject.toml`, `tests/test_gateway_app.py`.
 
 `pyproject.toml` gains `gateway*`: package discovery listed only
 `hermes_cloud*`, `control_plane*` and `web*`, so the wheel the image builds

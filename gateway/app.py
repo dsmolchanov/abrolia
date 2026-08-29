@@ -354,9 +354,20 @@ def build_router(env: Mapping[str, str] | None = None) -> WhatsAppGatewayRouter:
     can resolve a sender and sign a delivery, which is the whole of its job.
     """
     source = dict(os.environ if env is None else env)
-    database = open_control_plane_database(
-        Path(source.get(ENV_DB, "/data/control-plane.db"))
-    )
+    path = Path(source.get(ENV_DB, "/data/control-plane.db"))
+    # REFUSE TO CREATE ONE. `open_control_plane_database` migrates, so a
+    # missing file becomes a fresh empty database and the gateway comes up
+    # healthy, answers `/healthz`, and routes nobody — every real sender an
+    # `unknown_sender` against a table that was never populated.
+    #
+    # That is the shape of a gateway pointed at the wrong volume, and it is
+    # indistinguishable from a working one until a family's message goes
+    # missing. Failing here turns it into a deployment that does not start.
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"{ENV_DB} does not name an existing control-plane database: {path}"
+        )
+    database = open_control_plane_database(path)
     sender_key = source.get(ENV_SENDER_KEY, "").strip()
     relay_root = source.get(ENV_RELAY_ROOT, "").strip()
     return WhatsAppGatewayRouter(
