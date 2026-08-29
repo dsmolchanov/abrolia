@@ -189,6 +189,55 @@ class FieldCipher:
             raise CryptoError("decrypted value is not valid JSON") from error
 
 
+#: Labelled so a later scheme can coexist with this one through a rotation,
+#: and so a digest computed for one purpose can never collide with another
+#: derived from the same root.
+RELAY_KEY_LABEL = "abrolia-relay-key-v1:"
+
+
+def sender_hmac(sender: str, gateway_key: bytes) -> str:
+    """What a strict-mode gateway looks a sender up by.
+
+    Here rather than in `gateway/` because BOTH sides compute it — the gateway
+    to resolve an incoming sender, the control plane to write
+    `channel_bindings.external_id_hmac` — and two implementations of one
+    lookup is how the two ends of a keyed comparison drift apart. C5a was
+    exactly that failure for the relay signature.
+
+    The gateway already imports from `control_plane`, so this is the direction
+    that keeps: shared primitives here, the gateway importing them.
+    """
+    return hmac.new(gateway_key, sender.encode(), hashlib.sha256).hexdigest()
+
+
+def derive_relay_key(relay_root: bytes, household_id: str) -> bytes:
+    """The household's relay key, derived rather than stored.
+
+    Both ends need the same value: the control plane installs it into the
+    runtime as `HERMES_WHATSAPP_RELAY_SECRET`, and the gateway signs each
+    delivery with it. Deriving both from one root is not a preference, it is
+    what the two surrounding facts leave.
+
+    `FlySecretSink` can install, test for presence and delete, and cannot read
+    — Fly secrets are write-only, which is most of what makes them safe. And
+    the gateway is constructed with the database and its keys and nothing
+    else; it holds no field cipher by design, so a key stored encrypted beside
+    the binding would need a read path that does not exist and should not be
+    built for the layer that resolves senders.
+
+    So neither end can fetch the other's copy, and both can derive it. Storage
+    disappears, and rotation becomes one root change rather than a
+    per-household migration.
+
+    Per HOUSEHOLD and not per revision: a re-provisioning installs the same
+    value, so a rollout does not invalidate a delivery the gateway is part-way
+    through signing.
+    """
+    return hmac.new(
+        relay_root, (RELAY_KEY_LABEL + household_id).encode(), hashlib.sha256
+    ).digest()
+
+
 class LookupHasher:
     """Separate keyed HMAC for equality lookup; never reuse the AES key."""
 

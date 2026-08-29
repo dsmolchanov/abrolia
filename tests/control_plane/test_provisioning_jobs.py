@@ -2320,3 +2320,89 @@ def test_activation_during_launch_still_records_the_provider_outcome(
         " AND resource_type = 'runtime' AND config_revision = ?",
         (cp_stack.household.id, household.current_config_revision),
     )["status"] == "ready"
+
+
+def test_the_runtime_receives_the_relay_key_the_gateway_will_sign_with(
+    cp_stack,
+) -> None:
+    """C5c: the key both ends need, derived rather than stored.
+
+    `WhatsAppGatewayRouter.relay_keys` was populated only by tests and the
+    runtime's `HERMES_WHATSAPP_RELAY_SECRET` was never installed, so
+    `_whatsapp_config` raised `RuntimeNotReady` and no WhatsApp message could
+    reach any household. C5b's `relay_key_absent` is the outcome that waited
+    for this.
+
+    Asserted by DERIVING ON BOTH SIDES and comparing, never against a constant
+    this test computed once. A test that recomputes a digest the same way the
+    writer does passes when both are wrong together — which is exactly the C5a
+    defect, two ends of one keyed comparison each agreeing with its own fixture
+    and not with each other.
+    """
+    from control_plane.provisioning.worker import RUNTIME_WHATSAPP_RELAY_SECRET
+    from gateway.whatsapp_router import derive_relay_key
+
+    _queue_rollout_job(cp_stack)
+    worker = cp_stack.make_worker(providers=_runtime_registry(), now=BASE_TIME + 500)
+    _assert_launched(worker.run_once())
+
+    household = cp_stack.households.get(cp_stack.household.id)
+    installed = worker.secret_sink.get(
+        household.runtime_ref, RUNTIME_WHATSAPP_RELAY_SECRET
+    )
+    assert installed is not None, "the runtime was launched without its relay secret"
+
+    # What the GATEWAY would derive for this household, from the same root.
+    expected = derive_relay_key(
+        cp_stack.config.gateway_relay_root_key, cp_stack.household.id
+    ).hex()
+    value = installed.decode("ascii") if isinstance(installed, bytes) else installed
+    assert value == expected, (
+        "the runtime verifies with a key the gateway does not sign with"
+    )
+
+    # Per household, not per revision: a re-provisioning must install the same
+    # value, or a rollout would invalidate a delivery already in flight.
+    assert derive_relay_key(
+        cp_stack.config.gateway_relay_root_key, cp_stack.household.id
+    ) == derive_relay_key(
+        cp_stack.config.gateway_relay_root_key, cp_stack.household.id
+    )
+
+
+def test_the_relay_secret_name_matches_what_the_runtime_reads(cp_stack) -> None:
+    """One contract, spelled in two packages, pinned so it cannot drift.
+
+    The control plane does not import the runtime package, so the environment
+    variable is spelled independently at each end. That is precisely the shape
+    of the C5a defect — a gateway signing `body|timestamp` while the runtime
+    verified the bare body, each with passing tests of its own — so the two
+    spellings are compared rather than trusted.
+    """
+    from control_plane.provisioning.worker import RUNTIME_WHATSAPP_RELAY_SECRET
+    from hermes_cloud.runtime.service import ENV_WHATSAPP_RELAY_SECRET
+
+    assert RUNTIME_WHATSAPP_RELAY_SECRET == ENV_WHATSAPP_RELAY_SECRET
+
+
+def test_without_a_relay_root_the_runtime_launches_without_the_secret(cp_stack) -> None:
+    """K5: an unconfigured deployment is not a broken one.
+
+    Absent is not a failure here — it is a runtime that cannot serve WhatsApp,
+    which `_whatsapp_config` already reports honestly as `RuntimeNotReady`.
+    Refusing to launch would take down every household that does not use
+    WhatsApp for the absence of a key they never needed.
+    """
+    from control_plane.provisioning.worker import RUNTIME_WHATSAPP_RELAY_SECRET
+
+    _queue_rollout_job(cp_stack)
+    worker = cp_stack.make_worker(providers=_runtime_registry(), now=BASE_TIME + 500)
+    worker.gateway_relay_root_key = b""
+    _assert_launched(worker.run_once())
+
+    household = cp_stack.households.get(cp_stack.household.id)
+    assert worker.secret_sink.get(
+        household.runtime_ref, RUNTIME_WHATSAPP_RELAY_SECRET
+    ) is None
+    # And the launch still happened, which is the point.
+    assert worker.secret_sink.get(household.runtime_ref, "HERMES_BOOTSTRAP_TOKEN")

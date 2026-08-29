@@ -14,7 +14,25 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
+from control_plane.crypto import (  # one implementation, both ends
+    RELAY_KEY_LABEL,
+    derive_relay_key,
+    sender_hmac,
+)
 from control_plane.feature_flags import is_whatsapp_shared_enabled
+
+__all__ = [
+    "RELAY_KEY_LABEL",
+    "GatewayRedeliverWorker",
+    "GatewayResult",
+    "GatewayStore",
+    "RedeliverReport",
+    "WhatsAppGatewayRouter",
+    "derive_relay_key",
+    "relay_hmac",
+    "sender_hmac",
+    "verify_relay_hmac",
+]
 
 
 @dataclass(frozen=True)
@@ -45,10 +63,6 @@ def verify_relay_hmac(household_key: bytes, body: bytes, timestamp: str, signatu
     if len(supplied) != len(expected):
         return False
     return hmac.compare_digest(supplied, expected)
-
-
-def sender_hmac(sender: str, gateway_key: bytes) -> str:
-    return hmac.new(gateway_key, sender.encode(), hashlib.sha256).hexdigest()
 
 
 class GatewayStore:

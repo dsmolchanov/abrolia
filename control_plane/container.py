@@ -124,7 +124,13 @@ class ControlPlaneContainer:
         onboarding_repository = OnboardingRepository(database, cipher, lookup)
         jobs = JobsRepository(database, cipher, lookup)
         configs = ConfigRepository(database, cipher, lookup, token_hasher)
-        bindings = ChannelBindingsRepository(database, cipher, lookup, token_hasher)
+        bindings = ChannelBindingsRepository(
+            database,
+            cipher,
+            lookup,
+            token_hasher,
+            gateway_sender_hmac_key=config.gateway_sender_hmac_key,
+        )
         # Constructed here for the first time. The audit that opened the
         # go-live checklist found `channel_preferences` with a schema and no
         # production writer, and this is why: nothing in the container ever
@@ -246,6 +252,7 @@ class ControlPlaneContainer:
             email_identities=email_identities,
             runtime_provider=config.runtime_provider,
             model_api_key=config.runtime_model_api_key,
+            gateway_relay_root_key=config.gateway_relay_root_key,
             bootstrap_ttl_seconds=config.bootstrap_ttl_seconds,
             # The allowlist itself, not a boolean derived from it. Empty when
             # the brake is on, so an unauthorized household is refused by

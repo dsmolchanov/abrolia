@@ -138,6 +138,7 @@ class ControlPlaneStack:
             # real email in general.
             real_email_authorized_households=frozenset({self.household.id}),
             model_api_key=model_api_key,
+            gateway_relay_root_key=self.config.gateway_relay_root_key,
             clock=lambda: now,
         )
 
@@ -194,7 +195,13 @@ def cp_stack(tmp_path: Path) -> ControlPlaneStack:
     onboarding = OnboardingRepository(database, cipher, lookup)
     jobs = JobsRepository(database, cipher, lookup)
     configs = ConfigRepository(database, cipher, lookup, token_hasher)
-    bindings = ChannelBindingsRepository(database, cipher, lookup, token_hasher)
+    bindings = ChannelBindingsRepository(
+        database,
+        cipher,
+        lookup,
+        token_hasher,
+        gateway_sender_hmac_key=config.gateway_sender_hmac_key,
+    )
     email_identities = EmailIdentityRepository(database, cipher, lookup)
     email_identity_service = EmailIdentityService(email_identities)
     channel_prefs = ChannelPreferencesRepository(database)

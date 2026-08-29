@@ -91,6 +91,20 @@ class ControlPlaneConfig:
     active_encryption_key_version: str = "v1"
     lookup_hmac_key: bytes = field(default=b"", repr=False)
     token_hmac_key: bytes = field(default=b"", repr=False)
+    #: The key `gateway.whatsapp_router.sender_hmac` digests a sender with, and
+    #: the one the control plane writes `channel_bindings.external_id_hmac`
+    #: with. One key, two sides of one lookup.
+    #:
+    #: Deliberately NOT `lookup_hmac_key`, which would have been the short
+    #: path: that key digests email addresses and every other equality lookup
+    #: here, and handing it to the layer that resolves senders would let the
+    #: routing layer correlate identifiers it has no business seeing.
+    gateway_sender_hmac_key: bytes = field(default=b"", repr=False)
+    #: The root each household's relay key is DERIVED from — see
+    #: `gateway.whatsapp_router.derive_relay_key`. Never a stored per-household
+    #: secret: Fly secrets are write-only and the gateway holds no field
+    #: cipher, so neither end could read the other's copy.
+    gateway_relay_root_key: bytes = field(default=b"", repr=False)
     backup_key: bytes = field(default=b"", repr=False)
     synthetic_only: bool = True
     real_family_data_enabled: bool = False
@@ -252,6 +266,31 @@ class ControlPlaneConfig:
             self.token_hmac_key,
         }:
             raise ConfigurationError("backup key must be independent from application keys")
+        # Both gateway keys are OPTIONAL, because a deployment that has not
+        # provisioned them yet is unconfigured rather than broken: the digest
+        # stays NULL and the gateway keeps the plaintext lookup it runs today.
+        # Present, they answer to the same independence rule as every other
+        # key, and to each other — one signs deliveries and one digests
+        # senders, and a root that is also a lookup key makes every derived
+        # household key guessable by anyone holding the lookup key.
+        gateway_keys = {
+            "gateway sender HMAC key": self.gateway_sender_hmac_key,
+            "gateway relay root key": self.gateway_relay_root_key,
+        }
+        for name, key in gateway_keys.items():
+            if not key:
+                continue
+            if len(key) != 32:
+                raise ConfigurationError(f"{name} must be 32 bytes")
+            if key in {*field_keys, self.lookup_hmac_key, self.token_hmac_key, self.backup_key}:
+                raise ConfigurationError(
+                    f"{name} must be independent from application keys"
+                )
+        if (
+            self.gateway_sender_hmac_key
+            and self.gateway_sender_hmac_key == self.gateway_relay_root_key
+        ):
+            raise ConfigurationError("gateway sender and relay keys must be independent")
         if self.runtime_provider not in {"dry-run-runtime", "fly-runtime"}:
             raise ConfigurationError("runtime provider is not enabled for Phase 1")
         if self.runtime_provider == "fly-runtime" and (
@@ -289,6 +328,8 @@ class ControlPlaneConfig:
         encoded_lookup = source.get("ABROLIA_LOOKUP_HMAC_KEY", "")
         encoded_token = source.get("ABROLIA_TOKEN_HMAC_KEY", "")
         encoded_backup = source.get("ABROLIA_CONTROL_PLANE_BACKUP_KEY", "")
+        encoded_gateway_sender = source.get("ABROLIA_GATEWAY_SENDER_HMAC_KEY", "")
+        encoded_relay_root = source.get("ABROLIA_GATEWAY_RELAY_ROOT_KEY", "")
         config = cls(
             database_path=Path(source.get("ABROLIA_CONTROL_PLANE_DB", "data/control-plane.db")),
             public_origin=source.get("ABROLIA_PUBLIC_ORIGIN", "https://app.abrolia.com"),
@@ -313,6 +354,20 @@ class ControlPlaneConfig:
                     encoded_backup, name="ABROLIA_CONTROL_PLANE_BACKUP_KEY"
                 )
                 if encoded_backup
+                else b""
+            ),
+            gateway_sender_hmac_key=(
+                _decode_key(
+                    encoded_gateway_sender, name="ABROLIA_GATEWAY_SENDER_HMAC_KEY"
+                )
+                if encoded_gateway_sender
+                else b""
+            ),
+            gateway_relay_root_key=(
+                _decode_key(
+                    encoded_relay_root, name="ABROLIA_GATEWAY_RELAY_ROOT_KEY"
+                )
+                if encoded_relay_root
                 else b""
             ),
             synthetic_only=source.get("ABROLIA_SYNTHETIC_ONLY", "1") == "1",
@@ -376,5 +431,11 @@ class ControlPlaneConfig:
             active_encryption_key_version="test-v1",
             lookup_hmac_key=bytes([key_byte + 1]) * 32,
             token_hmac_key=bytes([key_byte + 2]) * 32,
+            # Configured, because the gateway keys are what a provisioned
+            # deployment has. The unconfigured case is its own test rather than
+            # the default every other test inherits — a default of "absent"
+            # would have meant nothing exercised the digest at all.
+            gateway_sender_hmac_key=bytes([key_byte + 3]) * 32,
+            gateway_relay_root_key=bytes([key_byte + 4]) * 32,
             internal_bootstrap_host="app.example.test",
         ).validate()

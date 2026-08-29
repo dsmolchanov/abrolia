@@ -9,6 +9,7 @@ writes one, and — mostly — the things it must not write.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -262,34 +263,128 @@ def test_an_already_bound_channel_is_refused_before_a_code_is_sent(
     ) == []
 
 
-def test_hmac_column_stays_null_until_c5_provisions_the_key(cp_stack) -> None:
-    """A known gap, pinned so it fails a test rather than a delivery.
+def test_a_written_binding_carries_the_digest_a_strict_gateway_looks_it_up_by(
+    cp_stack,
+) -> None:
+    """C5c closes the gap `test_hmac_column_stays_null_until_c5...` pinned.
 
-    The gateway's strict mode looks bindings up by `external_id_hmac`, keyed
-    with the relay key. The control plane does not hold that key, so every
-    binding written here is invisible to a strict-mode gateway. When C5c lands
-    the key, this test is the one that should start failing.
+    That test asserted `external_id_hmac IS NULL` and said it should start
+    failing when C5 landed the key. It did, and this is its opposite.
 
-    What is missing is the KEY, not a place to put one. This said
-    `provisioning/secrets.py` "is C5's work and does not exist", and that file
-    has been on disk throughout — `FlySecretSink` installs secret material and
-    the email providers already use it. Nothing generates a per-household relay
-    secret, installs it as `ABROLIA_WHATSAPP_RELAY_SECRET`, or computes the
-    digest this column holds; `WhatsAppGatewayRouter.relay_keys` is populated
-    only by tests. Naming the sink as the gap pointed the next reader at a file
-    they would find already written.
+    The digest is asserted by RESOLVING through the gateway rather than by
+    comparing against a constant this test computed. A test that recomputes the
+    digest the same way the writer does passes even when both are wrong
+    together, which is the shape of the C5a defect: two ends of one keyed
+    comparison, each agreeing with its own fixture and not with each other.
+    """
+    from gateway.whatsapp_router import WhatsAppGatewayRouter
+
+    with cp_stack.database.write() as connection:
+        issued = _issue(cp_stack, connection)
+        cp_stack.bindings.verify_challenge(
+            connection,
+            code=issued.code,
+            household_id=cp_stack.household.id,
+            owner_actor_id=OWNER,
+            now=BASE_TIME + 60,
+        )
+        # Published, because C3c makes only an activated binding routable and
+        # what is under test here is the digest, not the activation boundary.
+        connection.execute(
+            "UPDATE channel_bindings SET published_revision = 1"
+            " WHERE household_id = ?",
+            (cp_stack.household.id,),
+        )
+
+    rows = cp_stack.database.query("SELECT external_id, external_id_hmac FROM channel_bindings")
+    assert [row["external_id_hmac"] for row in rows] != [None]
+
+    # A fixed clock, so the strict-mode freshness check is not a hidden
+    # dependency on wall time in a test about a digest.
+    now = 1_700_000_000.0
+    router = WhatsAppGatewayRouter(
+        cp_stack.database,
+        gateway_hmac_key=cp_stack.config.gateway_sender_hmac_key,
+        now_fn=lambda: now,
+    )
+    resolved = router.route(
+        rows[0]["external_id"], "whatsapp", timestamp=str(int(now))
+    )
+    assert resolved.household_id == cp_stack.household.id, (
+        "the control plane wrote a digest the gateway does not look up by"
+    )
+
+
+def test_without_a_gateway_key_the_digest_stays_null_and_nothing_breaks(
+    tmp_path,
+) -> None:
+    """K5: an unprovisioned deployment is unconfigured, not broken.
+
+    Both gateway keys are optional. Without them the digest stays NULL and the
+    gateway keeps the plaintext lookup it ran before this slice — which is what
+    every deployment does today. Failing closed here would take a working
+    system down for the absence of a key it has never had.
+    """
+    from control_plane.config import ControlPlaneConfig
+    from control_plane.crypto import FieldCipher, LookupHasher
+    from control_plane.db import ControlPlaneDatabase
+    from control_plane.repositories.bindings import ChannelBindingsRepository
+
+    config = ControlPlaneConfig.for_test(tmp_path)
+    unconfigured = replace(
+        config, gateway_sender_hmac_key=b"", gateway_relay_root_key=b""
+    ).validate()
+    database = ControlPlaneDatabase(unconfigured.database_path)
+    database.migrate()
+    bindings = ChannelBindingsRepository(
+        database,
+        FieldCipher(
+            unconfigured.encryption_keys, unconfigured.active_encryption_key_version
+        ),
+        LookupHasher(unconfigured.lookup_hmac_key),
+        LookupHasher(unconfigured.token_hmac_key),
+    )
+    assert bindings.sender_digest("+999511234567") is None
+    with database.write() as connection:
+        assert bindings.backfill_sender_digests(connection) == 0
+    database.close()
+
+
+def test_the_repair_fills_a_null_digest_and_leaves_a_written_one_alone(
+    cp_stack,
+) -> None:
+    """Rows written before the key existed, and only those.
+
+    Not a migration: SQL cannot compute a keyed digest and the key belongs to
+    the application. Populated digests are left alone because recomputing them
+    is harmless under one key and destructive during a rotation, when the rows
+    carrying the previous key's digest are what a rollback needs.
     """
     with cp_stack.database.write() as connection:
         issued = _issue(cp_stack, connection)
         cp_stack.bindings.verify_challenge(
             connection,
-                code=issued.code,
-                household_id=cp_stack.household.id,
-                owner_actor_id=OWNER, now=BASE_TIME + 60
+            code=issued.code,
+            household_id=cp_stack.household.id,
+            owner_actor_id=OWNER,
+            now=BASE_TIME + 60,
         )
-
-    rows = cp_stack.database.query("SELECT external_id_hmac FROM channel_bindings")
-    assert [row["external_id_hmac"] for row in rows] == [None]
+        written = connection.execute(
+            "SELECT id, external_id_hmac FROM channel_bindings"
+        ).fetchone()
+        # A row from before the key: same shape, no digest.
+        connection.execute(
+            "UPDATE channel_bindings SET external_id_hmac = NULL WHERE id = ?",
+            (written["id"],),
+        )
+        assert cp_stack.bindings.backfill_sender_digests(connection) == 1
+        repaired = connection.execute(
+            "SELECT external_id_hmac FROM channel_bindings WHERE id = ?",
+            (written["id"],),
+        ).fetchone()
+        assert repaired["external_id_hmac"] == written["external_id_hmac"]
+        # Idempotent, and it does not touch what is already there.
+        assert cp_stack.bindings.backfill_sender_digests(connection) == 0
 
 
 def test_the_retention_sweep_retires_a_challenge_nobody_answered(cp_stack) -> None:
