@@ -111,8 +111,15 @@ class WhatsAppGatewayRouter:
             # Strict HMAC lookup — no plaintext fallback when key configured
             h = sender_hmac(sender, self.gateway_hmac_key)
             rows = self.db.query(
+                # `published_revision IS NOT NULL` is C3c: a binding is
+                # routable only once the revision carrying it has ACTIVATED.
+                # Without it a member verified during a rollout was routed to a
+                # runtime still serving the previous revision, whose manifest
+                # had no pair for them — the runtime denied the turn and their
+                # message went nowhere.
                 "SELECT household_id FROM channel_bindings "
-                "WHERE channel = ? AND external_id_hmac = ?",
+                "WHERE channel = ? AND external_id_hmac = ? "
+                "AND published_revision IS NOT NULL",
                 (channel, h),
             )
         else:
@@ -124,8 +131,10 @@ class WhatsAppGatewayRouter:
                 if abs(int(self.now_fn()) - ts) > self.REPLAY_WINDOW_SECONDS:
                     return GatewayResult(status="denied", code="timestamp_replay")
             rows = self.db.query(
+                # See the strict branch above: staged bindings do not route.
                 "SELECT household_id FROM channel_bindings "
-                "WHERE channel = ? AND external_id = ?",
+                "WHERE channel = ? AND external_id = ? "
+                "AND published_revision IS NOT NULL",
                 (channel, sender),
             )
         ids = [r["household_id"] for r in rows]

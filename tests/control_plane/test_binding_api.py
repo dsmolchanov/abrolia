@@ -502,7 +502,9 @@ def _finish_onboarding(api_harness, world) -> None:
 
     def drain() -> None:
         while (result := container.worker.run_once()) is not None:
-            assert result.status in {"succeeded", "cancelled"}, result
+            # Since C3e a runtime job stays open until its revision activates,
+            # so `pending` here is a launched runtime, not an unfinished drain.
+            assert result.status in {"succeeded", "cancelled", "pending"}, result
 
     container.onboarding.save_profile(
         world.household.id,
@@ -590,7 +592,9 @@ def test_verifying_over_http_deploys_the_revision_it_reports(api_harness) -> Non
     assert job["desired_revision"] == reported
 
     while (result := api_harness.container.worker.run_once()) is not None:
-        assert result.status in {"succeeded", "cancelled"}, result
+        # Since C3e a runtime job stays open until its revision activates, so
+        # `pending` here is a launched runtime rather than an unfinished drain.
+        assert result.status in {"succeeded", "cancelled", "pending"}, result
 
     # The runtime then CLAIMS its token and ACTIVATES the revision, which is
     # the half that makes the endpoint's answer true.

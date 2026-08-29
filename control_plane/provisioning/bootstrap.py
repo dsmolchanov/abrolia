@@ -446,6 +446,28 @@ class BootstrapService:
                 " WHERE household_id = ? AND published_revision IS NULL",
                 (config_revision, household_id),
             )
+            # And the job that produced this revision is finished — here,
+            # because here is where it actually finished.
+            #
+            # Activation previously had no link to that job in either
+            # direction: the worker settled it `succeeded` at launch, long
+            # before the runtime called back, so a runtime that never arrived
+            # left the household at `provisioning` with a settled row nothing
+            # would revisit. The job now waits, and this is what ends the wait.
+            #
+            # `settled_at IS NULL` makes it idempotent, which the replay path
+            # needs: an activation whose HTTP response was lost re-enters here
+            # and must not settle a second time.
+            pending_runtime = connection.execute(
+                "SELECT id FROM provisioning_jobs WHERE household_id = ?"
+                " AND kind = 'runtime' AND desired_revision = ?"
+                " AND settled_at IS NULL",
+                (household_id, config_revision),
+            ).fetchall()
+            for pending in pending_runtime:
+                self.jobs.settle(
+                    connection, pending["id"], status="succeeded", now=now
+                )
             workflow = WorkflowRecord(
                 workflow_row["id"],
                 workflow_row["household_id"],

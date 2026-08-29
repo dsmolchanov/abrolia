@@ -240,11 +240,11 @@ settling at launch would strand bindings with no job to retire them.
 
 #### Automated Verification
 
-- [ ] `python3 -m pytest tests/test_gateway_routing.py -q` — staged sender denied, published sender routed
-- [ ] `python3 -m pytest tests/control_plane/test_provisioning_jobs.py -q` — a rollout that never activates leaves an open job; the worker does not spin
-- [ ] `python3 -m pytest tests/control_plane/test_bootstrap.py -q` — activation settles the job
-- [ ] `python3 -m pytest -m "not live"`
-- [ ] `python3 scripts/check_fixtures.py --all`
+- [x] `python3 -m pytest tests/test_gateway_routing.py -q` — staged sender denied, published sender routed
+- [x] `python3 -m pytest tests/control_plane/test_provisioning_jobs.py -q` — a rollout that never activates leaves an open job; the worker does not spin
+- [x] `python3 -m pytest tests/control_plane/test_provisioning_jobs.py -q` — activation settles the job
+- [x] `python3 -m pytest -m "not live"` (1585 passed)
+- [x] `python3 scripts/check_fixtures.py --all`
 
 #### Manual Verification
 

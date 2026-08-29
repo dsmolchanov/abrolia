@@ -1320,7 +1320,8 @@ def _provision_second_household(cp_stack, email: str):
 
     def drain():
         while (result := worker.run_once()) is not None:
-            assert result.status == "succeeded", result
+            # Since C3e a runtime job stays open until its revision activates.
+            assert result.status in {"succeeded", "pending"}, result
 
     cp_stack.service.save_profile(
         household.id,
@@ -1403,6 +1404,17 @@ def test_a_second_household_can_provision_and_routes_to_itself(cp_stack) -> None
         second_actor, second_chat,
     )
 
+    # Publishing what activation would publish. This case is about D0 —
+    # each household holding a DISTINCT identity — and since C3c a binding
+    # only routes once its revision has activated, which neither household
+    # here has done. Staging is asserted in its own case
+    # (`tests/test_gateway_routing.py`); simulating it would be the subject.
+    with cp_stack.database.write() as connection:
+        connection.execute(
+            "UPDATE channel_bindings SET published_revision = 1"
+            " WHERE published_revision IS NULL"
+        )
+
     # And each sender reaches its OWN household, with no `ambiguous_sender`.
     router = WhatsAppGatewayRouter(
         cp_stack.database, ingress_path=cp_stack.config.database_path.parent / "ing.db"
@@ -1428,7 +1440,7 @@ def _drain(worker) -> None:
     re-planning sweep depends on.
     """
     while (result := worker.run_once()) is not None:
-        assert result.status in {"succeeded", "cancelled"}, result
+        assert result.status in {"succeeded", "cancelled", "pending"}, result
 
 
 def _activated(cp_stack) -> None:

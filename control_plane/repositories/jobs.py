@@ -276,6 +276,50 @@ class JobsRepository(Repository):
             ),
         )
 
+    def record_result(
+        self,
+        connection: sqlite3.Connection,
+        job_id: str,
+        *,
+        result: dict[str, Any],
+        external_ref: str,
+        now: float | None = None,
+    ) -> None:
+        """Store what the provider returned WITHOUT settling the job.
+
+        `settle` is the only other writer of these two columns and it is
+        terminal, which was fine while every job finished at the moment its
+        provider answered. A runtime job now stays open until the revision
+        activates, and the provider's answer has to survive that wait: the
+        DSAR export reads it (`control_plane/privacy/export.py:108`), so
+        losing it would take a provider outcome out of a subject access
+        response.
+        """
+        now = time.time() if now is None else now
+        row = connection.execute(
+            "SELECT encryption_key_version FROM provisioning_jobs WHERE id = ?",
+            (job_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(job_id)
+        key_version = row["encryption_key_version"]
+        connection.execute(
+            "UPDATE provisioning_jobs SET result_ciphertext = ?,"
+            " external_ref_ciphertext = ?, updated_at = ? WHERE id = ?",
+            (
+                self.encrypt_json(
+                    "provisioning_jobs", job_id, "result", result,
+                    key_version=key_version,
+                ).ciphertext,
+                self.encrypt_json(
+                    "provisioning_jobs", job_id, "external_ref", external_ref,
+                    key_version=key_version,
+                ).ciphertext,
+                now,
+                job_id,
+            ),
+        )
+
     def retry_later(
         self,
         job_id: str,

@@ -127,6 +127,18 @@ def requires_current_content_restriction(
 #: question has a different answer for it — see `_workflow_states_for`.
 REPROVISION_RUNTIME_OPERATION = "reprovision_runtime"
 
+#: A runtime job that has launched and is waiting for the runtime to claim its
+#: bootstrap token and activate the revision. NOT a failure: the job is
+#: deliberately non-terminal, because settling it `succeeded` at launch is what
+#: let a runtime that never called back leave the household at `provisioning`
+#: with a job `lease` would never return again.
+AWAITING_ACTIVATION = "awaiting_activation"
+
+#: The same wait, ended by the bootstrap token expiring. Terminal, and distinct
+#: from every provider failure: nothing went wrong upstream, the runtime simply
+#: never arrived, and the token it would have needed is no longer valid.
+ACTIVATION_DEADLINE_PASSED = "activation_deadline_passed"
+
 
 def _workflow_states_for(job: JobRecord, onboarding: set[str]) -> set[str]:
     """Which onboarding-workflow states mean "this job is still current".
@@ -299,6 +311,12 @@ class ProvisioningWorker:
         disabled = self._blocked_by_email_kill_switch(job)
         if disabled is not None:
             return self._brake_email_option(job, request, disabled)
+        if job.kind == "runtime" and job.error_code == AWAITING_ACTIVATION:
+            # Placed BEFORE `providers.get`, deliberately. This job has already
+            # prepared and launched; the only reason it is leasable again is
+            # that its activation deadline arrived. Falling through would call
+            # `prepare` a second time for a runtime that already exists.
+            return self._settle_activation_deadline(job)
         provider = None
         result = None
         try:
@@ -2956,10 +2974,9 @@ class ProvisioningWorker:
                 or state["runtime_ref"] != result.external_ref
             ):
                 raise _ProjectionCancelled
-            self.jobs.settle(
+            self.jobs.record_result(
                 connection,
                 job.id,
-                status="succeeded",
                 result=durable_result,
                 external_ref=result.external_ref,
                 now=self.clock(),
@@ -2971,7 +2988,52 @@ class ProvisioningWorker:
                 status="ready",
                 revision=job.desired_revision,
             )
-        return WorkResult(job.id, "succeeded")
+            deadline = connection.execute(
+                "SELECT MAX(expires_at) AS expires_at FROM bootstrap_tokens"
+                " WHERE household_id = ? AND config_revision = ?"
+                " AND used_at IS NULL AND revoked_at IS NULL",
+                (job.household_id, job.desired_revision),
+            ).fetchone()
+        # Launched, not finished. `BootstrapService.activate` settles this job
+        # when the runtime claims its token and the revision goes live; until
+        # then it stays non-terminal, because a succeeded row is one nothing
+        # revisits and a household whose runtime never called back would sit at
+        # `provisioning` for good.
+        #
+        # `not_before` is the token's own expiry rather than a poll interval:
+        # there is nothing to poll for. Either activation arrives and settles
+        # this job, or the token expires and the wait can end — and waking once,
+        # at exactly that moment, is the whole of what the worker needs to do.
+        #
+        # A missing expiry means no live token for this revision, which is the
+        # deadline having already passed.
+        expires_at = None if deadline is None else deadline["expires_at"]
+        if expires_at is None:
+            return self._settle_activation_deadline(job)
+        self.jobs.retry_later(
+            job.id,
+            not_before=float(expires_at),
+            error_code=AWAITING_ACTIVATION,
+            now=self.clock(),
+        )
+        return WorkResult(job.id, "pending", AWAITING_ACTIVATION)
+
+    def _settle_activation_deadline(self, job: JobRecord) -> WorkResult:
+        """End a wait the runtime never came back from.
+
+        Settled `failed` rather than `succeeded`: the revision is not serving,
+        and recording it as done is exactly the claim that made this stranding
+        invisible. `failed` is also what `_restore_settled_household` reads, so
+        a re-provisioning job that reached this point can hand the household
+        back to the revision it was already serving.
+        """
+        with self.jobs.db.write() as connection:
+            state = self._runtime_state(connection, job)
+            if state is not None and state["job_status"] == "succeeded":
+                return WorkResult(job.id, "succeeded")
+        return self._mark_step_problem(
+            job, self.jobs.request(job.id), "failed", ACTIVATION_DEADLINE_PASSED
+        )
 
     def _cleanup(self, job: JobRecord, request: dict, provider) -> WorkResult:
         deferred = self._defer_runtime_cleanup(job, request)

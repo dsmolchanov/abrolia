@@ -150,7 +150,10 @@ def _provision_runtime(api_harness) -> RuntimeBootstrap:
         )
         assert active.worker.run_once().status == "succeeded"
     runtime = active.worker.run_once()
-    assert runtime.status == "succeeded"
+    # Launched, not finished. Since C3e the runtime job stays non-terminal
+    # until the revision activates — which is what these tests then drive — so
+    # the launch reports `awaiting_activation` rather than success.
+    assert runtime.status == "pending" and runtime.error_code == "awaiting_activation"
     household = active.households.get(world.household.id)
     revision = active.configs.get(world.household.id, 1)
     raw = active.secret_sink.get(household.runtime_ref, "HERMES_BOOTSTRAP_TOKEN")
@@ -704,7 +707,10 @@ def test_a_member_rollout_activates_the_revision_without_rewriting_onboarding(
             runtime_provider=active.config.runtime_provider,
         )
     rollout = active.worker.run_once()
-    assert rollout is not None and rollout.status == "succeeded"
+    # Launched, not finished: the rollout job waits for this revision to
+    # activate, which is what the rest of this case then drives.
+    assert rollout is not None
+    assert (rollout.status, rollout.error_code) == ("pending", "awaiting_activation")
 
     # Activate the NEW revision — without this the guard under test is never
     # reached, and the assertions below would pass on a broken implementation.
