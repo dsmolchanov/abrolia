@@ -47,6 +47,18 @@ Anything unnamed is a defect rather than a condition, and a defect must be loud.
 Where a layer knows what a transport failure looks like, it translates there,
 so the layer that decides the retry can catch one named thing.
 
+**A narrowed inner catch is only as strong as the ladder above it.** `_run_once`
+ends its exception ladder with `except (OutcomeUnknown, TimeoutError,
+ConnectionError)`, so those two builtins are retryable wherever they arise —
+narrowing an inner handler does not change that. It is not a gap: they are
+transport conditions, and four C6a tests simulate a launch whose connection
+died by raising `TimeoutError` and depend on `outcome_unknown`. What the ladder
+does NOT catch is `TypeError`, `NameError`, `AttributeError` and `KeyError` —
+there is no trailing `except Exception` — which is the class this slice closes.
+
+Worth stating because the rule reads stronger than it is: C1 makes programming
+errors loud, and leaves named transport conditions retryable at every level.
+
 That is already how the working code in this repository is written:
 `runtimes/chat_client.py` and `privacy/runtime.py` catch
 `httpx.TimeoutException, httpx.TransportError` and nothing else, and the Fly
