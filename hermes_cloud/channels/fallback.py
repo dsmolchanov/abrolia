@@ -37,6 +37,7 @@ shown when it was not.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import time
 from typing import Protocol
@@ -138,6 +139,36 @@ class FallbackTransport:
 
     # --- the fallback -----------------------------------------------------
 
+    def _notice_id(self) -> str:
+        """An effect id that is safe in a header and true about the request.
+
+        `build_message` puts the effect id verbatim into `Message-ID`, where a
+        colon is not a legal character: the readable
+        `primary-unavailable:telegram:1` serialized as the truncated
+        `<hermes-primary-unavailable` with two `InvalidHeaderDefect`s, and every
+        window produced the same broken header for a provider to reject or
+        deduplicate.
+
+        A digest fixes more than the syntax. The send store settles by effect
+        id, so an id must identify the request it settles: it covers the
+        RECIPIENT and the sending address as well as the window, because a
+        fallback that changed mid-window would otherwise reuse the receipt of a
+        letter addressed somewhere else — and `EmailSendStore.begin` would
+        refuse the changed request, which `_refused` swallows, so the new
+        address would silently get nothing.
+        """
+        window = int(self.clock() // NOTICE_WINDOW_SECONDS)
+        material = "\x1f".join(
+            (
+                "primary-unavailable",
+                self.channel,
+                str(window),
+                self.fallback,
+                str(getattr(self.mail, "sender", "")),
+            )
+        )
+        return f"primary-unavailable-{hashlib.sha256(material.encode()).hexdigest()[:32]}"
+
     def _refused(self, error: TransportError) -> None:
         # The alert fires on every refusal, including the ones whose letter is
         # suppressed by the window: an operator counting outages must not have
@@ -156,16 +187,13 @@ class FallbackTransport:
                 "primary channel refused and no email fallback is configured"
             )
             return
-        window = int(self.clock() // NOTICE_WINDOW_SECONDS)
         letter = Outgoing(
             to=self.fallback,
             subject=SUBJECT,
             body=BODY.format(channel=self.channel),
         )
         try:
-            self.mail.send_notice(
-                letter, notice_id=f"primary-unavailable:{self.channel}:{window}"
-            )
+            self.mail.send_notice(letter, notice_id=self._notice_id())
         except EgressBlocked:
             # The operator brake is on. That is an answer, not an error.
             logger.warning("fallback notice suppressed: outgoing mail is disabled")

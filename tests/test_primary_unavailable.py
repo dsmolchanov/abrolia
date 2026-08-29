@@ -85,7 +85,7 @@ def test_a_refused_message_writes_to_the_family_and_raises_anyway(
 
     (letter, notice_id) = mail.letters[0]
     assert letter.to == FALLBACK
-    assert notice_id.startswith("primary-unavailable:telegram:")
+    assert notice_id.startswith("primary-unavailable-")
     assert "ALERT primary_unavailable" in caplog.text
     # The identifier is hashed by `emit_alert`, never printed.
     assert "synthetic-household" not in caplog.text
@@ -247,3 +247,56 @@ def test_no_family_transport_is_built_without_the_fallback_around_it() -> None:
         "these modules build a family-facing transport without wrapping it in"
         f" FallbackTransport: {', '.join(offenders)}"
     )
+
+
+@pytest.mark.parametrize("method", ("send_message", "send_document"))
+def test_the_notice_id_is_legal_in_a_message_header(method) -> None:
+    """`build_message` puts the effect id into `Message-ID` verbatim.
+
+    The readable form was `primary-unavailable:telegram:1`, and a colon is not
+    legal there: it serialized as the truncated `<hermes-primary-unavailable`
+    with two `InvalidHeaderDefect`s, identically for every window, which a
+    provider may reject or deduplicate.
+    """
+    from hermes_cloud.execute.email_send import build_message
+
+    mail = RecordingMail()
+    transport = _transport(RefusingTransport(), mail)
+    with pytest.raises(TransportError):
+        if method == "send_message":
+            transport.send_message(chat="c", text="привет")
+        else:
+            transport.send_document(chat="c", filename="a.ics", content=b"x")
+
+    letter, notice_id = mail.letters[0]
+    message = build_message(letter, sender="agent@abrolia.test", approval_id=notice_id)
+    assert message["Message-ID"].defects == ()
+    assert notice_id in str(message["Message-ID"])
+
+
+def test_the_notice_id_changes_with_the_window_and_with_the_recipient() -> None:
+    """It settles a send, so it has to identify the send it settles.
+
+    Two letters with one effect id are one receipt: a fallback address changed
+    mid-window would otherwise reuse the receipt of a letter addressed
+    somewhere else, and `EmailSendStore.begin` would refuse the changed
+    request — which `_refused` swallows, so the new address would get nothing.
+    """
+    now = [0.0]
+
+    def notice_for(fallback: str, sender: str) -> str:
+        mail = RecordingMail()
+        mail.sender = sender
+        transport = _transport(
+            RefusingTransport(), mail, clock=lambda: now[0], fallback=fallback
+        )
+        with pytest.raises(TransportError):
+            transport.send_message(chat="c", text="привет")
+        return mail.letters[0][1]
+
+    first = notice_for(FALLBACK, "agent@abrolia.test")
+    assert notice_for(FALLBACK, "agent@abrolia.test") == first
+    assert notice_for("other@family.test", "agent@abrolia.test") != first
+    assert notice_for(FALLBACK, "moved@abrolia.test") != first
+    now[0] = NOTICE_WINDOW_SECONDS
+    assert notice_for(FALLBACK, "agent@abrolia.test") != first
