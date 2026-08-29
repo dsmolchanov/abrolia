@@ -139,19 +139,12 @@ support ticket.
   own item.
 * **Telling the owner a member is pending activation.** Product decision.
 
-#### Inventory — C3c and C3e activation boundary
+#### Inventory
 
-**Files:** `control_plane/migrations/0011_channel_binding_published.sql`,
-`control_plane/repositories/bindings.py`,
-`control_plane/provisioning/bootstrap.py`,
-`control_plane/provisioning/worker.py`, `gateway/whatsapp_router.py`,
-`tests/control_plane/test_channel_bindings.py`,
-`tests/control_plane/test_bootstrap.py`,
-`tests/control_plane/test_provisioning_jobs.py`,
-`tests/test_gateway_routing.py`.
-
-**Branches:** `codex/c3c-c3e-activation-boundary`.
-
-One slice. Both halves hang off `activate`, and splitting them leaves a window
-where one is live and the other is not — which the Risks section shows is worse
-than either end state.
+Carried by
+`thoughts/shared/plans/2026-08-29-c3c-c3e-activation-boundary-implementation.md`,
+which is where execution is tracked. A design document that also claimed the
+branch would make two steps claim it, and the scope gate refuses to guess
+between them — correctly, since the point of that gate is that scope is stated
+rather than inferred. The same split is used by
+`2026-08-27-c3b-revision-rollout.md`.
