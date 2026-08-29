@@ -1,0 +1,70 @@
+app = "abrolia-gateway-synthetic"
+primary_region = "ams"
+
+[build]
+  dockerfile = "Dockerfile"
+
+# NO CONTROL-PLANE DATABASE, and that is the whole of C5e.
+#
+# A first draft mounted one on this app's own volume — which the control plane
+# had never written to, so the gateway came up healthy, passed its health check
+# and routed nobody. It now ASKS instead of reading, and the consequence is
+# that it holds no household data of any kind: no bindings table, no households
+# table, no field cipher, no lookup key.
+#
+# THREE SECRETS, and no [env] for any of them, because [env] is recorded in the
+# image configuration and readable by anything that can list it:
+#
+#   fly secrets set ABROLIA_GATEWAY_SENDER_HMAC_KEY=... \
+#                   ABROLIA_GATEWAY_RELAY_ROOT_KEY=... \
+#                   ABROLIA_GATEWAY_LOOKUP_TOKEN=... \
+#                   ABROLIA_GATEWAY_ADAPTER_TOKEN=...
+#
+# The two ROOTS must be the same values the control plane holds: the sender key
+# is what wrote `channel_bindings.external_id_hmac`, and the relay root is what
+# derived the secret installed in each runtime. A gateway with different roots
+# resolves nobody and signs what no runtime can verify.
+#
+# ABROLIA_GATEWAY_LOOKUP_TOKEN is what this app presents to
+# `/internal/v1/bindings/resolve`; ABROLIA_GATEWAY_ADAPTER_TOKEN is what the
+# internal relay adapter presents to THIS app. Two directions, two credentials,
+# deliberately not one — a single shared token would let anything that can call
+# the gateway also query the control plane directly.
+[env]
+  ABROLIA_GATEWAY_INGRESS_DB = "/data/gateway-ingress.db"
+  ABROLIA_GATEWAY_CONTROL_PLANE_URL = "http://abrolia-control-plane-synthetic.flycast:8080"
+  ABROLIA_GATEWAY_REDELIVER_INTERVAL_SECONDS = "60"
+  # Fail-closed by default. The relay carries family message content, so it
+  # starts braked and is switched on deliberately.
+  ABROLIA_WHATSAPP_SHARED_ENABLED = "0"
+
+[http_service]
+  internal_port = 8080
+  # Reached over Flycast from the internal relay adapter, which has no TLS
+  # certificates — the same arrangement the control plane uses.
+  force_https = false
+  auto_start_machines = true
+  # Never stopped: the redeliver scheduler runs in this process, and a machine
+  # that stops between webhooks stops draining the WAL.
+  auto_stop_machines = "off"
+  min_machines_running = 1
+  processes = ["app"]
+
+  [[http_service.checks]]
+    grace_period = "10s"
+    interval = "15s"
+    method = "GET"
+    path = "/healthz"
+    timeout = "2s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
+
+# The ingress WAL, and nothing else. It holds messages the gateway has accepted
+# responsibility for and not yet delivered, so a machine that lost it on
+# restart would lose exactly what "durable before ACK" promises.
+[mounts]
+  source = "gateway_data"
+  destination = "/data"
+  initial_size = "1gb"
