@@ -1,0 +1,63 @@
+app = "abrolia-gateway-synthetic"
+primary_region = "ams"
+
+[build]
+  dockerfile = "Dockerfile"
+
+# E6 — NO HOUSEHOLD SECRET LIVES HERE.
+#
+# The gateway is given two roots and a database. It is deliberately NOT given
+# ABROLIA_ENCRYPTION_KEY, ABROLIA_LOOKUP_HMAC_KEY or ABROLIA_TOKEN_HMAC_KEY, so
+# it cannot decrypt a manifest and cannot correlate any other keyed digest in
+# the system. It can resolve a sender and sign a delivery, which is the whole
+# of its job.
+#
+# Both roots arrive as Fly secrets rather than [env], because [env] is
+# recorded in the image configuration and readable by anything that can list
+# it:
+#
+#   fly secrets set ABROLIA_GATEWAY_SENDER_HMAC_KEY=... \
+#                   ABROLIA_GATEWAY_RELAY_ROOT_KEY=...
+#
+# They must be the SAME values the control plane holds: the sender key is what
+# wrote `channel_bindings.external_id_hmac`, and the relay root is what derived
+# the secret installed in each runtime. A gateway with different roots resolves
+# nobody and signs what no runtime can verify.
+[env]
+  ABROLIA_GATEWAY_CONTROL_PLANE_DB = "/data/control-plane.db"
+  ABROLIA_GATEWAY_INGRESS_DB = "/data/gateway-ingress.db"
+  ABROLIA_GATEWAY_REDELIVER_INTERVAL_SECONDS = "60"
+  # Fail-closed by default. The relay carries family message content, so it
+  # starts braked and is switched on deliberately.
+  ABROLIA_WHATSAPP_SHARED_ENABLED = "0"
+
+[http_service]
+  internal_port = 8080
+  # Reached over Flycast from the internal relay adapter, which has no TLS
+  # certificates — the same arrangement the control plane uses.
+  force_https = false
+  auto_start_machines = true
+  # Never stopped: the redeliver scheduler runs in this process, and a machine
+  # that stops between webhooks stops draining the WAL.
+  auto_stop_machines = "off"
+  min_machines_running = 1
+  processes = ["app"]
+
+  [[http_service.checks]]
+    grace_period = "10s"
+    interval = "15s"
+    method = "GET"
+    path = "/healthz"
+    timeout = "2s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
+
+# The ingress WAL is durable state: it holds messages the gateway has accepted
+# responsibility for and not yet delivered. A machine that lost it on restart
+# would lose exactly what "durable before ACK" promises.
+[mounts]
+  source = "gateway_data"
+  destination = "/data"
+  initial_size = "1gb"
