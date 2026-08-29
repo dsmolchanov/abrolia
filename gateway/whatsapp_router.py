@@ -16,7 +16,7 @@ from pathlib import Path
 
 from control_plane.crypto import (  # one implementation, both ends
     RELAY_KEY_LABEL,
-    derive_relay_key,
+    derive_relay_secret,
     sender_hmac,
 )
 from control_plane.feature_flags import is_whatsapp_shared_enabled
@@ -28,7 +28,7 @@ __all__ = [
     "GatewayStore",
     "RedeliverReport",
     "WhatsAppGatewayRouter",
-    "derive_relay_key",
+    "derive_relay_secret",
     "relay_hmac",
     "sender_hmac",
     "verify_relay_hmac",
@@ -200,6 +200,7 @@ class WhatsAppGatewayRouter:
         db,
         *,
         relay_keys: dict[str, bytes] | None = None,
+        relay_root: bytes | None = None,
         gateway_hmac_key: bytes | None = None,
         ingress_path: Path | str | None = None,
         runtime_deliver=None,
@@ -207,6 +208,7 @@ class WhatsAppGatewayRouter:
     ) -> None:
         self.db = db
         self.relay_keys = relay_keys or {}
+        self.relay_root = relay_root
         self.gateway_hmac_key = gateway_hmac_key
         self._ingress_path = Path(ingress_path or "data/gateway_ingress.db")
         self._store: GatewayStore | None = None
@@ -231,6 +233,33 @@ class WhatsAppGatewayRouter:
         if self._store is None:
             self._store = GatewayStore(self._ingress_path)
         return self._store
+
+    def relay_key(self, household_id: str) -> bytes | None:
+        """The HMAC key material for this household, or None if there is none.
+
+        THE ONE PLACE either consumer asks. `handle_webhook` and
+        `GatewayRedeliverWorker._process` both went through
+        `self.relay_keys.get(...)`, a map only tests ever populated — so
+        configuring a relay root gave the gateway nothing, every routable
+        webhook answered `relay_key_absent`, and the retained message expired
+        waiting for a key that was never going to arrive by that path.
+
+        `.encode()` and not raw digest bytes: the runtime reads this secret out
+        of an environment variable and signs with `secret.encode()`, so the key
+        material is the ASCII of the hex string at both ends. Returning bytes
+        here would make the gateway sign with something the runtime cannot
+        reproduce, which is the C5a failure in a new place.
+
+        The explicit map still wins where one is given. It is how a test names
+        a key without a root, and how an operator could pin one household
+        during a rotation.
+        """
+        injected = self.relay_keys.get(household_id)
+        if injected is not None:
+            return injected
+        if self.relay_root is None:
+            return None
+        return derive_relay_secret(self.relay_root, household_id).encode("ascii")
 
     def route(
         self, sender: str, channel: str = "whatsapp", *, timestamp: str | None = None
@@ -330,7 +359,7 @@ class WhatsAppGatewayRouter:
         # and the WAL row's fate was decided by which `return` happened to run.
         # The question the reader actually has to ask is not "was the HMAC bad"
         # but CAN THIS EVER BE DELIVERED, so that is what the code answers.
-        key = self.relay_keys.get(routed.household_id) if routed.household_id else None
+        key = self.relay_key(routed.household_id) if routed.household_id else None
         if not key:
             # No key for this household YET. Retryable, and the reason is C5c:
             # the relay-key provisioning path does not exist, so a binding can
@@ -543,7 +572,7 @@ class GatewayRedeliverWorker:
             # else does, which is I4: re-routing decides whether, never to whom.
             self.store.mark_delivered(ingress_id)
             return "undeliverable"
-        key = self.router.relay_keys.get(routed.household_id)
+        key = self.router.relay_key(routed.household_id)
         if key is not None and not verify_relay_hmac(
             key, row["payload"], row["origin_timestamp"], row["origin_signature"]
         ):

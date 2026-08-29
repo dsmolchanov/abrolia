@@ -8,7 +8,12 @@ from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
 
-from control_plane.crypto import SecretFieldError, SecretMaterial, derive_relay_key, normalize_email
+from control_plane.crypto import (
+    SecretFieldError,
+    SecretMaterial,
+    derive_relay_secret,
+    normalize_email,
+)
 from control_plane.db import new_id
 from control_plane.email.contracts import EmailFailureKind, EmailProviderError
 from control_plane.email.domain_policy import canonicalize_domain
@@ -2953,7 +2958,7 @@ class ProvisioningWorker:
         # value from the same root when it signs a delivery, so the two ends
         # agree without either being able to read the other's copy — Fly
         # secrets are write-only and the gateway holds no field cipher. See
-        # `control_plane.crypto.derive_relay_key`.
+        # `control_plane.crypto.derive_relay_secret`.
         #
         # Keyed on the household rather than the revision, so a re-provisioning
         # installs the same value and a rollout does not invalidate a delivery
@@ -2964,7 +2969,7 @@ class ProvisioningWorker:
         # already reports as `RuntimeNotReady`.
         if self.gateway_relay_root_key:
             merged[RUNTIME_WHATSAPP_RELAY_SECRET] = bytearray(
-                derive_relay_key(self.gateway_relay_root_key, job.household_id).hex(),
+                derive_relay_secret(self.gateway_relay_root_key, job.household_id),
                 "ascii",
             )
         install_failed = False

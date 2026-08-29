@@ -210,8 +210,18 @@ def sender_hmac(sender: str, gateway_key: bytes) -> str:
     return hmac.new(gateway_key, sender.encode(), hashlib.sha256).hexdigest()
 
 
-def derive_relay_key(relay_root: bytes, household_id: str) -> bytes:
-    """The household's relay key, derived rather than stored.
+def derive_relay_secret(relay_root: bytes, household_id: str) -> str:
+    """The household's relay secret, derived rather than stored.
+
+    Returns the SECRET AS INSTALLED — a hex string — and not raw key bytes,
+    because the representation is the contract and leaving it implicit is how
+    the two ends drift. The runtime reads this out of an environment variable
+    and signs with `secret.encode()` (`hermes_cloud/ingest/whatsapp_webhook.py`),
+    so the HMAC key material is the ASCII of this string at BOTH ends. A caller
+    holding raw bytes and a caller holding the hex of those bytes compute
+    different signatures while each looks correct on its own — which is exactly
+    the C5a failure this slice cites, and which an earlier draft of this
+    function reproduced by returning `bytes`.
 
     Both ends need the same value: the control plane installs it into the
     runtime as `HERMES_WHATSAPP_RELAY_SECRET`, and the gateway signs each
@@ -235,7 +245,7 @@ def derive_relay_key(relay_root: bytes, household_id: str) -> bytes:
     """
     return hmac.new(
         relay_root, (RELAY_KEY_LABEL + household_id).encode(), hashlib.sha256
-    ).digest()
+    ).hexdigest()
 
 
 class LookupHasher:

@@ -301,7 +301,7 @@ def test_a_written_binding_carries_the_digest_a_strict_gateway_looks_it_up_by(
 
     # A fixed clock, so the strict-mode freshness check is not a hidden
     # dependency on wall time in a test about a digest.
-    now = 1_700_000_000.0
+    now = 1_000_000.0
     router = WhatsAppGatewayRouter(
         cp_stack.database,
         gateway_hmac_key=cp_stack.config.gateway_sender_hmac_key,
@@ -2770,3 +2770,59 @@ def test_the_sweep_reaches_a_stranded_household_whose_drift_was_retired(
         " AND kind = 'runtime' AND settled_at IS NULL",
         (cp_stack.household.id,),
     )["total"] == 1
+
+
+def test_the_upgrade_path_repairs_a_pre_key_database_before_strict_lookup(
+    cp_stack, monkeypatch, capsys
+) -> None:
+    """The repair has an operator entrypoint, exercised through it.
+
+    `backfill_sender_digests` with no caller is a method that never runs. On a
+    database that predates `ABROLIA_GATEWAY_SENDER_HMAC_KEY`, enabling strict
+    lookup makes the gateway match ONLY `external_id_hmac` — so every household
+    already onboarded goes dark and only bindings written afterwards work.
+
+    Driven through `cli.main` rather than by calling the repository, because
+    what was missing was the path, not the method.
+    """
+    from contextlib import nullcontext
+
+    from control_plane import cli
+    from gateway.whatsapp_router import WhatsAppGatewayRouter
+
+    with cp_stack.database.write() as connection:
+        issued = _issue(cp_stack, connection)
+        cp_stack.bindings.verify_challenge(
+            connection,
+            code=issued.code,
+            household_id=cp_stack.household.id,
+            owner_actor_id=OWNER,
+            now=BASE_TIME + 60,
+        )
+        # Exactly the shape a database written before the key has.
+        connection.execute(
+            "UPDATE channel_bindings SET external_id_hmac = NULL,"
+            " published_revision = 1 WHERE household_id = ?",
+            (cp_stack.household.id,),
+        )
+
+    now = 1_000_000.0
+    gateway = WhatsAppGatewayRouter(
+        cp_stack.database,
+        gateway_hmac_key=cp_stack.config.gateway_sender_hmac_key,
+        now_fn=lambda: now,
+    )
+    sender = cp_stack.database.query_one(
+        "SELECT external_id FROM channel_bindings"
+    )["external_id"]
+    assert gateway.route(sender, "whatsapp", timestamp=str(int(now))).code == (
+        "unknown_sender"
+    ), "the precondition: strict lookup cannot see a pre-key binding"
+
+    monkeypatch.setattr(cli, "_container", lambda **_k: nullcontext(cp_stack))
+    assert cli.main(["backfill-sender-digests"]) == 0
+    assert json.loads(capsys.readouterr().out) == {"repaired": 1}
+
+    assert gateway.route(
+        sender, "whatsapp", timestamp=str(int(now))
+    ).household_id == cp_stack.household.id, "the household stayed dark after the repair"
