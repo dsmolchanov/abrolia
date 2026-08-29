@@ -1,6 +1,8 @@
 # The runtime packages and PWA assets are installed as the Abrolia distribution:
 # source-tree tests retain `pythonpath = ["."]`, while packaging includes
-# the household runtime, onboarding control plane, and its Web shell.
+# the household runtime, onboarding control plane, its Web shell, and the
+# shared gateway — whose image runs `python -m gateway.app`, so a wheel
+# without it starts and immediately exits with `No module named gateway`.
 
 [build-system]
 requires = ["setuptools>=75", "wheel"]
@@ -31,7 +33,7 @@ hermes-cloud = "hermes_cloud.cli:main"
 abrolia-control-plane = "control_plane.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["hermes_cloud*", "control_plane*", "web*"]
+include = ["hermes_cloud*", "control_plane*", "web*", "gateway*"]
 
 [tool.setuptools.package-data]
 hermes_cloud = ["core/migrations/*.sql"]

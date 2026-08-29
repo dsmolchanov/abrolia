@@ -242,7 +242,18 @@ Ordered slices:
     that should start failing here. Until this lands every binding is invisible
     to a strict-mode gateway, and C5b's `relay_key_absent` is the outcome that
     waits for it.
-  - [ ] **C5d. Something calls the gateway.** `handle_webhook` has no caller
+  - [x] **C5d. Something calls the gateway.** *Done — see the inventory below.*
+  - [ ] **C5e. Something the gateway can read bindings from.** The deploy unit
+    and the store lifecycle it needs. A gateway on its own Fly volume opens a
+    database the control plane never wrote to, so it starts, passes its health
+    check and routes nobody — every real sender an `unknown_sender`. It holds
+    no field cipher by design (C5c's K1), so it cannot simply be given the
+    control plane's database without the keys that separation exists to
+    withhold. The two candidate answers — an authenticated lookup endpoint, or
+    a replicated read projection — are different systems with different failure
+    modes, which is why this is a slice and not a patch. C5d refuses to start
+    on a missing database rather than inventing an empty one, which is the part
+    that does not need this answer. `handle_webhook` has no caller
     outside tests and there is no `deploy/gateway/`. The HTTP entrypoint and
     its narrow deploy unit, plus whatever schedules C5b's worker — which C5b
     deliberately left uncalled rather than inventing a scheduler for a process
@@ -590,6 +601,39 @@ them, because the gateway already depends on `control_plane` and two
 implementations of one keyed comparison is precisely the C5a defect.
 
 **Branches:** `codex/c5c-relay-key-provisioning`.
+
+#### Inventory — C5d something calls the gateway
+
+**Files:** `gateway/app.py`, `pyproject.toml`, `tests/test_gateway_app.py`.
+
+`pyproject.toml` gains `gateway*`: package discovery listed only
+`hermes_cloud*`, `control_plane*` and `web*`, so the wheel the image builds
+carried no `gateway/` and `python -m gateway.app` would have exited with
+`No module named gateway` on every deploy.
+
+Every piece of the WhatsApp path existed after C5c and none of it ran:
+`handle_webhook` had no caller outside tests, `run_once` had no scheduler, and
+there was no deploy unit.
+
+**The boundary this slice does not cross.** `handle_webhook` verifies the
+inbound signature with the HOUSEHOLD's relay key, which only something holding
+those keys can produce — so the caller is the internal relay adapter, not Meta
+or Telegram, who sign with an application secret this repository has never
+had. Step E5's prose says the gateway answers `200 OK` "to Telegram/WhatsApp",
+which reads like the other shape; it is the one place the plan and the code
+disagree, and the code is what four slices were built against. The public
+provider edge — application-secret verification, the subscription challenge,
+provider-payload parsing — is its own slice.
+
+**The status says what the caller should DO; the body says why.** A delivery,
+a terminal denial and a WAL-retained failure all answer `200`, so the status
+cannot be used to probe whether a sender is bound. A refused signature answers
+`403`, and the kill switch answers `503` — the one outcome where the gateway
+took no responsibility, because `handle_webhook` returns `flag_disabled`
+before it persists and a `200` would drop the message during exactly the
+incident the switch was thrown to contain.
+
+**Branches:** `codex/c5d-gateway-entrypoint`.
 
 #### Inventory — C3d tests that reach what they claim to cover
 
