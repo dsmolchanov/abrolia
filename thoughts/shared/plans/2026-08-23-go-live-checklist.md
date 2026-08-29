@@ -550,7 +550,8 @@ that has been on disk throughout. See the correction in the C5 box above.
 #### Inventory — C5c the relay key exists
 
 **Files:** `control_plane/crypto.py`, `control_plane/config.py`,
-`control_plane/container.py`, `control_plane/provisioning/worker.py`,
+`control_plane/container.py`, `control_plane/cli.py`,
+`control_plane/provisioning/worker.py`,
 `control_plane/repositories/bindings.py`, `gateway/whatsapp_router.py`,
 `tests/control_plane/conftest.py`,
 `tests/control_plane/test_channel_bindings.py`,
@@ -571,6 +572,13 @@ derive it from one root. Storage disappears and rotation is one root change.
 produce a binding the gateway cannot see. Being a pure projection of
 `external_id` is what also makes `backfill_sender_digests` possible for rows
 that predate the key.
+
+`cli.py` carries `backfill-sender-digests`, the upgrade step for a database
+written before the key: a strict-mode gateway matches ONLY `external_id_hmac`,
+so without it every household already onboarded goes dark the moment the key is
+configured. A command rather than a migration, because SQL cannot compute a
+keyed digest and a migration that needed the key would have to be handed a
+secret the schema has no business holding.
 
 The gateway's sender key is deliberately NOT the control plane's
 `lookup_hmac_key`: that key digests email addresses and every other equality
