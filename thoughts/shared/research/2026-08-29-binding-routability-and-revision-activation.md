@@ -1,6 +1,6 @@
 ---
 date: 2026-08-29T09:53:55+02:00
-researcher: Dmitry Molchanov
+researcher: Codex
 git_commit: 48bbdfbd4fb33226311f2800d9f1dd2c563bdb32
 branch: codex/c3c-c3e-activation-boundary
 repository: abrolia
@@ -8,13 +8,13 @@ topic: "How a channel binding becomes routable, and how a config revision become
 tags: [research, codebase, channel-bindings, gateway, provisioning, bootstrap, config-revisions, c3c, c3e]
 status: complete
 last_updated: 2026-08-29
-last_updated_by: Dmitry Molchanov
+last_updated_by: Codex
 ---
 
 # Research: How a channel binding becomes routable, and how a config revision becomes the one being served
 
 **Date**: 2026-08-29T09:53:55+02:00
-**Researcher**: Dmitry Molchanov
+**Researcher**: Codex
 **Git Commit**: 48bbdfbd4fb33226311f2800d9f1dd2c563bdb32
 **Branch**: codex/c3c-c3e-activation-boundary
 **Repository**: abrolia

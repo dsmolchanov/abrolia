@@ -2563,3 +2563,107 @@ def test_the_sweep_repairs_a_household_no_job_will_ever_return_to(cp_stack) -> N
         " AND kind = 'runtime' AND settled_at IS NULL",
         (cp_stack.household.id,),
     )["total"] == 1
+
+
+def test_the_sweep_reaches_a_stranded_household_whose_drift_was_retired(
+    cp_stack,
+) -> None:
+    """The same strandedness, reached the way the worker actually reaches it.
+
+    The test above marks the job failed by hand, which leaves the staged member
+    in the table — so the binding sets disagree and `find_stale_bindings` finds
+    the household through drift. The real path does one more thing:
+    `_mark_step_problem` calls `retire_staged_members` before
+    `_restore_settled_household` declines to move a household whose provider was
+    touched. Deleting that member puts the table back to EXACTLY the manifest
+    the runtime is still serving.
+
+    So the household is stranded at `provisioning` with no drift at all, and the
+    equality check skipped it before reading the queue — the mechanism built to
+    reach stranded households was blind to the one path that actually strands
+    them. Drift is how this sweep usually finds work; it is not the only way a
+    household needs converging.
+    """
+    _provisioned(cp_stack)
+    _activated(cp_stack)
+    owner = owner_actor(cp_stack)
+
+    with cp_stack.database.write() as connection:
+        issued = cp_stack.bindings.issue_challenge(
+            connection,
+            household_id=cp_stack.household.id,
+            channel=CHANNEL_SELECTION["kind"],
+            external_id=ADULT,
+            chat_id=owner_chat(cp_stack),
+            actor_id=ADULT,
+            role="adult",
+            issued_by_actor_id=owner,
+            now=BASE_TIME + 100,
+        )
+        cp_stack.bindings.verify_challenge(
+            connection,
+            code=issued.code,
+            household_id=cp_stack.household.id,
+            owner_actor_id=owner,
+            now=BASE_TIME + 200,
+        )
+        planned = cp_stack.make_worker().planner.issue(
+            connection, household_id=cp_stack.household.id
+        )
+        schedule_runtime_rollout(
+            connection,
+            jobs=cp_stack.jobs,
+            onboarding=cp_stack.onboarding,
+            household_id=cp_stack.household.id,
+            planned=planned,
+            runtime_provider=cp_stack.config.runtime_provider,
+            now=BASE_TIME + 201,
+        )
+        connection.execute(
+            "UPDATE provisioning_jobs SET status = 'failed', settled_at = 1,"
+            " error_code = 'activation_deadline_passed' WHERE household_id = ?"
+            " AND kind = 'runtime' AND settled_at IS NULL",
+            (cp_stack.household.id,),
+        )
+        # The step the other test omits, and the whole point of this one.
+        cp_stack.bindings.retire_staged_members(
+            connection, household_id=cp_stack.household.id
+        )
+
+    household = cp_stack.database.query_one(
+        "SELECT status FROM households WHERE id = ?", (cp_stack.household.id,)
+    )
+    assert household["status"] == "provisioning", "the precondition, not the subject"
+
+    with cp_stack.database.write() as connection:
+        stale = find_stale_bindings(
+            connection,
+            configs=cp_stack.configs,
+            bindings=cp_stack.bindings,
+            onboarding=cp_stack.onboarding,
+        )
+        # There is no drift left to find — that is the premise, asserted so a
+        # future change that stops retiring cannot make this test pass for the
+        # wrong reason.
+        assert [item.bindings_now for item in stale] == [
+            item.bindings_served for item in stale
+        ]
+        assert [item.blocked_by for item in stale] == [None]
+
+        applied = reconcile_stale_bindings(
+            connection,
+            planner=cp_stack.make_worker().planner,
+            jobs=cp_stack.jobs,
+            onboarding=cp_stack.onboarding,
+            configs=cp_stack.configs,
+            bindings=cp_stack.bindings,
+            runtime_provider=cp_stack.config.runtime_provider,
+            apply=True,
+            now=BASE_TIME + 300,
+        )
+    assert [item["action"] for item in applied] == ["reconciled"]
+    assert cp_stack.database.query_one(
+        "SELECT COUNT(*) AS total FROM provisioning_jobs WHERE household_id = ?"
+        " AND kind = 'runtime' AND settled_at IS NULL",
+        (cp_stack.household.id,),
+    )["total"] == 1

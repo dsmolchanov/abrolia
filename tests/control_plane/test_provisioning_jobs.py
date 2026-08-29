@@ -2224,9 +2224,99 @@ def test_activation_settles_the_job_it_activates(cp_stack) -> None:
     )
 
     settled = cp_stack.database.query_one(
-        "SELECT status, error_code FROM provisioning_jobs WHERE kind = 'runtime'"
+        "SELECT id, status, error_code FROM provisioning_jobs WHERE kind = 'runtime'"
         " AND desired_revision = ?",
         (revision,),
     )
     assert settled["status"] == "succeeded"
     assert settled["error_code"] is None, "the wait marker outlived the wait"
+
+    # And settling it REPORTS the outcome without erasing one. `activate` calls
+    # `settle` with a status and nothing else, which used to write NULL over
+    # both ciphertext columns that `_settle_runtime_ready` had deliberately
+    # persisted with `record_result` — taking the provider outcome out of the
+    # DSAR export (`control_plane/privacy/export.py:108`) and losing the job's
+    # durable external reference at the exact moment the job succeeded.
+    #
+    # This asserts the class, not the caller: `settle` now preserves what it is
+    # not asked to replace, so every one of its callers that reports a status
+    # alone — `_mark_step_problem` on the terminal-failure path included —
+    # keeps the provider's answer.
+    assert cp_stack.jobs.result(settled["id"]) is not None, (
+        "activation erased the recorded provider result"
+    )
+    assert cp_stack.jobs.result(settled["id"])["verified"] is True
+    assert cp_stack.jobs.external_ref(settled["id"]) == household.runtime_ref
+
+
+def test_activation_during_launch_still_records_the_provider_outcome(
+    cp_stack,
+) -> None:
+    """The same invariant in the other ordering, which is a real one.
+
+    `FlyRuntimeProvisioner.launch` starts the Machine before it returns, so the
+    Machine can claim its bootstrap token and `BootstrapService.activate` can
+    settle the runtime job while the worker is still inside `launch`. When the
+    worker then reached `_settle_runtime_ready`, it found the job already
+    `succeeded` and returned — without ever calling `record_result` or marking
+    the runtime resource `ready`.
+
+    The test above covers the ordering where the result is written and then
+    erased. Here it is never written at all, which the DSAR export cannot tell
+    apart from a job that had no provider outcome. One invariant, two orderings:
+    the provider's answer must not depend on which writer won.
+    """
+    from control_plane.provisioning.bootstrap import BootstrapService
+
+    _queue_rollout_job(cp_stack)
+    holder: dict = {}
+
+    def activate_mid_launch() -> None:
+        household = cp_stack.households.get(cp_stack.household.id)
+        raw = holder["worker"].secret_sink.get(
+            household.runtime_ref, "HERMES_BOOTSTRAP_TOKEN"
+        )
+        assert raw is not None, "the token is issued before launch, or this proves nothing"
+        token = raw.decode("ascii") if isinstance(raw, bytes) else raw
+        revision = household.current_config_revision
+        manifest = cp_stack.configs.manifest(cp_stack.household.id, revision)
+        binding = {
+            "household_id": cp_stack.household.id,
+            "runtime_ref": household.runtime_ref,
+            "config_revision": revision,
+        }
+        bootstrap = BootstrapService(
+            cp_stack.configs, cp_stack.onboarding, cp_stack.jobs
+        )
+        bootstrap.claim(token, **binding)
+        bootstrap.activate(
+            token, **binding, activated_sha256=manifest["config_sha256"]
+        )
+
+    worker = cp_stack.make_worker(
+        providers=_runtime_registry(on_launch=activate_mid_launch),
+        now=BASE_TIME + 500,
+    )
+    holder["worker"] = worker
+    worker.run_once()
+
+    household = cp_stack.households.get(cp_stack.household.id)
+    settled = cp_stack.database.query_one(
+        "SELECT id, status FROM provisioning_jobs WHERE kind = 'runtime'"
+        " AND desired_revision = ?",
+        (household.current_config_revision,),
+    )
+    # Activation won the race — the precondition, not the subject.
+    assert settled["status"] == "succeeded"
+
+    assert cp_stack.jobs.result(settled["id"]) is not None, (
+        "the provider outcome was never recorded because activation got there first"
+    )
+    assert cp_stack.jobs.external_ref(settled["id"]) == household.runtime_ref
+    # And the resource reached `ready` rather than being left at `creating`,
+    # which is the same loss seen from the resource table.
+    assert cp_stack.database.query_one(
+        "SELECT status FROM external_resources WHERE household_id = ?"
+        " AND resource_type = 'runtime' AND config_revision = ?",
+        (cp_stack.household.id, household.current_config_revision),
+    )["status"] == "ready"

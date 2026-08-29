@@ -38,11 +38,31 @@ ALTER TABLE channel_bindings ADD COLUMN published_revision INTEGER;
 -- A household with NO active revision keeps NULL and is therefore staged.
 -- That is correct rather than conservative: nothing is serving it, so nothing
 -- should be routed to it.
+--
+-- AND PER BINDING, NOT PER HOUSEHOLD. Having an active revision N does not make
+-- every one of a household's bindings a member of N. `verify_challenge` writes
+-- a binding the moment a member is verified, and if N+1 is in flight when this
+-- runs, that row is staged for N+1 and absent from N's manifest. Publishing it
+-- as N is the precise failure this column was added to prevent — the gateway
+-- would route that member to a runtime serving N, whose manifest has no pair
+-- for them — and it is worse than the original bug, because a row that is no
+-- longer NULL is one `retire_staged_members` can no longer delete when N+1
+-- fails. The member would hold their identity against every future attempt.
+--
+-- `verified_at` against `activated_at` is what separates them, and it is a
+-- fact already on both rows rather than a new one to record: a binding
+-- verified at or before N activated is carried by N's manifest, and one
+-- verified after it was staged for whatever comes next. Excluding the whole
+-- household instead — the coarser reading of "settled on that revision" —
+-- would strand every EXISTING member of a household that merely happens to
+-- have a rollout in flight, which turns a routing bug into an outage.
 UPDATE channel_bindings
    SET published_revision = (
        SELECT active.revision
          FROM config_revisions AS active
         WHERE active.household_id = channel_bindings.household_id
           AND active.status = 'active'
+          AND active.activated_at IS NOT NULL
+          AND channel_bindings.verified_at <= active.activated_at
    )
  WHERE published_revision IS NULL;

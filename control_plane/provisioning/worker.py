@@ -2985,6 +2985,35 @@ class ProvisioningWorker:
         with self.jobs.db.write() as connection:
             state = self._runtime_state(connection, job)
             if state is not None and state["job_status"] == "succeeded":
+                # Activation got here first. `FlyRuntimeProvisioner.launch`
+                # starts the Machine before it returns, so the Machine can
+                # claim its token and `BootstrapService.activate` can settle
+                # this job while this worker is still inside `launch` — and
+                # then this returned without ever recording what the provider
+                # answered or marking the runtime resource `ready`. In that
+                # ordering the result was not overwritten, it was never
+                # written, which the DSAR export cannot tell apart from a job
+                # that had no provider outcome at all.
+                #
+                # Recording it here is safe precisely because the job is
+                # already terminal: `record_result` writes the two ciphertext
+                # columns and `updated_at`, never `status` or `settled_at`, so
+                # a settled activation stays settled and the provider outcome
+                # stops depending on which of the two racing writers won.
+                self.jobs.record_result(
+                    connection,
+                    job.id,
+                    result=durable_result,
+                    external_ref=result.external_ref,
+                    now=self.clock(),
+                )
+                self._external_resource(
+                    connection,
+                    job,
+                    result.public_result,
+                    status="ready",
+                    revision=job.desired_revision,
+                )
                 return WorkResult(job.id, "succeeded")
             if (
                 state is None

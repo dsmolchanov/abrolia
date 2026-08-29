@@ -252,7 +252,9 @@ def find_stale_bindings(
         verified = bindings.verified(connection, household_id=household_id)
         now_bindings = _projected(verified)
         served = _served(manifest)
-        if now_bindings == served:
+        if now_bindings == served and not _stranded_mid_rollout(
+            connection, row, household_id
+        ):
             continue
         stale.append(StaleHousehold(
             household_id=household_id,
@@ -270,6 +272,36 @@ def find_stale_bindings(
             ),
         ))
     return tuple(stale)
+
+
+def _stranded_mid_rollout(
+    connection: sqlite3.Connection, row, household_id: str
+) -> bool:
+    """A household left mid-rollout with nothing running to finish it.
+
+    Binding drift is how this sweep normally finds work, and it is not the only
+    way a household needs converging. A terminal rollout failure retires the
+    members that revision staged — `_mark_step_problem` calls
+    `retire_staged_members` — which puts the binding table back to exactly the
+    manifest the runtime is still serving. The comparison above then finds no
+    divergence and skips the household, while `_restore_settled_household` has
+    deliberately left it at `provisioning` because the provider was touched and
+    no database-only write can say what the Machine now carries.
+
+    That combination is invisible to every check either function makes on its
+    own: the bindings agree, the household is busy-looking, and no job is left
+    to move it. It is the state D1 was built to reach, and reaching it through
+    binding drift alone missed it — the retirement is what removes the drift.
+
+    So strandedness is asked directly, from the same two facts `_blocked_by`
+    uses to tell BUSY from STRANDED. A household at `provisioning` with an open
+    runtime job is busy and stays skipped here as before; one with no open job
+    has nothing left that will ever finish the rollout, and roll-forward is the
+    repair. `_blocked_by` still has the final say on whether it can be planned.
+    """
+    if row["status"] != "provisioning":
+        return False
+    return _open_runtime_job(connection, household_id) is None
 
 
 def _blocked_by(

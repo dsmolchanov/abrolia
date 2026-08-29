@@ -340,25 +340,36 @@ def test_0011_backfills_from_the_revision_that_is_actually_serving(
                     " 'active', 1, 1, ?)",
                     (household, f"hh-{household}", current),
                 )
-            for household, revision, status in (
-                ("h1", 3, "active"),
-                ("h2", 3, "active"),
-                ("h2", 4, "issued"),
-                ("h3", 1, "issued"),
+            # `activated_at` is set on every ACTIVE revision because
+            # `BootstrapService.activate` writes it in the same statement as
+            # the status (`bootstrap.py:422`) and is the column's sole writer,
+            # so `status = 'active' AND activated_at IS NULL` does not occur.
+            # The fixture said otherwise, which is why it could not express the
+            # in-flight case below at all: with no activation instant to
+            # compare against, every binding of an active household looks
+            # equally like a member of the serving revision.
+            for household, revision, status, activated_at in (
+                ("h1", 3, "active", 100.0),
+                ("h2", 3, "active", 100.0),
+                ("h2", 4, "issued", None),
+                ("h3", 1, "issued", None),
             ):
                 connection.execute(
                     "INSERT INTO config_revisions (id, household_id, revision,"
                     " schema_version, manifest_ciphertext, encryption_key_version,"
-                    " manifest_sha256, status, created_at) VALUES (?, ?, ?, 1,"
-                    " X'00', 'v1', ?, ?, 1)",
+                    " manifest_sha256, status, created_at, activated_at) VALUES"
+                    " (?, ?, ?, 1, X'00', 'v1', ?, ?, 1, ?)",
                     (
                         f"{household}-r{revision}",
                         household,
                         revision,
                         f"{household}{revision}" + "0" * (64 - len(household) - 1),
                         status,
+                        activated_at,
                     ),
                 )
+            # Verified BEFORE their household's revision activated, so revision
+            # 3's manifest carries them.
             for household in ("h1", "h2", "h3"):
                 connection.execute(
                     "INSERT INTO channel_bindings (id, household_id, channel,"
@@ -374,21 +385,37 @@ def test_0011_backfills_from_the_revision_that_is_actually_serving(
                         f"99000000{household[-1]}",
                     ),
                 )
+            # And one verified AFTER h2's revision 3 activated: a member staged
+            # for the in-flight revision 4. Revision 3's manifest has no pair
+            # for them, so publishing them at 3 would route their messages to a
+            # runtime that must deny the turn — and would leave a non-NULL row
+            # that revision 4's failure could no longer retire.
+            connection.execute(
+                "INSERT INTO channel_bindings (id, household_id, channel,"
+                " external_id, chat_id, actor_id, role, verified_at,"
+                " verified_by_actor_id) VALUES ('b-h2-staged', 'h2', 'telegram',"
+                " '990000029', '-100990000109', '990000029', 'adult', 150.0,"
+                " '990000002')"
+            )
 
         assert "0012_channel_binding_published.sql" in database.migrate()
 
         published = dict(
-            (row["household_id"], row["published_revision"])
+            (row["id"], row["published_revision"])
             for row in database.query(
-                "SELECT household_id, published_revision FROM channel_bindings"
+                "SELECT id, published_revision FROM channel_bindings"
             )
         )
         # The settled household publishes at the revision it serves.
-        assert published["h1"] == 3
+        assert published["b-h1"] == 3
         # The mid-rollout household publishes at 3 — what it SERVES — and not
         # at 4, which is only what it is rolling out.
-        assert published["h2"] == 3
+        assert published["b-h2"] == 3
+        # But its member staged for 4 stays STAGED. Having an active revision
+        # does not make every one of a household's bindings a member of it, and
+        # publishing this row is the failure the column exists to prevent.
+        assert published["b-h2-staged"] is None
         # Nothing is serving h3, so nothing of its is routable.
-        assert published["h3"] is None
+        assert published["b-h3"] is None
     finally:
         database.close()
