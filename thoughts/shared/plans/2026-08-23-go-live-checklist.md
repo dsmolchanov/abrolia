@@ -211,10 +211,25 @@ Ordered slices:
   tables, so a preference reaches it either as a manifest projection — which
   makes changing one a revision, with C3b's rollout behind it — or not at all.
 - [ ] **C5. Gateway plumbing.** Redeliver-from-`gateway_ingress` worker (rows
-  are written and never read back); reconcile outbound HMAC scheme between
-  `relay_hmac` (signs `body|ts`) and `verify_webhook` (bare body) — they
-  reject each other today; HTTP entrypoint + narrow deploy unit; relay-key
-  provisioning path (`provisioning/secrets.py` planned, absent).
+  are written and never read back); HTTP entrypoint + narrow deploy unit;
+  relay-key provisioning path (`provisioning/secrets.py` planned, absent).
+
+- [ ] **C5a. One signature between the gateway and the runtime.** *Done — see
+  the inventory below.* `relay_hmac` signed `body|timestamp` and
+  `verify_webhook` verified the bare body, so the runtime rejected every
+  delivery the gateway signed and no WhatsApp message could reach a household
+  at all. Confirmed by running one payload through both ends rather than by
+  reading them. Both sides had passing tests, because each signed and verified
+  with its own helper — the fixture agreed with the code and the code
+  disagreed with the other end.
+
+  The gateway's scheme is the one kept, and not because it came first: a
+  signature over the body alone leaves the timestamp unauthenticated, so a
+  captured body can be replayed forever by attaching a fresh one and every
+  freshness check ever added would pass it. The runtime now reads
+  `X-Relay-Timestamp` — which the gateway has always sent and this end never
+  read, the reason the drift went unnoticed — verifies `body|timestamp`, and
+  enforces the same replay window the gateway does.
 - [ ] **C6. Box hygiene.** Update `phase-DE-pilot.md` checkboxes to the audited
   truth (several `[ ]` are done-but-renamed — e.g. flags boxes closed by #70,
   preferences storage landed in `control_plane/migrations/0006` not
@@ -405,6 +420,22 @@ that the planner chose among owners with an unordered `LIMIT 1`.
 `worker.py` is the consolidation of four currency checks into one answer;
 `rollout.py` exists so the scheduling can be tested without an HTTP client,
 which is what the endpoint's own shape was preventing.
+
+#### Inventory — C5a one signature between the gateway and the runtime
+
+**Files:** `hermes_cloud/ingest/whatsapp_webhook.py`,
+`hermes_cloud/runtime/service.py`, `tests/test_whatsapp.py`.
+
+`gateway/whatsapp_router.py` is deliberately unchanged: it was already
+signing the scheme that survives, and the defect was that the other end
+verified a different one.
+
+The regression that matters imports BOTH ends and verifies one against the
+other, because that is the only place the disagreement was visible — each
+side's own tests passed throughout. It fails when the runtime is reverted to
+the bare-body scheme.
+
+**Branches:** `codex/c5a-relay-hmac-reconciliation`.
 
 #### Inventory — C3d tests that reach what they claim to cover
 
