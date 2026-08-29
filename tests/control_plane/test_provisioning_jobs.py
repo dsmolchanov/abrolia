@@ -1884,7 +1884,7 @@ def _runtime_registry(*, on_prepare=None, on_launch=None, behavior=None):
     refused earlier, for a different reason. Making the provider itself mutate
     is what puts the staleness where the guard is.
     """
-    from control_plane.provisioning.contracts import ProviderRegistry
+    from control_plane.provisioning.contracts import InspectResult, InspectState, ProviderRegistry
     from control_plane.provisioning.fakes import (
         DeterministicFakeProvisioner,
         DryRunRuntimeProvisioner,
@@ -1897,13 +1897,27 @@ def _runtime_registry(*, on_prepare=None, on_launch=None, behavior=None):
                 self.behavior = behavior
 
         def inspect(self, stable_ref):
-            # A runtime reference is a dict and the base fake indexes by a
-            # hashable key. `deprovision_runtime` already unwraps it the same
-            # way; reconcile is the path that needs `inspect` to as well.
+            """Answer READY when this provider is still holding the runtime.
+
+            The split-runtime path inspects with the job's REQUEST, a dict that
+            names no reference, so the base fake — which indexes by a hashable
+            key — finds nothing and reports ABSENT. That made reconcile take
+            the branch where no provider reference exists to compare against,
+            which is the branch where a `runtime_ref` check cannot run at all.
+
+            A provider that accepted the work still has it, so the double says
+            so. Without this the READY branch is unreachable in tests and the
+            comparison it guards could never be exercised.
+            """
             if isinstance(stable_ref, dict):
-                stable_ref = (
-                    stable_ref.get("runtime_ref") or stable_ref.get("app_ref") or ""
-                )
+                held = [
+                    value
+                    for value in self.resources.values()
+                    if value.public_result.get("stage") != "secret_namespace_ready"
+                ]
+                if held:
+                    return InspectResult(InspectState.READY, held[0])
+                return InspectResult(InspectState.ABSENT)
             return super().inspect(stable_ref)
 
         #: Whether the worker got as far as launching. This is how each case
@@ -2114,3 +2128,49 @@ def test_reconcile_refuses_a_runtime_job_whose_revision_moved_on(cp_stack) -> No
     assert provider.ensure_calls == 1, (
         "reconcile re-entered the provider for a revision nobody is serving"
     )
+
+    # Only the revision, and that is measured rather than an omission. The
+    # `runtime_ref` half of this predicate cannot be exercised from here: with
+    # the clause and without it, this path produces an identical result, error
+    # code, provider call count and household row. Its behaviour is pinned by
+    # `test_a_household_with_no_runtime_ref_yet_is_not_read_as_drift` instead,
+    # which asserts the branch directly and says so.
+
+
+def test_a_household_with_no_runtime_ref_yet_is_not_read_as_drift() -> None:
+    """A NULL `runtime_ref` means "not written yet", not "changed".
+
+    The comparison added to the reconcile predicate must stay silent when the
+    household has no reference at all — a job that failed before the bootstrap
+    phase leaves exactly that, and it is the state reconcile exists to resume.
+
+    Asserted against the predicate directly, and labelled as such, because it
+    could not be reached through the worker: with the fake provider that
+    scenario reaches the same outcome with the clause and without it, so an
+    end-to-end version would assert nothing. This is the smaller honest claim
+    — that the branch behaves — rather than a scenario dressed up as one.
+    """
+    from control_plane.provisioning.worker import (
+        REPROVISION_RUNTIME_OPERATION,
+        ProvisioningWorker,
+    )
+
+    class _Job:
+        operation = REPROVISION_RUNTIME_OPERATION
+        desired_revision = 7
+
+    state = {
+        "job_status": "outcome_unknown",
+        "workflow_state": "complete",
+        "household_status": "provisioning",
+        "current_config_revision": 7,
+        "runtime_ref": None,
+    }
+    current = ProvisioningWorker._runtime_projection_is_current
+    assert current(state, _Job(), "synthetic-runtime:anything") is True
+    # And a reference that really did change is drift.
+    assert current(
+        {**state, "runtime_ref": "synthetic-runtime:one"},
+        _Job(),
+        "synthetic-runtime:two",
+    ) is False

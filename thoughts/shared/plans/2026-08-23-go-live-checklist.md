@@ -308,8 +308,15 @@ which is what the endpoint's own shape was preventing.
 
 #### Inventory — C3d tests that reach what they claim to cover
 
-**Files:** `tests/control_plane/test_binding_api.py`,
+**Files:** `control_plane/provisioning/worker.py`,
+`tests/control_plane/test_binding_api.py`,
 `tests/control_plane/test_provisioning_jobs.py`.
+
+`worker.py` is not a test file and this slice was meant to contain none.
+`_runtime_projection_is_current` gained a `runtime_ref` comparison on review's
+instruction, after I argued against it and was overruled — recorded here rather
+than blended in, because a tests-only slice that ships production behaviour
+should say so in its inventory.
 
 **Branches:** `codex/c3d-tests-that-reach-their-path`.
 
@@ -342,6 +349,16 @@ provider call count is the right one.
 The lesson is narrower than "cover everything": a guard whose absence changes
 no observable outcome may still be the only thing preventing an external side
 effect, and outcome-shaped assertions cannot see that.
+
+That predicate later gained a `runtime_ref` comparison too, on review's
+instruction. The argument against it was that the state is unreachable —
+`households.runtime_ref` has one writer, jobs are keyed one per revision, and
+the reference is deterministic for a revision — and implementing it did not
+refute that: with the clause and without it, the worker produces an identical
+result, error code, provider call count and household row. It is pinned by a
+direct assertion on the predicate, which is the only thing that can see it, and
+that test says as much. Recorded so nobody later mistakes it for coverage of a
+reachable defect, or removes it believing it was never justified.
 
 
 ## Track R — Staged rollout (fixed order; runbook §Rollout)

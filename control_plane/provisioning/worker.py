@@ -2018,7 +2018,11 @@ class ProvisioningWorker:
                 with self.jobs.db.write() as connection:
                     runtime_state = self._runtime_state(connection, job)
                 projection_current = self._runtime_projection_is_current(
-                    runtime_state, job
+                    runtime_state,
+                    job,
+                    inspected.result.external_ref
+                    if inspected is not None and inspected.result is not None
+                    else None,
                 )
                 if not projection_current:
                     if inspected.state is InspectState.READY and inspected.result:
@@ -2750,10 +2754,34 @@ class ProvisioningWorker:
         ).fetchone()
 
     @staticmethod
-    def _runtime_projection_is_current(state, job: JobRecord) -> bool:
+    def _runtime_projection_is_current(
+        state, job: JobRecord, expected_ref: str | None = None
+    ) -> bool:
+        """Is this job still acting on the state it was leased for?
+
+        The other three checkpoints compare `households.runtime_ref` against a
+        reference they are HOLDING — `prepared.external_ref` at launch,
+        `result.external_ref` at settle. Reconcile has none until the provider
+        answers, which is what reconcile is for, so this asks only once one is
+        available and stays silent otherwise.
+
+        `expected_ref` is therefore optional in a way the others are not, and
+        the two None cases mean different things. No expected reference means
+        the provider reported ABSENT and there is nothing to compare. A NULL
+        `runtime_ref` on the household means the job crashed BEFORE the
+        bootstrap phase wrote one — a reachable state, and the case reconcile
+        exists to resume, so it must not be read as drift.
+        """
+        if state is None:
+            return False
+        if (
+            expected_ref is not None
+            and state["runtime_ref"] is not None
+            and state["runtime_ref"] != expected_ref
+        ):
+            return False
         return bool(
-            state is not None
-            and state["job_status"] in {"running", "outcome_unknown"}
+            state["job_status"] in {"running", "outcome_unknown"}
             and state["workflow_state"]
             in _workflow_states_for(job, {"runtime_provisioning", "activating"})
             and state["household_status"] == "provisioning"
