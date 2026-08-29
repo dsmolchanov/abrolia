@@ -181,6 +181,35 @@ Ordered slices:
   (replace dead `_validate_no_self_ingestion`, persist the fallback ref);
   permanent-failure → short email fallback sender + `primary_unavailable`
   emission (`observability.py:104` label exists, never emitted).
+  **Split 2026-08-29 into C4a and C4b**, because the write path and the
+  consumer answer different questions and the second is larger than the audit
+  read.
+
+- [ ] **C4a. Give `channel_preferences` a writer, and a fallback it can check.**
+  The table has had a schema, CHECKs and an index since `0006` and no writer at
+  all — `container.py` never even built the repository, so no code path could
+  have written a row. Seeded now by `DesiredSpecPlanner.issue` from the same
+  `primary_channel` result it builds `channels.primary` from.
+  **`primary_channel` is a projection, not a second choice**, and no endpoint
+  sets it: two records of one fact disagree the moment either moves, which is
+  the conflation C3a spent five rounds removing from `channel_bindings`, and
+  the way to change the channel is to re-run the step that proves it.
+  **The fallback is a reference, not a copy**: `0011` adds
+  `fallback_account_id`, the address stays in `accounts`, and the
+  self-ingestion rule is answered by comparing `recovery_email_lookup_hmac`
+  with the household's live `email_identities.address_lookup_hmac` — same
+  `LookupHasher`, so no decryption and nothing supplied by the caller. That
+  replaces `_validate_no_self_ingestion`, which read a row, described in
+  comments what a real check would need, and returned None.
+
+- [ ] **C4b. The consumer, and the alert nobody emits.** Route replies and
+  fallbacks through the preference; permanent-failure → short email fallback
+  sender; emit `primary_unavailable` (`hermes_cloud/core/observability.py:106`
+  — the label exists and nothing has ever emitted it, exactly as
+  `budget_exceeded` did before C1). Its first question is one C4a deliberately
+  did not answer: the runtime reads a manifest, not the control plane's
+  tables, so a preference reaches it either as a manifest projection — which
+  makes changing one a revision, with C3b's rollout behind it — or not at all.
 - [ ] **C5. Gateway plumbing.** Redeliver-from-`gateway_ingress` worker (rows
   are written and never read back); reconcile outbound HMAC scheme between
   `relay_hmac` (signs `body|ts`) and `verify_webhook` (bare body) — they
@@ -290,6 +319,77 @@ being correct at that moment — the exporter that never read it, the projection
 that assumed one binding per actor, the seeding that matched a tuple without
 looking at whose row it was.
 
+
+#### Inventory — C4a preferences writer
+
+**Files:** `AGENTS.repo-invariants.md`,
+`control_plane/channel_preferences.py`, `control_plane/container.py`,
+`control_plane/owners.py`, `tests/control_plane/test_owner_predicate.py`,
+`control_plane/migrations/0011_channel_preference_fallback.sql`,
+`control_plane/api/onboarding.py`, `control_plane/email/service.py`,
+`control_plane/privacy/export.py`,
+`control_plane/providers/email/google_oauth.py`,
+`tests/control_plane/email/test_google_oauth.py`,
+`control_plane/provisioning/planner.py`, `tests/control_plane/conftest.py`,
+`tests/control_plane/test_api.py`,
+`tests/control_plane/test_export_delete.py`,
+`tests/control_plane/test_channel_preferences.py`,
+`tests/control_plane/test_consent_withdrawal.py`,
+`tests/control_plane/test_db.py`, `tests/control_plane/test_manifest.py`.
+
+`container.py` is here because the repository was never constructed in
+production — which is the mechanical reason the table had no writer, and worth
+recording rather than fixing silently. The four test files beyond the
+preferences one are the planner's construction sites and the migration ledger:
+`DesiredSpecPlanner` gains an argument, so `conftest.py` and the two modules
+that build one directly move with it, and `test_db.py` names every migration in
+order.
+
+`tests/control_plane/test_channel_preferences.py` is rewritten rather than
+extended. Its cases passed the repository both halves of the comparison —
+`set_household(..., fallback_email=X, agent_inbox=Y)` — so the self-ingestion
+case proved that two arguments can be compared and nothing about whether the
+system knows its own inbox.
+
+Two files joined during review, and both are the same lesson — a rule that
+only holds where it is asked. `control_plane/email/service.py` refuses a
+mailbox equal to an owner's own contact address at SELECTION, because the
+repository's refusal alone lands after the provider has created the inbox,
+where the family can no longer correct it; it is the one place both the
+managed and own-domain options compose an address.
+`control_plane/privacy/export.py` returns the new rows, because
+`docs/privacy/data-map.md` has promised export and erasure for this table since
+Phase 5 and the promise only became falsifiable once something wrote a row —
+the same sequence `channel_bindings` went through in C3.
+
+`control_plane/api/onboarding.py` joined for the third turn of the same
+lesson: refusing is half the job, and a refusal has to ARRIVE as one.
+`select_step` catches Pydantic's `ValidationError` and nothing else, so the
+selection refusal above reached a JSON client as a 500 while the browser
+route — which redirects on any `ValueError` — showed the family exactly what
+it should. It is a `MailboxRefused` now, answered 409 with its own text the
+way `api/bindings.py` answers a `BindingError`.
+
+`control_plane/providers/email/google_oauth.py` is the third consumer, and the
+one that could not be fixed with the other two: `gmail_agent` reaches selection
+with NO address, because the address exists only once Google grants it. Its
+callback compared the grant with the initiating account alone, so an adult or a
+second owner could connect the mailbox the fallback owner is reached at. The
+rule is now written once — `owner_contact_query` in `email/service.py` — and
+executed by each path in the style it already uses, because two spellings of
+one rule is how the third consumer got forgotten in the first place.
+
+`control_plane/owners.py`, `tests/control_plane/test_owner_predicate.py` and
+the `AGENTS.repo-invariants.md` entry are the FOURTH round, and they are a
+different kind of change: `AGENTS.md` says a class reported twice is one
+missing rule, and this one was patched four times instead. The rule — who a
+household's fallback owner is, and that active means the membership and the
+account both — now lives in one module, with a check that greps the control
+plane for anyone answering it themselves. The fourth finding itself was that
+the predicate required an active membership but not an active account, and
+that the planner chose among owners with an unordered `LIMIT 1`.
+
+**Branches:** `codex/c4a-preferences-writer`.
 
 #### Inventory — C3b revision rollout
 

@@ -38,7 +38,8 @@ def test_migrations_are_ordered_and_idempotent(tmp_path: Path) -> None:
             "0008_runtime_health_ownership.sql",
             "0009_channel_binding_challenges.sql",
             "0010_channel_binding_chat_id.sql",
-            "0011_channel_binding_published.sql",
+            "0011_channel_preference_fallback.sql",
+            "0012_channel_binding_published.sql",
         ]
         assert database.migrate() == []
         assert database.pragma() == {
@@ -121,10 +122,12 @@ def test_0010_repairs_what_has_provenance_and_retires_what_does_not(
                 " 'synthetic-adult', 'adult', 'digest', 'o', 9e9, 0, NULL, 1)"
             )
 
-        # It runs at all, which the rewrite did not. Membership rather than
-        # equality: every later migration applies in the same batch, and this
-        # case is about 0010's behaviour, not about how many follow it.
-        assert "0010_channel_binding_chat_id.sql" in database.migrate()
+        # It runs at all, which the rewrite did not. Everything from 0010
+        # onward applies here — `migrate()` reads the real directory while the
+        # staged one stops short of it — so this names the migration under test
+        # rather than the whole tail, which would need editing for every
+        # migration that follows.
+        assert database.migrate()[0] == "0010_channel_binding_chat_id.sql"
 
         rows = database.query(
             "SELECT id, household_id, external_id, chat_id FROM channel_bindings"
@@ -314,7 +317,7 @@ def test_0011_backfills_from_the_revision_that_is_actually_serving(
     staged = tmp_path / "migrations"
     staged.mkdir()
     for script in sorted(MIGRATIONS_DIR.glob("*.sql")):
-        if script.name.startswith("0011"):
+        if script.name.startswith("0012"):
             break
         (staged / script.name).write_text(script.read_text(encoding="utf-8"))
 
@@ -372,7 +375,7 @@ def test_0011_backfills_from_the_revision_that_is_actually_serving(
                     ),
                 )
 
-        assert "0011_channel_binding_published.sql" in database.migrate()
+        assert "0012_channel_binding_published.sql" in database.migrate()
 
         published = dict(
             (row["household_id"], row["published_revision"])

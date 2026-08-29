@@ -10,6 +10,7 @@ from control_plane.auth.mailer import Mailer, MemoryMailer, ResendMailer
 from control_plane.auth.rate_limit import RateLimiter
 from control_plane.auth.sessions import SessionService
 from control_plane.auth.tokens import MagicLinkService
+from control_plane.channel_preferences import ChannelPreferencesRepository
 from control_plane.config import ControlPlaneConfig
 from control_plane.crypto import FieldCipher, LookupHasher
 from control_plane.db import ControlPlaneDatabase
@@ -124,6 +125,11 @@ class ControlPlaneContainer:
         jobs = JobsRepository(database, cipher, lookup)
         configs = ConfigRepository(database, cipher, lookup, token_hasher)
         bindings = ChannelBindingsRepository(database, cipher, lookup, token_hasher)
+        # Constructed here for the first time. The audit that opened the
+        # go-live checklist found `channel_preferences` with a schema and no
+        # production writer, and this is why: nothing in the container ever
+        # built the repository, so no code path could have written a row.
+        channel_preferences = ChannelPreferencesRepository(database)
         email_identities = EmailIdentityRepository(database, cipher, lookup)
         email_identity_service = EmailIdentityService(email_identities)
         sessions = SessionService(auth)
@@ -222,7 +228,12 @@ class ControlPlaneContainer:
             email_identities=email_identity_service,
         )
         planner = DesiredSpecPlanner(
-            accounts, households, onboarding_repository, configs, bindings
+            accounts,
+            households,
+            onboarding_repository,
+            configs,
+            bindings,
+            channel_preferences,
         )
         worker = ProvisioningWorker(
             jobs=jobs,

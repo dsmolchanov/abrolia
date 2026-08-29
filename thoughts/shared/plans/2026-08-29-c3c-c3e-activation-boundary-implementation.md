@@ -137,7 +137,7 @@ already correct.
 
 #### 1. Migration
 
-**Files**: `control_plane/migrations/0011_channel_binding_published.sql` (new)
+**Files**: `control_plane/migrations/0012_channel_binding_published.sql` (new)
 
 **Changes**:
 
@@ -395,7 +395,7 @@ already holds the row lock.
 
 ## Migration and Rollback
 
-`0011` is additive: one nullable column plus a backfill. Rolling the control
+`0012` is additive: one nullable column plus a backfill. Rolling the control
 plane back leaves the column present and unread, which is inert — the gateway
 predicate is the only reader and it ships in the same deployment.
 
@@ -419,7 +419,7 @@ Retirement in Phase 3 is destructive by design. It only ever removes rows with
 
 #### Inventory — C3c and C3e activation boundary
 
-**Files:** `control_plane/migrations/0011_channel_binding_published.sql`,
+**Files:** `control_plane/migrations/0012_channel_binding_published.sql`,
 `control_plane/repositories/bindings.py`,
 `control_plane/repositories/jobs.py`,
 `control_plane/provisioning/bootstrap.py`,

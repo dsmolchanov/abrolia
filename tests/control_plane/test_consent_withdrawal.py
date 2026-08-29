@@ -334,6 +334,7 @@ def test_no_new_revision_can_be_issued_after_withdrawal(cp_stack) -> None:
         cp_stack.onboarding,
         cp_stack.configs,
         cp_stack.bindings,
+        cp_stack.channel_prefs,
     )
     with (
         cp_stack.database.write() as connection,

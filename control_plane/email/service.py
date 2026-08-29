@@ -6,6 +6,19 @@ import time
 from control_plane.email.local_part import normalize_local_part, suggest_local_part
 from control_plane.email.models import EmailIdentityRecord, EmailOption
 from control_plane.email.repository import EmailIdentityRepository
+from control_plane.owners import owner_contact_query
+
+
+class MailboxRefused(ValueError):
+    """A mailbox this household may not have. The message names no address.
+
+    A `ValueError` subclass so the browser route, which redirects the family
+    back to the form on any of them, keeps treating it as a correctable
+    selection. A TYPE of its own so the JSON route can answer 409 instead of
+    letting a refusal the caller can act on arrive as a 500: `select_step`
+    catches Pydantic's `ValidationError` and nothing else, and a plain
+    `ValueError` there is an unhandled exception.
+    """
 
 
 class EmailIdentityService:
@@ -29,6 +42,8 @@ class EmailIdentityService:
             address = (
                 f"{normalize_local_part(selection['local_part'])}@{selection['domain']}"
             )
+        if address is not None:
+            self._reject_owner_contact(connection, household_id, address)
         identity = self.repository.create_selected(
             connection,
             household_id=household_id,
@@ -41,6 +56,38 @@ class EmailIdentityService:
             "SELECT * FROM email_identities WHERE id = ?", (identity.id,)
         ).fetchone()
         return self.repository._record(current)
+
+    def _reject_owner_contact(
+        self, connection: sqlite3.Connection, household_id: str, address: str
+    ) -> None:
+        """A household's assistant must not answer on an owner's own address.
+
+        `channel_preferences` records the owner's verified contact as the
+        fallback the assistant writes to when the primary channel fails, so a
+        mailbox equal to that address makes every failed delivery arrive back
+        as a new inbound message. `ChannelPreferencesRepository` refuses that
+        pairing, and refusing it THERE alone would be too late: the planner
+        runs after the provider has created and verified the inbox, where a
+        refusal is no longer something the family can correct — it propagates
+        out of the provisioning job's transaction instead of out of the
+        selection they can change.
+
+        So the collision is refused at the door, in the one place both options
+        compose an address: managed and own-domain differ in where the domain
+        comes from and not in this. The comparison is between lookup digests
+        under one `LookupHasher`, so it needs no decryption, and it asks about
+        every ACTIVE OWNER rather than the one the planner happens to pick,
+        because the rule is about the household's inbox and not about which
+        owner row is first.
+        """
+        sql, params = owner_contact_query(
+            self.repository.lookup, household_id=household_id, address=address
+        )
+        if connection.execute(sql, params).fetchone() is not None:
+            raise MailboxRefused(
+                "that mailbox is an owner's own contact address"
+                " (self-ingestion loop)"
+            )
 
     def suggest(self, household_id: str) -> str:
         profile = self.repository.db.query_one(

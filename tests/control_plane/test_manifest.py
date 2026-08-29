@@ -256,6 +256,7 @@ def test_planner_requires_all_three_verified_provider_results(cp_stack) -> None:
         cp_stack.onboarding,
         cp_stack.configs,
         cp_stack.bindings,
+        cp_stack.channel_prefs,
     )
     with pytest.raises(ValueError, match="verified results"), cp_stack.database.write() as connection:
         planner.issue(connection, household_id=cp_stack.household.id)
