@@ -67,7 +67,19 @@ an orphan" are different questions.** They diverge in exactly one case: the job
 is stale BECAUSE IT SUCCEEDED. Every place that answers the second with the
 first must first ask whether the revision activated.
 
-**J2 — Activation is the authority on whether a revision is serving.**
+**J2 — Activation is the authority on whether a revision is serving, AND the
+household must still exist to serve it.** An active revision alone is not
+enough: erasure is a different lifecycle. `DeletionService` moves the household
+to `deleting` and deletes its runtime without superseding
+`config_revisions`, so the revision row still reads `active` while nothing is
+serving. Since every guard below declines to settle a serving job, reading the
+revision alone would leave an `outcome_unknown` runtime job unresolvable — and
+`privacy/delete.py` treats exactly those as unresolved, so the erasure would be
+blocked for good.
+
+A deletion that cannot finish is worse than the teardown this slice prevents:
+one is a runtime nobody meant to destroy, the other is a person's data that
+cannot be removed.
 `config_revisions.status = 'active'` has one writer,
 `BootstrapService.activate`, and it supersedes the previous row in the same
 transaction. The worker's own bookkeeping — `job_status`, `settled_at`, the

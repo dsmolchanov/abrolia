@@ -2840,10 +2840,26 @@ class ProvisioningWorker:
         token means either that the deadline passed OR that activation used it,
         which are opposite facts. #86 fixed three defects that were all this
         same substitution.
+
+        AND A HOUSEHOLD THAT STILL EXISTS TO SERVE. An active revision alone is
+        not enough, because erasure is a different lifecycle: `DeletionService`
+        moves the household to `deleting` and deletes its runtime WITHOUT
+        superseding `config_revisions`. Reading the revision row alone would
+        then call a household "serving" whose runtime is already gone — and
+        because every guard here declines to settle a serving job, the
+        `outcome_unknown` runtime job would never resolve, while
+        `privacy/delete.py` treats exactly those as unresolved. The erasure
+        would be blocked for good.
+
+        A deletion that cannot finish is worse than the teardown this guard
+        exists to prevent: one is a runtime nobody meant to destroy, the other
+        is a person's data that cannot be removed.
         """
         return connection.execute(
-            "SELECT 1 FROM config_revisions WHERE household_id = ?"
-            " AND revision = ? AND status = 'active' LIMIT 1",
+            "SELECT 1 FROM config_revisions AS r"
+            " JOIN households AS h ON h.id = r.household_id"
+            " WHERE r.household_id = ? AND r.revision = ? AND r.status = 'active'"
+            " AND h.status NOT IN ('deleting', 'deleted') LIMIT 1",
             (job.household_id, job.desired_revision),
         ).fetchone() is not None
 

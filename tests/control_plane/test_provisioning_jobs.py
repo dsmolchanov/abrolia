@@ -2596,3 +2596,54 @@ def test_the_deadline_does_not_fail_a_job_whose_revision_activated(cp_stack) -> 
     )
     assert row["status"] == "succeeded"
     assert row["error_code"] != "activation_deadline_passed"
+
+
+def test_erasure_can_settle_a_runtime_job_whose_revision_is_still_active(
+    cp_stack,
+) -> None:
+    """Erasure is a different lifecycle, and it does not supersede the revision.
+
+    `DeletionService` moves the household to `deleting` and deletes its
+    runtime WITHOUT touching `config_revisions`, so the revision row still says
+    `active` while nothing is serving. Reading that row alone made
+    `_revision_is_serving` true, and every guard added by C6a declines to settle
+    a serving job — so the `outcome_unknown` runtime job never resolved, and
+    `privacy/delete.py` treats exactly those as unresolved.
+
+    The erasure would be blocked for good. That is worse than the teardown C6a
+    exists to prevent: one is a runtime nobody meant to destroy, the other is a
+    person's data that cannot be removed.
+    """
+    def time_out_after_the_machine_starts() -> None:
+        raise TimeoutError("the connection ended after the Machine started")
+
+    _queue_rollout_job(cp_stack)
+    worker = cp_stack.make_worker(
+        providers=_runtime_registry(on_launch=time_out_after_the_machine_starts),
+        now=BASE_TIME + 500,
+    )
+    unknown = worker.run_once()
+    assert unknown is not None and unknown.status == "outcome_unknown"
+    revision = _activate_out_of_band(cp_stack, worker)
+
+    # Erasure begins: the household is being deleted and its runtime is gone,
+    # while the revision row still reads `active`.
+    with cp_stack.database.write() as connection:
+        connection.execute(
+            "UPDATE households SET status = 'deleting' WHERE id = ?",
+            (cp_stack.household.id,),
+        )
+    assert cp_stack.database.query_one(
+        "SELECT status FROM config_revisions WHERE household_id = ? AND revision = ?",
+        (cp_stack.household.id, revision),
+    )["status"] == "active", "the precondition: erasure leaves the revision active"
+
+    settled = worker.reconcile(unknown.job_id)
+    assert settled.status != "outcome_unknown", (
+        "an erasure was blocked by a job that could never resolve"
+    )
+    assert cp_stack.database.query_one(
+        "SELECT COUNT(*) AS total FROM provisioning_jobs WHERE household_id = ?"
+        " AND status IN ('running', 'outcome_unknown')",
+        (cp_stack.household.id,),
+    )["total"] == 0, "privacy/delete.py would still see this as unresolved"
