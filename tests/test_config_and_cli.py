@@ -257,6 +257,24 @@ def test_provisioned_gmail_selects_oauth_api_sender(tmp_path: Path, monkeypatch)
         sender.backend.client.close()
 
 
+def test_the_fallback_address_comes_from_the_manifest_and_nowhere_else(
+    tmp_path: Path,
+) -> None:
+    """C4b reads `email.fallback`; an environment variable must not supply one.
+
+    The address is the family's own, and the control plane is what knows which
+    account is the fallback owner — an env var would be a second place to state
+    it, drifting from the preference row that decided it. No manifest therefore
+    means no fallback, which fails closed to sending nothing rather than to
+    writing somewhere stale.
+    """
+    path = tmp_path / "household.toml"
+    path.write_text(runtime_manifest(), encoding="utf-8")
+
+    assert load_config(manifest_path=path, env={}).email_fallback == "owner@example.test"
+    assert load_config(env={"HERMES_EMAIL_FALLBACK": "someone@example.test"}).email_fallback == ""
+
+
 def test_config_repr_never_contains_provider_secrets() -> None:
     canary = "provider-secret-canary"
     config = load_config(
