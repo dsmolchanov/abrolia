@@ -252,8 +252,10 @@ settling at launch would strand bindings with no job to retire them.
       `route()` resolves its owner's sender before and after the migration —
       the deny must not black out existing households. (Automated in Phase 1's
       migration test; repeated here by hand because a mistake is an outage.)
-      **Confirmed by the operator 2026-08-29.** Ticked on their word, not on a
-      check this session ran.
+      Run it with `python3 scripts/rehearse_0012_routing.py <copy-of-db>`,
+      which reports every sender that routes today and would stop. Exit 0 is
+      the pass. **Ticked on the operator's word; the script exists so the next
+      person does not have to reconstruct what the check was.**
 
 ---
 
@@ -453,7 +455,8 @@ Retirement in Phase 3 is destructive by design. It only ever removes rows with
 `tests/control_plane/test_provision_dry_run.py`,
 `tests/control_plane/test_binding_api.py`,
 `tests/control_plane/test_db.py`, `tests/control_plane/chaos_child.py`,
-`tests/test_gateway_routing.py`, `tests/test_feature_flags.py`.
+`tests/test_gateway_routing.py`, `tests/test_feature_flags.py`,
+`scripts/rehearse_0012_routing.py`.
 
 Six files were added during implementation, each because the job's new
 non-terminal state is visible to something the plan did not trace:
