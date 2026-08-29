@@ -21,7 +21,7 @@ from control_plane.email.models import (
     EmailProvisionIntent,
 )
 from control_plane.email.repository import EmailIdentityRepository
-from control_plane.email.service import owner_contact_query
+from control_plane.owners import owner_contact_query
 from control_plane.provisioning.contracts import (
     InspectResult,
     InspectState,

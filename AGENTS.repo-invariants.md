@@ -485,3 +485,50 @@ makes a review loop unable to terminate.
   one human reachable on two channels is two members of `actors.family`. The
   system has no cross-channel notion of a person, and the internal actor names
   made it look as though it did.
+
+### A household's fallback owner is decided in one place
+
+- **Any code that chooses which account receives a household's email fallback,
+  or asks whether an address belongs to one, calls `control_plane/owners.py`.
+  No other module may join `accounts` to `household_memberships`, and "active
+  owner" means the membership AND the account are both `active`.** Enforced by
+  `tests/control_plane/test_owner_predicate.py`: one case greps the control
+  plane for the join and names any module that performs it, the other gives a
+  household a locked owner beside an active one and asserts the locked account
+  is neither chosen as the fallback nor treated as a mailbox collision.
+
+  Recorded after the FOURTH instance, which is three later than
+  `AGENTS.md` allows, and the four are worth listing because every one of them
+  passed its own tests and each looked like a different bug:
+
+  1. `ChannelPreferencesRepository` refused a pairing nothing had asked it
+     about — the table had no writer at all, so the rule was unreachable.
+  2. The refusal moved to `EmailIdentityService.select` for the managed and
+     own-domain mailboxes, because the repository's own refusal lands after
+     the provider has created the inbox, where a family cannot correct it.
+  3. `gmail_agent` walked past that: its address does not exist until Google
+     grants one, so `select` sees `address = None`, and the callback compared
+     the grant with the INITIATING account rather than with every owner.
+  4. The predicate itself was incomplete — membership status without account
+     status — and the planner chose an owner with an unordered `LIMIT 1`, so a
+     LOCKED account could become the fallback and be refused afterwards, from
+     inside a provisioning job whose provider had already succeeded.
+
+  **The shape they share** is that four call sites each needed the same
+  question answered and each answered it locally, correctly for the case in
+  front of them. That is not a review failure; it is what happens when a rule
+  lives in prose. It lives in `owners.py` now, and the queries are returned as
+  SQL and parameters rather than executed, so a caller inside a transaction
+  and a caller holding no connection can both ask it without the rule being
+  written twice.
+
+  **Both lifecycles, in both directions.** A locked account cannot receive a
+  fallback, so it must not be chosen as one — and a mailbox equal to its
+  address must not be refused on its behalf either. Only the first direction
+  is a delivery failure; the second silently blocks an onboarding that had
+  nothing wrong with it, which is the harder one to find.
+
+  **The choice is ordered.** `LIMIT 1` over an unordered set makes which owner
+  is the fallback depend on storage order, and `config_sha256` would then move
+  for a household that changed nothing — the same reason `verified()` orders
+  the bindings it projects.

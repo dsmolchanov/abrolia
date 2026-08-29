@@ -322,7 +322,9 @@ looking at whose row it was.
 
 #### Inventory — C4a preferences writer
 
-**Files:** `control_plane/channel_preferences.py`, `control_plane/container.py`,
+**Files:** `AGENTS.repo-invariants.md`,
+`control_plane/channel_preferences.py`, `control_plane/container.py`,
+`control_plane/owners.py`, `tests/control_plane/test_owner_predicate.py`,
 `control_plane/migrations/0011_channel_preference_fallback.sql`,
 `control_plane/api/onboarding.py`, `control_plane/email/service.py`,
 `control_plane/privacy/export.py`,
@@ -376,6 +378,16 @@ second owner could connect the mailbox the fallback owner is reached at. The
 rule is now written once — `owner_contact_query` in `email/service.py` — and
 executed by each path in the style it already uses, because two spellings of
 one rule is how the third consumer got forgotten in the first place.
+
+`control_plane/owners.py`, `tests/control_plane/test_owner_predicate.py` and
+the `AGENTS.repo-invariants.md` entry are the FOURTH round, and they are a
+different kind of change: `AGENTS.md` says a class reported twice is one
+missing rule, and this one was patched four times instead. The rule — who a
+household's fallback owner is, and that active means the membership and the
+account both — now lives in one module, with a check that greps the control
+plane for anyone answering it themselves. The fourth finding itself was that
+the predicate required an active membership but not an active account, and
+that the planner chose among owners with an unordered `LIMIT 1`.
 
 **Branches:** `codex/c4a-preferences-writer`.
 

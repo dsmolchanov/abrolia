@@ -40,6 +40,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from control_plane.db import ControlPlaneDatabase
+from control_plane.owners import fallback_owner_check_query
 
 PrimaryChannel = Literal["telegram", "whatsapp", "web"]
 FallbackChannel = Literal["email"]
@@ -174,25 +175,29 @@ class ChannelPreferencesRepository:
         so two rows naming one address carry one digest, and this module needs
         neither the plaintext nor a key to know that.
         """
-        owner = connection.execute(
-            "SELECT a.id, a.status, a.recovery_email_lookup_hmac"
-            " FROM accounts AS a"
-            " JOIN household_memberships AS m ON m.account_id = a.id"
-            " WHERE a.id = ? AND m.household_id = ? AND m.role = 'owner'"
-            " AND m.status = 'active'",
-            (account_id, household_id),
-        ).fetchone()
-        if owner is None:
+        # Asked through `control_plane/owners.py`, so "active owner" means the
+        # same thing here as it does to the planner that chooses one and to
+        # the mailbox paths that refuse a collision with one. Two spellings of
+        # this predicate is what four review rounds were about: a membership
+        # can be active while the account behind it is locked, and such an
+        # account can neither receive a fallback nor justify refusing a
+        # mailbox on its behalf.
+        owner_sql, owner_params = fallback_owner_check_query(
+            household_id=household_id, account_id=account_id
+        )
+        if connection.execute(owner_sql, owner_params).fetchone() is None:
             raise ChannelPreferenceError(
                 "a fallback must be an active owner of this household"
             )
-        if owner["status"] != "active":
-            raise ChannelPreferenceError("that account cannot receive a fallback")
+        digest = connection.execute(
+            "SELECT recovery_email_lookup_hmac FROM accounts WHERE id = ?",
+            (account_id,),
+        ).fetchone()["recovery_email_lookup_hmac"]
         placeholders = ",".join("?" for _ in LIVE_IDENTITY_STATUSES)
         collision = connection.execute(
             "SELECT 1 FROM email_identities WHERE household_id = ?"
             f" AND address_lookup_hmac = ? AND status IN ({placeholders}) LIMIT 1",
-            (household_id, owner["recovery_email_lookup_hmac"], *LIVE_IDENTITY_STATUSES),
+            (household_id, digest, *LIVE_IDENTITY_STATUSES),
         ).fetchone()
         if collision is not None:
             raise ChannelPreferenceError(

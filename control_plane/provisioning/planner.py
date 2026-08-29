@@ -5,6 +5,7 @@ import sqlite3
 from dataclasses import dataclass
 
 from control_plane.channel_preferences import ChannelPreferencesRepository
+from control_plane.owners import fallback_owner_query
 from control_plane.privacy.consent import (
     consent_version_and_sha,
     required_consent_purposes,
@@ -74,14 +75,16 @@ class DesiredSpecPlanner:
         results = (email_result, whatsapp_result, channel_result)
         if not all(result and result.get("verified") for result in results):
             raise ValueError("provider results are missing durable verification")
-        membership = connection.execute(
-            "SELECT account_id FROM household_memberships WHERE household_id = ?"
-            " AND role = 'owner' AND status = 'active' LIMIT 1",
-            (household_id,),
-        ).fetchone()
+        # `control_plane/owners.py` answers this, and nothing here does: the
+        # account chosen becomes the household's email fallback, and choosing
+        # it by membership alone let a LOCKED account be picked and then
+        # refused — from inside a provisioning job, after the provider had
+        # already succeeded.
+        owner_sql, owner_params = fallback_owner_query(household_id)
+        membership = connection.execute(owner_sql, owner_params).fetchone()
         if membership is None:
             raise ValueError("household has no active account owner")
-        account = self.accounts.get(membership["account_id"])
+        account = self.accounts.get(membership["id"])
         if account is None:
             raise ValueError("account owner is unavailable")
         email_public = email_result["public_result"]

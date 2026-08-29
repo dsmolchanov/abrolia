@@ -3,49 +3,10 @@ from __future__ import annotations
 import sqlite3
 import time
 
-from control_plane.crypto import LookupHasher, normalize_email
 from control_plane.email.local_part import normalize_local_part, suggest_local_part
 from control_plane.email.models import EmailIdentityRecord, EmailOption
 from control_plane.email.repository import EmailIdentityRepository
-
-#: The one question every mailbox path must ask before it becomes durable.
-#:
-#: C4a makes an active owner's verified contact the household's email fallback,
-#: so a mailbox equal to that address is a loop: every failed delivery arrives
-#: back as a new inbound message. `ChannelPreferencesRepository` refuses to
-#: record such a pairing, and by then the mailbox exists — so the question has
-#: to be asked by each path that can create one, and asked the same way.
-#:
-#: Stated once here because it has now been missed twice: the repository
-#: refused a pairing nothing had asked it about, and the fix for the managed
-#: and own-domain options left `gmail_agent` out, since its address is not
-#: known until Google grants it. Two spellings of one rule is how the third
-#: consumer gets forgotten.
-#:
-#: It asks about EVERY active owner rather than one, because the fallback is
-#: chosen from them and not fixed in advance.
-_OWNER_CONTACT_SQL = (
-    "SELECT 1 FROM accounts AS a JOIN household_memberships AS m"
-    " ON m.account_id = a.id WHERE m.household_id = ? AND m.role = 'owner'"
-    " AND m.status = 'active' AND a.recovery_email_lookup_hmac = ? LIMIT 1"
-)
-
-
-def owner_contact_query(
-    lookup: LookupHasher, *, household_id: str, address: str
-) -> tuple[str, tuple[str, str]]:
-    """The SQL and parameters that answer "is this an owner's own address?".
-
-    Returned rather than executed, so each caller runs it the way it already
-    talks to the database — inside the selection's transaction, or as a plain
-    read from a service that holds no connection — while the rule itself is
-    written down once.
-
-    The comparison is between lookup digests: `accounts` and `email_identities`
-    hash addresses with the same `LookupHasher`, so equality of address is
-    equality of digest, and no caller needs a key or a plaintext.
-    """
-    return _OWNER_CONTACT_SQL, (household_id, lookup.email(normalize_email(address)))
+from control_plane.owners import owner_contact_query
 
 
 class MailboxRefused(ValueError):
