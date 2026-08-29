@@ -106,6 +106,39 @@ the ingress id and the last error code, never the body or the sender.
 still low cannot outlive the window in which delivering it would mean anything.
 A WhatsApp message delivered three days late is not a repair.
 
+## The worker's invariants
+
+Written down because not writing them down is what went wrong: four review
+generations found these one at a time, each fix locally correct and incomplete
+because the rule was being inferred from the last defect rather than stated.
+`GatewayRedeliverWorker._process` is ordered to satisfy them in this order, and
+each has a test named for it.
+
+1. **Classification is never gated.** A row's outcome is either TERMINAL —
+   too old, no provenance, nobody to deliver to, a signature that does not
+   verify — and deletes the row, or RETRYABLE and keeps it. Terminal outcomes
+   are retention and security decisions that hold whether or not traffic is
+   flowing. The kill switch sits exactly on that seam: it stops sending and
+   retrying, never classification, so an incident does not also suspend
+   cleanup.
+2. **One clock per row, read when that row is processed.** A batch is up to
+   `limit` rows with a blocking call in each. A batch-start stamp goes stale
+   inside the batch, and a backoff scheduled after a delivery attempt is
+   measured from after it, because the attempt consumed real time.
+3. **An attempt is spent only on a genuine try that could succeed later.** No
+   key yet, and the runtime refusing. A hold spends none — an operator brake
+   must not exhaust the work it was pulled to protect. A terminal drop spends
+   none, because nothing is left to try.
+4. **Re-routing decides whether to deliver, never to whom.** On the channel
+   the row arrived on, and the answer must agree with the household the row
+   was accepted for.
+5. **Nothing is signed that was not proven to come from the relay.** The
+   stored timestamp and signature are verified against the key that later
+   appears before anything is re-signed.
+
+Structurally: every row yields exactly one outcome, and a row that fails
+unexpectedly is deferred rather than abandoning the batch.
+
 ## Risks
 
 **A retained payload may never have been authenticated.** The

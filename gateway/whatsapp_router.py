@@ -386,11 +386,54 @@ class GatewayRedeliverWorker:
     spent, which is the same as not having it — a message the gateway accepted
     responsibility for was lost the moment the first attempt failed.
 
-    Rows are RE-ROUTED rather than delivered to the household the first attempt
-    resolved. That matters most for the case this was written for: a row kept
-    because no relay key existed is retried after C5c installs one, and by then
-    the binding may also have changed. Trusting the old answer would deliver a
-    message to a household that no longer holds the sender.
+    THE INVARIANTS, written down because not writing them down is what went
+    wrong. This function has five cross-cutting concerns, and four review
+    generations found them one at a time — each fix locally correct, each
+    incomplete, because the rule was being inferred from the last defect rather
+    than stated. They are stated here, and `_process` is ordered to satisfy
+    them in this order:
+
+    **I1 — Every row is classified before anything is gated.** A row's outcome
+    splits in two. TERMINAL outcomes delete the row and are retention or
+    security decisions: too old to be worth delivering, no provenance to
+    authenticate, nobody to deliver to, a signature that does not verify. Those
+    are correct whether or not traffic is flowing, so nothing gates them.
+    RETRYABLE outcomes keep the row, and delivery sends it; both are gated.
+    The kill switch sits exactly on that seam — it stops sending and retrying,
+    never classification, so an incident does not also suspend cleanup.
+
+    **I2 — One clock per row, read when that row is processed.** Expiry, route
+    freshness, the runtime signature and every backoff are time-sensitive, and
+    a batch is up to `limit` rows with a blocking network call in each. A stamp
+    taken at batch start goes stale inside the batch: past
+    `REPLAY_WINDOW_SECONDS` the next row routes as `timestamp_replay` and is
+    deleted as undeliverable. A backoff scheduled after a delivery attempt is
+    measured from AFTER it, because the attempt itself consumed real time.
+
+    **I3 — An attempt is spent only on a genuine try that could succeed later.**
+    No key yet and the runtime refusing are attempts. A hold is not: the switch
+    being off is an operator decision, and letting it burn `MAX_ATTEMPTS` would
+    mean the brake destroyed the work it was pulled to protect. A terminal drop
+    spends nothing because there is nothing left to try.
+
+    **I4 — Re-routing decides WHETHER to deliver, never to whom.** A row waits
+    across the window in which a binding can change, so it is re-routed on the
+    channel it arrived on — and the answer must agree with the household the
+    row was accepted for. A sender rebound from A to B would otherwise carry
+    A's message into B's runtime, signed with B's key.
+
+    **I5 — Nothing is signed that was not proven to come from the relay.** The
+    `relay_key_absent` path retains a row without verifying it, because there
+    is no key to verify with. The stored timestamp and signature are checked
+    against the key that later appears BEFORE anything is re-signed; a row that
+    cannot answer is dropped, never blessed. The gateway's signature is exactly
+    the runtime's reason to trust a payload.
+
+    One more, which is structural rather than about the domain: **every row
+    yields exactly one outcome, and a row that fails unexpectedly is deferred
+    rather than allowed to abandon the batch.** `_process` returns that outcome
+    and `run_once` only counts, so a row cannot be both delivered and deferred,
+    and one poison row cannot block a backlog forever.
     """
 
     #: First retry this far out, doubling per attempt. A runtime that is down
@@ -414,147 +457,122 @@ class GatewayRedeliverWorker:
             raise ValueError("a redeliver worker needs an ingress store to read")
 
     def run_once(self, *, limit: int = 100) -> RedeliverReport:
-        now = self.router.now_fn()
-        # One stamp for the whole pass, and it is not cosmetic: it is what the
-        # re-route below is checked against and what each redelivery is signed
-        # with, so a row cannot be routed against one instant and signed for
-        # another.
-        timestamp = str(int(now))
-        delivered = deferred = exhausted = expired = undeliverable = 0
-        held = unverifiable = 0
-        # The incident brake, asked HERE and not only at ingress. The switch is
-        # read at call time so it can be thrown during an incident, and a brake
-        # that stops new webhooks while a worker keeps draining the backlog
-        # into the runtime is not a brake. Nothing is dropped: the rows stay
-        # for a later enabled run.
-        rows = self.store.due(now=now, limit=limit)
-        for index, row in enumerate(rows):
-            ingress_id = row["id"]
-            if now - row["received_at"] > self.MAX_AGE_SECONDS:
-                self.store.mark_delivered(ingress_id)
-                expired += 1
-                continue
-            if not self._has_provenance(row):
-                # A row that cannot say what it arrived as. Written by the
-                # implementation before this one — which retained rows after a
-                # REJECTED HMAC — or by any version predating these columns.
-                # It cannot be authenticated, and the one thing that must never
-                # happen is signing it with the real key, so it is dropped
-                # rather than blessed.
-                self.store.mark_delivered(ingress_id)
-                unverifiable += 1
-                continue
-            # Re-routed on the channel the row ARRIVED on. Defaulting to
-            # whatsapp here made a telegram row resolve against the wrong
-            # binding set and get dropped as undeliverable.
-            #
-            # And with a FRESH timestamp: `route` refuses `None` outright in
-            # strict mode and refuses anything outside `REPLAY_WINDOW_SECONDS`
-            # in either, so passing the message's original stamp would answer
-            # `timestamp_replay` for every row and drop the whole backlog. The
-            # window guards an inbound webhook's freshness; a redelivery's own
-            # freshness is now.
-            routed = self.router.route(
-                row["sender"], row["channel"], timestamp=timestamp
-            )
-            if routed.status == "denied" or routed.household_id != row["household_id"]:
-                # Either nobody holds this sender now, or SOMEBODY ELSE does.
-                # The second is why the row remembers its household instead of
-                # trusting the lookup: a sender rebound from A to B between the
-                # failure and the retry would otherwise have carried A's
-                # message into B's runtime, signed with B's key — one
-                # household's content delivered to another. Re-routing is still
-                # right; it just decides whether to deliver, never to whom.
-                self.store.mark_delivered(ingress_id)
-                undeliverable += 1
-                continue
-            # THE BRAKE, before anything that either spends an attempt or
-            # delivers, and not once per batch. Two orderings were wrong here.
-            # Checking once before selecting the batch let a switch thrown
-            # during the first delivery send the remaining rows. Checking just
-            # before `runtime_deliver` still left the `relay_key_absent` defer
-            # above it, so a keyless row spent an attempt on every disabled run
-            # and `MAX_ATTEMPTS` deleted it during the incident — the brake
-            # destroying exactly the work it was pulled to protect, which is
-            # the thing this hold exists to prevent.
-            #
-            # The terminal cleanups above stay outside it deliberately: expiry,
-            # missing provenance and an unroutable sender are retention and
-            # security decisions that are correct whether or not traffic is
-            # flowing, and holding a forged or expired row would be keeping
-            # message content for no reason.
-            if not is_whatsapp_shared_enabled():
-                held += self._hold(row, now)
-                for remaining in rows[index + 1 :]:
-                    held += self._hold(remaining, now)
-                break
-            key = self.router.relay_keys.get(routed.household_id)
-            if not key:
-                # Still no key. This is the wait C5c ends.
-                kept = self._defer(row, now, "relay_key_absent")
-                deferred += kept
-                exhausted += 1 - kept
-                continue
-            if not verify_relay_hmac(
-                key, row["payload"], row["origin_timestamp"], row["origin_signature"]
-            ):
-                # PROVE IT CAME FROM THE RELAY, then sign it. The
-                # `relay_key_absent` path retains a row without ever verifying
-                # it, because there was no key to verify with — so without this
-                # check the worker would take an unauthenticated payload and
-                # give it a valid signature the moment C5c installed a key.
-                # Anyone able to reach the gateway for a known sender during
-                # that window could have had a forged body laundered into the
-                # runtime's trusted ingest.
-                #
-                # The original timestamp is used for the check because that is
-                # what was signed. Freshness is not what is being asked here —
-                # authenticity is — and the fresh stamp below is what answers
-                # freshness to the runtime.
-                self.store.mark_delivered(ingress_id)
-                unverifiable += 1
-                continue
+        """Drain what is due. Every row gets exactly one outcome; this counts.
+
+        The selection clock is the only one taken here — see I2: each row reads
+        its own, because the delivery inside the loop blocks and a batch-wide
+        stamp goes stale between rows.
+        """
+        counted: dict[str, int] = {}
+        for row in self.store.due(now=self.router.now_fn(), limit=limit):
             try:
-                if self.router.runtime_deliver:
-                    # Re-signed under the household's current key, over the
-                    # same body, with this pass's stamp: the runtime enforces
-                    # the replay window C5a gave it, so a redelivery carrying
-                    # the original hour-old signature would be refused by the
-                    # very freshness check that makes the scheme safe. The BODY
-                    # is unchanged and now proven authentic, so this is the same
-                    # message and not a new one — the runtime's ingest dedupes
-                    # on the relay provenance it carries, which is why this
-                    # slice adds no second idempotency mechanism beside it.
-                    self.router.runtime_deliver(
-                        routed.household_id,
-                        row["payload"],
-                        timestamp,
-                        relay_hmac(key, row["payload"], timestamp),
-                    )
+                outcome = self._process(row)
             except Exception:
-                kept = self._defer(row, now, "runtime_unavailable")
-                deferred += kept
-                exhausted += 1 - kept
-                continue
-            self.store.mark_delivered(ingress_id)
-            delivered += 1
+                # A row whose processing throws must not abandon the batch, and
+                # must not spin: it is deferred like any other retryable
+                # failure, so a poison row backs off and is eventually dropped
+                # by `MAX_ATTEMPTS` instead of blocking every row behind it.
+                outcome = self._defer(row, self.router.now_fn(), "worker_error")
+            counted[outcome] = counted.get(outcome, 0) + 1
         return RedeliverReport(
-            delivered=delivered,
-            deferred=deferred,
-            dropped_exhausted=exhausted,
-            dropped_expired=expired,
-            dropped_undeliverable=undeliverable,
-            dropped_unverifiable=unverifiable,
-            held=held,
+            delivered=counted.get("delivered", 0),
+            deferred=counted.get("deferred", 0),
+            dropped_exhausted=counted.get("exhausted", 0),
+            dropped_expired=counted.get("expired", 0),
+            dropped_undeliverable=counted.get("undeliverable", 0),
+            dropped_unverifiable=counted.get("unverifiable", 0),
+            held=counted.get("held", 0),
         )
 
-    def _hold(self, row, now: float) -> int:
-        """Leave a row exactly as it is, for a run when the switch is back on.
+    def _process(self, row) -> str:
+        """One row, one outcome. Ordered by the invariants in the class docstring."""
+        # I2: this row's clock, not the batch's.
+        now = self.router.now_fn()
+        ingress_id = row["id"]
 
-        Not a drop and not a failure, so it does not spend an attempt: the
-        switch being off is an operator decision, and letting it burn
-        `MAX_ATTEMPTS` would mean the brake destroyed the work it was pulled to
-        protect.
+        # ------------------------------------------------------------------
+        # I1, first half: TERMINAL classification. Ungated — these delete the
+        # row, and deleting message content is correct during an incident.
+        # ------------------------------------------------------------------
+        if now - row["received_at"] > self.MAX_AGE_SECONDS:
+            # Attempts are not the only way a row goes stale. A message
+            # delivered a day late is not a repair, and holding it is the
+            # retention problem either way.
+            self.store.mark_delivered(ingress_id)
+            return "expired"
+        if not self._has_provenance(row):
+            # I5: a row that cannot say what it arrived as. Written before
+            # these columns existed, or by the implementation that retained
+            # rows after a REJECTED HMAC. It can never be authenticated, so it
+            # is dropped rather than kept for a signature it must not get.
+            self.store.mark_delivered(ingress_id)
+            return "unverifiable"
+        stamp = str(int(now))
+        # I4, and on the channel the row ARRIVED on: defaulting to whatsapp
+        # resolved a telegram row against the wrong binding set. The stamp is
+        # fresh because `route` refuses `None` and anything outside
+        # `REPLAY_WINDOW_SECONDS` — that window guards an inbound webhook's
+        # freshness, and a redelivery's own freshness is now.
+        routed = self.router.route(row["sender"], row["channel"], timestamp=stamp)
+        if routed.status == "denied" or routed.household_id != row["household_id"]:
+            # Either nobody holds this sender now — a revocation taking effect
+            # on a message in flight, which is the right outcome — or somebody
+            # else does, which is I4: re-routing decides whether, never to whom.
+            self.store.mark_delivered(ingress_id)
+            return "undeliverable"
+        key = self.router.relay_keys.get(routed.household_id)
+        if key is not None and not verify_relay_hmac(
+            key, row["payload"], row["origin_timestamp"], row["origin_signature"]
+        ):
+            # I5. Checked HERE, above the brake, because it is terminal: a body
+            # a present key rejects is forged or corrupt and no future state
+            # makes it deliverable. The original timestamp is what the check
+            # uses because that is what was signed — authenticity is the
+            # question, and the fresh stamp below answers freshness instead.
+            self.store.mark_delivered(ingress_id)
+            return "unverifiable"
+
+        # ------------------------------------------------------------------
+        # I1, second half: RETRYABLE work and delivery. Everything below is
+        # gated by the brake, and nothing above it is.
+        # ------------------------------------------------------------------
+        if not is_whatsapp_shared_enabled():
+            # Per row rather than per batch: a batch is up to `limit` rows with
+            # a blocking call in each, so a switch thrown during the first
+            # delivery has to stop the rest. I3 — a hold spends no attempt.
+            self._hold(row, now)
+            return "held"
+        if key is None:
+            # The wait C5c ends. I3 — a genuine attempt, so it spends one.
+            return self._defer(row, now, "relay_key_absent")
+        try:
+            if self.router.runtime_deliver:
+                # Re-signed under the household's current key, over the same
+                # body, with this row's stamp: the runtime enforces the replay
+                # window C5a gave it, so the original hour-old signature would
+                # be refused by the very freshness check that makes the scheme
+                # safe. The BODY is unchanged and now proven authentic, so this
+                # is the same message and not a new one — the runtime's ingest
+                # dedupes on the relay provenance it carries, which is why this
+                # slice adds no second idempotency mechanism beside it.
+                self.router.runtime_deliver(
+                    routed.household_id,
+                    row["payload"],
+                    stamp,
+                    relay_hmac(key, row["payload"], stamp),
+                )
+        except Exception:
+            # I2: measured from AFTER the attempt. A delivery that blocked for
+            # a minute before failing has already spent that minute, and
+            # backing off from before it would retry immediately.
+            return self._defer(row, self.router.now_fn(), "runtime_unavailable")
+        self.store.mark_delivered(ingress_id)
+        return "delivered"
+
+    def _hold(self, row, now: float) -> None:
+        """Leave a row as it is, for a run when the switch is back on.
+
+        I3: not a drop and not a failure, so it spends no attempt.
         """
         self.store.defer(
             row["id"],
@@ -562,7 +580,6 @@ class GatewayRedeliverWorker:
             not_before=now + self.BASE_BACKOFF_SECONDS,
             spend_attempt=False,
         )
-        return 1
 
     @staticmethod
     def _has_provenance(row) -> bool:
@@ -572,19 +589,19 @@ class GatewayRedeliverWorker:
             for column in ("channel", "household_id", "origin_timestamp", "origin_signature")
         )
 
-    def _defer(self, row, now: float, error: str) -> int:
-        """Keep the row for another attempt, or drop it once attempts run out.
+    def _defer(self, row, now: float, error: str) -> str:
+        """Spend an attempt: keep the row, or drop it once attempts run out.
 
-        Returns 1 if the row was kept and 0 if it was dropped, so the caller
-        counts one or the other from a single answer.
+        Returns the outcome name, so the caller reports what happened rather
+        than deciding it a second time.
         """
         attempts = int(row["attempts"]) + 1
         if attempts >= self.MAX_ATTEMPTS:
             self.store.mark_delivered(row["id"])
-            return 0
+            return "exhausted"
         self.store.defer(
             row["id"],
             error=error,
             not_before=now + self.BASE_BACKOFF_SECONDS * (2 ** (attempts - 1)),
         )
-        return 1
+        return "deferred"

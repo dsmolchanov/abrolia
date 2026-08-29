@@ -960,3 +960,212 @@ def test_the_brake_does_not_spend_the_attempts_of_a_keyless_row(
     clock[0] += GatewayRedeliverWorker.BASE_BACKOFF_SECONDS * 2
     assert worker.run_once().public_dict()["delivered"] == 1
     assert delivered == [body]
+
+
+def test_a_slow_delivery_does_not_expire_the_rows_behind_it(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """I2: one clock per row, read when that row is processed.
+
+    A batch is up to `limit` rows with a blocking network call in each, so a
+    stamp taken at batch start goes stale INSIDE the batch. Once the first
+    delivery has blocked longer than `REPLAY_WINDOW_SECONDS`, the next row was
+    routed with that stale stamp, answered `timestamp_replay`, and was deleted
+    as undeliverable — a queued household message lost because the one before
+    it was slow.
+    """
+    monkeypatch.setenv("ABROLIA_WHATSAPP_SHARED_ENABLED", "1")
+    gateway_key = b"synthetic-gateway-hmac-key-1234567890abcdef"
+    db, hid, phone = _bound_household(tmp_path, gateway_key=gateway_key)
+    key = b"household-relay-key-1234567890abcdef"
+
+    clock = [1_000_000.0]
+    delivered: list[bytes] = []
+    failing = True
+
+    def deliver(household_id, payload, timestamp, signature):
+        if failing:
+            raise RuntimeError("not yet")
+        # This delivery blocks for longer than the replay window.
+        clock[0] += WhatsAppGatewayRouter.REPLAY_WINDOW_SECONDS + 100
+        delivered.append(payload)
+
+    router = WhatsAppGatewayRouter(
+        db,
+        relay_keys={hid: key},
+        gateway_hmac_key=gateway_key,
+        ingress_path=tmp_path / "ingress.db",
+        runtime_deliver=deliver,
+        now_fn=lambda: clock[0],
+    )
+    first, second = b'{"message":"one"}', b'{"message":"two"}'
+    for body in (first, second):
+        ts = str(int(clock[0]))
+        router.handle_webhook(
+            body, phone, timestamp=ts, signature=relay_hmac(key, body, ts)
+        )
+        clock[0] += 1
+    assert _ingress_count(tmp_path / "ingress.db") == 2
+
+    failing = False
+    clock[0] += GatewayRedeliverWorker.BASE_BACKOFF_SECONDS + 1
+    report = GatewayRedeliverWorker(router).run_once()
+    assert report.public_dict()["delivered"] == 2, (
+        "the row behind a slow delivery was dropped as a replay"
+    )
+    assert report.public_dict()["dropped_undeliverable"] == 0
+    assert delivered == [first, second]
+
+
+def test_a_backoff_is_measured_from_after_the_attempt_that_failed(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """I2, the other half: an attempt consumes real time.
+
+    A delivery that blocked for a minute before failing has already spent that
+    minute. Scheduling the retry from a stamp taken BEFORE it would make the
+    row due again immediately and retry hot through an outage — which is the
+    thing the backoff exists to prevent.
+    """
+    monkeypatch.setenv("ABROLIA_WHATSAPP_SHARED_ENABLED", "1")
+    gateway_key = b"synthetic-gateway-hmac-key-1234567890abcdef"
+    db, hid, phone = _bound_household(tmp_path, gateway_key=gateway_key)
+    key = b"household-relay-key-1234567890abcdef"
+
+    clock = [1_000_000.0]
+    blocked_for = 600.0
+
+    def slow_then_fail(household_id, payload, timestamp, signature):
+        clock[0] += blocked_for
+        raise RuntimeError("the runtime took a long time to say no")
+
+    router = WhatsAppGatewayRouter(
+        db,
+        relay_keys={hid: key},
+        gateway_hmac_key=gateway_key,
+        ingress_path=tmp_path / "ingress.db",
+        runtime_deliver=slow_then_fail,
+        now_fn=lambda: clock[0],
+    )
+    body = b'{"message":"slow refusal"}'
+    ts = str(int(clock[0]))
+    router.handle_webhook(body, phone, timestamp=ts, signature=relay_hmac(key, body, ts))
+
+    # Past the backoff the ingress attempt already scheduled, so the row is due.
+    clock[0] += GatewayRedeliverWorker.BASE_BACKOFF_SECONDS + 1
+    started = clock[0]
+    GatewayRedeliverWorker(router).run_once()
+    next_attempt = sqlite3.connect(tmp_path / "ingress.db").execute(
+        "SELECT next_attempt_at FROM gateway_ingress"
+    ).fetchone()[0]
+    assert next_attempt >= started + blocked_for, (
+        "the retry was scheduled from before the attempt that consumed the time"
+    )
+
+
+def test_the_brake_stops_delivery_but_not_cleanup(tmp_path: Path, monkeypatch) -> None:
+    """I1: the switch sits on the terminal/retryable seam.
+
+    An incident suspends SENDING. It must not also suspend retention and
+    security cleanup, or a forged payload and an expired message are kept for
+    the length of the incident — message content held for no reason, and held
+    precisely when the operator is trying to contain something.
+    """
+    monkeypatch.setenv("ABROLIA_WHATSAPP_SHARED_ENABLED", "1")
+    gateway_key = b"synthetic-gateway-hmac-key-1234567890abcdef"
+    db, hid, phone = _bound_household(tmp_path, gateway_key=gateway_key)
+    key = b"household-relay-key-1234567890abcdef"
+
+    clock = [1_000_000.0]
+    path = tmp_path / "ingress.db"
+    store = GatewayStore(path)
+    # One deliverable, one already too old, one whose signature is a lie.
+    good = b'{"message":"deliverable"}'
+    good_ts = str(int(clock[0]))
+    store.persist_before_ack(
+        good, phone, channel="whatsapp", household_id=hid,
+        timestamp=good_ts, signature=relay_hmac(key, good, good_ts), now=clock[0],
+    )
+    store.persist_before_ack(
+        b'{"message":"far too old"}', phone, channel="whatsapp", household_id=hid,
+        timestamp=good_ts, signature=relay_hmac(key, b'{"message":"far too old"}', good_ts),
+        now=clock[0] - GatewayRedeliverWorker.MAX_AGE_SECONDS * 2,
+    )
+    forged = b'{"message":"never signed"}'
+    store.persist_before_ack(
+        forged, phone, channel="whatsapp", household_id=hid,
+        timestamp=good_ts, signature="sha256=" + "0" * 64, now=clock[0],
+    )
+
+    router = WhatsAppGatewayRouter(
+        db,
+        relay_keys={hid: key},
+        gateway_hmac_key=gateway_key,
+        ingress_path=path,
+        runtime_deliver=lambda h, p, t, s: (_ for _ in ()).throw(
+            AssertionError("nothing may be sent while the switch is off")
+        ),
+        now_fn=lambda: clock[0],
+    )
+    monkeypatch.setenv("ABROLIA_WHATSAPP_SHARED_ENABLED", "0")
+    report = GatewayRedeliverWorker(router).run_once().public_dict()
+
+    assert report["dropped_expired"] == 1, "the brake suspended retention cleanup"
+    assert report["dropped_unverifiable"] == 1, "the brake kept a forged payload"
+    assert report["held"] == 1, "the deliverable row was not held"
+    assert report["delivered"] == 0
+    assert _ingress_count(path) == 1, "only the deliverable row should remain"
+
+
+def test_one_unprocessable_row_does_not_take_the_batch_with_it(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Structural: a row that throws is deferred, not allowed to abandon the run.
+
+    Without this the first row to raise anywhere outside the delivery call
+    aborts `run_once` before every row behind it, and because nothing was
+    deferred the next run selects the same row and does it again — a backlog
+    blocked forever by one bad row, with no backoff between attempts.
+    """
+    monkeypatch.setenv("ABROLIA_WHATSAPP_SHARED_ENABLED", "1")
+    gateway_key = b"synthetic-gateway-hmac-key-1234567890abcdef"
+    db, hid, phone = _bound_household(tmp_path, gateway_key=gateway_key)
+    key = b"household-relay-key-1234567890abcdef"
+
+    clock = [1_000_000.0]
+    delivered: list[bytes] = []
+    router = WhatsAppGatewayRouter(
+        db,
+        relay_keys={hid: key},
+        gateway_hmac_key=gateway_key,
+        ingress_path=tmp_path / "ingress.db",
+        runtime_deliver=lambda h, p, t, s: delivered.append(p),
+        now_fn=lambda: clock[0],
+    )
+    poison, healthy = b'{"message":"poison"}', b'{"message":"healthy"}'
+    for body in (poison, healthy):
+        ts = str(int(clock[0]))
+        # Persisted directly so both rows are due and neither was delivered.
+        router.store.persist_before_ack(
+            body, phone, channel="whatsapp", household_id=hid,
+            timestamp=ts, signature=relay_hmac(key, body, ts), now=clock[0],
+        )
+
+    real_route = router.route
+    calls: list[int] = []
+
+    def route_that_throws_once(sender, channel="whatsapp", *, timestamp=None):
+        calls.append(1)
+        if len(calls) == 1:  # the first row processed
+            raise RuntimeError("the binding lookup blew up")
+        return real_route(sender, channel, timestamp=timestamp)
+
+    router.route = route_that_throws_once
+    report = GatewayRedeliverWorker(router).run_once().public_dict()
+
+    assert delivered == [healthy], "the batch stopped at the row that threw"
+    assert report["deferred"] == 1, "the row that threw was not deferred"
+    next_attempt = sqlite3.connect(tmp_path / "ingress.db").execute(
+        "SELECT next_attempt_at FROM gateway_ingress"
+    ).fetchone()[0]
+    assert next_attempt > clock[0], "the failed row would be retried hot"
