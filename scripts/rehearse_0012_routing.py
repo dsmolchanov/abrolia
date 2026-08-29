@@ -49,10 +49,23 @@ def main(argv: list[str]) -> int:
         print(f"not a file: {source}")
         return 2
 
-    work = Path(tempfile.mkdtemp()) / "rehearsal.db"
-    shutil.copy2(source, work)
-    database = ControlPlaneDatabase(work)
+    # The copy is bounded to the operation that needs it. `mkdtemp` has no
+    # owner and nothing here removed it, so every rehearsal — successful or
+    # not — left a full copy of a control-plane database in an unnamed `/tmp`
+    # directory: plaintext channel identifiers and every other retained row,
+    # outliving the run that needed them and disclosed to anything that can
+    # read `/tmp`. The whole point of this script is that it is pointed at
+    # REAL data, which makes the copy the most sensitive thing it touches.
+    #
+    # `rmtree` in `finally` rather than a `TemporaryDirectory` context so the
+    # removal is on the same path as the close it sits beside, and so the test
+    # can name the directory and watch it go.
+    work_dir = Path(tempfile.mkdtemp(prefix="abrolia-rehearsal-"))
+    database = None
     try:
+        work = work_dir / "rehearsal.db"
+        shutil.copy2(source, work)
+        database = ControlPlaneDatabase(work)
         pending = database.pending_migrations()
         if "0012_channel_binding_published.sql" not in pending:
             print("0012 is not pending on this database; nothing to rehearse.")
@@ -83,7 +96,9 @@ def main(argv: list[str]) -> int:
             return 0
         return 1
     finally:
-        database.close()
+        if database is not None:
+            database.close()
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

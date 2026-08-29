@@ -419,3 +419,74 @@ def test_0011_backfills_from_the_revision_that_is_actually_serving(
         assert published["b-h3"] is None
     finally:
         database.close()
+
+
+def _rehearsal_module():
+    """`scripts/rehearse_0012_routing.py` is a script, not an importable module."""
+    import importlib.util
+
+    path = Path(__file__).resolve().parents[2] / "scripts" / "rehearse_0012_routing.py"
+    spec = importlib.util.spec_from_file_location("rehearse_0012_routing", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def _database_with_0012_pending(tmp_path: Path) -> Path:
+    """A control-plane database migrated up to, but not including, 0012."""
+    staged = tmp_path / "migrations"
+    staged.mkdir()
+    for script in sorted(MIGRATIONS_DIR.glob("*.sql")):
+        if script.name.startswith("0012"):
+            break
+        (staged / script.name).write_text(script.read_text(encoding="utf-8"))
+    path = tmp_path / "source-control-plane.db"
+    database = ControlPlaneDatabase(path)
+    try:
+        database.migrate(staged)
+    finally:
+        database.close()
+    return path
+
+
+@pytest.mark.parametrize("outcome", ["rehearsed", "nothing_to_rehearse"])
+def test_the_rehearsal_does_not_leave_a_copy_of_the_database_behind(
+    tmp_path: Path, monkeypatch, outcome: str
+) -> None:
+    """The copy is bounded to the operation that needs it.
+
+    This script is pointed at REAL data by design — that is what makes it worth
+    running — so the copy it takes is the most sensitive thing it touches. It
+    took that copy into a `mkdtemp` directory nothing ever removed, leaving
+    plaintext channel identifiers and every other retained control-plane row in
+    an unnamed `/tmp` directory after every run, successful or not.
+
+    Both exits are covered because the leak was in neither branch's code: it was
+    in the `finally` that closed the connection and stopped there, so every path
+    out of the function leaked equally.
+    """
+    module = _rehearsal_module()
+    source = _database_with_0012_pending(tmp_path)
+    if outcome == "nothing_to_rehearse":
+        # Already migrated, so the script returns early — the path that reaches
+        # its `return` without doing any of the work.
+        already = ControlPlaneDatabase(source)
+        try:
+            already.migrate()
+        finally:
+            already.close()
+
+    work_dir = tmp_path / "scratch-that-must-not-survive"
+
+    def fake_mkdtemp(*args, **kwargs) -> str:
+        work_dir.mkdir()
+        return str(work_dir)
+
+    monkeypatch.setattr(module.tempfile, "mkdtemp", fake_mkdtemp)
+    code = module.main(["rehearse_0012_routing.py", str(source)])
+
+    assert code == (0 if outcome == "rehearsed" else 2)
+    assert not work_dir.exists(), (
+        "a copy of the control-plane database outlived the rehearsal"
+    )
