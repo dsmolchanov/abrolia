@@ -454,3 +454,326 @@ def test_a_redelivery_is_re_routed_so_a_revoked_sender_does_not_land(
     assert report.public_dict()["dropped_undeliverable"] == 1
     assert delivered == [], "a revoked sender's message was delivered anyway"
     assert _ingress_count(tmp_path / "ingress.db") == 0
+
+
+def test_a_rebound_sender_does_not_carry_the_previous_households_message(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Re-routing decides WHETHER to deliver, never to whom.
+
+    A row waits precisely across the window in which a binding can change, and
+    a sender can move between households as well as disappear. Re-deriving the
+    household from the sender at redelivery time meant that a sender rebound
+    from A to B carried A's queued message into B's runtime — signed with B's
+    key, so B's runtime would accept it — which is one household's content
+    delivered to another.
+
+    The row remembers the household it was accepted for, and the re-route has
+    to agree with it.
+    """
+    monkeypatch.setenv("ABROLIA_WHATSAPP_SHARED_ENABLED", "1")
+    gateway_key = b"synthetic-gateway-hmac-key-1234567890abcdef"
+    db, hid, phone = _bound_household(tmp_path, gateway_key=gateway_key)
+    other = "00000000-0000-4000-a000-0000000000b2"
+    db.connection.execute(
+        "INSERT INTO households (id, slug, status, created_at, updated_at)"
+        " VALUES (?, ?, 'draft', 1, 1)",
+        (other, "hh-other"),
+    )
+    db.connection.commit()
+
+    key_a = b"household-a-relay-key-1234567890abcd"
+    key_b = b"household-b-relay-key-1234567890abcd"
+    delivered: list[tuple[str, bytes]] = []
+    failing = True
+
+    def deliver(household_id, payload, timestamp, signature):
+        if failing:
+            raise RuntimeError("not yet")
+        delivered.append((household_id, payload))
+
+    clock = [1_000_000.0]
+    router = WhatsAppGatewayRouter(
+        db,
+        relay_keys={hid: key_a, other: key_b},
+        gateway_hmac_key=gateway_key,
+        ingress_path=tmp_path / "ingress.db",
+        runtime_deliver=deliver,
+        now_fn=lambda: clock[0],
+    )
+    body = b'{"message":"for household A only"}'
+    ts = str(int(clock[0]))
+    router.handle_webhook(body, phone, timestamp=ts, signature=relay_hmac(key_a, body, ts))
+    assert _ingress_count(tmp_path / "ingress.db") == 1
+
+    # The sender is rebound to the other household while the row waits.
+    db.connection.execute(
+        "UPDATE channel_bindings SET household_id = ? WHERE id = 'b-c5b'", (other,)
+    )
+    db.connection.commit()
+
+    failing = False
+    clock[0] += GatewayRedeliverWorker.BASE_BACKOFF_SECONDS + 1
+    report = GatewayRedeliverWorker(router).run_once()
+    assert delivered == [], "one household's message was delivered to another"
+    assert report.public_dict()["dropped_undeliverable"] == 1
+    assert _ingress_count(tmp_path / "ingress.db") == 0
+
+
+def test_a_payload_retained_without_a_key_is_proven_before_it_is_signed(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The worker must not bless what nobody ever authenticated.
+
+    `relay_key_absent` retains a row WITHOUT verifying it, because there is no
+    key to verify with. If redelivery then signs that body with the real key
+    the moment C5c installs one, anyone who could reach the gateway for a known
+    sender during the wait would have had a forged payload laundered into the
+    runtime's trusted ingest — the gateway's signature is exactly the runtime's
+    reason to trust it.
+
+    So the row keeps what it arrived with, and the worker checks that against
+    the key before signing anything.
+    """
+    monkeypatch.setenv("ABROLIA_WHATSAPP_SHARED_ENABLED", "1")
+    gateway_key = b"synthetic-gateway-hmac-key-1234567890abcdef"
+    db, hid, phone = _bound_household(tmp_path, gateway_key=gateway_key)
+    key = b"household-relay-key-1234567890abcdef"
+
+    delivered: list[bytes] = []
+    clock = [1_000_000.0]
+    router = WhatsAppGatewayRouter(
+        db,
+        relay_keys={},  # C5c has not run
+        gateway_hmac_key=gateway_key,
+        ingress_path=tmp_path / "ingress.db",
+        runtime_deliver=lambda h, p, t, s: delivered.append(p),
+        now_fn=lambda: clock[0],
+    )
+    forged = b'{"message":"never signed by the relay"}'
+    ts = str(int(clock[0]))
+    assert router.handle_webhook(
+        forged, phone, timestamp=ts, signature="sha256=" + "0" * 64
+    ).code == "relay_key_absent"
+    assert _ingress_count(tmp_path / "ingress.db") == 1
+
+    router.relay_keys[hid] = key  # the key arrives
+    clock[0] += GatewayRedeliverWorker.BASE_BACKOFF_SECONDS + 1
+    report = GatewayRedeliverWorker(router).run_once()
+    assert delivered == [], "a payload nobody authenticated was signed and delivered"
+    assert report.public_dict()["dropped_unverifiable"] == 1
+    assert _ingress_count(tmp_path / "ingress.db") == 0
+
+
+def test_a_row_that_cannot_say_what_it_arrived_as_is_dropped(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Legacy rows are dropped, not blessed.
+
+    The implementation before this one retained rows after a REJECTED HMAC, and
+    any version predating these columns wrote rows with no provenance at all.
+    Such a row cannot be authenticated, so the one thing that must not happen is
+    signing it with the real key.
+    """
+    monkeypatch.setenv("ABROLIA_WHATSAPP_SHARED_ENABLED", "1")
+    gateway_key = b"synthetic-gateway-hmac-key-1234567890abcdef"
+    db, hid, phone = _bound_household(tmp_path, gateway_key=gateway_key)
+    key = b"household-relay-key-1234567890abcdef"
+
+    path = tmp_path / "legacy.db"
+    store = GatewayStore(path)
+    legacy = store.persist_before_ack(
+        b'{"message":"from an older gateway"}', phone, now=1_000_000.0
+    )
+    # Exactly the shape the previous schema left behind: no provenance columns,
+    # and `next_attempt_at` at the ALTER's default rather than a real stamp.
+    store.conn.execute(
+        "UPDATE gateway_ingress SET channel = NULL, household_id = NULL,"
+        " origin_timestamp = NULL, origin_signature = NULL, next_attempt_at = 0"
+        " WHERE id = ?",
+        (legacy,),
+    )
+    store.conn.commit()
+
+    delivered: list[bytes] = []
+    router = WhatsAppGatewayRouter(
+        db,
+        relay_keys={hid: key},
+        gateway_hmac_key=gateway_key,
+        ingress_path=path,
+        runtime_deliver=lambda h, p, t, s: delivered.append(p),
+        now_fn=lambda: 1_000_000.0,
+    )
+    report = GatewayRedeliverWorker(router).run_once()
+    assert delivered == []
+    assert report.public_dict()["dropped_unverifiable"] == 1
+    assert _ingress_count(path) == 0
+
+
+def test_the_kill_switch_stops_the_worker_and_the_backlog_survives_it(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A brake that only stops new webhooks is not a brake.
+
+    `handle_webhook` reads the switch at call time so it can be thrown during
+    an incident. The worker did not, so an operator turning the switch off
+    stopped new traffic while the worker went on draining the backlog into the
+    runtime — the one thing the switch exists to prevent.
+
+    Held, not dropped, and without spending an attempt: the switch being off is
+    an operator decision, not the row's failure, and burning `MAX_ATTEMPTS`
+    while it is off would mean the brake destroyed the work it was pulled to
+    protect.
+    """
+    monkeypatch.setenv("ABROLIA_WHATSAPP_SHARED_ENABLED", "1")
+    gateway_key = b"synthetic-gateway-hmac-key-1234567890abcdef"
+    db, hid, phone = _bound_household(tmp_path, gateway_key=gateway_key)
+    key = b"household-relay-key-1234567890abcdef"
+
+    delivered: list[bytes] = []
+    failing = True
+
+    def deliver(household_id, payload, timestamp, signature):
+        if failing:
+            raise RuntimeError("not yet")
+        delivered.append(payload)
+
+    clock = [1_000_000.0]
+    router = WhatsAppGatewayRouter(
+        db,
+        relay_keys={hid: key},
+        gateway_hmac_key=gateway_key,
+        ingress_path=tmp_path / "ingress.db",
+        runtime_deliver=deliver,
+        now_fn=lambda: clock[0],
+    )
+    body = b'{"message":"queued while the switch was on"}'
+    ts = str(int(clock[0]))
+    router.handle_webhook(body, phone, timestamp=ts, signature=relay_hmac(key, body, ts))
+    assert _ingress_count(tmp_path / "ingress.db") == 1
+
+    worker = GatewayRedeliverWorker(router)
+    failing = False
+    monkeypatch.setenv("ABROLIA_WHATSAPP_SHARED_ENABLED", "0")
+    clock[0] += GatewayRedeliverWorker.BASE_BACKOFF_SECONDS + 1
+    report = worker.run_once()
+    assert delivered == [], "the brake did not stop already-queued work"
+    assert report.public_dict()["held"] == 1
+    assert _ingress_count(tmp_path / "ingress.db") == 1, "the brake dropped the backlog"
+
+    monkeypatch.setenv("ABROLIA_WHATSAPP_SHARED_ENABLED", "1")
+    clock[0] += GatewayRedeliverWorker.BASE_BACKOFF_SECONDS + 1
+    assert worker.run_once().public_dict()["delivered"] == 1
+    assert delivered == [body]
+
+
+def test_the_worker_reads_the_same_wal_the_router_writes_by_default(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """One store, including on the configuration that is actually deployed.
+
+    `router.store` was None whenever no `ingress_path` was given, while
+    `handle_webhook` opened a throwaway store on the default path to write to.
+    Two stores for one WAL: the router persisted retryable failures and the
+    worker, built the normal way from that router, raised because the store was
+    None — so on the default configuration nothing was ever retried.
+    """
+    monkeypatch.setenv("ABROLIA_WHATSAPP_SHARED_ENABLED", "1")
+    monkeypatch.chdir(tmp_path)
+    gateway_key = b"synthetic-gateway-hmac-key-1234567890abcdef"
+    db, hid, phone = _bound_household(tmp_path, gateway_key=gateway_key)
+    key = b"household-relay-key-1234567890abcdef"
+
+    delivered: list[bytes] = []
+    failing = True
+
+    def deliver(household_id, payload, timestamp, signature):
+        if failing:
+            raise RuntimeError("not yet")
+        delivered.append(payload)
+
+    clock = [1_000_000.0]
+    router = WhatsAppGatewayRouter(  # NO ingress_path — the deployed shape
+        db,
+        relay_keys={hid: key},
+        gateway_hmac_key=gateway_key,
+        runtime_deliver=deliver,
+        now_fn=lambda: clock[0],
+    )
+    body = b'{"message":"default WAL"}'
+    ts = str(int(clock[0]))
+    assert router.handle_webhook(
+        body, phone, timestamp=ts, signature=relay_hmac(key, body, ts)
+    ).code == "runtime_unavailable"
+
+    worker = GatewayRedeliverWorker(router)  # used to raise ValueError
+    failing = False
+    clock[0] += GatewayRedeliverWorker.BASE_BACKOFF_SECONDS + 1
+    assert worker.run_once().public_dict()["delivered"] == 1
+    assert delivered == [body]
+
+
+def test_a_retained_telegram_row_is_rerouted_on_the_channel_it_arrived_on(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The channel is part of what the row arrived as, not a default.
+
+    `handle_webhook` takes a `channel`, and the row did not record it, so every
+    redelivery re-routed as whatsapp. A retained telegram message therefore
+    resolved against the wrong binding set, found nobody, and was dropped as
+    undeliverable — a message lost by the mechanism built to save it.
+    """
+    monkeypatch.setenv("ABROLIA_WHATSAPP_SHARED_ENABLED", "1")
+    gateway_key = b"synthetic-gateway-hmac-key-1234567890abcdef"
+    db = open_control_plane_database(tmp_path / "cp.db")
+    hid = "00000000-0000-4000-a000-0000000000t1"[:36]
+    sender = "990000777"
+    db.connection.execute(
+        "INSERT INTO households (id, slug, status, created_at, updated_at)"
+        " VALUES (?, ?, 'draft', 1, 1)",
+        (hid, "hh-tg"),
+    )
+    db.connection.execute(
+        "INSERT INTO channel_bindings (id, household_id, channel, external_id,"
+        " chat_id, external_id_hmac, actor_id, role, verified_at,"
+        " verified_by_actor_id) VALUES (?, ?, 'telegram', ?, ?, ?, 'owner1',"
+        " 'owner', 1, 'owner1')",
+        ("b-tg", hid, sender, "-100990000777", sender_hmac(sender, gateway_key)),
+    )
+    db.connection.commit()
+
+    key = b"household-relay-key-1234567890abcdef"
+    delivered: list[bytes] = []
+    failing = True
+
+    def deliver(household_id, payload, timestamp, signature):
+        if failing:
+            raise RuntimeError("not yet")
+        delivered.append(payload)
+
+    clock = [1_000_000.0]
+    router = WhatsAppGatewayRouter(
+        db,
+        relay_keys={hid: key},
+        gateway_hmac_key=gateway_key,
+        ingress_path=tmp_path / "ingress.db",
+        runtime_deliver=deliver,
+        now_fn=lambda: clock[0],
+    )
+    body = b'{"message":"sent on telegram"}'
+    ts = str(int(clock[0]))
+    assert router.handle_webhook(
+        body,
+        sender,
+        channel="telegram",
+        timestamp=ts,
+        signature=relay_hmac(key, body, ts),
+    ).code == "runtime_unavailable"
+
+    failing = False
+    clock[0] += GatewayRedeliverWorker.BASE_BACKOFF_SECONDS + 1
+    report = GatewayRedeliverWorker(router).run_once()
+    assert report.public_dict()["delivered"] == 1, (
+        "a telegram row was re-routed as whatsapp and lost"
+    )
+    assert delivered == [body]

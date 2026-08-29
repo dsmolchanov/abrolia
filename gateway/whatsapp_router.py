@@ -26,6 +26,11 @@ class GatewayResult:
     #: The last three are all "denied", and they differ in what happens to the
     #: ingress row: `hmac_rejected` is terminal and drops it, the other two are
     #: retryable and keep it. See `handle_webhook`.
+    #:
+    #: A retained row keeps the timestamp and signature it arrived with, so the
+    #: redeliver worker can prove it came from the relay before signing it with
+    #: the real key. Retaining without that proof is what would let a forged
+    #: body be laundered into the runtime once a key appeared.
     code: str
     household_id: str | None = None
 
@@ -82,13 +87,33 @@ class GatewayStore:
             ("attempts", "attempts INTEGER NOT NULL DEFAULT 0"),
             ("next_attempt_at", "next_attempt_at REAL NOT NULL DEFAULT 0"),
             ("last_error", "last_error TEXT"),
+            # The routing context the row was accepted UNDER. A redelivery that
+            # re-derives these instead of remembering them answers a different
+            # question than the one the message arrived with: the channel
+            # defaults to whatsapp, so a telegram row becomes undeliverable,
+            # and the household is whoever holds the sender NOW, so a sender
+            # rebound from A to B carries A's message into B.
+            ("channel", "channel TEXT"),
+            ("household_id", "household_id TEXT"),
+            # And the credentials it arrived with. Kept so redelivery can PROVE
+            # the payload came from the relay before signing it with the real
+            # key — see `GatewayRedeliverWorker.run_once`.
+            ("origin_timestamp", "origin_timestamp TEXT"),
+            ("origin_signature", "origin_signature TEXT"),
         ):
             if column not in existing:
                 self.conn.execute(f"ALTER TABLE gateway_ingress ADD COLUMN {ddl}")
         self.conn.commit()
 
     def persist_before_ack(
-        self, payload: bytes, sender: str, *, now: float | None = None
+        self,
+        payload: bytes,
+        sender: str,
+        *,
+        channel: str = "whatsapp",
+        timestamp: str | None = None,
+        signature: str | None = None,
+        now: float | None = None,
     ) -> str:
         # `now` comes from the router's clock rather than being read here.
         # `received_at` is only meaningful against the clock the redeliver
@@ -100,8 +125,9 @@ class GatewayStore:
         ingress_id = uuid.uuid4().hex
         self.conn.execute(
             "INSERT INTO gateway_ingress (id, payload, sender, received_at, delivered,"
-            " attempts, next_attempt_at) VALUES (?, ?, ?, ?, 0, 0, ?)",
-            (ingress_id, payload, sender, now, now),
+            " attempts, next_attempt_at, channel, origin_timestamp, origin_signature)"
+            " VALUES (?, ?, ?, ?, 0, 0, ?, ?, ?, ?)",
+            (ingress_id, payload, sender, now, now, channel, timestamp, signature),
         )
         self.conn.commit()
         return ingress_id
@@ -110,19 +136,35 @@ class GatewayStore:
         self.conn.execute("DELETE FROM gateway_ingress WHERE id = ?", (ingress_id,))
         self.conn.commit()
 
-    def defer(self, ingress_id: str, *, error: str, not_before: float) -> None:
-        """Leave the row for the reader, one attempt older."""
+    def defer(
+        self,
+        ingress_id: str,
+        *,
+        error: str,
+        not_before: float,
+        household_id: str | None = None,
+        spend_attempt: bool = True,
+    ) -> None:
+        """Leave the row for the reader, normally one attempt older.
+
+        `spend_attempt=False` is for a hold that is nobody's failure — the
+        kill switch being off is an operator decision, and letting it burn the
+        backlog's attempts would mean the brake destroyed the work it was
+        pulled to protect.
+        """
         self.conn.execute(
-            "UPDATE gateway_ingress SET attempts = attempts + 1,"
-            " next_attempt_at = ?, last_error = ? WHERE id = ?",
-            (not_before, error, ingress_id),
+            "UPDATE gateway_ingress SET attempts = attempts + ?,"
+            " next_attempt_at = ?, last_error = ?,"
+            " household_id = COALESCE(?, household_id) WHERE id = ?",
+            (1 if spend_attempt else 0, not_before, error, household_id, ingress_id),
         )
         self.conn.commit()
 
     def due(self, *, now: float, limit: int = 100) -> list[sqlite3.Row]:
         return list(
             self.conn.execute(
-                "SELECT id, payload, sender, received_at, attempts, last_error"
+                "SELECT id, payload, sender, received_at, attempts, last_error,"
+                " channel, household_id, origin_timestamp, origin_signature"
                 " FROM gateway_ingress WHERE next_attempt_at <= ?"
                 " ORDER BY received_at LIMIT ?",
                 (now, limit),
@@ -148,13 +190,29 @@ class WhatsAppGatewayRouter:
         self.db = db
         self.relay_keys = relay_keys or {}
         self.gateway_hmac_key = gateway_hmac_key
-        self.store = (
-            GatewayStore(ingress_path or Path("data/gateway_ingress.db"))
-            if ingress_path is not None
-            else None
-        )
+        self._ingress_path = Path(ingress_path or "data/gateway_ingress.db")
+        self._store: GatewayStore | None = None
         self.runtime_deliver = runtime_deliver
         self.now_fn = now_fn or time.time
+
+    @property
+    def store(self) -> GatewayStore:
+        """The one ingress store, opened on first use.
+
+        `self.store` used to be None whenever no `ingress_path` was given,
+        while `handle_webhook` quietly opened a throwaway store on the default
+        path to write to. That made two stores for one WAL: the router wrote
+        retryable failures into `data/gateway_ingress.db` and the redeliver
+        worker, constructed the normal way from that router, raised because
+        `router.store` was None — so on the default configuration, which is the
+        deployed one, nothing was ever retried.
+
+        Lazy rather than eager so constructing a router still creates no
+        directory until something actually persists.
+        """
+        if self._store is None:
+            self._store = GatewayStore(self._ingress_path)
+        return self._store
 
     def route(
         self, sender: str, channel: str = "whatsapp", *, timestamp: str | None = None
@@ -214,8 +272,15 @@ class WhatsAppGatewayRouter:
         # Durable before ACK — persist first, ACK only after persist succeeds
         if not timestamp or not signature:
             return GatewayResult(status="denied", code="hmac_rejected", household_id=None)
-        store = self.store or GatewayStore(Path("data/gateway_ingress.db"))
-        ingress_id = store.persist_before_ack(payload, sender, now=self.now_fn())
+        store = self.store
+        ingress_id = store.persist_before_ack(
+            payload,
+            sender,
+            channel=channel,
+            timestamp=timestamp,
+            signature=signature,
+            now=self.now_fn(),
+        )
         routed = self.route(sender, channel, timestamp=timestamp)
         if routed.status == "denied":
             store.mark_delivered(ingress_id)
@@ -235,6 +300,7 @@ class WhatsAppGatewayRouter:
                 ingress_id,
                 error="relay_key_absent",
                 not_before=self.now_fn() + GatewayRedeliverWorker.BASE_BACKOFF_SECONDS,
+                household_id=routed.household_id,
             )
             return GatewayResult(
                 status="denied", code="relay_key_absent", household_id=None
@@ -258,6 +324,7 @@ class WhatsAppGatewayRouter:
                 ingress_id,
                 error="runtime_unavailable",
                 not_before=self.now_fn() + GatewayRedeliverWorker.BASE_BACKOFF_SECONDS,
+                household_id=routed.household_id,
             )
             return GatewayResult(
                 status="denied", code="runtime_unavailable", household_id=None
@@ -275,6 +342,11 @@ class RedeliverReport:
     dropped_exhausted: int = 0
     dropped_expired: int = 0
     dropped_undeliverable: int = 0
+    #: Could not be proven to have come from the relay — a legacy row, or one
+    #: retained while no key existed and never authenticated since.
+    dropped_unverifiable: int = 0
+    #: Left alone because the kill switch is off. Not a drop and not a failure.
+    held: int = 0
 
     def public_dict(self) -> dict[str, int]:
         return {
@@ -283,6 +355,8 @@ class RedeliverReport:
             "dropped_exhausted": self.dropped_exhausted,
             "dropped_expired": self.dropped_expired,
             "dropped_undeliverable": self.dropped_undeliverable,
+            "dropped_unverifiable": self.dropped_unverifiable,
+            "held": self.held,
         }
 
 
@@ -331,25 +405,63 @@ class GatewayRedeliverWorker:
         # another.
         timestamp = str(int(now))
         delivered = deferred = exhausted = expired = undeliverable = 0
+        held = unverifiable = 0
+        # The incident brake, asked HERE and not only at ingress. The switch is
+        # read at call time so it can be thrown during an incident, and a brake
+        # that stops new webhooks while a worker keeps draining the backlog
+        # into the runtime is not a brake. Nothing is dropped: the rows stay
+        # for a later enabled run.
+        if not is_whatsapp_shared_enabled():
+            for row in self.store.due(now=now, limit=limit):
+                # Without spending an attempt — the switch being off is an
+                # operator decision, not the row's failure, and letting it burn
+                # `MAX_ATTEMPTS` would mean the brake destroyed the very work
+                # it was pulled to protect.
+                self.store.defer(
+                    row["id"],
+                    error="flag_disabled",
+                    not_before=now + self.BASE_BACKOFF_SECONDS,
+                    spend_attempt=False,
+                )
+                held += 1
+            return RedeliverReport(held=held)
         for row in self.store.due(now=now, limit=limit):
             ingress_id = row["id"]
             if now - row["received_at"] > self.MAX_AGE_SECONDS:
                 self.store.mark_delivered(ingress_id)
                 expired += 1
                 continue
-            # A FRESH timestamp, not the one the message arrived with. `route`
-            # refuses `None` outright in strict mode and refuses anything older
-            # than `REPLAY_WINDOW_SECONDS` in either — so passing the original
-            # would make every redelivery answer `timestamp_replay` and drop
-            # the entire backlog as undeliverable, which is the opposite of
-            # what this worker is for. The window guards the freshness of an
-            # inbound webhook; a redelivery's own freshness is now.
-            routed = self.router.route(row["sender"], timestamp=timestamp)
-            if routed.status == "denied":
-                # Nobody to deliver to. `unknown_sender` here is not the same
-                # event as at ingress: the binding was resolvable once and is
-                # not now, which is a revocation taking effect on a message in
-                # flight — the right outcome, and a terminal one.
+            if not self._has_provenance(row):
+                # A row that cannot say what it arrived as. Written by the
+                # implementation before this one — which retained rows after a
+                # REJECTED HMAC — or by any version predating these columns.
+                # It cannot be authenticated, and the one thing that must never
+                # happen is signing it with the real key, so it is dropped
+                # rather than blessed.
+                self.store.mark_delivered(ingress_id)
+                unverifiable += 1
+                continue
+            # Re-routed on the channel the row ARRIVED on. Defaulting to
+            # whatsapp here made a telegram row resolve against the wrong
+            # binding set and get dropped as undeliverable.
+            #
+            # And with a FRESH timestamp: `route` refuses `None` outright in
+            # strict mode and refuses anything outside `REPLAY_WINDOW_SECONDS`
+            # in either, so passing the message's original stamp would answer
+            # `timestamp_replay` for every row and drop the whole backlog. The
+            # window guards an inbound webhook's freshness; a redelivery's own
+            # freshness is now.
+            routed = self.router.route(
+                row["sender"], row["channel"], timestamp=timestamp
+            )
+            if routed.status == "denied" or routed.household_id != row["household_id"]:
+                # Either nobody holds this sender now, or SOMEBODY ELSE does.
+                # The second is why the row remembers its household instead of
+                # trusting the lookup: a sender rebound from A to B between the
+                # failure and the retry would otherwise have carried A's
+                # message into B's runtime, signed with B's key — one
+                # household's content delivered to another. Re-routing is still
+                # right; it just decides whether to deliver, never to whom.
                 self.store.mark_delivered(ingress_id)
                 undeliverable += 1
                 continue
@@ -360,17 +472,36 @@ class GatewayRedeliverWorker:
                 deferred += kept
                 exhausted += 1 - kept
                 continue
+            if not verify_relay_hmac(
+                key, row["payload"], row["origin_timestamp"], row["origin_signature"]
+            ):
+                # PROVE IT CAME FROM THE RELAY, then sign it. The
+                # `relay_key_absent` path retains a row without ever verifying
+                # it, because there was no key to verify with — so without this
+                # check the worker would take an unauthenticated payload and
+                # give it a valid signature the moment C5c installed a key.
+                # Anyone able to reach the gateway for a known sender during
+                # that window could have had a forged body laundered into the
+                # runtime's trusted ingest.
+                #
+                # The original timestamp is used for the check because that is
+                # what was signed. Freshness is not what is being asked here —
+                # authenticity is — and the fresh stamp below is what answers
+                # freshness to the runtime.
+                self.store.mark_delivered(ingress_id)
+                unverifiable += 1
+                continue
             try:
                 if self.router.runtime_deliver:
-                    # Re-signed under the household's CURRENT key, over the
+                    # Re-signed under the household's current key, over the
                     # same body, with this pass's stamp: the runtime enforces
                     # the replay window C5a gave it, so a redelivery carrying
                     # the original hour-old signature would be refused by the
                     # very freshness check that makes the scheme safe. The BODY
-                    # is unchanged, so this is the same message and not a new
-                    # one — the runtime's ingest dedupes on the relay
-                    # provenance it carries, which is why this slice does not
-                    # add a second idempotency mechanism beside it.
+                    # is unchanged and now proven authentic, so this is the same
+                    # message and not a new one — the runtime's ingest dedupes
+                    # on the relay provenance it carries, which is why this
+                    # slice adds no second idempotency mechanism beside it.
                     self.router.runtime_deliver(
                         routed.household_id,
                         row["payload"],
@@ -390,6 +521,16 @@ class GatewayRedeliverWorker:
             dropped_exhausted=exhausted,
             dropped_expired=expired,
             dropped_undeliverable=undeliverable,
+            dropped_unverifiable=unverifiable,
+            held=held,
+        )
+
+    @staticmethod
+    def _has_provenance(row) -> bool:
+        """Whether the row can say what it arrived as, and for whom."""
+        return all(
+            row[column] is not None
+            for column in ("channel", "household_id", "origin_timestamp", "origin_signature")
         )
 
     def _defer(self, row, now: float, error: str) -> int:

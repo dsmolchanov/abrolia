@@ -108,6 +108,16 @@ A WhatsApp message delivered three days late is not a repair.
 
 ## Risks
 
+**A retained payload may never have been authenticated.** The
+`relay_key_absent` path keeps a row without verifying it, because there is no
+key to verify with. Signing that body with the real key when one appears would
+launder a forged payload into the runtime's trusted ingest — the gateway's
+signature is precisely the runtime's reason to trust it. So the row keeps the
+timestamp and signature it arrived with, and redelivery PROVES authenticity
+against the now-present key before signing anything. A row that cannot answer
+— written before these columns, or retained by the earlier implementation after
+a rejected HMAC — is dropped rather than blessed.
+
 **A redelivery is a second delivery if the first only appeared to fail.**
 `runtime_deliver` raising does not prove the runtime did not receive the
 payload. The runtime's own ingest is the layer that has to be idempotent, and
@@ -122,6 +132,15 @@ loses privacy instead. The count is the operator's signal that it happened.
 ## Acceptance
 
 * A delivery failure leaves a row, and the worker delivers it on the next run.
+* A payload retained while no key existed is verified against the key that
+  later appears, and dropped if it does not verify.
+* A row with no provenance is dropped, never signed.
+* A sender rebound from household A to B does not carry A's message into B.
+* A row retained on a non-default channel is re-routed on THAT channel.
+* The kill switch stops the worker too, holding the backlog rather than
+  dropping it and without spending its attempts.
+* The worker reads the same WAL the router writes on the default
+  configuration, where no `ingress_path` is given.
 * A row kept because the relay key was absent is delivered once a key appears,
   without the payload being re-signed — the C5c seam, tested here with the key
   simply arriving.
