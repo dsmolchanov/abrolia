@@ -286,9 +286,9 @@ Closes the dead end Phase 1 creates. Until now no failure path wrote
 
 #### Automated Verification
 
-- [ ] `python3 -m pytest tests/control_plane/test_channel_bindings.py -q` — a terminal failure retires the staged adult and leaves the published owner
-- [ ] `python3 -m pytest tests/control_plane/test_provisioning_jobs.py -q` — the sender can be issued again after a failed rollout
-- [ ] `python3 -m pytest -m "not live"`
+- [x] `python3 -m pytest tests/control_plane/test_channel_bindings.py -q` — a terminal failure retires the staged adult and leaves the published owner
+- [x] `python3 -m pytest tests/control_plane/test_channel_bindings.py -q` — the sender can be issued again after a failed rollout
+- [x] `python3 -m pytest -m "not live"` (1587 passed)
 
 #### Manual Verification
 
@@ -421,12 +421,35 @@ Retirement in Phase 3 is destructive by design. It only ever removes rows with
 
 **Files:** `control_plane/migrations/0011_channel_binding_published.sql`,
 `control_plane/repositories/bindings.py`,
+`control_plane/repositories/jobs.py`,
 `control_plane/provisioning/bootstrap.py`,
 `control_plane/provisioning/worker.py`,
-`control_plane/provisioning/rollout.py`, `gateway/whatsapp_router.py`,
+`control_plane/provisioning/rollout.py`,
+`control_plane/onboarding/provision.py`, `gateway/whatsapp_router.py`,
 `tests/control_plane/test_channel_bindings.py`,
 `tests/control_plane/test_bootstrap.py`,
 `tests/control_plane/test_provisioning_jobs.py`,
-`tests/control_plane/test_db.py`, `tests/test_gateway_routing.py`.
+`tests/control_plane/test_provision_dry_run.py`,
+`tests/control_plane/test_binding_api.py`,
+`tests/control_plane/test_db.py`, `tests/control_plane/chaos_child.py`,
+`tests/test_gateway_routing.py`, `tests/test_feature_flags.py`.
+
+Six files were added during implementation, each because the job's new
+non-terminal state is visible to something the plan did not trace:
+
+* `repositories/jobs.py` — `record_result`. `settle` was the only writer of a
+  job's result columns and it is terminal, which was fine while every job
+  finished when its provider answered. The DSAR export reads that result
+  (`privacy/export.py:108`), so leaving it unset across the wait would take a
+  provider outcome out of a subject access response.
+* `onboarding/provision.py` — the dry-run report. A job awaiting activation is
+  non-terminal, so it matched the report's `pending` query and would have
+  advertised a runtime write set for work already done. It also had to learn
+  the state, and to declare the `channel_bindings` delete Phase 3 adds to the
+  content-restriction path — the recorded invariant "a report describes the
+  branch the worker will actually take" is what caught that.
+* `test_provision_dry_run.py`, `test_binding_api.py`, `test_feature_flags.py`,
+  `chaos_child.py` — fixtures that asserted `succeeded` at launch, or inserted
+  bindings that must now be published to route.
 
 **Branches:** `codex/c3c-c3e-activation-boundary`.

@@ -622,6 +622,14 @@ class ProvisioningWorker:
                 error_code="content_restriction_receipt_required",
                 now=now,
             )
+            # Before the workflow gate below, deliberately. That gate returns
+            # early for a re-provisioning job — its workflow is `complete`, not
+            # `runtime_provisioning` — which is one of the three shapes that
+            # strands a household, and it would take the staged members with it
+            # if the retirement sat after it.
+            self.planner.bindings.retire_staged_members(
+                connection, household_id=job.household_id
+            )
             workflow_row = connection.execute(
                 "SELECT * FROM onboarding_workflows WHERE id = ? AND household_id = ?",
                 (job.workflow_id, job.household_id),
@@ -2263,6 +2271,20 @@ class ProvisioningWorker:
                 )
                 self.email_identities.finish_disconnect(
                     connection, request["email_identity_id"], now=now
+                )
+            if job.kind == "runtime" and job_status == "failed":
+                # The revision will never activate, so the members it staged
+                # will never be published. Leaving them is not a delay: a
+                # staged row never routes AND holds its identity against every
+                # future attempt, so the owner cannot re-invite that member and
+                # nobody else can claim the sender either.
+                #
+                # Reached through the planner because the worker is not
+                # constructed with the binding repository, and threading one
+                # through would change every call site to say what
+                # `planner.bindings` already says.
+                self.planner.bindings.retire_staged_members(
+                    connection, household_id=job.household_id
                 )
             if (
                 job.operation == REPROVISION_RUNTIME_OPERATION

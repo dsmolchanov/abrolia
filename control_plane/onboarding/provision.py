@@ -173,7 +173,8 @@ CONTENT_RESTRICTION_BLOCK_ACTION: dict[str, str] = {
     "runtime": (
         "fails on the special-category content restriction receipt before any"
         " provider call: the runtime revision and the unused bootstrap tokens"
-        " are revoked and the workflow returns to email"
+        " are revoked, members this rollout staged are retired, and the"
+        " workflow returns to email"
     ),
     "step": (
         "fails on the special-category content restriction receipt before any"
@@ -185,6 +186,10 @@ CONTENT_RESTRICTION_BLOCK_ACTION: dict[str, str] = {
 CONTENT_RESTRICTION_BLOCK_WRITES: dict[str, tuple[TableWrite, ...]] = {
     "runtime": (
         TableWrite("bootstrap_tokens", "update"),
+        # A revision that will never activate leaves members it staged
+        # unpublished, and a staged binding that never publishes holds its
+        # identity against every future attempt — so this path retires them.
+        TableWrite("channel_bindings", "delete"),
         TableWrite("config_revisions", "update"),
         TableWrite("households", "update"),
         TableWrite("onboarding_transitions", "insert"),

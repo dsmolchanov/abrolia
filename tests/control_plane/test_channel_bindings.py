@@ -2281,3 +2281,119 @@ def test_a_legacy_spelling_is_one_identity_to_every_writer(cp_stack, writer) -> 
             (cp_stack.household.id,),
         ).fetchall()
         assert [row["external_id"] for row in held] in ([bare], [PHONE])
+
+
+# --- C3c Phase 3: a terminal failure retires what it staged ----------------
+
+
+def test_a_terminal_failure_retires_the_members_it_staged(cp_stack) -> None:
+    """A staged binding whose revision dies is a dead end, not a delay.
+
+    It never routes, and it holds its identity against every future attempt:
+    `issue_challenge` refuses a tuple this household already holds and
+    `_reject_foreign_holder` refuses it to every other. So the owner cannot
+    re-invite that member and nobody else can claim the sender either — the
+    failure of a rollout would permanently consume an identity.
+
+    The owner's row is left alone even though it is staged too. It is re-seeded
+    from the durable onboarding result on every plan, so the next successful
+    activation publishes the same row; deleting it would leave `owner_actor`
+    returning None and the household unable to invite anyone at all.
+    """
+    _provisioned(cp_stack)
+    _activated(cp_stack)
+    owner = owner_actor(cp_stack)
+    household_chat = owner_chat(cp_stack)
+
+    with cp_stack.database.write() as connection:
+        issued = cp_stack.bindings.issue_challenge(
+            connection,
+            household_id=cp_stack.household.id,
+            channel=CHANNEL_SELECTION["kind"],
+            external_id=ADULT,
+            chat_id=household_chat,
+            actor_id=ADULT,
+            role="adult",
+            issued_by_actor_id=owner,
+            now=BASE_TIME + 100,
+        )
+        cp_stack.bindings.verify_challenge(
+            connection,
+            code=issued.code,
+            household_id=cp_stack.household.id,
+            owner_actor_id=owner,
+            now=BASE_TIME + 200,
+        )
+        rows = cp_stack.bindings.verified(
+            connection, household_id=cp_stack.household.id
+        )
+    # Staged: written, and not yet routable.
+    assert {r.actor_id: r.published_revision for r in rows} == {
+        owner: None, ADULT: None,
+    }
+
+    with cp_stack.database.write() as connection:
+        retired = cp_stack.bindings.retire_staged_members(
+            connection, household_id=cp_stack.household.id
+        )
+        rows = cp_stack.bindings.verified(
+            connection, household_id=cp_stack.household.id
+        )
+    assert retired == 1
+    assert [r.actor_id for r in rows] == [owner]
+
+    # And the identity is free again, which is the whole point.
+    with cp_stack.database.write() as connection:
+        cp_stack.bindings.issue_challenge(
+            connection,
+            household_id=cp_stack.household.id,
+            channel=CHANNEL_SELECTION["kind"],
+            external_id=ADULT,
+            chat_id=household_chat,
+            actor_id=ADULT,
+            role="adult",
+            issued_by_actor_id=owner,
+            now=BASE_TIME + 300,
+        )
+
+
+def test_retirement_never_touches_a_published_binding(cp_stack) -> None:
+    """Published means routing, and routing members are not this to remove."""
+    _provisioned(cp_stack)
+    _activated(cp_stack)
+    owner = owner_actor(cp_stack)
+
+    with cp_stack.database.write() as connection:
+        issued = cp_stack.bindings.issue_challenge(
+            connection,
+            household_id=cp_stack.household.id,
+            channel="whatsapp",
+            external_id=PHONE,
+            chat_id=PHONE_CHAT,
+            actor_id=PHONE,
+            role="adult",
+            issued_by_actor_id=owner,
+            now=BASE_TIME + 100,
+        )
+        cp_stack.bindings.verify_challenge(
+            connection,
+            code=issued.code,
+            household_id=cp_stack.household.id,
+            owner_actor_id=owner,
+            now=BASE_TIME + 200,
+        )
+        # What activation would have done for a revision that succeeded.
+        connection.execute(
+            "UPDATE channel_bindings SET published_revision = 1"
+            " WHERE household_id = ? AND actor_id = ?",
+            (cp_stack.household.id, PHONE),
+        )
+        retired = cp_stack.bindings.retire_staged_members(
+            connection, household_id=cp_stack.household.id
+        )
+        rows = cp_stack.bindings.verified(
+            connection, household_id=cp_stack.household.id
+        )
+
+    assert retired == 0
+    assert PHONE in {r.actor_id for r in rows}
