@@ -20,6 +20,7 @@ entrypoint the code already implements.
 
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import threading
@@ -36,11 +37,15 @@ from gateway.whatsapp_router import (
     GatewayResult,
     WhatsAppGatewayRouter,
 )
+from hermes_cloud.ingest.whatsapp_webhook import MAX_WHATSAPP_WEBHOOK_BYTES
 
-#: Mirrors the runtime's own webhook ceiling rather than inventing a second
-#: one: the two ends carry the same payload, so a body one accepts and the
-#: other refuses is a delivery that fails after the gateway already owns it.
-MAX_WEBHOOK_BYTES = 128 * 1024
+#: The runtime's own ceiling, IMPORTED rather than restated. The comment here
+#: used to say it mirrored the runtime and the number said 128 KiB against the
+#: runtime's 256 KiB, so a payload between the two was refused by the gateway
+#: and would have been accepted by the end it was going to — a message dropped
+#: by a limit that claimed to be shared and was not. Restating a constant is
+#: how two ends of one contract drift; the C5a defect in miniature.
+MAX_WEBHOOK_BYTES = MAX_WHATSAPP_WEBHOOK_BYTES
 
 ENV_HOST = "ABROLIA_GATEWAY_HOST"
 ENV_PORT = "ABROLIA_GATEWAY_PORT"
@@ -49,6 +54,10 @@ ENV_INGRESS = "ABROLIA_GATEWAY_INGRESS_DB"
 ENV_SENDER_KEY = "ABROLIA_GATEWAY_SENDER_HMAC_KEY"
 ENV_RELAY_ROOT = "ABROLIA_GATEWAY_RELAY_ROOT_KEY"
 ENV_REDELIVER_SECONDS = "ABROLIA_GATEWAY_REDELIVER_INTERVAL_SECONDS"
+#: The credential the internal relay adapter presents. E2 said detailed codes
+#: are safe "because this entrypoint's caller is the internal adapter" — and
+#: nothing checked that they were. Assumed, not enforced.
+ENV_ADAPTER_TOKEN = "ABROLIA_GATEWAY_ADAPTER_TOKEN"
 
 #: Authentication the caller got wrong. Retrying the same bytes cannot help.
 _REFUSED = frozenset({"hmac_rejected", "timestamp_replay"})
@@ -140,8 +149,11 @@ class GatewayApp:
     second place to get that decision wrong.
     """
 
-    def __init__(self, router: WhatsAppGatewayRouter) -> None:
+    def __init__(
+        self, router: WhatsAppGatewayRouter, *, adapter_token: str | None = None
+    ) -> None:
         self.router = router
+        self.adapter_token = adapter_token
 
     def __call__(self, environ: Mapping[str, Any], start_response: Callable):
         status, body = self._respond(environ)
@@ -193,6 +205,24 @@ class GatewayApp:
         if not isinstance(payload, bytes) or len(payload) != length:
             return "400 Bad Request", {"status": "invalid_request"}
 
+        # AUTHENTICATE THE CALLER BEFORE LOOKING ANYTHING UP.
+        #
+        # Routing ran before signature verification, which is unavoidable —
+        # the signature is verified with the household's key and the household
+        # comes from the route. The consequence was an oracle: with invalid
+        # bytes, an unknown sender got `200 unknown_sender` because routing
+        # denied first, while a BOUND sender reached verification and got
+        # `403 hmac_rejected`. Anyone who could reach this service could
+        # enumerate which numbers belong to a household without holding a
+        # single key.
+        #
+        # E2 claimed the detailed codes were safe "because this entrypoint's
+        # caller is the internal adapter". That was an assumption about the
+        # deployment, not a property of the code, and this is what turns it
+        # into one. After it, the codes really are safe.
+        if not self._adapter_is_authentic(environ):
+            return "401 Unauthorized", {"status": "unauthenticated"}
+
         sender = str(environ.get("HTTP_X_RELAY_SENDER") or "")
         signature = str(environ.get("HTTP_X_RELAY_SIGNATURE") or "")
         timestamp = str(environ.get("HTTP_X_RELAY_TIMESTAMP") or "")
@@ -208,6 +238,24 @@ class GatewayApp:
             signature=signature,
         )
         return self._status_for(result)
+
+    def _adapter_is_authentic(self, environ: Mapping[str, Any]) -> bool:
+        """Whether the caller proved it is the relay adapter.
+
+        FAIL CLOSED when no token is configured. Every other optional key in
+        this system degrades to previous behaviour, and this one must not: an
+        unauthenticated endpoint that accepts family message bodies and answers
+        questions about who is bound is a hole, not an unconfigured
+        convenience. There is no previous behaviour to degrade to — this
+        endpoint did not exist before.
+        """
+        if not self.adapter_token:
+            return False
+        presented = str(environ.get("HTTP_AUTHORIZATION") or "")
+        prefix = "Bearer "
+        if not presented.startswith(prefix):
+            return False
+        return hmac.compare_digest(presented[len(prefix) :], self.adapter_token)
 
     @staticmethod
     def _status_for(result: GatewayResult) -> tuple[str, dict[str, Any]]:
@@ -324,6 +372,14 @@ def build_router(env: Mapping[str, str] | None = None) -> WhatsAppGatewayRouter:
     )
 
 
+def build_app(env: Mapping[str, str] | None = None) -> GatewayApp:
+    source = dict(os.environ if env is None else env)
+    return GatewayApp(
+        build_router(source),
+        adapter_token=source.get(ENV_ADAPTER_TOKEN, "").strip() or None,
+    )
+
+
 def serve(env: Mapping[str, str] | None = None) -> None:  # pragma: no cover - process entry
     """Run the entrypoint and the redeliver scheduler in one process.
 
@@ -335,7 +391,8 @@ def serve(env: Mapping[str, str] | None = None) -> None:  # pragma: no cover - p
     from wsgiref.simple_server import make_server
 
     source = dict(os.environ if env is None else env)
-    router = build_router(source)
+    app = build_app(source)
+    router = app.router
     worker = GatewayRedeliverWorker(router)
     try:
         interval = float(source.get(ENV_REDELIVER_SECONDS, "60"))
@@ -350,7 +407,7 @@ def serve(env: Mapping[str, str] | None = None) -> None:  # pragma: no cover - p
         raise ValueError(f"{ENV_PORT} must be an integer") from error
     if not 0 <= port <= 65535:
         raise ValueError(f"{ENV_PORT} is outside the valid range")
-    make_server(host, port, GatewayApp(router)).serve_forever()
+    make_server(host, port, app).serve_forever()
 
 
 if __name__ == "__main__":  # pragma: no cover - process entry

@@ -593,8 +593,13 @@ implementations of one keyed comparison is precisely the C5a defect.
 
 #### Inventory — C5d something calls the gateway
 
-**Files:** `gateway/app.py`, `deploy/gateway/Dockerfile`,
+**Files:** `gateway/app.py`, `pyproject.toml`, `deploy/gateway/Dockerfile`,
 `deploy/gateway/fly.toml`, `tests/test_gateway_app.py`.
+
+`pyproject.toml` gains `gateway*`: package discovery listed only
+`hermes_cloud*`, `control_plane*` and `web*`, so the wheel the image builds
+carried no `gateway/` and `python -m gateway.app` would have exited with
+`No module named gateway` on every deploy.
 
 Every piece of the WhatsApp path existed after C5c and none of it ran:
 `handle_webhook` had no caller outside tests, `run_once` had no scheduler, and

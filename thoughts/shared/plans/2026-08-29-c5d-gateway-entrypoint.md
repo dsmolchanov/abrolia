@@ -62,10 +62,24 @@ leaking whether a household exists.
   retrying is the right thing.
 
 `unknown_sender` and `ambiguous_sender` return `200` like every other terminal
-outcome, so the status cannot be used to probe whether a sender is bound —
-E5's "not a 404 leak". The code travels in the body, which is safe because
-this entrypoint's caller is the internal adapter that already holds household
-keys.
+outcome, so a caller with valid credentials cannot probe membership by status
+— E5's "not a 404 leak".
+
+**And the caller must authenticate first.** This originally said the detailed
+codes were safe "because the caller is the internal adapter", which was an
+assumption about the deployment and not a property of the code. It left an
+oracle: routing runs before signature verification — it must, since the
+signature is checked with the household's key and the household comes from the
+route — so with invalid bytes an unknown sender was denied at routing and
+answered `200`, while a BOUND sender reached verification and answered `403`.
+Anyone who could reach the service could enumerate membership holding no key
+at all.
+
+`ABROLIA_GATEWAY_ADAPTER_TOKEN` is checked before any lookup, and the
+entrypoint FAILS CLOSED without it. Every other optional key in this system
+degrades to previous behaviour; this one must not, because an endpoint that
+accepts family message bodies has no previous behaviour to degrade to. After
+it, the detailed codes really are safe rather than assumed to be.
 
 **E3 — Durable before ACK survives the HTTP layer.** The entrypoint must never
 answer `200` for something `handle_webhook` neither persisted nor terminally

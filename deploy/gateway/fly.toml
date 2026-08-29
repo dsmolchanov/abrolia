@@ -17,7 +17,14 @@ primary_region = "ams"
 # it:
 #
 #   fly secrets set ABROLIA_GATEWAY_SENDER_HMAC_KEY=... \
-#                   ABROLIA_GATEWAY_RELAY_ROOT_KEY=...
+#                   ABROLIA_GATEWAY_RELAY_ROOT_KEY=... \
+#                   ABROLIA_GATEWAY_ADAPTER_TOKEN=...
+#
+# ABROLIA_GATEWAY_ADAPTER_TOKEN is what the internal relay adapter presents,
+# and the entrypoint FAILS CLOSED without it. Every other key here degrades to
+# previous behaviour when absent; this one must not, because an endpoint that
+# takes family message bodies and answers questions about who is bound has no
+# previous behaviour to degrade to.
 #
 # They must be the SAME values the control plane holds: the sender key is what
 # wrote `channel_bindings.external_id_hmac`, and the relay root is what derived

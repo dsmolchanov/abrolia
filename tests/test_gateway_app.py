@@ -29,6 +29,7 @@ from gateway.whatsapp_router import (
     relay_hmac,
 )
 
+ADAPTER_TOKEN = "synthetic-adapter-token-1234567890"
 GATEWAY_KEY = b"synthetic-gateway-hmac-key-1234567890abcdef"
 RELAY_KEY = b"household-relay-key-1234567890abcdef"
 HOUSEHOLD = "00000000-0000-4000-a000-0000000000d5"
@@ -59,6 +60,7 @@ def _request(body: bytes, *, signature: str, timestamp: str, sender: str = PHONE
         "REQUEST_METHOD": "POST",
         "CONTENT_LENGTH": str(len(body)),
         "wsgi.input": io.BytesIO(body),
+        "HTTP_AUTHORIZATION": f"Bearer {ADAPTER_TOKEN}",
         "HTTP_X_RELAY_SENDER": sender,
         "HTTP_X_RELAY_SIGNATURE": signature,
         "HTTP_X_RELAY_TIMESTAMP": timestamp,
@@ -119,7 +121,7 @@ def test_a_signed_request_for_a_bound_sender_reaches_the_runtime(
     ts = str(int(now))
 
     status, payload = _call(
-        GatewayApp(router),
+        GatewayApp(router, adapter_token=ADAPTER_TOKEN),
         _request(body, signature=relay_hmac(RELAY_KEY, body, ts), timestamp=ts),
     )
     assert status.startswith("200")
@@ -142,7 +144,7 @@ def test_a_wrong_signature_is_refused_and_keeps_nothing(
     body = b'{"message":"not signed by the relay"}'
 
     status, payload = _call(
-        GatewayApp(router),
+        GatewayApp(router, adapter_token=ADAPTER_TOKEN),
         _request(body, signature="sha256=" + "0" * 64, timestamp=str(int(now))),
     )
     assert status.startswith("403")
@@ -165,7 +167,7 @@ def test_an_unknown_sender_is_indistinguishable_from_a_delivery(
     router = _router(tmp_path, deliver=lambda h, p, t, s: None, now=now)
     body = b'{"message":"nobody"}'
     ts = str(int(now))
-    app = GatewayApp(router)
+    app = GatewayApp(router, adapter_token=ADAPTER_TOKEN)
 
     bound_status, _ = _call(
         app, _request(body, signature=relay_hmac(RELAY_KEY, body, ts), timestamp=ts)
@@ -181,6 +183,32 @@ def test_an_unknown_sender_is_indistinguishable_from_a_delivery(
     )
     assert unknown_status == bound_status, "the status told the caller who exists"
     assert unknown_body == {"status": "unknown_sender"}
+
+    # AND UNDER INVALID BYTES, which is where the oracle actually was. Routing
+    # runs before signature verification — it has to, because the signature is
+    # verified with the household's key and the household comes from the route
+    # — so with a bad signature an unknown sender was denied at routing and
+    # answered `200 unknown_sender`, while a BOUND sender reached verification
+    # and answered `403 hmac_rejected`. The earlier version of this test
+    # compared two VALID requests and never touched that path.
+    # Under INVALID bytes the two DO differ — `403 hmac_rejected` for a bound
+    # sender, `200 unknown_sender` for one nobody holds — and that difference
+    # is the oracle Codex found. It is acceptable only because the caller had
+    # to authenticate to reach it at all: routing runs before signature
+    # verification by necessity, since the signature is checked with the
+    # household's key and the household comes from the route.
+    #
+    # So the property that has to hold is about the UNAUTHENTICATED caller, and
+    # `test_an_unauthenticated_caller_learns_nothing_at_all` is where it lives.
+    # Pinned here rather than left implicit, so a later change that removed the
+    # credential would have to confront what it re-exposes.
+    forged = "sha256=" + "0" * 64
+    bound_bad = _call(app, _request(body, signature=forged, timestamp=ts))
+    unknown_bad = _call(
+        app, _request(body, signature=forged, timestamp=ts, sender="+999511234000")
+    )
+    assert bound_bad != unknown_bad
+    assert bound_bad[0].startswith("403") and unknown_bad[0].startswith("200")
 
 
 def test_a_delivery_failure_is_owned_by_the_gateway_not_the_caller(
@@ -208,7 +236,7 @@ def test_a_delivery_failure_is_owned_by_the_gateway_not_the_caller(
     ts = str(int(clock[0]))
 
     status, payload = _call(
-        GatewayApp(router),
+        GatewayApp(router, adapter_token=ADAPTER_TOKEN),
         _request(body, signature=relay_hmac(RELAY_KEY, body, ts), timestamp=ts),
     )
     assert status.startswith("200"), "the caller was told to retry what we already own"
@@ -238,7 +266,7 @@ def test_the_kill_switch_closes_the_entrypoint_without_dropping_the_message(
     ts = str(int(now))
 
     status, payload = _call(
-        GatewayApp(router),
+        GatewayApp(router, adapter_token=ADAPTER_TOKEN),
         _request(body, signature=relay_hmac(RELAY_KEY, body, ts), timestamp=ts),
     )
     assert status.startswith("503")
@@ -262,7 +290,7 @@ def test_an_oversized_body_is_refused_before_it_is_read(
             raise AssertionError("the body was read before the ceiling was checked")
 
     status, payload = _call(
-        GatewayApp(router),
+        GatewayApp(router, adapter_token=ADAPTER_TOKEN),
         {
             "PATH_INFO": "/v1/whatsapp/webhook",
             "REQUEST_METHOD": "POST",
@@ -291,7 +319,7 @@ def test_the_surface_is_exactly_two_routes(
     """A relay with more surface than it needs is more to get wrong."""
     router = _router(tmp_path, deliver=lambda *a: None)
     status, _ = _call(
-        GatewayApp(router), {"PATH_INFO": path, "REQUEST_METHOD": method}
+        GatewayApp(router, adapter_token=ADAPTER_TOKEN), {"PATH_INFO": path, "REQUEST_METHOD": method}
     )
     assert status.startswith(expected)
 
@@ -400,3 +428,43 @@ def test_the_deploy_unit_carries_no_household_secret() -> None:
     assert "ABROLIA_GATEWAY_RELAY_ROOT_KEY =" not in config
     # Fail-closed by default: the relay carries family message content.
     assert 'ABROLIA_WHATSAPP_SHARED_ENABLED = "0"' in config
+
+
+def test_an_unauthenticated_caller_learns_nothing_at_all(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The adapter credential, checked before any lookup.
+
+    E2 said the detailed outcome codes are safe "because this entrypoint's
+    caller is the internal adapter". Nothing checked that they were — it was an
+    assumption about the deployment rather than a property of the code, and
+    without it anyone who could reach the service could enumerate binding
+    membership without holding a single key.
+
+    Fail-closed with no token configured, unlike every other optional key in
+    this system: an endpoint that accepts family message bodies has no previous
+    behaviour to degrade to.
+    """
+    monkeypatch.setenv("ABROLIA_WHATSAPP_SHARED_ENABLED", "1")
+    now = 1_000_000.0
+    router = _router(tmp_path, deliver=lambda *a: None, now=now)
+    body = b'{"message":"who is bound?"}'
+    ts = str(int(now))
+    signature = relay_hmac(RELAY_KEY, body, ts)
+
+    app = GatewayApp(router, adapter_token=ADAPTER_TOKEN)
+    for headers in ({}, {"HTTP_AUTHORIZATION": "Bearer wrong"}, {"HTTP_AUTHORIZATION": ADAPTER_TOKEN}):
+        request = _request(body, signature=signature, timestamp=ts)
+        request.pop("HTTP_AUTHORIZATION", None)
+        request.update(headers)
+        status, payload = _call(app, request)
+        assert status.startswith("401")
+        assert payload == {"status": "unauthenticated"}
+
+    # And an unconfigured gateway refuses even a correct-looking caller.
+    unconfigured = GatewayApp(router, adapter_token=None)
+    status, _ = _call(
+        unconfigured, _request(body, signature=signature, timestamp=ts)
+    )
+    assert status.startswith("401"), "an unconfigured gateway served traffic"
+    assert _ingress_count(tmp_path / "ingress.db") == 0
