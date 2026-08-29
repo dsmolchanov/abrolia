@@ -9,6 +9,18 @@ from control_plane.email.models import EmailIdentityRecord, EmailOption
 from control_plane.email.repository import EmailIdentityRepository
 
 
+class MailboxRefused(ValueError):
+    """A mailbox this household may not have. The message names no address.
+
+    A `ValueError` subclass so the browser route, which redirects the family
+    back to the form on any of them, keeps treating it as a correctable
+    selection. A TYPE of its own so the JSON route can answer 409 instead of
+    letting a refusal the caller can act on arrive as a 500: `select_step`
+    catches Pydantic's `ValidationError` and nothing else, and a plain
+    `ValueError` there is an unhandled exception.
+    """
+
+
 class EmailIdentityService:
     def __init__(self, repository: EmailIdentityRepository) -> None:
         self.repository = repository
@@ -75,7 +87,7 @@ class EmailIdentityService:
             (household_id, self.repository.lookup.email(normalize_email(address))),
         ).fetchone()
         if held is not None:
-            raise ValueError(
+            raise MailboxRefused(
                 "that mailbox is an owner's own contact address"
                 " (self-ingestion loop)"
             )

@@ -324,8 +324,10 @@ looking at whose row it was.
 
 **Files:** `control_plane/channel_preferences.py`, `control_plane/container.py`,
 `control_plane/migrations/0011_channel_preference_fallback.sql`,
-`control_plane/email/service.py`, `control_plane/privacy/export.py`,
+`control_plane/api/onboarding.py`, `control_plane/email/service.py`,
+`control_plane/privacy/export.py`,
 `control_plane/provisioning/planner.py`, `tests/control_plane/conftest.py`,
+`tests/control_plane/test_api.py`,
 `tests/control_plane/test_export_delete.py`,
 `tests/control_plane/test_channel_preferences.py`,
 `tests/control_plane/test_consent_withdrawal.py`,
@@ -355,6 +357,14 @@ managed and own-domain options compose an address.
 `docs/privacy/data-map.md` has promised export and erasure for this table since
 Phase 5 and the promise only became falsifiable once something wrote a row —
 the same sequence `channel_bindings` went through in C3.
+
+`control_plane/api/onboarding.py` joined for the third turn of the same
+lesson: refusing is half the job, and a refusal has to ARRIVE as one.
+`select_step` catches Pydantic's `ValidationError` and nothing else, so the
+selection refusal above reached a JSON client as a 500 while the browser
+route — which redirects on any `ValueError` — showed the family exactly what
+it should. It is a `MailboxRefused` now, answered 409 with its own text the
+way `api/bindings.py` answers a `BindingError`.
 
 **Branches:** `codex/c4a-preferences-writer`.
 
