@@ -132,6 +132,19 @@ def _selected_email_with_provider(cp_stack, behavior: str):
     return fake, cp_stack.make_worker(providers=registry, now=BASE_TIME + 3)
 
 
+
+def _assert_launched(result) -> None:
+    """The runtime job's outcome at LAUNCH, since C3e.
+
+    It no longer settles `succeeded` there: the job waits for the revision to
+    activate, because a job settled at launch is one nothing revisits and a
+    runtime that never called back left the household at `provisioning` for
+    good. `awaiting_activation` is the successful launch.
+    """
+    assert result is not None, "no runtime job ran"
+    assert (result.status, result.error_code) == ("pending", "awaiting_activation"), result
+
+
 def _advance_to_runtime(cp_stack) -> None:
     cp_stack.complete_profile()
     worker = cp_stack.make_worker(now=BASE_TIME + 20)
@@ -743,7 +756,7 @@ def test_secret_canary_is_confined_to_sink_across_sink_crash_and_public_surfaces
         assert worker.run_once().status == "succeeded"
 
     runtime = worker.run_once()
-    assert runtime is not None and runtime.status == "succeeded"
+    _assert_launched(runtime)
     namespace = worker._secret_namespace_ref(cp_stack.household.id)
     assert namespace is not None
     assert sink.get(namespace, binding) == canary.encode()
@@ -1182,7 +1195,7 @@ def test_email_reset_strips_runtime_manifest_digest_from_cleanup_reference(
             now=BASE_TIME + 21,
         )
         assert worker.run_once().status == "succeeded"
-    assert worker.run_once().status == "succeeded"
+    _assert_launched(worker.run_once())
 
     runtime = cp_stack.database.query_one(
         "SELECT id, external_id_ciphertext, encryption_key_version"
@@ -1272,7 +1285,7 @@ def test_email_reset_runtime_cleanup_preserves_namespace_for_reconnect(
             now=BASE_TIME + 21,
         )
         assert worker.run_once().status == "succeeded"
-    assert worker.run_once().status == "succeeded"
+    _assert_launched(worker.run_once())
 
     cp_stack.service.reset_from(
         cp_stack.household.id,
@@ -1345,7 +1358,7 @@ def test_cancel_runtime_cleanup_deletes_namespace_only_after_workload(
             now=BASE_TIME + 21,
         )
         assert worker.run_once().status == "succeeded"
-    assert worker.run_once().status == "succeeded"
+    _assert_launched(worker.run_once())
 
     cp_stack.service.cancel(
         cp_stack.household.id,
@@ -1403,7 +1416,7 @@ def test_runtime_worker_stages_bootstrap_between_prepare_and_launch(cp_stack) ->
     result = cp_stack.make_worker(
         providers=registry, secret_sink=sink, now=BASE_TIME + 30
     ).run_once()
-    assert result.status == "succeeded"
+    _assert_launched(result)
     assert calls == ["prepare", "stage-secret", "launch"]
     runtime_ref = f"synthetic-runtime:{cp_stack.household.id}"
     assert sink.get(runtime_ref, "HERMES_BOOTSTRAP_TOKEN") is not None
@@ -1424,7 +1437,7 @@ def test_bootstrap_cleanup_without_runtime_receipt_or_cancellation_is_rejected(
     _advance_to_runtime(cp_stack)
     sink = InMemorySecretSink()
     worker = cp_stack.make_worker(secret_sink=sink, now=BASE_TIME + 30)
-    assert worker.run_once().status == "succeeded"
+    _assert_launched(worker.run_once())
     runtime_ref = f"synthetic-runtime:{cp_stack.household.id}"
     assert sink.get(runtime_ref, "HERMES_BOOTSTRAP_TOKEN") is not None
     workflow = cp_stack.onboarding.workflow_for_household(cp_stack.household.id)
@@ -1485,7 +1498,7 @@ def test_runtime_secret_install_unknown_reconciles_without_blind_machine_launch(
     assert not provider.launched
 
     recovered = worker.reconcile(unknown.job_id)
-    assert recovered.status == "succeeded"
+    _assert_launched(recovered)
     assert calls == ["prepare", "stage-secret", "prepare", "stage-secret", "launch"]
     tokens = cp_stack.database.query(
         "SELECT revoked_at, used_at FROM bootstrap_tokens ORDER BY created_at, id"
@@ -1741,7 +1754,7 @@ def _install_runtime(cp_stack, *, model_api_key: str | None):
     result = cp_stack.make_worker(
         secret_sink=sink, model_api_key=model_api_key, now=BASE_TIME + 30
     ).run_once()
-    assert result is not None and result.status == "succeeded"
+    _assert_launched(result)
     return sink, f"synthetic-runtime:{cp_stack.household.id}"
 
 
@@ -1849,6 +1862,16 @@ def test_a_rollout_job_leaves_the_onboarding_workflow_where_it_found_it(
         )
         connection.execute(
             "UPDATE onboarding_workflows SET state = 'complete' WHERE household_id = ?",
+            (cp_stack.household.id,),
+        )
+        # What activation does to the onboarding runtime job. Since C3e that
+        # job stays open until the revision goes live, and a rollout scheduled
+        # beside it is the collision `schedule_runtime_rollout` refuses — so
+        # the precondition has to be a household that really has finished, not
+        # one whose row merely says `active`.
+        connection.execute(
+            "UPDATE provisioning_jobs SET status = 'succeeded', error_code = NULL,"
+            " settled_at = 1 WHERE household_id = ? AND kind = 'runtime'",
             (cp_stack.household.id,),
         )
         planned = cp_stack.make_worker().planner.issue(
@@ -2114,3 +2137,186 @@ def test_reconcile_refuses_a_runtime_job_whose_revision_moved_on(cp_stack) -> No
     assert provider.ensure_calls == 1, (
         "reconcile re-entered the provider for a revision nobody is serving"
     )
+
+
+def test_a_rollout_that_never_activates_leaves_work_the_worker_returns_to(
+    cp_stack,
+) -> None:
+    """C3e: the job waits for activation instead of claiming success at launch.
+
+    `_settle_runtime_ready` used to settle `succeeded` right after launch, so a
+    runtime that never claimed its bootstrap token left the household at
+    `provisioning` with a settled row `lease` would never return — invisible,
+    because every layer the control plane can see reported success.
+
+    Asserted through the worker rather than by reading a status this test
+    wrote: the job is leasable again at the token's expiry, and what it does
+    then is settle terminally rather than redo the provider's work.
+    """
+    _queue_rollout_job(cp_stack)
+    worker = cp_stack.make_worker(providers=_runtime_registry(), now=BASE_TIME + 500)
+    _assert_launched(worker.run_once())
+
+    provider = worker.providers.get("dry-run-runtime")
+    launched_calls = provider.ensure_calls
+    job = cp_stack.jobs.get(cp_stack.database.query_one(
+        "SELECT id FROM provisioning_jobs WHERE kind = 'runtime'"
+        " AND error_code = 'awaiting_activation'"
+    )["id"])
+    assert job.status == "pending", "a settled job is one nothing revisits"
+
+    # Nothing to do until the deadline: the worker must not spin on a household
+    # that is waiting for a runtime to call in.
+    assert worker.run_once() is None
+
+    token = cp_stack.database.query_one(
+        "SELECT expires_at FROM bootstrap_tokens WHERE household_id = ?",
+        (cp_stack.household.id,),
+    )
+    after = cp_stack.make_worker(
+        providers=_runtime_registry(), now=float(token["expires_at"]) + 1
+    )
+    result = after.run_once()
+
+    assert result is not None
+    assert (result.status, result.error_code) == (
+        "failed", "activation_deadline_passed",
+    )
+    # And the wait ended without re-entering the provider: the runtime was
+    # already launched, and preparing it again would create a second one.
+    assert after.providers.get("dry-run-runtime").ensure_calls == 0
+    assert launched_calls == 1
+
+
+def test_activation_settles_the_job_it_activates(cp_stack) -> None:
+    """The link activation did not have in either direction.
+
+    `activate` never read, updated or settled the runtime job that produced the
+    revision — it recorded `related_job_id=None` — because the worker had
+    already settled it at launch. Now the job waits, and activation is what
+    ends the wait.
+    """
+    from control_plane.provisioning.bootstrap import BootstrapService
+
+    _queue_rollout_job(cp_stack)
+    worker = cp_stack.make_worker(providers=_runtime_registry(), now=BASE_TIME + 500)
+    _assert_launched(worker.run_once())
+
+    household = cp_stack.households.get(cp_stack.household.id)
+    raw = worker.secret_sink.get(household.runtime_ref, "HERMES_BOOTSTRAP_TOKEN")
+    assert raw is not None
+    revision = household.current_config_revision
+    manifest = cp_stack.configs.manifest(cp_stack.household.id, revision)
+
+    bootstrap = BootstrapService(
+        cp_stack.configs, cp_stack.onboarding, cp_stack.jobs
+    )
+    binding = {
+        "household_id": cp_stack.household.id,
+        "runtime_ref": household.runtime_ref,
+        "config_revision": revision,
+    }
+    bootstrap.claim(raw.decode("ascii") if isinstance(raw, bytes) else raw, **binding)
+    bootstrap.activate(
+        raw.decode("ascii") if isinstance(raw, bytes) else raw,
+        **binding,
+        activated_sha256=manifest["config_sha256"],
+    )
+
+    settled = cp_stack.database.query_one(
+        "SELECT id, status, error_code FROM provisioning_jobs WHERE kind = 'runtime'"
+        " AND desired_revision = ?",
+        (revision,),
+    )
+    assert settled["status"] == "succeeded"
+    assert settled["error_code"] is None, "the wait marker outlived the wait"
+
+    # And settling it REPORTS the outcome without erasing one. `activate` calls
+    # `settle` with a status and nothing else, which used to write NULL over
+    # both ciphertext columns that `_settle_runtime_ready` had deliberately
+    # persisted with `record_result` — taking the provider outcome out of the
+    # DSAR export (`control_plane/privacy/export.py:108`) and losing the job's
+    # durable external reference at the exact moment the job succeeded.
+    #
+    # This asserts the class, not the caller: `settle` now preserves what it is
+    # not asked to replace, so every one of its callers that reports a status
+    # alone — `_mark_step_problem` on the terminal-failure path included —
+    # keeps the provider's answer.
+    assert cp_stack.jobs.result(settled["id"]) is not None, (
+        "activation erased the recorded provider result"
+    )
+    assert cp_stack.jobs.result(settled["id"])["verified"] is True
+    assert cp_stack.jobs.external_ref(settled["id"]) == household.runtime_ref
+
+
+def test_activation_during_launch_still_records_the_provider_outcome(
+    cp_stack,
+) -> None:
+    """The same invariant in the other ordering, which is a real one.
+
+    `FlyRuntimeProvisioner.launch` starts the Machine before it returns, so the
+    Machine can claim its bootstrap token and `BootstrapService.activate` can
+    settle the runtime job while the worker is still inside `launch`. When the
+    worker then reached `_settle_runtime_ready`, it found the job already
+    `succeeded` and returned — without ever calling `record_result` or marking
+    the runtime resource `ready`.
+
+    The test above covers the ordering where the result is written and then
+    erased. Here it is never written at all, which the DSAR export cannot tell
+    apart from a job that had no provider outcome. One invariant, two orderings:
+    the provider's answer must not depend on which writer won.
+    """
+    from control_plane.provisioning.bootstrap import BootstrapService
+
+    _queue_rollout_job(cp_stack)
+    holder: dict = {}
+
+    def activate_mid_launch() -> None:
+        household = cp_stack.households.get(cp_stack.household.id)
+        raw = holder["worker"].secret_sink.get(
+            household.runtime_ref, "HERMES_BOOTSTRAP_TOKEN"
+        )
+        assert raw is not None, "the token is issued before launch, or this proves nothing"
+        token = raw.decode("ascii") if isinstance(raw, bytes) else raw
+        revision = household.current_config_revision
+        manifest = cp_stack.configs.manifest(cp_stack.household.id, revision)
+        binding = {
+            "household_id": cp_stack.household.id,
+            "runtime_ref": household.runtime_ref,
+            "config_revision": revision,
+        }
+        bootstrap = BootstrapService(
+            cp_stack.configs, cp_stack.onboarding, cp_stack.jobs
+        )
+        bootstrap.claim(token, **binding)
+        bootstrap.activate(
+            token, **binding, activated_sha256=manifest["config_sha256"]
+        )
+
+    worker = cp_stack.make_worker(
+        providers=_runtime_registry(on_launch=activate_mid_launch),
+        now=BASE_TIME + 500,
+    )
+    holder["worker"] = worker
+    worker.run_once()
+
+    household = cp_stack.households.get(cp_stack.household.id)
+    settled = cp_stack.database.query_one(
+        "SELECT id, status FROM provisioning_jobs WHERE kind = 'runtime'"
+        " AND desired_revision = ?",
+        (household.current_config_revision,),
+    )
+    # Activation won the race — the precondition, not the subject.
+    assert settled["status"] == "succeeded"
+
+    assert cp_stack.jobs.result(settled["id"]) is not None, (
+        "the provider outcome was never recorded because activation got there first"
+    )
+    assert cp_stack.jobs.external_ref(settled["id"]) == household.runtime_ref
+    # And the resource reached `ready` rather than being left at `creating`,
+    # which is the same loss seen from the resource table.
+    assert cp_stack.database.query_one(
+        "SELECT status FROM external_resources WHERE household_id = ?"
+        " AND resource_type = 'runtime' AND config_revision = ?",
+        (cp_stack.household.id, household.current_config_revision),
+    )["status"] == "ready"

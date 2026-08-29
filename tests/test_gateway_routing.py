@@ -47,8 +47,8 @@ def test_unknown_and_ambiguous_senders_denied(tmp_path: Path) -> None:
     )
     db.connection.commit()
     db.connection.execute(
-        "INSERT INTO channel_bindings (id, household_id, channel, external_id, chat_id, actor_id, role, verified_at, verified_by_actor_id) "
-        "VALUES (?, ?, 'whatsapp', ?, ?, 'owner1', 'owner', 1, 'owner1')",
+        "INSERT INTO channel_bindings (id, household_id, channel, external_id, chat_id, actor_id, role, verified_at, verified_by_actor_id, published_revision) "
+        "VALUES (?, ?, 'whatsapp', ?, ?, 'owner1', 'owner', 1, 'owner1', 1)",
         ("b1", hid, phone, phone),
     )
     db.connection.commit()
@@ -56,8 +56,8 @@ def test_unknown_and_ambiguous_senders_denied(tmp_path: Path) -> None:
     assert router.route("unknown") == GatewayResult(status="denied", code="unknown_sender", household_id=None)
     # add second household with same sender -> ambiguous
     db.connection.execute(
-        "INSERT INTO channel_bindings (id, household_id, channel, external_id, chat_id, actor_id, role, verified_at, verified_by_actor_id) "
-        "VALUES (?, ?, 'whatsapp', ?, ?, 'owner2', 'owner', 1, 'owner2')",
+        "INSERT INTO channel_bindings (id, household_id, channel, external_id, chat_id, actor_id, role, verified_at, verified_by_actor_id, published_revision) "
+        "VALUES (?, ?, 'whatsapp', ?, ?, 'owner2', 'owner', 1, 'owner2', 1)",
         ("b2", hid2, phone, phone),
     )
     db.connection.commit()
@@ -80,8 +80,8 @@ def test_per_household_relay_hmac_and_durable_before_ack(tmp_path: Path, monkeyp
         (hid, "hh1"),
     )
     db.connection.execute(
-        "INSERT INTO channel_bindings (id, household_id, channel, external_id, chat_id, external_id_hmac, actor_id, role, verified_at, verified_by_actor_id) "
-        "VALUES (?, ?, 'whatsapp', ?, ?, ?, 'owner1', 'owner', 1, 'owner1')",
+        "INSERT INTO channel_bindings (id, household_id, channel, external_id, chat_id, external_id_hmac, actor_id, role, verified_at, verified_by_actor_id, published_revision) "
+        "VALUES (?, ?, 'whatsapp', ?, ?, ?, 'owner1', 'owner', 1, 'owner1', 1)",
         ("b1", hid, phone, phone, phone_hmac),
     )
     db.connection.commit()
@@ -173,8 +173,8 @@ def test_routing_is_by_sender_so_two_members_in_one_chat_still_resolve(
     ):
         db.connection.execute(
             "INSERT INTO channel_bindings (id, household_id, channel, external_id,"
-            " chat_id, actor_id, role, verified_at, verified_by_actor_id)"
-            " VALUES (?, ?, 'telegram', ?, ?, ?, ?, 1, 'owner1')",
+            " chat_id, actor_id, role, verified_at, verified_by_actor_id, published_revision)"
+            " VALUES (?, ?, 'telegram', ?, ?, ?, ?, 1, 'owner1', 1)",
             (row_id, hid, sender, chat, actor, role),
         )
     db.connection.commit()
@@ -189,8 +189,8 @@ def test_routing_is_by_sender_so_two_members_in_one_chat_still_resolve(
     # binding one another household holds is refused at bind time.
     db.connection.execute(
         "INSERT INTO channel_bindings (id, household_id, channel, external_id,"
-        " chat_id, actor_id, role, verified_at, verified_by_actor_id)"
-        " VALUES ('b3', ?, 'telegram', ?, ?, 'owner2', 'owner', 1, 'owner2')",
+        " chat_id, actor_id, role, verified_at, verified_by_actor_id, published_revision)"
+        " VALUES ('b3', ?, 'telegram', ?, ?, 'owner2', 'owner', 1, 'owner2', 1)",
         (other, adult_sender, "-100990000202"),
     )
     db.connection.commit()
@@ -220,12 +220,54 @@ def test_a_binding_without_a_chat_cannot_be_written(tmp_path: Path) -> None:
     with pytest.raises(sqlite3.IntegrityError, match="chat_id is required"):
         db.connection.execute(
             "INSERT INTO channel_bindings (id, household_id, channel, external_id,"
-            " actor_id, role, verified_at, verified_by_actor_id)"
-            " VALUES ('b1', ?, 'telegram', '990000001', 'owner1', 'owner', 1, 'owner1')",
+            " actor_id, role, verified_at, verified_by_actor_id, published_revision)"
+            " VALUES ('b1', ?, 'telegram', '990000001', 'owner1', 'owner', 1, 'owner1', 1)",
             (hid,),
         )
 
 
+def test_a_staged_binding_does_not_route_until_its_revision_publishes(
+    tmp_path: Path,
+) -> None:
+    """C3c: routability follows activation, not the row existing.
+
+    `verify_challenge` commits the binding immediately, and before this the
+    gateway matched it at once — sending the new member's traffic to a runtime
+    still serving the previous revision, whose manifest has no pair for them.
+    The runtime denied the turn and the message went nowhere, which is a
+    failure nobody could see from the control plane.
+
+    `published_revision` is written by `BootstrapService.activate`. This case
+    sets it directly, because what is under test is the GATEWAY's half of that
+    contract; the activation half is asserted in
+    `tests/control_plane/test_bootstrap.py`.
+    """
+    db = open_control_plane_database(tmp_path / "cp.db")
+    hid = "00000000-0000-4000-a000-000000000041"
+    sender = "990000004"
+    db.connection.execute(
+        "INSERT INTO households (id, slug, status, created_at, updated_at)"
+        " VALUES (?, 'hh1', 'active', 1, 1)",
+        (hid,),
+    )
+    db.connection.execute(
+        "INSERT INTO channel_bindings (id, household_id, channel, external_id,"
+        " chat_id, actor_id, role, verified_at, verified_by_actor_id,"
+        " published_revision) VALUES ('b1', ?, 'telegram', ?, '-100990000401',"
+        " ?, 'owner', 1, ?, NULL)",
+        (hid, sender, sender, sender),
+    )
+    db.connection.commit()
+
+    router = WhatsAppGatewayRouter(db, ingress_path=tmp_path / "ingress.db")
+    assert router.route(sender, "telegram").code == "unknown_sender"
+
+    # Activation publishes it, and only then does it route.
+    db.connection.execute(
+        "UPDATE channel_bindings SET published_revision = 4 WHERE id = 'b1'"
+    )
+    db.connection.commit()
+    assert router.route(sender, "telegram").household_id == hid
 def _bound_household(tmp_path: Path, *, gateway_key: bytes):
     """One household with one verified WhatsApp binding, and its identifiers."""
     db = open_control_plane_database(tmp_path / "cp.db")
@@ -237,10 +279,14 @@ def _bound_household(tmp_path: Path, *, gateway_key: bytes):
         (hid, "hh-c5b"),
     )
     db.connection.execute(
+        # PUBLISHED, because these cases are about redelivering a real
+        # member's message. C3c makes only a published binding routable, so a
+        # staged one would answer `unknown_sender` and every row here would be
+        # dropped as undeliverable before reaching what is under test.
         "INSERT INTO channel_bindings (id, household_id, channel, external_id,"
         " chat_id, external_id_hmac, actor_id, role, verified_at,"
-        " verified_by_actor_id) VALUES (?, ?, 'whatsapp', ?, ?, ?, 'owner1',"
-        " 'owner', 1, 'owner1')",
+        " verified_by_actor_id, published_revision) VALUES (?, ?, 'whatsapp',"
+        " ?, ?, ?, 'owner1', 'owner', 1, 'owner1', 1)",
         ("b-c5b", hid, phone, phone, sender_hmac(phone, gateway_key)),
     )
     db.connection.commit()
@@ -737,8 +783,8 @@ def test_a_retained_telegram_row_is_rerouted_on_the_channel_it_arrived_on(
     db.connection.execute(
         "INSERT INTO channel_bindings (id, household_id, channel, external_id,"
         " chat_id, external_id_hmac, actor_id, role, verified_at,"
-        " verified_by_actor_id) VALUES (?, ?, 'telegram', ?, ?, ?, 'owner1',"
-        " 'owner', 1, 'owner1')",
+        " verified_by_actor_id, published_revision) VALUES (?, ?, 'telegram',"
+        " ?, ?, ?, 'owner1', 'owner', 1, 'owner1', 1)",
         ("b-tg", hid, sender, "-100990000777", sender_hmac(sender, gateway_key)),
     )
     db.connection.commit()

@@ -1026,19 +1026,11 @@ def test_verifying_a_binding_schedules_the_rollout_and_leaves_onboarding_alone(
 
     _provisioned(cp_stack)
     # The precondition, not the subject: a household that finished setup.
-    # `_provisioned` stops at `runtime_provisioning` because activation runs
-    # through the runtime's bootstrap, which this harness does not host. These
-    # two writes are exactly what activation performs
-    # (`provisioning/bootstrap.py:427` and `:440`).
-    with cp_stack.database.write() as connection:
-        connection.execute(
-            "UPDATE households SET status = 'active' WHERE id = ?",
-            (cp_stack.household.id,),
-        )
-        connection.execute(
-            "UPDATE onboarding_workflows SET state = 'complete' WHERE household_id = ?",
-            (cp_stack.household.id,),
-        )
+    # `_provisioned` stops short because activation runs through the runtime's
+    # bootstrap, which this harness does not host — `_activated` performs what
+    # it would, including settling the runtime job, which since C3e is part of
+    # what "finished" means.
+    _activated(cp_stack)
     before = cp_stack.onboarding.snapshot(cp_stack.household.id)
     assert before.state.value == "complete"
 
@@ -1328,7 +1320,8 @@ def _provision_second_household(cp_stack, email: str):
 
     def drain():
         while (result := worker.run_once()) is not None:
-            assert result.status == "succeeded", result
+            # Since C3e a runtime job stays open until its revision activates.
+            assert result.status in {"succeeded", "pending"}, result
 
     cp_stack.service.save_profile(
         household.id,
@@ -1411,6 +1404,17 @@ def test_a_second_household_can_provision_and_routes_to_itself(cp_stack) -> None
         second_actor, second_chat,
     )
 
+    # Publishing what activation would publish. This case is about D0 —
+    # each household holding a DISTINCT identity — and since C3c a binding
+    # only routes once its revision has activated, which neither household
+    # here has done. Staging is asserted in its own case
+    # (`tests/test_gateway_routing.py`); simulating it would be the subject.
+    with cp_stack.database.write() as connection:
+        connection.execute(
+            "UPDATE channel_bindings SET published_revision = 1"
+            " WHERE published_revision IS NULL"
+        )
+
     # And each sender reaches its OWN household, with no `ambiguous_sender`.
     router = WhatsAppGatewayRouter(
         cp_stack.database, ingress_path=cp_stack.config.database_path.parent / "ing.db"
@@ -1436,7 +1440,7 @@ def _drain(worker) -> None:
     re-planning sweep depends on.
     """
     while (result := worker.run_once()) is not None:
-        assert result.status in {"succeeded", "cancelled"}, result
+        assert result.status in {"succeeded", "cancelled", "pending"}, result
 
 
 def _activated(cp_stack) -> None:
@@ -1456,6 +1460,42 @@ def _activated(cp_stack) -> None:
             "UPDATE onboarding_workflows SET state = 'complete' WHERE household_id = ?",
             (cp_stack.household.id,),
         )
+        # Activation also settles the runtime job and publishes the bindings
+        # that revision carries. Since C3e the job stays open until it does, so
+        # a helper that skipped this left the household looking `active` with a
+        # rollout still in flight — and `schedule_runtime_rollout` refuses
+        # that, correctly.
+        connection.execute(
+            "UPDATE provisioning_jobs SET status = 'succeeded', error_code = NULL,"
+            " settled_at = 1 WHERE household_id = ? AND kind = 'runtime'"
+            " AND settled_at IS NULL",
+            (cp_stack.household.id,),
+        )
+        connection.execute(
+            "UPDATE channel_bindings SET published_revision ="
+            " (SELECT current_config_revision FROM households WHERE id = ?)"
+            " WHERE household_id = ? AND published_revision IS NULL",
+            (cp_stack.household.id, cp_stack.household.id),
+        )
+        # And the revision itself goes live. `config_revisions.status` is the
+        # only fact that answers "which revision is serving" — the household
+        # column answers "which is being rolled out" — so a simulation that
+        # skipped this left every consumer of the real answer seeing nothing
+        # activated at all.
+        connection.execute(
+            "UPDATE config_revisions SET status = 'superseded'"
+            " WHERE household_id = ? AND status = 'active'"
+            " AND revision != (SELECT current_config_revision FROM households"
+            " WHERE id = ?)",
+            (cp_stack.household.id, cp_stack.household.id),
+        )
+        connection.execute(
+            "UPDATE config_revisions SET status = 'active', activated_at = 1"
+            " WHERE household_id = ? AND revision ="
+            " (SELECT current_config_revision FROM households WHERE id = ?)",
+            (cp_stack.household.id, cp_stack.household.id),
+        )
+
 
 
 def _served_pairs(cp_stack, household_id: str):
@@ -1646,10 +1686,18 @@ def test_a_household_still_settling_is_reported_and_never_forced(cp_stack) -> No
             owner_actor_id=owner,
             now=BASE_TIME + 200,
         )
-        # A rollout already in flight: the state where forcing a second one
-        # overwrites `current_config_revision` and strands both jobs.
+        # A rollout genuinely in flight. Writing the status alone is no longer
+        # enough to express that, and that is the point of this phase: a
+        # household at `provisioning` with no job left is STRANDED, and the
+        # sweep must be able to repair it. Busy is the open job.
         connection.execute(
             "UPDATE households SET status = 'provisioning' WHERE id = ?",
+            (cp_stack.household.id,),
+        )
+        connection.execute(
+            "UPDATE provisioning_jobs SET status = 'pending', settled_at = NULL,"
+            " error_code = 'awaiting_activation' WHERE household_id = ?"
+            " AND kind = 'runtime'",
             (cp_stack.household.id,),
         )
         stale = find_stale_bindings(
@@ -1658,7 +1706,10 @@ def test_a_household_still_settling_is_reported_and_never_forced(cp_stack) -> No
             bindings=cp_stack.bindings,
             onboarding=cp_stack.onboarding,
         )
-        assert [item.blocked_by for item in stale] == ["household_status_provisioning"]
+        # The reason names the rollout, not the row: `provisioning` alone
+        # cannot tell a household that is busy from one that is stranded, and
+        # telling them apart is what lets the sweep repair the second.
+        assert [item.blocked_by for item in stale] == ["rollout_in_flight"]
 
         applied = reconcile_stale_bindings(
             connection,
@@ -2080,6 +2131,20 @@ def test_one_household_the_planner_refuses_leaves_the_others_reconciled(
     _activated(cp_stack)
     owner = owner_actor(cp_stack)
 
+    # The refused household must reach the PLANNER, which means it cannot be
+    # blocked earlier for an unrelated reason. Since C3e its runtime job is
+    # still open awaiting activation, and `rollout_in_flight` would answer
+    # before the planner was ever asked — so this settles it the way
+    # activation does, leaving the planner's own refusal as the only thing in
+    # the way. That is what the case is about.
+    with cp_stack.database.write() as connection:
+        connection.execute(
+            "UPDATE provisioning_jobs SET status = 'succeeded', error_code = NULL,"
+            " settled_at = 1 WHERE household_id = ? AND kind = 'runtime'"
+            " AND settled_at IS NULL",
+            (refused.id,),
+        )
+
     with cp_stack.database.write() as connection:
         # The plannable household is stale because a member was verified after
         # its revision was deployed — the ordinary case this sweep repairs.
@@ -2109,6 +2174,17 @@ def test_one_household_the_planner_refuses_leaves_the_others_reconciled(
         connection.execute(
             "UPDATE onboarding_workflows SET state = 'complete' WHERE household_id = ?",
             (refused.id,),
+        )
+        # …including having a revision that actually SERVES something. Without
+        # one the sweep does not consider it at all, and rightly: a household
+        # that has never activated anything has no runtime authorizing a stale
+        # set. It has to be a live household for the planner's refusal to be
+        # the thing under test.
+        connection.execute(
+            "UPDATE config_revisions SET status = 'active', activated_at = 1"
+            " WHERE household_id = ? AND revision ="
+            " (SELECT current_config_revision FROM households WHERE id = ?)",
+            (refused.id, refused.id),
         )
         connection.execute(
             "INSERT INTO channel_bindings (id, household_id, channel,"
@@ -2277,3 +2353,325 @@ def test_a_legacy_spelling_is_one_identity_to_every_writer(cp_stack, writer) -> 
             (cp_stack.household.id,),
         ).fetchall()
         assert [row["external_id"] for row in held] in ([bare], [PHONE])
+
+
+# --- C3c Phase 3: a terminal failure retires what it staged ----------------
+
+
+def test_a_terminal_failure_retires_the_members_it_staged(cp_stack) -> None:
+    """A staged binding whose revision dies is a dead end, not a delay.
+
+    It never routes, and it holds its identity against every future attempt:
+    `issue_challenge` refuses a tuple this household already holds and
+    `_reject_foreign_holder` refuses it to every other. So the owner cannot
+    re-invite that member and nobody else can claim the sender either — the
+    failure of a rollout would permanently consume an identity.
+
+    The owner's row is left alone even though it is staged too. It is re-seeded
+    from the durable onboarding result on every plan, so the next successful
+    activation publishes the same row; deleting it would leave `owner_actor`
+    returning None and the household unable to invite anyone at all.
+    """
+    _provisioned(cp_stack)
+    _activated(cp_stack)
+    owner = owner_actor(cp_stack)
+    household_chat = owner_chat(cp_stack)
+
+    with cp_stack.database.write() as connection:
+        issued = cp_stack.bindings.issue_challenge(
+            connection,
+            household_id=cp_stack.household.id,
+            channel=CHANNEL_SELECTION["kind"],
+            external_id=ADULT,
+            chat_id=household_chat,
+            actor_id=ADULT,
+            role="adult",
+            issued_by_actor_id=owner,
+            now=BASE_TIME + 100,
+        )
+        cp_stack.bindings.verify_challenge(
+            connection,
+            code=issued.code,
+            household_id=cp_stack.household.id,
+            owner_actor_id=owner,
+            now=BASE_TIME + 200,
+        )
+        rows = cp_stack.bindings.verified(
+            connection, household_id=cp_stack.household.id
+        )
+    # The owner is published — its revision activated — and the new member is
+    # staged behind a rollout that has not.
+    published = {r.actor_id: r.published_revision for r in rows}
+    assert published[ADULT] is None
+    assert published[owner] is not None
+
+    with cp_stack.database.write() as connection:
+        retired = cp_stack.bindings.retire_staged_members(
+            connection, household_id=cp_stack.household.id
+        )
+        rows = cp_stack.bindings.verified(
+            connection, household_id=cp_stack.household.id
+        )
+    assert retired == 1
+    assert [r.actor_id for r in rows] == [owner]
+
+    # And the identity is free again, which is the whole point.
+    with cp_stack.database.write() as connection:
+        cp_stack.bindings.issue_challenge(
+            connection,
+            household_id=cp_stack.household.id,
+            channel=CHANNEL_SELECTION["kind"],
+            external_id=ADULT,
+            chat_id=household_chat,
+            actor_id=ADULT,
+            role="adult",
+            issued_by_actor_id=owner,
+            now=BASE_TIME + 300,
+        )
+
+
+def test_retirement_never_touches_a_published_binding(cp_stack) -> None:
+    """Published means routing, and routing members are not this to remove."""
+    _provisioned(cp_stack)
+    _activated(cp_stack)
+    owner = owner_actor(cp_stack)
+
+    with cp_stack.database.write() as connection:
+        issued = cp_stack.bindings.issue_challenge(
+            connection,
+            household_id=cp_stack.household.id,
+            channel="whatsapp",
+            external_id=PHONE,
+            chat_id=PHONE_CHAT,
+            actor_id=PHONE,
+            role="adult",
+            issued_by_actor_id=owner,
+            now=BASE_TIME + 100,
+        )
+        cp_stack.bindings.verify_challenge(
+            connection,
+            code=issued.code,
+            household_id=cp_stack.household.id,
+            owner_actor_id=owner,
+            now=BASE_TIME + 200,
+        )
+        # What activation would have done for a revision that succeeded.
+        connection.execute(
+            "UPDATE channel_bindings SET published_revision = 1"
+            " WHERE household_id = ? AND actor_id = ?",
+            (cp_stack.household.id, PHONE),
+        )
+        retired = cp_stack.bindings.retire_staged_members(
+            connection, household_id=cp_stack.household.id
+        )
+        rows = cp_stack.bindings.verified(
+            connection, household_id=cp_stack.household.id
+        )
+
+    assert retired == 0
+    assert PHONE in {r.actor_id for r in rows}
+
+
+def test_the_sweep_repairs_a_household_no_job_will_ever_return_to(cp_stack) -> None:
+    """C3c Phase 4: the D1 unblock.
+
+    `reconcile_stale_bindings` exists to find households whose runtime is
+    serving a binding set the table no longer has, and it could not reach the
+    ones that need it most. `_blocked_by` refused anything not `active`, and a
+    household stranded by a failed rollout sits at `provisioning` — reported
+    `household_status_provisioning` and skipped, for good, because
+    `JobsRepository.lease` never returns a settled job and `reconcile` refuses
+    anything that is not `outcome_unknown`.
+
+    The household row cannot tell busy from stranded; the QUEUE can. Busy means
+    a rollout is still in flight and a second would collide with it. Stranded
+    means nothing is coming.
+
+    Repair is a roll forward. Planning the next revision converges the runtime
+    whatever it currently holds, which is a claim this side can honestly make
+    where "you are back on N-1" is not — that is why
+    `_restore_settled_household` declines once the provider has been touched.
+    """
+    _provisioned(cp_stack)
+    _activated(cp_stack)
+    owner = owner_actor(cp_stack)
+
+    with cp_stack.database.write() as connection:
+        issued = cp_stack.bindings.issue_challenge(
+            connection,
+            household_id=cp_stack.household.id,
+            channel=CHANNEL_SELECTION["kind"],
+            external_id=ADULT,
+            chat_id=owner_chat(cp_stack),
+            actor_id=ADULT,
+            role="adult",
+            issued_by_actor_id=owner,
+            now=BASE_TIME + 100,
+        )
+        cp_stack.bindings.verify_challenge(
+            connection,
+            code=issued.code,
+            household_id=cp_stack.household.id,
+            owner_actor_id=owner,
+            now=BASE_TIME + 200,
+        )
+        # A rollout that died without handing the household back: the job is
+        # terminal, and the household was left mid-flight.
+        planned = cp_stack.make_worker().planner.issue(
+            connection, household_id=cp_stack.household.id
+        )
+        schedule_runtime_rollout(
+            connection,
+            jobs=cp_stack.jobs,
+            onboarding=cp_stack.onboarding,
+            household_id=cp_stack.household.id,
+            planned=planned,
+            runtime_provider=cp_stack.config.runtime_provider,
+            now=BASE_TIME + 201,
+        )
+        connection.execute(
+            "UPDATE provisioning_jobs SET status = 'failed', settled_at = 1,"
+            " error_code = 'activation_deadline_passed' WHERE household_id = ?"
+            " AND kind = 'runtime' AND settled_at IS NULL",
+            (cp_stack.household.id,),
+        )
+
+    household = cp_stack.database.query_one(
+        "SELECT status FROM households WHERE id = ?", (cp_stack.household.id,)
+    )
+    assert household["status"] == "provisioning", "the precondition, not the subject"
+
+    with cp_stack.database.write() as connection:
+        stale = find_stale_bindings(
+            connection,
+            configs=cp_stack.configs,
+            bindings=cp_stack.bindings,
+            onboarding=cp_stack.onboarding,
+        )
+        # Reachable. This is the assertion the whole phase is for: before it,
+        # every one of these answered `household_status_provisioning`.
+        assert [item.blocked_by for item in stale] == [None]
+
+        applied = reconcile_stale_bindings(
+            connection,
+            planner=cp_stack.make_worker().planner,
+            jobs=cp_stack.jobs,
+            onboarding=cp_stack.onboarding,
+            configs=cp_stack.configs,
+            bindings=cp_stack.bindings,
+            runtime_provider=cp_stack.config.runtime_provider,
+            apply=True,
+            now=BASE_TIME + 300,
+        )
+    assert [item["action"] for item in applied] == ["reconciled"]
+
+    # And a fresh rollout is queued, which is what rolling forward means.
+    assert cp_stack.database.query_one(
+        "SELECT COUNT(*) AS total FROM provisioning_jobs WHERE household_id = ?"
+        " AND kind = 'runtime' AND settled_at IS NULL",
+        (cp_stack.household.id,),
+    )["total"] == 1
+
+
+def test_the_sweep_reaches_a_stranded_household_whose_drift_was_retired(
+    cp_stack,
+) -> None:
+    """The same strandedness, reached the way the worker actually reaches it.
+
+    The test above marks the job failed by hand, which leaves the staged member
+    in the table — so the binding sets disagree and `find_stale_bindings` finds
+    the household through drift. The real path does one more thing:
+    `_mark_step_problem` calls `retire_staged_members` before
+    `_restore_settled_household` declines to move a household whose provider was
+    touched. Deleting that member puts the table back to EXACTLY the manifest
+    the runtime is still serving.
+
+    So the household is stranded at `provisioning` with no drift at all, and the
+    equality check skipped it before reading the queue — the mechanism built to
+    reach stranded households was blind to the one path that actually strands
+    them. Drift is how this sweep usually finds work; it is not the only way a
+    household needs converging.
+    """
+    _provisioned(cp_stack)
+    _activated(cp_stack)
+    owner = owner_actor(cp_stack)
+
+    with cp_stack.database.write() as connection:
+        issued = cp_stack.bindings.issue_challenge(
+            connection,
+            household_id=cp_stack.household.id,
+            channel=CHANNEL_SELECTION["kind"],
+            external_id=ADULT,
+            chat_id=owner_chat(cp_stack),
+            actor_id=ADULT,
+            role="adult",
+            issued_by_actor_id=owner,
+            now=BASE_TIME + 100,
+        )
+        cp_stack.bindings.verify_challenge(
+            connection,
+            code=issued.code,
+            household_id=cp_stack.household.id,
+            owner_actor_id=owner,
+            now=BASE_TIME + 200,
+        )
+        planned = cp_stack.make_worker().planner.issue(
+            connection, household_id=cp_stack.household.id
+        )
+        schedule_runtime_rollout(
+            connection,
+            jobs=cp_stack.jobs,
+            onboarding=cp_stack.onboarding,
+            household_id=cp_stack.household.id,
+            planned=planned,
+            runtime_provider=cp_stack.config.runtime_provider,
+            now=BASE_TIME + 201,
+        )
+        connection.execute(
+            "UPDATE provisioning_jobs SET status = 'failed', settled_at = 1,"
+            " error_code = 'activation_deadline_passed' WHERE household_id = ?"
+            " AND kind = 'runtime' AND settled_at IS NULL",
+            (cp_stack.household.id,),
+        )
+        # The step the other test omits, and the whole point of this one.
+        cp_stack.bindings.retire_staged_members(
+            connection, household_id=cp_stack.household.id
+        )
+
+    household = cp_stack.database.query_one(
+        "SELECT status FROM households WHERE id = ?", (cp_stack.household.id,)
+    )
+    assert household["status"] == "provisioning", "the precondition, not the subject"
+
+    with cp_stack.database.write() as connection:
+        stale = find_stale_bindings(
+            connection,
+            configs=cp_stack.configs,
+            bindings=cp_stack.bindings,
+            onboarding=cp_stack.onboarding,
+        )
+        # There is no drift left to find — that is the premise, asserted so a
+        # future change that stops retiring cannot make this test pass for the
+        # wrong reason.
+        assert [item.bindings_now for item in stale] == [
+            item.bindings_served for item in stale
+        ]
+        assert [item.blocked_by for item in stale] == [None]
+
+        applied = reconcile_stale_bindings(
+            connection,
+            planner=cp_stack.make_worker().planner,
+            jobs=cp_stack.jobs,
+            onboarding=cp_stack.onboarding,
+            configs=cp_stack.configs,
+            bindings=cp_stack.bindings,
+            runtime_provider=cp_stack.config.runtime_provider,
+            apply=True,
+            now=BASE_TIME + 300,
+        )
+    assert [item["action"] for item in applied] == ["reconciled"]
+    assert cp_stack.database.query_one(
+        "SELECT COUNT(*) AS total FROM provisioning_jobs WHERE household_id = ?"
+        " AND kind = 'runtime' AND settled_at IS NULL",
+        (cp_stack.household.id,),
+    )["total"] == 1

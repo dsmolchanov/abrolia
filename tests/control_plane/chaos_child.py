@@ -135,8 +135,14 @@ def _sink_commit(database_path: Path, sink_path: Path) -> None:
 def _runtime_issued(database_path: Path, token_path: Path) -> None:
     active = _container(database_path)
     result = active.worker.run_once()
-    if result is None or result.status != "succeeded":
-        raise AssertionError("runtime provisioning did not settle")
+    # Launched, not settled. Since C3e the runtime job stays open until the
+    # revision activates — which is precisely what the stages after this one
+    # go on to drive, and crash in the middle of.
+    if result is None or (result.status, result.error_code) != (
+        "pending",
+        "awaiting_activation",
+    ):
+        raise AssertionError(f"runtime provisioning did not launch: {result}")
     household = active.database.query_one(
         "SELECT id, runtime_ref FROM households WHERE status = 'provisioning'"
         " ORDER BY created_at DESC LIMIT 1"

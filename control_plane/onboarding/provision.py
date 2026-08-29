@@ -33,7 +33,10 @@ from control_plane.privacy.consent import (
 )
 from control_plane.provisioning.contracts import ProviderRejected
 from control_plane.provisioning.fly import FlyRuntimeProvisioner
-from control_plane.provisioning.worker import requires_current_content_restriction
+from control_plane.provisioning.worker import (
+    AWAITING_ACTIVATION,
+    requires_current_content_restriction,
+)
 
 #: The purpose whose receipt `_run_once` requires before dispatching a
 #: runtime job. Spelled once here, matching the worker's own literal.
@@ -170,7 +173,8 @@ CONTENT_RESTRICTION_BLOCK_ACTION: dict[str, str] = {
     "runtime": (
         "fails on the special-category content restriction receipt before any"
         " provider call: the runtime revision and the unused bootstrap tokens"
-        " are revoked and the workflow returns to email"
+        " are revoked, members this rollout staged are retired, and the"
+        " workflow returns to email"
     ),
     "step": (
         "fails on the special-category content restriction receipt before any"
@@ -182,6 +186,10 @@ CONTENT_RESTRICTION_BLOCK_ACTION: dict[str, str] = {
 CONTENT_RESTRICTION_BLOCK_WRITES: dict[str, tuple[TableWrite, ...]] = {
     "runtime": (
         TableWrite("bootstrap_tokens", "update"),
+        # A revision that will never activate leaves members it staged
+        # unpublished, and a staged binding that never publishes holds its
+        # identity against every future attempt — so this path retires them.
+        TableWrite("channel_bindings", "delete"),
         TableWrite("config_revisions", "update"),
         TableWrite("households", "update"),
         TableWrite("onboarding_transitions", "insert"),
@@ -662,8 +670,18 @@ def plan_onboarding(
                 " WHERE household_id = ? AND workflow_id = ? AND kind = 'runtime'"
                 " AND operation = 'ensure_runtime'"
                 " AND status IN ('pending','running','waiting_user','outcome_unknown')"
+                # A job waiting for its revision to activate is NOT pending
+                # runtime work. Since C3e the job stays open past launch, so it
+                # matches `pending` above — and reporting it here would
+                # advertise the write set of a runtime operation that has
+                # already happened, when the writes that remain belong to
+                # bootstrap activation. That is the same defect
+                # `test_a_succeeded_runtime_job_is_not_reported_as_pending` was
+                # written for, arriving through a status rather than through a
+                # settled row.
+                " AND COALESCE(error_code, '') != ?"
                 " ORDER BY created_at DESC, id DESC",
-                (household_id, workflow["id"]),
+                (household_id, workflow["id"], AWAITING_ACTIVATION),
             ).fetchall()
             plan.unresolved_runtime_jobs = [
                 {
@@ -801,17 +819,32 @@ def plan_onboarding(
             # absence of a pending job therefore reported a failed onboarding as
             # waiting for activation — hiding the one state that needs a human.
             settled = connection.execute(
-                "SELECT status FROM provisioning_jobs WHERE household_id = ?"
+                "SELECT status, error_code FROM provisioning_jobs"
+                " WHERE household_id = ?"
                 " AND workflow_id = ? AND kind = 'runtime'"
                 " AND operation = 'ensure_runtime'"
                 " ORDER BY created_at DESC LIMIT 1",
                 (household_id, workflow["id"]),
             ).fetchone()
             settled_status = str(settled["status"]) if settled else ""
+            # "The runtime operation got as far as launching" has two spellings
+            # and both must read the same, because every branch below asks that
+            # question and none of them cares which spelling answered it.
+            #
+            # Before C3e the job settled `succeeded` at launch, so a settled row
+            # was the evidence. Since C3e the job stays open until the revision
+            # activates and carries `awaiting_activation` instead — better
+            # evidence, because it is on the job rather than inferred from a
+            # workflow label. Both are read: a database migrated mid-flight
+            # carries rows of the first shape.
+            runtime_launched = settled is not None and (
+                settled_status == "succeeded"
+                or str(settled["error_code"] or "") == AWAITING_ACTIVATION
+            )
             awaiting_activation = (
                 issued is not None
+                and runtime_launched
                 and runtime_job is None
-                and settled_status == "succeeded"
                 and str(workflow["state"]) == "activating"
             )
             # `complete` means bootstrap activation already committed. Folding
@@ -821,7 +854,7 @@ def plan_onboarding(
             already_onboarded = (
                 issued is not None
                 and runtime_job is None
-                and settled_status == "succeeded"
+                and runtime_launched
                 and str(workflow["state"]) == "complete"
             )
             # A terminal workflow has no next operation, and the planner does

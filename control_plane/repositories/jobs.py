@@ -261,9 +261,28 @@ class JobsRepository(Repository):
                 external_ref,
                 key_version=key_version,
             ).ciphertext
+        # COALESCE, so that settling a job REPORTS its outcome without erasing
+        # one already recorded. This used to write both columns unconditionally,
+        # which was safe only while `settle` was the sole writer of them — the
+        # assumption `record_result` was added to break. A runtime job now stays
+        # open across the wait for activation, so by the time anything settles
+        # it the provider's answer is already stored, and every caller that
+        # settles a status alone — `BootstrapService.activate` on the success
+        # path, `ProvisioningWorker._mark_step_problem` on the terminal-failure
+        # path — passed no `result`, wrote NULL over it, and took the provider
+        # outcome out of the DSAR export that reads it
+        # (`control_plane/privacy/export.py:108`) along with the job's durable
+        # external reference.
+        #
+        # Fixed here rather than at those two call sites because the defect is
+        # this method's contract: `result=None` means "I am not reporting one",
+        # never "discard the one on the row". Threading the old values through
+        # eighteen callers would leave the next one to get it wrong.
         connection.execute(
-            "UPDATE provisioning_jobs SET status = ?, result_ciphertext = ?,"
-            " external_ref_ciphertext = ?, error_code = ?, lease_until = NULL,"
+            "UPDATE provisioning_jobs SET status = ?,"
+            " result_ciphertext = COALESCE(?, result_ciphertext),"
+            " external_ref_ciphertext = COALESCE(?, external_ref_ciphertext),"
+            " error_code = ?, lease_until = NULL,"
             " leased_by = NULL, updated_at = ?, settled_at = ? WHERE id = ?",
             (
                 status,
@@ -272,6 +291,50 @@ class JobsRepository(Repository):
                 error_code,
                 now,
                 now if status in {"succeeded", "failed", "outcome_unknown", "cancelled"} else None,
+                job_id,
+            ),
+        )
+
+    def record_result(
+        self,
+        connection: sqlite3.Connection,
+        job_id: str,
+        *,
+        result: dict[str, Any],
+        external_ref: str,
+        now: float | None = None,
+    ) -> None:
+        """Store what the provider returned WITHOUT settling the job.
+
+        `settle` is the only other writer of these two columns and it is
+        terminal, which was fine while every job finished at the moment its
+        provider answered. A runtime job now stays open until the revision
+        activates, and the provider's answer has to survive that wait: the
+        DSAR export reads it (`control_plane/privacy/export.py:108`), so
+        losing it would take a provider outcome out of a subject access
+        response.
+        """
+        now = time.time() if now is None else now
+        row = connection.execute(
+            "SELECT encryption_key_version FROM provisioning_jobs WHERE id = ?",
+            (job_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(job_id)
+        key_version = row["encryption_key_version"]
+        connection.execute(
+            "UPDATE provisioning_jobs SET result_ciphertext = ?,"
+            " external_ref_ciphertext = ?, updated_at = ? WHERE id = ?",
+            (
+                self.encrypt_json(
+                    "provisioning_jobs", job_id, "result", result,
+                    key_version=key_version,
+                ).ciphertext,
+                self.encrypt_json(
+                    "provisioning_jobs", job_id, "external_ref", external_ref,
+                    key_version=key_version,
+                ).ciphertext,
+                now,
                 job_id,
             ),
         )

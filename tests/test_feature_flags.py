@@ -91,7 +91,7 @@ def test_flag_toggle_mid_run_blocks_next_call(monkeypatch, tmp_path) -> None:
     gw_key = b"test-gateway-key-1234567890abcdef12345678"
     h = sender_hmac(phone, gw_key)
     db.connection.execute(
-        "INSERT INTO channel_bindings (id, household_id, channel, external_id, chat_id, external_id_hmac, actor_id, role, verified_at, verified_by_actor_id) VALUES (?, ?, 'whatsapp', ?, ?, ?, 'owner', 'owner', 1, 'owner')",
+        "INSERT INTO channel_bindings (id, household_id, channel, external_id, chat_id, external_id_hmac, actor_id, role, verified_at, verified_by_actor_id, published_revision) VALUES (?, ?, 'whatsapp', ?, ?, ?, 'owner', 'owner', 1, 'owner', 1)",
         ("b-flag", hid, phone, phone, h),
     )
     db.connection.commit()

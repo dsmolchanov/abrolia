@@ -500,7 +500,13 @@ def test_the_declared_write_set_matches_a_real_run_from_activating(container) ->
     with _tracing_writes(observed):
         reconciled = container.worker.reconcile(stalled.job_id)
 
-    assert reconciled.status == "succeeded"
+    # Launched, and since C3e that is where the runtime operation ends: the
+    # job waits for activation rather than settling here. The declared write
+    # set is unchanged, because the same tables are touched — `record_result`
+    # and `retry_later` write `provisioning_jobs` exactly where `settle` did.
+    assert (reconciled.status, reconciled.error_code) == (
+        "pending", "awaiting_activation",
+    )
     assert observed == set(RUNTIME_WRITES_BY_WORKFLOW_STATE["activating"])
 
 
@@ -662,13 +668,19 @@ def test_an_unplannable_provider_asserts_nothing_rather_than_guessing() -> None:
     assert FlyRuntimeProvisioner.stable_volume_name() not in str(resources)
 
 
-def test_a_succeeded_runtime_job_is_not_reported_as_pending(container) -> None:
-    """`_settle_runtime_ready` settles the job while the workflow is `activating`.
+def test_a_launched_runtime_job_is_not_reported_as_pending(container) -> None:
+    """A job past launch has no `ensure_runtime` work left to advertise.
 
-    A terminal row was still selected, labelled `pending_runtime_job`, and used
-    to advertise a reconcile write set — but no `ensure_runtime` operation
-    remains at that point; the next writes belong to bootstrap activation, which
-    this command says nothing about.
+    Originally: `_settle_runtime_ready` settled the job while the workflow was
+    `activating`, and the terminal row was still selected, labelled
+    `pending_runtime_job`, and used to advertise a reconcile write set.
+
+    Since C3e the job does not settle at launch — it waits for the revision to
+    activate — so it now matches the `pending` status this query selects, and
+    the same wrong report arrives through a status instead of a settled row.
+    The query excludes `awaiting_activation` for that reason. The writes that
+    remain belong to bootstrap activation, which this command says nothing
+    about.
     """
     household_id = _household_with_profile(container)
     _verify_all_steps(container, household_id)
@@ -680,7 +692,8 @@ def test_a_succeeded_runtime_job_is_not_reported_as_pending(container) -> None:
         " ORDER BY created_at DESC LIMIT 1",
         (household_id,),
     )
-    assert settled["status"] == "succeeded"
+    # Launched and waiting, which is the state that used to be reported wrongly.
+    assert settled["status"] == "pending"
 
     plan = plan_onboarding(container, household_id)
 

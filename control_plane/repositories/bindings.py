@@ -143,6 +143,12 @@ class BindingRecord:
     role: str
     verified_at: float
     verified_by_actor_id: str
+    #: The revision whose activation made this binding routable, or None while
+    #: it is still STAGED. A staged binding is written, and projected into the
+    #: manifest being planned, but the gateway will not route to it — the
+    #: runtime serving the previous revision has no pair for that member, so
+    #: routing them there sends their message nowhere.
+    published_revision: int | None = None
 
 
 class ChannelBindingsRepository(Repository):
@@ -205,6 +211,11 @@ class ChannelBindingsRepository(Repository):
             role=row["role"],
             verified_at=float(row["verified_at"]),
             verified_by_actor_id=row["verified_by_actor_id"],
+            published_revision=(
+                None
+                if row["published_revision"] is None
+                else int(row["published_revision"])
+            ),
         )
 
     # --- writing ---------------------------------------------------------
@@ -388,6 +399,40 @@ class ChannelBindingsRepository(Repository):
             " AND consumed_at IS NULL",
             (household_id,),
         )
+
+    @staticmethod
+    def retire_staged_members(
+        connection: sqlite3.Connection, *, household_id: str
+    ) -> int:
+        """Remove members a rollout staged but never published.
+
+        A staged binding whose revision will never activate is not a delay but
+        a DEAD END. It never routes, and it holds its identity against every
+        future attempt: `issue_challenge` refuses a tuple this household
+        already holds and `_reject_foreign_holder` refuses it to every other,
+        so the owner cannot re-invite that member and nobody else can claim the
+        identity. Leaving it is worse than never having written it.
+
+        Every staged row belongs to the one rollout that would have published
+        it, so no revision scoping is needed and none is recorded. A household
+        can have at most one rollout in flight: `schedule_runtime_rollout`
+        refuses unless the household is `active` and immediately sets it to
+        `provisioning`, and the binding endpoint's transaction rolls back with
+        that refusal — so a second staged binding cannot be created alongside a
+        first.
+
+        The OWNER's row is deliberately left alone even when staged. It is
+        seeded from the durable onboarding result by `ensure_owner_binding` on
+        every plan, so the next successful activation publishes the same row;
+        deleting it would make `owner_actor` return None and leave the
+        household unable to invite anyone, which is a worse state than the one
+        being cleaned up.
+        """
+        return connection.execute(
+            "DELETE FROM channel_bindings WHERE household_id = ?"
+            " AND role != 'owner' AND published_revision IS NULL",
+            (household_id,),
+        ).rowcount
 
     def issue_challenge(
         self,
@@ -786,9 +831,16 @@ class ChannelBindingsRepository(Repository):
         # written here. `test_hmac_column_stays_null_until_c5_provisions_the_key`
         # pins it so the gap fails a test rather than a delivery.
         connection.execute(
+            # `published_revision` is NULL — STAGED. The row exists, the
+            # planner will project it into the revision being planned, and the
+            # gateway will not route to it until `BootstrapService.activate`
+            # publishes that revision. Writing it routable here is the defect
+            # C3c exists to close: the runtime still serving N-1 has no pair
+            # for this member, so their traffic would arrive and be denied.
             "INSERT INTO channel_bindings (id, household_id, channel, external_id,"
             " chat_id, external_id_hmac, actor_id, role, verified_at,"
-            " verified_by_actor_id) VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)",
+            " verified_by_actor_id, published_revision)"
+            " VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, NULL)",
             (
                 row_id,
                 household_id,
