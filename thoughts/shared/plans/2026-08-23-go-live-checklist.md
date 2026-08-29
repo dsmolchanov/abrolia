@@ -640,6 +640,39 @@ incident the switch was thrown to contain.
 
 **Branches:** `codex/c5d-gateway-entrypoint`.
 
+#### Inventory — C6a a successful activation is not a stale projection
+
+**Files:** `control_plane/provisioning/worker.py`,
+`tests/control_plane/test_provisioning_jobs.py`.
+
+Found while reviewing #86 and deliberately not patched there. Pre-existing on
+`main`.
+
+`_runtime_projection_is_current` requires `household_status = 'provisioning'`
+and a workflow in `{runtime_provisioning, activating}` — and SUCCESSFUL
+ACTIVATION is precisely what ends both. So a job whose revision went live read
+as "not current", and reconcile's not-current branch treated a READY provider
+as an orphan: `_cleanup_cancelled_result` marks the resource and runs the
+deprovision through. **That is teardown of the runtime currently serving the
+household**, triggered by an operator reconciling a job that succeeded.
+
+The guard answers "is this job the household's current intent"; the branch used
+it for "is this provider resource an orphan". Those diverge in exactly one
+case — the job is stale BECAUSE IT SUCCEEDED — so `_revision_is_serving` asks
+the authority first, and all three consumers of the currency guard that lead to
+a terminal or destructive outcome now consult it. The two reconcile branches
+were found by grepping the guard rather than by following the reported
+instance; the third, `_settle_activation_deadline`, is the guard #86 drafted
+and reverted as untestable, reachable now that reconcile no longer cancels
+first.
+
+`config_revisions.status = 'active'` is the authority because it has one
+writer. `job_status`, `settled_at` and the presence of an unused bootstrap
+token are the worker's own bookkeeping, and #86 fixed three defects that were
+all the same substitution.
+
+**Branches:** `codex/c6a-reconcile-activation-authority`.
+
 #### Inventory — C5e the gateway asks and holds nothing
 
 **Files:** `control_plane/bindings_resolution.py`,

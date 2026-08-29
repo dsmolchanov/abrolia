@@ -2055,9 +2055,34 @@ class ProvisioningWorker:
                 inspected = provider.inspect(request if split_runtime else job.intent_key)
                 with self.jobs.db.write() as connection:
                     runtime_state = self._runtime_state(connection, job)
+                    # J1/J2: asked BEFORE the not-current branch, because that
+                    # branch treats "not current" as "orphan" and the two
+                    # diverge exactly here. Successful activation moves the
+                    # household to `active` and the workflow to `complete`,
+                    # which is what makes the projection read as stale — so a
+                    # job that SUCCEEDED reached the cleanup path and, with a
+                    # real provider answering READY, scheduled teardown of the
+                    # runtime currently serving the household.
+                    serving = self._revision_is_serving(connection, job)
                 projection_current = self._runtime_projection_is_current(
                     runtime_state, job
                 )
+                if serving and not projection_current:
+                    # The revision this job produced IS what is serving. It is
+                    # not superseded, it is finished — so it settles the way
+                    # `_settle_runtime_ready` would have, and the resource it
+                    # created is the household's runtime rather than an orphan.
+                    if inspected.state is InspectState.READY and inspected.result:
+                        inspected.result.secret_material.clear()
+                        return self._settle_runtime_ready(job, inspected.result)
+                    # READY is the only state that can finish it here. Anything
+                    # else and the provider disagrees with an active revision,
+                    # which is a contradiction this end cannot resolve by
+                    # guessing — and J4 says a resource left alone is visible
+                    # and reversible where a destroyed one is neither.
+                    return WorkResult(
+                        job.id, "outcome_unknown", "serving_revision_provider_unclear"
+                    )
                 if not projection_current:
                     if inspected.state is InspectState.READY and inspected.result:
                         inspected.result.secret_material.clear()
@@ -2802,7 +2827,56 @@ class ProvisioningWorker:
         ).fetchone()
 
     @staticmethod
+    def _revision_is_serving(connection, job: JobRecord) -> bool:
+        """Whether this job's revision is the one actually being served.
+
+        J2. `config_revisions.status = 'active'` has ONE writer,
+        `BootstrapService.activate`, and it supersedes the previous row in the
+        same transaction — so this is the event itself, not a record of it.
+
+        Everything else the worker could ask instead is its own bookkeeping.
+        `job_status` says what the worker last wrote; `settled_at` says the
+        worker finished, not that the runtime did; a missing unused bootstrap
+        token means either that the deadline passed OR that activation used it,
+        which are opposite facts. #86 fixed three defects that were all this
+        same substitution.
+
+        AND A HOUSEHOLD THAT STILL EXISTS TO SERVE. An active revision alone is
+        not enough, because erasure is a different lifecycle: `DeletionService`
+        moves the household to `deleting` and deletes its runtime WITHOUT
+        superseding `config_revisions`. Reading the revision row alone would
+        then call a household "serving" whose runtime is already gone — and
+        because every guard here declines to settle a serving job, the
+        `outcome_unknown` runtime job would never resolve, while
+        `privacy/delete.py` treats exactly those as unresolved. The erasure
+        would be blocked for good.
+
+        A deletion that cannot finish is worse than the teardown this guard
+        exists to prevent: one is a runtime nobody meant to destroy, the other
+        is a person's data that cannot be removed.
+        """
+        return connection.execute(
+            "SELECT 1 FROM config_revisions AS r"
+            " JOIN households AS h ON h.id = r.household_id"
+            " WHERE r.household_id = ? AND r.revision = ? AND r.status = 'active'"
+            " AND h.status NOT IN ('deleting', 'deleted') LIMIT 1",
+            (job.household_id, job.desired_revision),
+        ).fetchone() is not None
+
+    @staticmethod
     def _runtime_projection_is_current(state, job: JobRecord) -> bool:
+        """Whether this job is still the household's CURRENT INTENT.
+
+        J1 — this is not the same question as "is the provider resource an
+        orphan", and it must not be used to answer that one. The two diverge in
+        exactly one case: successful activation moves the household to `active`
+        and the workflow to `complete`, which is precisely what this returns
+        False for. A job that SUCCEEDED reads here exactly like a job that was
+        superseded.
+
+        Callers that go on to settle terminally or to delete must ask
+        `_revision_is_serving` first.
+        """
         return bool(
             state is not None
             and state["job_status"] in {"running", "outcome_unknown"}
@@ -2820,6 +2894,16 @@ class ProvisioningWorker:
                     job.id,
                     "outcome_unknown",
                     "runtime_projection_changed_during_reconcile",
+                )
+            if self._revision_is_serving(connection, job):
+                # J3: never write `cancelled` over a job whose revision serves.
+                # The provider answering ABSENT while an active revision exists
+                # is a contradiction — most likely a reference this end can no
+                # longer address — and recording the job cancelled would put
+                # durable history and the privacy export at odds with the thing
+                # actually running.
+                return WorkResult(
+                    job.id, "outcome_unknown", "serving_revision_provider_absent"
                 )
             if state is not None and state["job_status"] in {
                 "running",
@@ -3115,6 +3199,24 @@ class ProvisioningWorker:
         with self.jobs.db.write() as connection:
             state = self._runtime_state(connection, job)
             if state is not None and state["job_status"] == "succeeded":
+                return WorkResult(job.id, "succeeded")
+            if self._revision_is_serving(connection, job):
+                # BUT ONLY IF IT REALLY DID NOT COME BACK. The caller infers
+                # the deadline from the absence of a live bootstrap token, and
+                # a token is missing for two opposite reasons: it expired
+                # unused, or ACTIVATION USED IT. J2 — the `job_status` check
+                # above is the worker's own bookkeeping, and this is the event.
+                #
+                # J3: a job whose revision serves is not `failed`. Recording it
+                # so would leave durable history and the privacy export
+                # contradicting the household's active revision.
+                #
+                # Settling with a status alone is safe because `settle`
+                # preserves what it is not asked to replace (#86), so the
+                # recovered provider result survives.
+                self.jobs.settle(
+                    connection, job.id, status="succeeded", now=self.clock()
+                )
                 return WorkResult(job.id, "succeeded")
         return self._mark_step_problem(
             job, self.jobs.request(job.id), "failed", ACTIVATION_DEADLINE_PASSED

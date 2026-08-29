@@ -1899,7 +1899,7 @@ def test_a_rollout_job_leaves_the_onboarding_workflow_where_it_found_it(
 # --- C3d: the currency guards, run rather than described -------------------
 
 
-def _runtime_registry(*, on_prepare=None, on_launch=None, behavior=None):
+def _runtime_registry(*, on_prepare=None, on_launch=None, behavior=None, inspect_ready=False):
     """A runtime provider that can change the world between checkpoints.
 
     The guards sit BETWEEN provider calls, so a test that only sets up state
@@ -1926,6 +1926,21 @@ def _runtime_registry(*, on_prepare=None, on_launch=None, behavior=None):
             if isinstance(stable_ref, dict):
                 stable_ref = (
                     stable_ref.get("runtime_ref") or stable_ref.get("app_ref") or ""
+                )
+            if inspect_ready and self.resources:
+                # A REAL provider answers READY for a Machine that is running,
+                # and the dry-run fake answers ABSENT because the request dict
+                # it is handed carries no reference it indexes by. That
+                # difference is not cosmetic: READY is the branch that deletes,
+                # so a suite where `inspect` never says READY cannot reach the
+                # destructive path at all.
+                from control_plane.provisioning.contracts import (
+                    InspectResult,
+                    InspectState,
+                )
+
+                return InspectResult(
+                    InspectState.READY, next(iter(self.resources.values()))
                 )
             return super().inspect(stable_ref)
 
@@ -2409,3 +2424,226 @@ def test_without_a_relay_root_the_runtime_launches_without_the_secret(cp_stack) 
     ) is None
     # And the launch still happened, which is the point.
     assert worker.secret_sink.get(household.runtime_ref, "HERMES_BOOTSTRAP_TOKEN")
+
+
+def _runtime_is_being_torn_down(cp_stack) -> bool:
+    """Whether any runtime resource has entered a teardown state.
+
+    `deleting` AND `deleted`: `_cleanup_cancelled_result` marks the row and
+    then runs the deprovision through, so a test watching only for `deleting`
+    sees a live runtime and a destroyed one alike.
+    """
+    return bool(
+        cp_stack.database.query_one(
+            "SELECT COUNT(*) AS total FROM external_resources WHERE household_id = ?"
+            " AND resource_type = 'runtime' AND status IN ('deleting', 'deleted')",
+            (cp_stack.household.id,),
+        )["total"]
+    )
+
+
+def _activate_out_of_band(cp_stack, worker):
+    """The Machine claims its token after the job is already terminal.
+
+    `launch` starts the Machine and then raises, so `_run_once` settles the job
+    `outcome_unknown` — which stamps `settled_at`, so `BootstrapService.activate`
+    skips it. The revision goes live and the job stays terminal-but-wrong.
+    """
+    from control_plane.provisioning.bootstrap import BootstrapService
+
+    household = cp_stack.households.get(cp_stack.household.id)
+    raw = worker.secret_sink.get(household.runtime_ref, "HERMES_BOOTSTRAP_TOKEN")
+    token = raw.decode("ascii") if isinstance(raw, bytes) else raw
+    revision = household.current_config_revision
+    manifest = cp_stack.configs.manifest(cp_stack.household.id, revision)
+    binding = {
+        "household_id": cp_stack.household.id,
+        "runtime_ref": household.runtime_ref,
+        "config_revision": revision,
+    }
+    bootstrap = BootstrapService(cp_stack.configs, cp_stack.onboarding, cp_stack.jobs)
+    bootstrap.claim(token, **binding)
+    bootstrap.activate(token, **binding, activated_sha256=manifest["config_sha256"])
+    return revision
+
+
+def test_reconciling_a_job_whose_revision_serves_does_not_tear_down_its_runtime(
+    cp_stack,
+) -> None:
+    """C6a: the defect #86 found and deliberately did not patch.
+
+    `_runtime_projection_is_current` requires `household_status == 'provisioning'`
+    and a workflow in `{runtime_provisioning, activating}`, and SUCCESSFUL
+    ACTIVATION is precisely what ends both. So a job whose revision went live
+    reads as "not current", and reconcile's not-current branch treats a READY
+    provider as an orphan: `_cleanup_cancelled_result` marks the resource
+    `deleting` and enqueues a `bootstrap_cleanup` with
+    `cleanup_authorization: "runtime_cancelled"`.
+
+    That is teardown of the runtime currently serving the household, triggered
+    by an operator reconciling a job that succeeded.
+
+    `inspect_ready` matters: the dry-run fake answers ABSENT for the request
+    dict it is handed, which is the harmless half of this branch. A real
+    provider answers READY for a Machine that is running, and READY is the
+    branch that deletes.
+    """
+    def time_out_after_the_machine_starts() -> None:
+        raise TimeoutError("the connection ended after the Machine started")
+
+    _queue_rollout_job(cp_stack)
+    worker = cp_stack.make_worker(
+        providers=_runtime_registry(
+            on_launch=time_out_after_the_machine_starts, inspect_ready=True
+        ),
+        now=BASE_TIME + 500,
+    )
+    unknown = worker.run_once()
+    assert unknown is not None and unknown.status == "outcome_unknown"
+
+    revision = _activate_out_of_band(cp_stack, worker)
+    assert cp_stack.database.query_one(
+        "SELECT status FROM config_revisions WHERE household_id = ? AND revision = ?",
+        (cp_stack.household.id, revision),
+    )["status"] == "active", "the precondition: it really did activate"
+
+    reconciled = worker.reconcile(unknown.job_id)
+
+    assert reconciled.status == "succeeded", (
+        "a job whose revision serves was not recorded as finished"
+    )
+    # The runtime is NOT being torn down. Asserted with the same predicate the
+    # superseded case asserts the presence of, so the two bracket one branch
+    # from either side rather than each measuring something different — an
+    # earlier draft checked only for `deleting` and would have passed on the
+    # bug, because the cleanup path runs the deprovision through to `deleted`.
+    assert not _runtime_is_being_torn_down(cp_stack), (
+        "the runtime serving this household was torn down"
+    )
+    # And the household is still active on that revision, which is the fact the
+    # whole guard is derived from.
+    assert cp_stack.households.get(cp_stack.household.id).status == "active"
+
+
+def test_a_genuinely_superseded_job_still_reaches_cleanup(cp_stack) -> None:
+    """The guard must not disable the branch it guards.
+
+    A job whose revision is NOT active and whose provider answers READY is a
+    real orphan: nothing is serving it and the resource should go. If the fix
+    for the case above also swallowed this one it would leak a Machine per
+    abandoned rollout, which is the opposite failure and just as quiet.
+    """
+    def time_out_after_the_machine_starts() -> None:
+        raise TimeoutError("the connection ended after the Machine started")
+
+    _queue_rollout_job(cp_stack)
+    worker = cp_stack.make_worker(
+        providers=_runtime_registry(
+            on_launch=time_out_after_the_machine_starts, inspect_ready=True
+        ),
+        now=BASE_TIME + 500,
+    )
+    unknown = worker.run_once()
+    assert unknown is not None and unknown.status == "outcome_unknown"
+
+    # No activation. The household moves on without this revision ever serving.
+    with cp_stack.database.write() as connection:
+        _make_stale(connection, cp_stack, "revision")
+    assert cp_stack.database.query_one(
+        "SELECT COUNT(*) AS total FROM config_revisions WHERE household_id = ?"
+        " AND status = 'active'",
+        (cp_stack.household.id,),
+    )["total"] == 0, "the precondition: nothing is serving"
+
+    worker.reconcile(unknown.job_id)
+    # The teardown signal is the resource marked `deleting` — the same one the
+    # case above asserts the ABSENCE of, so the two tests bracket the branch
+    # from either side rather than each measuring something different.
+    assert _runtime_is_being_torn_down(cp_stack), "an abandoned runtime was left behind"
+
+
+def test_the_deadline_does_not_fail_a_job_whose_revision_activated(cp_stack) -> None:
+    """J3, on the path that infers a deadline from a missing token.
+
+    A bootstrap token is missing for two opposite reasons: it expired unused, or
+    ACTIVATION USED IT. The caller cannot tell them apart — it is looking at the
+    token, and the token is gone either way — so the job that succeeded was
+    recorded `failed`.
+
+    #86 drafted this guard and reverted it because no test could reach it while
+    reconcile cancelled first. With that path fixed it is reachable, so it comes
+    back with the test that reaches it.
+    """
+    def time_out_after_the_machine_starts() -> None:
+        raise TimeoutError("the connection ended after the Machine started")
+
+    _queue_rollout_job(cp_stack)
+    worker = cp_stack.make_worker(
+        providers=_runtime_registry(on_launch=time_out_after_the_machine_starts),
+        now=BASE_TIME + 500,
+    )
+    unknown = worker.run_once()
+    revision = _activate_out_of_band(cp_stack, worker)
+
+    settled = worker._settle_activation_deadline(
+        cp_stack.jobs.get(unknown.job_id)
+    )
+    assert settled.status == "succeeded"
+    row = cp_stack.database.query_one(
+        "SELECT status, error_code FROM provisioning_jobs WHERE kind = 'runtime'"
+        " AND desired_revision = ?",
+        (revision,),
+    )
+    assert row["status"] == "succeeded"
+    assert row["error_code"] != "activation_deadline_passed"
+
+
+def test_erasure_can_settle_a_runtime_job_whose_revision_is_still_active(
+    cp_stack,
+) -> None:
+    """Erasure is a different lifecycle, and it does not supersede the revision.
+
+    `DeletionService` moves the household to `deleting` and deletes its
+    runtime WITHOUT touching `config_revisions`, so the revision row still says
+    `active` while nothing is serving. Reading that row alone made
+    `_revision_is_serving` true, and every guard added by C6a declines to settle
+    a serving job — so the `outcome_unknown` runtime job never resolved, and
+    `privacy/delete.py` treats exactly those as unresolved.
+
+    The erasure would be blocked for good. That is worse than the teardown C6a
+    exists to prevent: one is a runtime nobody meant to destroy, the other is a
+    person's data that cannot be removed.
+    """
+    def time_out_after_the_machine_starts() -> None:
+        raise TimeoutError("the connection ended after the Machine started")
+
+    _queue_rollout_job(cp_stack)
+    worker = cp_stack.make_worker(
+        providers=_runtime_registry(on_launch=time_out_after_the_machine_starts),
+        now=BASE_TIME + 500,
+    )
+    unknown = worker.run_once()
+    assert unknown is not None and unknown.status == "outcome_unknown"
+    revision = _activate_out_of_band(cp_stack, worker)
+
+    # Erasure begins: the household is being deleted and its runtime is gone,
+    # while the revision row still reads `active`.
+    with cp_stack.database.write() as connection:
+        connection.execute(
+            "UPDATE households SET status = 'deleting' WHERE id = ?",
+            (cp_stack.household.id,),
+        )
+    assert cp_stack.database.query_one(
+        "SELECT status FROM config_revisions WHERE household_id = ? AND revision = ?",
+        (cp_stack.household.id, revision),
+    )["status"] == "active", "the precondition: erasure leaves the revision active"
+
+    settled = worker.reconcile(unknown.job_id)
+    assert settled.status != "outcome_unknown", (
+        "an erasure was blocked by a job that could never resolve"
+    )
+    assert cp_stack.database.query_one(
+        "SELECT COUNT(*) AS total FROM provisioning_jobs WHERE household_id = ?"
+        " AND status IN ('running', 'outcome_unknown')",
+        (cp_stack.household.id,),
+    )["total"] == 0, "privacy/delete.py would still see this as unresolved"
