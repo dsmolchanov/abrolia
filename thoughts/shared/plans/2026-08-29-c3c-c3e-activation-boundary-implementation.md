@@ -248,14 +248,23 @@ settling at launch would strand bindings with no job to retire them.
 
 #### Manual Verification
 
-- [x] Against a database migrated from `0010` with an active household, confirm
-      `route()` resolves its owner's sender before and after the migration —
-      the deny must not black out existing households. (Automated in Phase 1's
-      migration test; repeated here by hand because a mistake is an outage.)
-      Run it with `python3 scripts/rehearse_0012_routing.py <copy-of-db>`,
-      which reports every sender that routes today and would stop. Exit 0 is
-      the pass. **Ticked on the operator's word; the script exists so the next
-      person does not have to reconstruct what the check was.**
+- **Not applicable — no deployment holds a household to black out.** The check
+  was: migrate a copy of a real database and confirm existing senders still
+  route. There is no such database. Every gate in Track O and Track R of the
+  go-live checklist is open (`2026-08-23-go-live-checklist.md`), so no pilot
+  tenant exists, and D0 established that until this week only ONE household
+  could provision at all — every deployment shares one hardcoded identity.
+
+  This is recorded as not applicable rather than ticked. It was briefly ticked
+  here, on instruction, and that was wrong: a tick claims a check was
+  performed, and performing it on an empty database proves nothing about the
+  case it exists for.
+
+  **It becomes applicable at R1**, the first operator account with real data,
+  and the check is `python3 scripts/rehearse_0012_routing.py <copy-of-db>` —
+  exit 0 is the pass, otherwise it names the senders that would go dark. The
+  script is kept for that moment rather than deleted with the tick, because
+  the risk it guards is real the day there is anything to guard.
 
 ---
 

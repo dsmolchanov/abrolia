@@ -451,7 +451,11 @@ Prerequisite: O1 ticked. Order is not negotiable per runbook and canon.
 - [ ] **R0. Operator soak prep (synthetic, can start anytime).** Dedicated
   staging org confirmed; `ABROLIA_REAL_EMAIL_HOUSEHOLD_ALLOWLIST` populated
   with the operator household only.
-- [ ] **R1. Operator accounts, managed email first.**
+- [ ] **R1. Operator accounts, managed email first.** *Before this promotion,
+  run `python3 scripts/rehearse_0012_routing.py` against a copy of the
+  database it creates: `0012` decides which existing bindings the gateway will
+  still route, and a household it misses goes silent rather than failing a
+  test. Not applicable until here — there is no data to lose before it.*
   `ABROLIA_REAL_EMAIL_ENABLED=1` + allowlist; manual live battery O3; soak.
 - [ ] **R2. First invited pilot family.** Managed `@abrolia.com` only. MVP
   surface: onboarding 3-step machine, approvals→staged effects, deletion.
