@@ -141,6 +141,9 @@ loses privacy instead. The count is the operator's signal that it happened.
   dropping it and without spending its attempts.
 * The worker reads the same WAL the router writes on the default
   configuration, where no `ingress_path` is given.
+* A row is never on disk without the household it was accepted for, so a
+  process killed mid-delivery restarts into a row it can still redeliver.
+* The brake stops the REST of a batch, not only the next one.
 * A row kept because the relay key was absent is delivered once a key appears,
   without the payload being re-signed — the C5c seam, tested here with the key
   simply arriving.

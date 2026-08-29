@@ -1,5 +1,6 @@
 """Gateway narrow multi-tenant routing + durable before ACK + HMAC."""
 
+import contextlib
 import sqlite3
 from pathlib import Path
 
@@ -777,3 +778,124 @@ def test_a_retained_telegram_row_is_rerouted_on_the_channel_it_arrived_on(
         "a telegram row was re-routed as whatsapp and lost"
     )
     assert delivered == [body]
+
+
+def test_a_row_is_never_on_disk_without_the_household_it_was_accepted_for(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The WAL must not lose a message on the crash it exists to survive.
+
+    Recording the household in a later `defer` left a window — from the insert
+    until that update — in which a row on disk had no household. A process
+    killed in it, which is most likely while `runtime_deliver` is in flight,
+    restarted into a row `_has_provenance` reads as unverifiable and deletes.
+
+    Simulated by killing the process where it hurts: `runtime_deliver` raises
+    `KeyboardInterrupt`, which no `except Exception` catches, so nothing after
+    it runs — exactly what a SIGKILL leaves behind.
+    """
+    monkeypatch.setenv("ABROLIA_WHATSAPP_SHARED_ENABLED", "1")
+    gateway_key = b"synthetic-gateway-hmac-key-1234567890abcdef"
+    db, hid, phone = _bound_household(tmp_path, gateway_key=gateway_key)
+    key = b"household-relay-key-1234567890abcdef"
+
+    clock = [1_000_000.0]
+
+    def killed(household_id, payload, timestamp, signature):
+        raise KeyboardInterrupt("SIGKILL mid-delivery")
+
+    router = WhatsAppGatewayRouter(
+        db,
+        relay_keys={hid: key},
+        gateway_hmac_key=gateway_key,
+        ingress_path=tmp_path / "ingress.db",
+        runtime_deliver=killed,
+        now_fn=lambda: clock[0],
+    )
+    body = b'{"message":"in flight when the process died"}'
+    ts = str(int(clock[0]))
+    with contextlib.suppress(KeyboardInterrupt):
+        router.handle_webhook(body, phone, timestamp=ts, signature=relay_hmac(key, body, ts))
+
+    row = sqlite3.connect(tmp_path / "ingress.db").execute(
+        "SELECT household_id, channel, origin_timestamp, origin_signature"
+        " FROM gateway_ingress"
+    ).fetchone()
+    assert row is not None, "the WAL lost the message it had already committed"
+    assert row[0] == hid, "a committed row had no household to be redelivered to"
+
+    # And the restarted worker delivers it rather than dropping it.
+    delivered: list[bytes] = []
+    restarted = WhatsAppGatewayRouter(
+        db,
+        relay_keys={hid: key},
+        gateway_hmac_key=gateway_key,
+        ingress_path=tmp_path / "ingress.db",
+        runtime_deliver=lambda h, p, t, s: delivered.append(p),
+        now_fn=lambda: clock[0] + GatewayRedeliverWorker.BASE_BACKOFF_SECONDS + 1,
+    )
+    report = GatewayRedeliverWorker(restarted).run_once()
+    assert report.public_dict()["dropped_unverifiable"] == 0
+    assert report.public_dict()["delivered"] == 1
+    assert delivered == [body]
+
+
+def test_the_brake_stops_the_rest_of_the_batch_not_just_the_next_one(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A batch is up to `limit` rows, so once per batch is not often enough.
+
+    Checking the switch only before selecting the batch meant a switch thrown
+    while the first `runtime_deliver` was in flight still sent every remaining
+    row — up to 99 more messages during the incident the switch was pulled for.
+    It is read immediately before each delivery, for the same reason
+    `handle_webhook` reads it at call time: the switch exists to be thrown
+    DURING the work.
+    """
+    monkeypatch.setenv("ABROLIA_WHATSAPP_SHARED_ENABLED", "1")
+    gateway_key = b"synthetic-gateway-hmac-key-1234567890abcdef"
+    db, hid, phone = _bound_household(tmp_path, gateway_key=gateway_key)
+    key = b"household-relay-key-1234567890abcdef"
+
+    clock = [1_000_000.0]
+    delivered: list[bytes] = []
+    failing = True
+
+    def deliver(household_id, payload, timestamp, signature):
+        if failing:
+            raise RuntimeError("not yet")
+        delivered.append(payload)
+        # The operator throws the switch while this first delivery is running.
+        monkeypatch.setenv("ABROLIA_WHATSAPP_SHARED_ENABLED", "0")
+
+    router = WhatsAppGatewayRouter(
+        db,
+        relay_keys={hid: key},
+        gateway_hmac_key=gateway_key,
+        ingress_path=tmp_path / "ingress.db",
+        runtime_deliver=deliver,
+        now_fn=lambda: clock[0],
+    )
+    first = b'{"message":"one"}'
+    second = b'{"message":"two"}'
+    for body in (first, second):
+        ts = str(int(clock[0]))
+        router.handle_webhook(
+            body, phone, timestamp=ts, signature=relay_hmac(key, body, ts)
+        )
+        clock[0] += 1
+    assert _ingress_count(tmp_path / "ingress.db") == 2
+
+    worker = GatewayRedeliverWorker(router)
+    failing = False
+    clock[0] += GatewayRedeliverWorker.BASE_BACKOFF_SECONDS + 1
+    report = worker.run_once()
+    assert delivered == [first], "the brake let the rest of the batch through"
+    assert report.public_dict()["held"] == 1
+    assert _ingress_count(tmp_path / "ingress.db") == 1, "the held row was dropped"
+
+    # And it goes out once the switch is back on.
+    monkeypatch.setenv("ABROLIA_WHATSAPP_SHARED_ENABLED", "1")
+    clock[0] += GatewayRedeliverWorker.BASE_BACKOFF_SECONDS + 1
+    assert worker.run_once().public_dict()["delivered"] == 1
+    assert delivered == [first, second]

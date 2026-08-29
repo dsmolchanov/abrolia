@@ -111,6 +111,7 @@ class GatewayStore:
         sender: str,
         *,
         channel: str = "whatsapp",
+        household_id: str | None = None,
         timestamp: str | None = None,
         signature: str | None = None,
         now: float | None = None,
@@ -125,9 +126,12 @@ class GatewayStore:
         ingress_id = uuid.uuid4().hex
         self.conn.execute(
             "INSERT INTO gateway_ingress (id, payload, sender, received_at, delivered,"
-            " attempts, next_attempt_at, channel, origin_timestamp, origin_signature)"
-            " VALUES (?, ?, ?, ?, 0, 0, ?, ?, ?, ?)",
-            (ingress_id, payload, sender, now, now, channel, timestamp, signature),
+            " attempts, next_attempt_at, channel, household_id, origin_timestamp,"
+            " origin_signature) VALUES (?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?)",
+            (
+                ingress_id, payload, sender, now, now, channel, household_id,
+                timestamp, signature,
+            ),
         )
         self.conn.commit()
         return ingress_id
@@ -269,22 +273,36 @@ class WhatsAppGatewayRouter:
         # `feature_flags` that the switch was live at all.
         if not is_whatsapp_shared_enabled():
             return GatewayResult(status="denied", code="flag_disabled", household_id=None)
-        # Durable before ACK — persist first, ACK only after persist succeeds
         if not timestamp or not signature:
             return GatewayResult(status="denied", code="hmac_rejected", household_id=None)
         store = self.store
+        # ROUTE FIRST, then persist the row COMPLETE. The resolved household is
+        # part of what the row was accepted as, and recording it in a later
+        # `defer` left a window — from this commit until that update — in which
+        # a row on disk had no household. A process killed in that window,
+        # which is most likely while `runtime_deliver` is in flight, restarted
+        # into a row `_has_provenance` reads as unverifiable and deletes. The
+        # write-ahead log would have lost the message on exactly the crash it
+        # exists to survive, and both retryable paths shared the window.
+        #
+        # Routing before persisting does not weaken "durable before ACK":
+        # `route` is a local read of `channel_bindings` with no external effect,
+        # and the ACK is this function returning. What is now true is that the
+        # row is never on disk in a state the reader cannot act on.
+        #
+        # A denied route also stops writing a row it would immediately delete.
+        routed = self.route(sender, channel, timestamp=timestamp)
+        if routed.status == "denied":
+            return routed
         ingress_id = store.persist_before_ack(
             payload,
             sender,
             channel=channel,
+            household_id=routed.household_id,
             timestamp=timestamp,
             signature=signature,
             now=self.now_fn(),
         )
-        routed = self.route(sender, channel, timestamp=timestamp)
-        if routed.status == "denied":
-            store.mark_delivered(ingress_id)
-            return routed
         # `hmac_rejected` used to be the answer to four different questions,
         # and the WAL row's fate was decided by which `return` happened to run.
         # The question the reader actually has to ask is not "was the HMAC bad"
@@ -300,7 +318,6 @@ class WhatsAppGatewayRouter:
                 ingress_id,
                 error="relay_key_absent",
                 not_before=self.now_fn() + GatewayRedeliverWorker.BASE_BACKOFF_SECONDS,
-                household_id=routed.household_id,
             )
             return GatewayResult(
                 status="denied", code="relay_key_absent", household_id=None
@@ -324,7 +341,6 @@ class WhatsAppGatewayRouter:
                 ingress_id,
                 error="runtime_unavailable",
                 not_before=self.now_fn() + GatewayRedeliverWorker.BASE_BACKOFF_SECONDS,
-                household_id=routed.household_id,
             )
             return GatewayResult(
                 status="denied", code="runtime_unavailable", household_id=None
@@ -411,21 +427,8 @@ class GatewayRedeliverWorker:
         # that stops new webhooks while a worker keeps draining the backlog
         # into the runtime is not a brake. Nothing is dropped: the rows stay
         # for a later enabled run.
-        if not is_whatsapp_shared_enabled():
-            for row in self.store.due(now=now, limit=limit):
-                # Without spending an attempt — the switch being off is an
-                # operator decision, not the row's failure, and letting it burn
-                # `MAX_ATTEMPTS` would mean the brake destroyed the very work
-                # it was pulled to protect.
-                self.store.defer(
-                    row["id"],
-                    error="flag_disabled",
-                    not_before=now + self.BASE_BACKOFF_SECONDS,
-                    spend_attempt=False,
-                )
-                held += 1
-            return RedeliverReport(held=held)
-        for row in self.store.due(now=now, limit=limit):
+        rows = self.store.due(now=now, limit=limit)
+        for index, row in enumerate(rows):
             ingress_id = row["id"]
             if now - row["received_at"] > self.MAX_AGE_SECONDS:
                 self.store.mark_delivered(ingress_id)
@@ -491,6 +494,18 @@ class GatewayRedeliverWorker:
                 self.store.mark_delivered(ingress_id)
                 unverifiable += 1
                 continue
+            # The brake, immediately before the external call it brakes, and
+            # not once per batch. A batch is up to `limit` rows, so a switch
+            # thrown while the first `runtime_deliver` was in flight still sent
+            # every remaining row — an incident brake that let 99 more messages
+            # through is not one. Read here for the same reason
+            # `handle_webhook` reads it at call time: the switch exists to be
+            # thrown DURING the work.
+            if not is_whatsapp_shared_enabled():
+                held += self._hold(row, now)
+                for remaining in rows[index + 1 :]:
+                    held += self._hold(remaining, now)
+                break
             try:
                 if self.router.runtime_deliver:
                     # Re-signed under the household's current key, over the
@@ -524,6 +539,22 @@ class GatewayRedeliverWorker:
             dropped_unverifiable=unverifiable,
             held=held,
         )
+
+    def _hold(self, row, now: float) -> int:
+        """Leave a row exactly as it is, for a run when the switch is back on.
+
+        Not a drop and not a failure, so it does not spend an attempt: the
+        switch being off is an operator decision, and letting it burn
+        `MAX_ATTEMPTS` would mean the brake destroyed the work it was pulled to
+        protect.
+        """
+        self.store.defer(
+            row["id"],
+            error="flag_disabled",
+            not_before=now + self.BASE_BACKOFF_SECONDS,
+            spend_attempt=False,
+        )
+        return 1
 
     @staticmethod
     def _has_provenance(row) -> bool:
