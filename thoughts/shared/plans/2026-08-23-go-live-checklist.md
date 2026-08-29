@@ -236,7 +236,7 @@ Ordered slices:
     which `return` happened to run, into terminal and retryable outcomes: a
     payload a present key rejects can never verify, and keeping it stored a
     family's message body indefinitely.
-  - [ ] **C5c. The relay key exists.** Generate it, install it through the sink
+  - [x] **C5c. The relay key exists.** *Done — see the inventory below.* Generate it, install it through the sink
     above, and backfill `external_id_hmac` — which C3c deliberately left NULL,
     with `test_hmac_column_stays_null_until_c5_provisions_the_key` as the test
     that should start failing here. Until this lands every binding is invisible
@@ -546,6 +546,50 @@ checklist's own "provisioning/secrets.py does not exist" claim about a file
 that has been on disk throughout. See the correction in the C5 box above.
 
 **Branches:** `codex/c5b-gateway-redeliver`.
+
+#### Inventory — C5c the relay key exists
+
+**Files:** `control_plane/crypto.py`, `control_plane/config.py`,
+`control_plane/container.py`, `control_plane/cli.py`,
+`control_plane/provisioning/worker.py`,
+`control_plane/repositories/bindings.py`, `gateway/whatsapp_router.py`,
+`tests/control_plane/conftest.py`,
+`tests/control_plane/test_channel_bindings.py`,
+`tests/control_plane/test_provisioning_jobs.py`.
+
+Two things were missing and the box named neither correctly until #87 fixed
+the text: `relay_keys` was populated only by tests, and `external_id_hmac` was
+always NULL, so no WhatsApp message could reach a household and no binding was
+visible to a strict-mode gateway.
+
+**The relay key is DERIVED, not stored,** and that is forced rather than
+preferred: `FlySecretSink` cannot read — Fly secrets are write-only — and the
+gateway holds no field cipher, so neither end can fetch the other's copy. Both
+derive it from one root. Storage disappears and rotation is one root change.
+
+**The lookup digest is written at `_insert`,** the single funnel
+`ensure_owner_binding` and `verify_challenge` both reach, so no writer can
+produce a binding the gateway cannot see. Being a pure projection of
+`external_id` is what also makes `backfill_sender_digests` possible for rows
+that predate the key.
+
+`cli.py` carries `backfill-sender-digests`, the upgrade step for a database
+written before the key: a strict-mode gateway matches ONLY `external_id_hmac`,
+so without it every household already onboarded goes dark the moment the key is
+configured. A command rather than a migration, because SQL cannot compute a
+keyed digest and a migration that needed the key would have to be handed a
+secret the schema has no business holding.
+
+The gateway's sender key is deliberately NOT the control plane's
+`lookup_hmac_key`: that key digests email addresses and every other equality
+lookup here, and sharing it would let the layer that resolves senders
+correlate identifiers it has no business seeing.
+
+Both primitives live in `control_plane/crypto.py` and the gateway imports
+them, because the gateway already depends on `control_plane` and two
+implementations of one keyed comparison is precisely the C5a defect.
+
+**Branches:** `codex/c5c-relay-key-provisioning`.
 
 #### Inventory — C3d tests that reach what they claim to cover
 

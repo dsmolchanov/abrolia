@@ -77,7 +77,7 @@ from control_plane.channels import (
     canonical_chat,
     canonical_sender,
 )
-from control_plane.crypto import LookupHasher
+from control_plane.crypto import LookupHasher, sender_hmac
 from control_plane.db import new_id
 from control_plane.repositories.base import Repository
 
@@ -152,9 +152,67 @@ class BindingRecord:
 
 
 class ChannelBindingsRepository(Repository):
-    def __init__(self, database, cipher, lookup, token_hasher: LookupHasher) -> None:
+    def __init__(
+        self,
+        database,
+        cipher,
+        lookup,
+        token_hasher: LookupHasher,
+        *,
+        gateway_sender_hmac_key: bytes = b"",
+    ) -> None:
         super().__init__(database, cipher, lookup)
         self.token_hasher = token_hasher
+        # The key the GATEWAY digests a sender with, not this repository's
+        # `lookup`. Reusing `lookup` would have been the short path and is the
+        # wrong one: it digests email addresses and every other equality
+        # lookup here, and the gateway needs whatever key writes this column,
+        # so sharing it would hand the layer that resolves senders the ability
+        # to correlate identifiers it has no business seeing.
+        #
+        # Optional, because a deployment that has not provisioned it is
+        # unconfigured rather than broken — the digest stays NULL and the
+        # gateway keeps the plaintext lookup it runs today.
+        self.gateway_sender_hmac_key = gateway_sender_hmac_key
+
+    def sender_digest(self, external_id: str) -> str | None:
+        """What a strict-mode gateway will look this sender up by, or None.
+
+        The gateway computes `sender_hmac(sender, gateway_key)` and matches it
+        against `external_id_hmac`. This is the other side of that one lookup,
+        so it must use the same function rather than a second implementation
+        of the same digest — which is why it imports the gateway's.
+        """
+        if not self.gateway_sender_hmac_key:
+            return None
+        return sender_hmac(external_id, self.gateway_sender_hmac_key)
+
+    def backfill_sender_digests(self, connection: sqlite3.Connection) -> int:
+        """Give rows written before the key existed their lookup digest.
+
+        Not a migration, because SQL cannot compute a keyed digest and the key
+        belongs to the application, not to the schema. A repository method the
+        operator can run once, idempotent by construction: it reads only rows
+        whose digest is NULL and recomputes from `external_id`, which is the
+        column the digest is a projection of.
+
+        Populated digests are left alone. Recomputing them would be harmless
+        while one key is configured and destructive during a rotation, when the
+        rows carrying the previous key's digest are exactly what a rollback
+        needs.
+        """
+        if not self.gateway_sender_hmac_key:
+            return 0
+        rows = connection.execute(
+            "SELECT id, external_id FROM channel_bindings"
+            " WHERE external_id_hmac IS NULL"
+        ).fetchall()
+        for row in rows:
+            connection.execute(
+                "UPDATE channel_bindings SET external_id_hmac = ? WHERE id = ?",
+                (sender_hmac(row["external_id"], self.gateway_sender_hmac_key), row["id"]),
+            )
+        return len(rows)
 
     # --- reading ---------------------------------------------------------
 
@@ -823,13 +881,19 @@ class ChannelBindingsRepository(Repository):
         )
         self._reject_when_full(connection, household_id=household_id)
         row_id = new_id()
-        # `external_id_hmac` stays NULL, and that is a KNOWN GAP rather than an
-        # oversight: the digest the gateway compares against is keyed with the
-        # relay key, which the control plane does not hold and has no path to —
-        # `provisioning/secrets.py` is C5's work and does not exist yet. A
-        # gateway running in strict HMAC mode therefore cannot see any binding
-        # written here. `test_hmac_column_stays_null_until_c5_provisions_the_key`
-        # pins it so the gap fails a test rather than a delivery.
+        # `external_id_hmac` is a PROJECTION of `external_id` under the
+        # deployment's gateway sender key, and it is computed here because here
+        # is the one funnel both writers reach — `ensure_owner_binding` and
+        # `verify_challenge`. Computing it at either call site would leave the
+        # other writing bindings a strict-mode gateway cannot see.
+        #
+        # Being a pure projection is also what makes `backfill_sender_digests`
+        # possible for rows written before the key existed: anything that can
+        # write it can recompute it.
+        #
+        # NULL when no key is configured, which is C5c's K5 — the gateway then
+        # runs the plaintext lookup it runs today rather than failing closed on
+        # a deployment that simply has not been given keys yet.
         connection.execute(
             # `published_revision` is NULL — STAGED. The row exists, the
             # planner will project it into the revision being planned, and the
@@ -840,13 +904,14 @@ class ChannelBindingsRepository(Repository):
             "INSERT INTO channel_bindings (id, household_id, channel, external_id,"
             " chat_id, external_id_hmac, actor_id, role, verified_at,"
             " verified_by_actor_id, published_revision)"
-            " VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, NULL)",
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
             (
                 row_id,
                 household_id,
                 channel,
                 external_id,
                 chat_id,
+                self.sender_digest(external_id),
                 actor_id,
                 role,
                 verified_at,

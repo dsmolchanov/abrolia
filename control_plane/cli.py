@@ -56,6 +56,10 @@ def _parser() -> argparse.ArgumentParser:
         help="schedule the rollouts instead of only reporting them",
     )
     commands.add_parser(
+        "backfill-sender-digests",
+        help="give bindings written before the gateway key their lookup digest",
+    )
+    commands.add_parser(
         "runtime-health", help="reconcile dedicated runtime readiness receipts"
     )
     resume_deletions = commands.add_parser(
@@ -403,6 +407,26 @@ def main(argv: Sequence[str] | None = None) -> int:
                     apply=args.apply,
                 )
             print(json.dumps(list(report), sort_keys=True))
+            return 0
+        if args.command == "backfill-sender-digests":
+            # The upgrade step for a database that predates
+            # `ABROLIA_GATEWAY_SENDER_HMAC_KEY`. A strict-mode gateway matches
+            # ONLY `external_id_hmac`, so on such a database every existing
+            # binding resolves as `unknown_sender` the moment the key is
+            # configured — only bindings written afterwards would work, and the
+            # households already onboarded would go dark.
+            #
+            # Run it BEFORE enabling strict lookup. It is idempotent and fills
+            # only NULL digests, so running it twice, or on a database that
+            # never needed it, costs one query and changes nothing.
+            #
+            # A command rather than a migration because SQL cannot compute a
+            # keyed digest: the key belongs to the application, and a migration
+            # that needed it would have to be handed a secret the schema has no
+            # business holding.
+            with active.database.write() as connection:
+                repaired = active.bindings.backfill_sender_digests(connection)
+            print(json.dumps({"repaired": repaired}, sort_keys=True))
             return 0
         if args.command == "retention":
             result = active.retention.run()

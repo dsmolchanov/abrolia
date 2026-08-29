@@ -2320,3 +2320,92 @@ def test_activation_during_launch_still_records_the_provider_outcome(
         " AND resource_type = 'runtime' AND config_revision = ?",
         (cp_stack.household.id, household.current_config_revision),
     )["status"] == "ready"
+
+
+def test_the_gateway_signs_what_the_runtime_installed_can_verify(cp_stack) -> None:
+    """C5c end to end, across the boundary rather than within one side of it.
+
+    An earlier version of this test compared the installed secret against
+    `derive_relay_secret(...)` and passed while the two ends disagreed
+    completely: the worker installed the hex string, the gateway signed with
+    the raw digest bytes, and the runtime verified with the ASCII of the hex.
+    Every signature differed. The test never noticed because both of its sides
+    were the CONTROL PLANE's — it recomputed the writer's value the writer's
+    way, which is the trap this file warns about elsewhere and fell into here.
+
+    So this signs through the gateway's real path and verifies through the
+    runtime's real one, with the secret the worker actually installed. It is
+    the same shape as the C5a regression: import both ends and run one payload
+    through them, because that is the only place the disagreement is visible.
+    """
+    from control_plane.provisioning.worker import RUNTIME_WHATSAPP_RELAY_SECRET
+    from gateway.whatsapp_router import WhatsAppGatewayRouter, relay_hmac
+    from hermes_cloud.ingest.whatsapp_webhook import sign_webhook
+
+    _queue_rollout_job(cp_stack)
+    worker = cp_stack.make_worker(providers=_runtime_registry(), now=BASE_TIME + 500)
+    _assert_launched(worker.run_once())
+
+    household = cp_stack.households.get(cp_stack.household.id)
+    installed = worker.secret_sink.get(
+        household.runtime_ref, RUNTIME_WHATSAPP_RELAY_SECRET
+    )
+    assert installed is not None, "the runtime was launched without its relay secret"
+    runtime_secret = (
+        installed.decode("ascii") if isinstance(installed, bytes) else installed
+    )
+
+    # The gateway, built the way a deployment builds it: from the ROOT, with no
+    # injected key map. Before this the map was the only thing either consumer
+    # read, so configuring the root gave the gateway nothing at all.
+    gateway = WhatsAppGatewayRouter(
+        cp_stack.database, relay_root=cp_stack.config.gateway_relay_root_key
+    )
+    key = gateway.relay_key(cp_stack.household.id)
+    assert key is not None, "a configured root did not give the gateway a key"
+
+    body = b'{"message":"one payload through both ends"}'
+    # Inside the synthetic range the fixture sanitiser enforces, so a stamp in
+    # a test cannot be mistaken for a real channel identifier.
+    timestamp = "990000001"
+    assert relay_hmac(key, body, timestamp) == sign_webhook(
+        body, runtime_secret, timestamp
+    ), "the gateway signs something the runtime it provisioned cannot verify"
+
+
+def test_the_relay_secret_name_matches_what_the_runtime_reads(cp_stack) -> None:
+    """One contract, spelled in two packages, pinned so it cannot drift.
+
+    The control plane does not import the runtime package, so the environment
+    variable is spelled independently at each end. That is precisely the shape
+    of the C5a defect — a gateway signing `body|timestamp` while the runtime
+    verified the bare body, each with passing tests of its own — so the two
+    spellings are compared rather than trusted.
+    """
+    from control_plane.provisioning.worker import RUNTIME_WHATSAPP_RELAY_SECRET
+    from hermes_cloud.runtime.service import ENV_WHATSAPP_RELAY_SECRET
+
+    assert RUNTIME_WHATSAPP_RELAY_SECRET == ENV_WHATSAPP_RELAY_SECRET
+
+
+def test_without_a_relay_root_the_runtime_launches_without_the_secret(cp_stack) -> None:
+    """K5: an unconfigured deployment is not a broken one.
+
+    Absent is not a failure here — it is a runtime that cannot serve WhatsApp,
+    which `_whatsapp_config` already reports honestly as `RuntimeNotReady`.
+    Refusing to launch would take down every household that does not use
+    WhatsApp for the absence of a key they never needed.
+    """
+    from control_plane.provisioning.worker import RUNTIME_WHATSAPP_RELAY_SECRET
+
+    _queue_rollout_job(cp_stack)
+    worker = cp_stack.make_worker(providers=_runtime_registry(), now=BASE_TIME + 500)
+    worker.gateway_relay_root_key = b""
+    _assert_launched(worker.run_once())
+
+    household = cp_stack.households.get(cp_stack.household.id)
+    assert worker.secret_sink.get(
+        household.runtime_ref, RUNTIME_WHATSAPP_RELAY_SECRET
+    ) is None
+    # And the launch still happened, which is the point.
+    assert worker.secret_sink.get(household.runtime_ref, "HERMES_BOOTSTRAP_TOKEN")
