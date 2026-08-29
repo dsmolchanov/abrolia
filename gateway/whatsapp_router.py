@@ -468,6 +468,26 @@ class GatewayRedeliverWorker:
                 self.store.mark_delivered(ingress_id)
                 undeliverable += 1
                 continue
+            # THE BRAKE, before anything that either spends an attempt or
+            # delivers, and not once per batch. Two orderings were wrong here.
+            # Checking once before selecting the batch let a switch thrown
+            # during the first delivery send the remaining rows. Checking just
+            # before `runtime_deliver` still left the `relay_key_absent` defer
+            # above it, so a keyless row spent an attempt on every disabled run
+            # and `MAX_ATTEMPTS` deleted it during the incident — the brake
+            # destroying exactly the work it was pulled to protect, which is
+            # the thing this hold exists to prevent.
+            #
+            # The terminal cleanups above stay outside it deliberately: expiry,
+            # missing provenance and an unroutable sender are retention and
+            # security decisions that are correct whether or not traffic is
+            # flowing, and holding a forged or expired row would be keeping
+            # message content for no reason.
+            if not is_whatsapp_shared_enabled():
+                held += self._hold(row, now)
+                for remaining in rows[index + 1 :]:
+                    held += self._hold(remaining, now)
+                break
             key = self.router.relay_keys.get(routed.household_id)
             if not key:
                 # Still no key. This is the wait C5c ends.
@@ -494,18 +514,6 @@ class GatewayRedeliverWorker:
                 self.store.mark_delivered(ingress_id)
                 unverifiable += 1
                 continue
-            # The brake, immediately before the external call it brakes, and
-            # not once per batch. A batch is up to `limit` rows, so a switch
-            # thrown while the first `runtime_deliver` was in flight still sent
-            # every remaining row — an incident brake that let 99 more messages
-            # through is not one. Read here for the same reason
-            # `handle_webhook` reads it at call time: the switch exists to be
-            # thrown DURING the work.
-            if not is_whatsapp_shared_enabled():
-                held += self._hold(row, now)
-                for remaining in rows[index + 1 :]:
-                    held += self._hold(remaining, now)
-                break
             try:
                 if self.router.runtime_deliver:
                     # Re-signed under the household's current key, over the

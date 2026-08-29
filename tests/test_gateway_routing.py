@@ -899,3 +899,64 @@ def test_the_brake_stops_the_rest_of_the_batch_not_just_the_next_one(
     clock[0] += GatewayRedeliverWorker.BASE_BACKOFF_SECONDS + 1
     assert worker.run_once().public_dict()["delivered"] == 1
     assert delivered == [first, second]
+
+
+def test_the_brake_does_not_spend_the_attempts_of_a_keyless_row(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The hold has to come before the retryable branch, not just before delivery.
+
+    A `relay_key_absent` row reached `_defer` above the brake check, so every
+    run while the switch was off spent one of its attempts. Long enough into an
+    incident and `MAX_ATTEMPTS` deleted it — so when C5c finally installed the
+    key and traffic was re-enabled, the message the brake was protecting had
+    already been destroyed by the brake.
+    """
+    monkeypatch.setenv("ABROLIA_WHATSAPP_SHARED_ENABLED", "1")
+    gateway_key = b"synthetic-gateway-hmac-key-1234567890abcdef"
+    db, hid, phone = _bound_household(tmp_path, gateway_key=gateway_key)
+    key = b"household-relay-key-1234567890abcdef"
+
+    delivered: list[bytes] = []
+    clock = [1_000_000.0]
+    router = WhatsAppGatewayRouter(
+        db,
+        relay_keys={},  # C5c has not run
+        gateway_hmac_key=gateway_key,
+        ingress_path=tmp_path / "ingress.db",
+        runtime_deliver=lambda h, p, t, s: delivered.append(p),
+        now_fn=lambda: clock[0],
+    )
+    body = b'{"message":"queued with no key, during an incident"}'
+    ts = str(int(clock[0]))
+    assert router.handle_webhook(
+        body, phone, timestamp=ts, signature=relay_hmac(key, body, ts)
+    ).code == "relay_key_absent"
+
+    def _attempts() -> int:
+        return sqlite3.connect(tmp_path / "ingress.db").execute(
+            "SELECT attempts FROM gateway_ingress"
+        ).fetchone()[0]
+
+    # One attempt was genuinely made at ingress: the key was looked for and was
+    # not there. What must not grow is this number, once the switch is off.
+    at_ingress = _attempts()
+    assert at_ingress == 1
+
+    worker = GatewayRedeliverWorker(router)
+    monkeypatch.setenv("ABROLIA_WHATSAPP_SHARED_ENABLED", "0")
+    for _ in range(GatewayRedeliverWorker.MAX_ATTEMPTS + 2):
+        clock[0] += GatewayRedeliverWorker.BASE_BACKOFF_SECONDS * 2
+        report = worker.run_once()
+        assert report.public_dict()["dropped_exhausted"] == 0, (
+            "the brake exhausted the row it was meant to protect"
+        )
+    assert _ingress_count(tmp_path / "ingress.db") == 1
+    assert _attempts() == at_ingress, "a hold spent an attempt"
+
+    # The incident ends and C5c installs the key.
+    router.relay_keys[hid] = key
+    monkeypatch.setenv("ABROLIA_WHATSAPP_SHARED_ENABLED", "1")
+    clock[0] += GatewayRedeliverWorker.BASE_BACKOFF_SECONDS * 2
+    assert worker.run_once().public_dict()["delivered"] == 1
+    assert delivered == [body]

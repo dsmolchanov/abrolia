@@ -143,7 +143,9 @@ loses privacy instead. The count is the operator's signal that it happened.
   configuration, where no `ingress_path` is given.
 * A row is never on disk without the household it was accepted for, so a
   process killed mid-delivery restarts into a row it can still redeliver.
-* The brake stops the REST of a batch, not only the next one.
+* The brake stops the REST of a batch, not only the next one, and holds a
+  keyless row without spending its attempts — an incident must not exhaust the
+  work the brake was pulled to protect.
 * A row kept because the relay key was absent is delivered once a key appears,
   without the payload being re-signed — the C5c seam, tested here with the key
   simply arriving.
