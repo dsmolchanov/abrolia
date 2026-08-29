@@ -40,9 +40,12 @@ jobs:
     # whatever that ref resolves to. A tag is mutable: retagging `v1` — by
     # compromise or by accident — would silently change the code holding those
     # secrets in every consumer at once, with no diff anywhere to review.
-    # The SHA below is tag v1 of dsmolchanov/codex-review-gate. To move it,
+    # The SHA below pins tag v2 in dsmolchanov/codex-review-gate: completed
+    # review generations are counted statelessly from head-bound verdicts,
+    # re-reviews are scoped to the delta since the last completed verdict, and
+    # after three completed rounds only P0 holds the merge. To move the pin,
     # read the host diff first, then change this line: the bump is the review.
-    uses: dsmolchanov/codex-review-gate/.github/workflows/codex-review-window.yml@8cafcd277cff80a4ae9b097a106afd252fea6af2  # v1
+    uses: dsmolchanov/codex-review-gate/.github/workflows/codex-review-window.yml@5af5ca538fa84bf0ed933f4eb6ee927dddc0dd52
     permissions:
       contents: read
       issues: read
