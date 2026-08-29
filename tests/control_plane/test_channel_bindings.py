@@ -266,10 +266,18 @@ def test_hmac_column_stays_null_until_c5_provisions_the_key(cp_stack) -> None:
     """A known gap, pinned so it fails a test rather than a delivery.
 
     The gateway's strict mode looks bindings up by `external_id_hmac`, keyed
-    with the relay key. The control plane does not hold that key and has no
-    path to one — `provisioning/secrets.py` is C5's work and does not exist.
-    So every binding written here is invisible to a strict-mode gateway. When
-    C5 lands the key, this test is the one that should start failing.
+    with the relay key. The control plane does not hold that key, so every
+    binding written here is invisible to a strict-mode gateway. When C5c lands
+    the key, this test is the one that should start failing.
+
+    What is missing is the KEY, not a place to put one. This said
+    `provisioning/secrets.py` "is C5's work and does not exist", and that file
+    has been on disk throughout — `FlySecretSink` installs secret material and
+    the email providers already use it. Nothing generates a per-household relay
+    secret, installs it as `ABROLIA_WHATSAPP_RELAY_SECRET`, or computes the
+    digest this column holds; `WhatsAppGatewayRouter.relay_keys` is populated
+    only by tests. Naming the sink as the gap pointed the next reader at a file
+    they would find already written.
     """
     with cp_stack.database.write() as connection:
         issued = _issue(cp_stack, connection)

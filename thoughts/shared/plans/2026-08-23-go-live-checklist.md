@@ -212,7 +212,41 @@ Ordered slices:
   makes changing one a revision, with C3b's rollout behind it — or not at all.
 - [ ] **C5. Gateway plumbing.** Redeliver-from-`gateway_ingress` worker (rows
   are written and never read back); HTTP entrypoint + narrow deploy unit;
-  relay-key provisioning path (`provisioning/secrets.py` planned, absent).
+  relay-key provisioning path.
+
+  **Correction: `provisioning/secrets.py` is not absent.** This box has said
+  "planned, absent" since it was written, and the file has been on disk
+  throughout — `FlySecretSink` and `InMemorySecretSink`, installing secret
+  material over stdin, used by the email providers and by the runtime launch
+  path. `tests/control_plane/test_channel_bindings.py` repeats the claim in a
+  comment. What is actually missing is narrower and worth naming precisely,
+  because the wrong version of it made C3c pin a test against a file that
+  already existed: **there is no relay KEY**. Nothing generates a per-household
+  relay secret, nothing installs it as `ABROLIA_WHATSAPP_RELAY_SECRET`, nothing
+  computes the `external_id_hmac` the strict-mode gateway matches on, and
+  `WhatsAppGatewayRouter.relay_keys` is populated only by tests. The sink to
+  put a key in is there; the key is not.
+
+  Remaining, as three slices:
+
+  - [ ] **C5b. The ingress WAL is read back.** `GatewayStore` persists before
+    ACK and deletes on delivery, and nothing between those ever reads a row —
+    durability that was written and never spent. Also splits `hmac_rejected`,
+    which answered four different questions and decided the row's fate by
+    which `return` happened to run, into terminal and retryable outcomes: a
+    payload a present key rejects can never verify, and keeping it stored a
+    family's message body indefinitely.
+  - [ ] **C5c. The relay key exists.** Generate it, install it through the sink
+    above, and backfill `external_id_hmac` — which C3c deliberately left NULL,
+    with `test_hmac_column_stays_null_until_c5_provisions_the_key` as the test
+    that should start failing here. Until this lands every binding is invisible
+    to a strict-mode gateway, and C5b's `relay_key_absent` is the outcome that
+    waits for it.
+  - [ ] **C5d. Something calls the gateway.** `handle_webhook` has no caller
+    outside tests and there is no `deploy/gateway/`. The HTTP entrypoint and
+    its narrow deploy unit, plus whatever schedules C5b's worker — which C5b
+    deliberately left uncalled rather than inventing a scheduler for a process
+    that does not exist yet.
 
 - [ ] **C5a. One signature between the gateway and the runtime.** *Done — see
   the inventory below.* `relay_hmac` signed `body|timestamp` and
@@ -489,6 +523,29 @@ side's own tests passed throughout. It fails when the runtime is reverted to
 the bare-body scheme.
 
 **Branches:** `codex/c5a-relay-hmac-reconciliation`.
+
+#### Inventory — C5b the ingress WAL is read back
+
+**Files:** `gateway/whatsapp_router.py`, `tests/test_gateway_routing.py`,
+`tests/control_plane/test_channel_bindings.py`.
+
+`GatewayStore` has always written a row before the webhook is ACKed and
+deleted it once the runtime confirmed. Between those there was no reader, so
+the durability was spent on nothing: a row a failed delivery left behind
+stayed until somebody deleted the file.
+
+The half that is not the worker is the taxonomy. `hmac_rejected` answered four
+different questions and the row's fate was decided by which `return` happened
+to run — which is how a payload that a present key had already rejected, and
+that therefore can never verify, came to be stored indefinitely. The outcomes
+now say whether redelivery could change anything: `relay_key_absent` and
+`runtime_unavailable` keep the row, `hmac_rejected` drops it.
+
+`test_channel_bindings.py` is touched for one docstring only: it repeated the
+checklist's own "provisioning/secrets.py does not exist" claim about a file
+that has been on disk throughout. See the correction in the C5 box above.
+
+**Branches:** `codex/c5b-gateway-redeliver`.
 
 #### Inventory — C3d tests that reach what they claim to cover
 
