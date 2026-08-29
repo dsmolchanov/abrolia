@@ -21,6 +21,7 @@ from control_plane.email.models import (
     EmailProvisionIntent,
 )
 from control_plane.email.repository import EmailIdentityRepository
+from control_plane.owners import owner_contact_query
 from control_plane.provisioning.contracts import (
     InspectResult,
     InspectState,
@@ -385,7 +386,26 @@ class GoogleOAuthService:
             self.client.revoke(grant.refresh_credential)
             raise ProviderRejected("Google granted an unexpected scope set")
         account = self.accounts.get(account_id)
-        if account is None or normalize_email(account.recovery_email) == grant.email:
+        # Two rules, and they are not the same one. The first is this option's
+        # own: a household's assistant does not read the mail of the person who
+        # connected it. The second is C4a's, and this is the path that could
+        # not ask it earlier — `EmailIdentityService.select` refuses a mailbox
+        # equal to an active owner's contact address, but a Gmail address is
+        # not known until Google grants it, so `gmail_agent` reaches selection
+        # with no address at all.
+        #
+        # An adult, or a second owner, could therefore connect the mailbox the
+        # FALLBACK owner is reached at. Refused here, before the credential is
+        # installed, and refused the way this method already refuses: revoke
+        # the grant, then the correctable provider rejection.
+        collision_sql, collision_params = owner_contact_query(
+            self.accounts.lookup, household_id=row["household_id"], address=grant.email
+        )
+        if (
+            account is None
+            or normalize_email(account.recovery_email) == grant.email
+            or self.accounts.db.query_one(collision_sql, collision_params) is not None
+        ):
             self.client.revoke(grant.refresh_credential)
             raise ProviderRejected("Gmail must be a separate dedicated mailbox")
         namespace_ref = self._namespace_ref(row["household_id"])

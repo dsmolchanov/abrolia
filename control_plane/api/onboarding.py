@@ -16,6 +16,7 @@ from control_plane.api.dependencies import (
     current_household_mutation,
     request_id,
 )
+from control_plane.email.service import MailboxRefused
 from control_plane.models import ProfileInput, StepKind
 from control_plane.onboarding.contracts import CommandContext, CommandResult
 from control_plane.privacy.consent import (
@@ -152,6 +153,11 @@ def select_step(
             selection,
             context=_context(request, current, headers),
         )
+    except MailboxRefused as error:
+        # 409 with the refusal's own text, the way `api/bindings.py` answers a
+        # `BindingError`: the family chose something this household may not
+        # have, and the message says which rule without naming an address.
+        raise HTTPException(status.HTTP_409_CONFLICT, str(error)) from error
     except ValidationError as error:
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,

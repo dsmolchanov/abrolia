@@ -119,6 +119,7 @@ class ControlPlaneStack:
             self.onboarding,
             self.configs,
             self.bindings,
+            self.channel_prefs,
         )
         return ProvisioningWorker(
             jobs=self.jobs,

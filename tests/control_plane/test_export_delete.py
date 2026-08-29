@@ -853,3 +853,48 @@ def test_the_export_carries_the_household_s_channel_bindings(cp_stack) -> None:
     assert "external_id_hmac" not in serialized
     assert issued.code not in serialized
     assert "code_hash" not in serialized
+
+
+def test_the_export_carries_the_household_s_channel_preference(cp_stack) -> None:
+    """Same promise as the bindings above, and it became real the same way.
+
+    `docs/privacy/data-map.md` has listed `channel_preferences` as exportable
+    and erasable since Phase 5, and `TABLE_CLASSIFICATION` agrees. Until C4a
+    nothing wrote a row, so the omission cost nothing; the table now records
+    where a household is reached and which account receives its fallback, and
+    an export that answers `completion_status: complete` without it would be
+    saying something untrue.
+    """
+    hid = cp_stack.household.id
+    with cp_stack.database.write() as connection:
+        cp_stack.channel_prefs.set_household(
+            connection,
+            household_id=hid,
+            primary_channel="telegram",
+            fallback_account_id=cp_stack.account.id,
+            verified_at=BASE_TIME,
+            now=BASE_TIME + 1,
+        )
+
+    document = HouseholdExporter(
+        cp_stack.accounts,
+        cp_stack.households,
+        cp_stack.onboarding,
+        cp_stack.jobs,
+        runtime=SyntheticRuntimeExporter(),
+    ).export(cp_stack.account.id, hid)
+
+    assert document["channel_preferences"] == [
+        {
+            "subject_type": "household",
+            "subject_id": hid,
+            "primary_channel": "telegram",
+            "fallback_channel": "email",
+            "fallback_account_id": cp_stack.account.id,
+            "verified_at": BASE_TIME,
+            "updated_at": BASE_TIME + 1,
+        }
+    ]
+    # The reference, and not a second copy of the address it resolves to: that
+    # address is already in this document once, under `account`.
+    assert document["account"]["id"] == cp_stack.account.id

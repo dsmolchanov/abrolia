@@ -591,3 +591,76 @@ def test_authenticated_onboarding_html_is_never_cached(api_harness) -> None:
     assert response.headers["cache-control"] == "no-store"
     assert response.headers["pragma"] == "no-cache"
     assert "private" not in response.headers.get("cache-control", "")
+
+
+@pytest.mark.parametrize(
+    ("option", "extra", "mailbox"),
+    (
+        # Composed rather than written: a literal managed address names the
+        # deployment's own domain, which the fixture sanitizer refuses.
+        ("abrolia_managed", {"local_part": "family-agent"}, None),
+        (
+            "family_domain",
+            {"domain": "family.example.test", "local_part": "assistant"},
+            "assistant@family.example.test",
+        ),
+    ),
+)
+def test_a_mailbox_that_is_the_owners_own_address_is_a_client_error(
+    api_harness, monkeypatch, option, extra, mailbox
+) -> None:
+    """A refusal the family can act on must arrive as one.
+
+    C4a makes the owner's verified contact the household's email fallback, so
+    a mailbox equal to that address is a self-ingestion loop and
+    `EmailIdentityService` refuses it at selection. Refusing is only half the
+    job: this route catches Pydantic's `ValidationError` and nothing else, so
+    a plain `ValueError` reached the client as a 500 — an unhandled exception
+    where a correctable answer belongs. The browser route never showed it,
+    because it redirects on any `ValueError`.
+    """
+    mailbox = mailbox or f"{extra['local_part']}@abrolia.com"
+    world = api_harness.create_principal(mailbox)
+    api_harness.authenticate(world)
+    if option == "family_domain":
+        # Behind its own kill switch, which is not what this case is about.
+        monkeypatch.setenv("ABROLIA_BYO_EMAIL_ENABLED", "1")
+    profile = api_harness.client.put(
+        "/api/v1/onboarding/profile",
+        headers=_command_headers(api_harness, version=0, key=f"loop-{option}"),
+        json=_profile(),
+    )
+    assert profile.status_code == 200
+
+    refused = api_harness.client.post(
+        "/api/v1/onboarding/steps/email_identity/select",
+        headers=_command_headers(api_harness, version=1, key=f"loop-select-{option}"),
+        json={
+            "kind": option,
+            "special_category_restriction_acknowledged": True,
+            "special_category_restriction_receipt_id":
+                "10000000-0000-4000-8000-000000000011",
+            **_restriction_binding(),
+            **extra,
+        },
+    )
+
+    assert refused.status_code == 409
+    assert refused.json() == {"detail": (
+        "that mailbox is an owner's own contact address (self-ingestion loop)"
+    )}
+    # The address is never echoed, and nothing was left for a provider to act on.
+    assert mailbox not in refused.text
+    database = api_harness.container.database
+    assert database.query(
+        "SELECT id FROM email_identities WHERE household_id = ?",
+        (world.household.id,),
+    ) == []
+    # Scoped to the email step's own work, the way the option-flag cases are:
+    # a household has other jobs for reasons that have nothing to do with this
+    # refusal, and asserting the queue is empty would pin those instead.
+    assert database.query(
+        "SELECT id FROM provisioning_jobs WHERE household_id = ?"
+        " AND kind = 'email_identity'",
+        (world.household.id,),
+    ) == []
