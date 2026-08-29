@@ -52,6 +52,9 @@ branch.
 
 - **Batch** all open blockers + CI failures into one commit. Do not reply
   per-comment.
+- The batch includes badge-carrying findings listed under a `Non-blocking
+  notes` heading: on a round past the review budget, P1s no longer hold the
+  merge but they are still yours to fix in the same pass.
 - Fix the **invariant**, not the reported instance: find every sibling consumer
   of the affected contract and fix them in the same batch, with one test that
   represents the class. See "Fix the invariant, not the instance" in
@@ -76,6 +79,13 @@ Absence of a Codex verdict is not approval, and the gate treats it as such: a
 missing, quota-blocked, or unparseable verdict holds the merge. If the gate
 reports one of those, the remedy is to restore the reviewer or re-run the job,
 never to push a commit hoping to shake a verdict loose.
+
+Which checks branch protection waits for is a per-repository lane decision. On
+the prod lane (the default) the `codex-review-window` check is a hard merge
+gate. In repositories carrying the `review-lane-fast` topic the check runs and
+posts findings but does not hold the merge — green CI merges via auto-merge, so
+a fix pass there is best-effort: address what has arrived while the PR is open,
+and leave anything that lands after the merge to the weekly trunk review.
 
 ## When to stop and hand back
 
