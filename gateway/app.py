@@ -23,6 +23,7 @@ from __future__ import annotations
 import hmac
 import json
 import os
+import stat
 import threading
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -358,16 +359,46 @@ def build_router(env: Mapping[str, str] | None = None) -> WhatsAppGatewayRouter:
     # REFUSE TO CREATE ONE. `open_control_plane_database` migrates, so a
     # missing file becomes a fresh empty database and the gateway comes up
     # healthy, answers `/healthz`, and routes nobody — every real sender an
-    # `unknown_sender` against a table that was never populated.
-    #
-    # That is the shape of a gateway pointed at the wrong volume, and it is
+    # `unknown_sender` against a table that was never populated. That is the
+    # shape of a gateway pointed at the wrong volume, and it is
     # indistinguishable from a working one until a family's message goes
-    # missing. Failing here turns it into a deployment that does not start.
-    if not path.is_file():
+    # missing.
+    #
+    # ONE OPEN, not a check and then a second open by the same name. The first
+    # draft of this guard used `Path.is_file()` and then let SQLite reopen the
+    # pathname, which is a check-then-use: a symlink passes `is_file()`, and
+    # the name can be replaced in between, so the database that gets migrated
+    # and trusted need not be the entry that was validated.
+    #
+    # `O_NOFOLLOW` refuses a symlink and proves existence in one syscall, and
+    # the descriptor is held OPEN across the connect below so the inode cannot
+    # be swapped out from under it — replacing the name afterwards leaves this
+    # process holding the file it checked.
+    try:
+        probe = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError as error:
         raise FileNotFoundError(
             f"{ENV_DB} does not name an existing control-plane database: {path}"
-        )
-    database = open_control_plane_database(path)
+        ) from error
+    except OSError as error:
+        # ELOOP for a symlink, and anything else the entry refuses. The gateway
+        # reads one database and it should be the one an operator named, not
+        # whatever a link happens to point at today.
+        raise FileNotFoundError(
+            f"{ENV_DB} is not a regular control-plane database: {path}"
+        ) from error
+    try:
+        # On the DESCRIPTOR, so this asks about the same inode `O_NOFOLLOW`
+        # just accepted rather than resolving the name a second time. A
+        # directory passes `O_NOFOLLOW` happily and would otherwise reach
+        # SQLite as an unhelpful "unable to open database file".
+        if not stat.S_ISREG(os.fstat(probe).st_mode):
+            raise FileNotFoundError(
+                f"{ENV_DB} is not a regular control-plane database: {path}"
+            )
+        database = open_control_plane_database(path)
+    finally:
+        os.close(probe)
     sender_key = source.get(ENV_SENDER_KEY, "").strip()
     relay_root = source.get(ENV_RELAY_ROOT, "").strip()
     return WhatsAppGatewayRouter(

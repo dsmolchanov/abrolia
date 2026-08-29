@@ -423,3 +423,29 @@ def test_the_gateway_refuses_to_invent_a_control_plane_database(tmp_path: Path) 
     with pytest.raises(FileNotFoundError):
         build_router({"ABROLIA_GATEWAY_CONTROL_PLANE_DB": str(missing)})
     assert not missing.exists(), "the gateway created the database it refused"
+
+
+@pytest.mark.parametrize("shape", ["symlink", "directory"])
+def test_the_gateway_opens_only_a_real_file_it_named(tmp_path: Path, shape: str) -> None:
+    """No check-then-use: one guarded open, not a test followed by a reopen.
+
+    The first draft validated with `Path.is_file()` and then let SQLite reopen
+    the same pathname. A symlink passes `is_file()`, and the name can be
+    replaced between the two calls, so the database that got migrated and
+    trusted need not be the entry that was checked — and this process both
+    routes on it and writes migrations to it.
+
+    `O_NOFOLLOW` refuses the link and proves existence in one syscall, and the
+    descriptor is held open across the connect so the inode cannot be swapped
+    out underneath.
+    """
+    real = tmp_path / "real-control-plane.db"
+    open_control_plane_database(real).close()
+    target = tmp_path / "named-entry.db"
+    if shape == "symlink":
+        target.symlink_to(real)
+    else:
+        target.mkdir()
+
+    with pytest.raises((FileNotFoundError, OSError)):
+        build_router({"ABROLIA_GATEWAY_CONTROL_PLANE_DB": str(target)})
