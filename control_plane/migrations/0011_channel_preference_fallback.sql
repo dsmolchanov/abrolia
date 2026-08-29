@@ -15,8 +15,12 @@
 -- `accounts.recovery_email_lookup_hmac` is what the self-ingestion check
 -- compares — against `email_identities.address_lookup_hmac`, under the same
 -- key, so the comparison needs no decryption and no caller-supplied value.
+-- ON DELETE CASCADE for the same reason 0006 gave the household reference one:
+-- a preference that names an account which no longer exists is a fallback that
+-- cannot be delivered, and erasure must not have to know about this table to
+-- leave it consistent.
 ALTER TABLE channel_preferences ADD COLUMN fallback_account_id TEXT
-    REFERENCES accounts (id);
+    REFERENCES accounts (id) ON DELETE CASCADE;
 
 -- Required in fact, nullable in the schema, for the reason 0010 states: SQLite
 -- cannot add a NOT NULL column to a populated table without inventing a

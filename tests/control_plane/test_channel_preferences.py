@@ -180,3 +180,74 @@ def test_a_channel_this_system_does_not_speak_is_rejected(
         pytest.raises(ChannelPreferenceError, match=f"unknown {field}"),
     ):
             cp_stack.channel_prefs.set_household(connection, **arguments)
+
+
+@pytest.mark.parametrize(
+    ("option", "mailbox"),
+    (
+        # The managed address is COMPOSED rather than written: a literal one
+        # names the deployment's own domain, which the fixture sanitizer
+        # refuses outside the reserved documentation domains.
+        ("abrolia_managed", None),
+        ("family_domain", "assistant@family.example.test"),
+    ),
+)
+def test_a_mailbox_that_is_an_owners_own_address_is_refused_at_selection(
+    cp_stack, monkeypatch, option, mailbox
+) -> None:
+    """Refused where the family can still change it, not at provisioning.
+
+    `ChannelPreferencesRepository` refuses to make an owner's contact the
+    fallback when that address is the household's own inbox, and refusing there
+    ALONE would be too late: the planner runs after the provider has created
+    and verified the mailbox, where the refusal is no longer a correctable
+    selection — it comes out of the provisioning job instead.
+
+    Both options are covered because both compose an address and they differ
+    only in where the domain comes from. `EmailIdentityService.select` is the
+    one place that composition happens, which is why one guard covers the pair.
+    """
+    cp_stack.complete_profile()
+    mailbox = mailbox or f"{EMAIL_SELECTION['local_part']}@abrolia.com"
+    owner = cp_stack.accounts.create_verified(mailbox, now=BASE_TIME)
+    with cp_stack.database.write() as connection:
+        connection.execute(
+            "INSERT INTO household_memberships (account_id, household_id, role,"
+            " status, created_at, accepted_at) VALUES (?, ?, 'owner', 'active',"
+            " ?, ?)",
+            (owner.id, cp_stack.household.id, BASE_TIME, BASE_TIME),
+        )
+
+    selection = dict(EMAIL_SELECTION)
+    if option == "family_domain":
+        # Behind its own kill switch, which is not what this case is about.
+        monkeypatch.setenv("ABROLIA_BYO_EMAIL_ENABLED", "1")
+        selection = {
+            "kind": "family_domain",
+            "domain": "family.example.test",
+            "local_part": "assistant",
+            "special_category_restriction_acknowledged": True,
+            "special_category_restriction_receipt_id": EMAIL_SELECTION[
+                "special_category_restriction_receipt_id"
+            ],
+            "special_category_restriction_text_version": EMAIL_SELECTION[
+                "special_category_restriction_text_version"
+            ],
+            "special_category_restriction_text_sha256": EMAIL_SELECTION[
+                "special_category_restriction_text_sha256"
+            ],
+        }
+
+    with pytest.raises(ValueError, match="self-ingestion"):
+        cp_stack.service.select(
+            cp_stack.household.id,
+            StepKind.EMAIL,
+            selection,
+            context=cp_stack.context(),
+            now=BASE_TIME + 2,
+        )
+    # And nothing was left behind for the provider to act on.
+    assert not cp_stack.database.query(
+        "SELECT id FROM email_identities WHERE household_id = ?",
+        (cp_stack.household.id,),
+    )

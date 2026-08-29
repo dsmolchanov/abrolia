@@ -249,6 +249,24 @@ class HouseholdExporter:
             " ORDER BY verified_at, id",
             (household_id,),
         )
+        # Same class as `channel_bindings` above, and it became real in the same
+        # way: `docs/privacy/data-map.md` has promised export and erasure for
+        # `channel_preferences` since Phase 5, and until C4a nothing wrote a row
+        # so the omission cost nothing. It now holds where a household is
+        # reached and which account receives its fallback, which is exactly what
+        # a subject access request is for.
+        #
+        # `fallback_account_id` is returned as the reference it is. The address
+        # behind it is already in this document under `account.recovery_email`,
+        # and copying it here would put one identity in two places inside one
+        # export.
+        channel_preferences = self._rows(
+            "channel_preferences",
+            "SELECT subject_type, subject_id, primary_channel, fallback_channel,"
+            " fallback_account_id, verified_at, updated_at FROM channel_preferences"
+            " WHERE subject_id = ? ORDER BY subject_type",
+            (household_id,),
+        )
         runtime_status = "absent"
         runtime_export = None
         if household.runtime_ref:
@@ -298,6 +316,7 @@ class HouseholdExporter:
             "email_identities": email_identities,
             "email_address_reservations": email_reservations,
             "email_activation_receipts": email_activation_receipts,
+            "channel_preferences": channel_preferences,
             "consent_receipts": consents,
             "channel_bindings": channel_bindings,
             "runtime": {

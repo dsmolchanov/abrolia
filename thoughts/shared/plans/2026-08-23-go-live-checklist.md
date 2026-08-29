@@ -324,7 +324,9 @@ looking at whose row it was.
 
 **Files:** `control_plane/channel_preferences.py`, `control_plane/container.py`,
 `control_plane/migrations/0011_channel_preference_fallback.sql`,
+`control_plane/email/service.py`, `control_plane/privacy/export.py`,
 `control_plane/provisioning/planner.py`, `tests/control_plane/conftest.py`,
+`tests/control_plane/test_export_delete.py`,
 `tests/control_plane/test_channel_preferences.py`,
 `tests/control_plane/test_consent_withdrawal.py`,
 `tests/control_plane/test_db.py`, `tests/control_plane/test_manifest.py`.
@@ -342,6 +344,17 @@ extended. Its cases passed the repository both halves of the comparison —
 `set_household(..., fallback_email=X, agent_inbox=Y)` — so the self-ingestion
 case proved that two arguments can be compared and nothing about whether the
 system knows its own inbox.
+
+Two files joined during review, and both are the same lesson — a rule that
+only holds where it is asked. `control_plane/email/service.py` refuses a
+mailbox equal to an owner's own contact address at SELECTION, because the
+repository's refusal alone lands after the provider has created the inbox,
+where the family can no longer correct it; it is the one place both the
+managed and own-domain options compose an address.
+`control_plane/privacy/export.py` returns the new rows, because
+`docs/privacy/data-map.md` has promised export and erasure for this table since
+Phase 5 and the promise only became falsifiable once something wrote a row —
+the same sequence `channel_bindings` went through in C3.
 
 **Branches:** `codex/c4a-preferences-writer`.
 
