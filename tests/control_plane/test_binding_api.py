@@ -538,6 +538,41 @@ def _finish_onboarding(api_harness, world) -> None:
             "UPDATE onboarding_workflows SET state = 'complete' WHERE household_id = ?",
             (world.household.id,),
         )
+        # Activation also settles the runtime job and publishes the bindings
+        # that revision carries. Since C3e the job stays open until it does,
+        # and a household whose row says `active` while a rollout is still in
+        # flight is exactly what `schedule_runtime_rollout` refuses.
+        connection.execute(
+            "UPDATE provisioning_jobs SET status = 'succeeded', error_code = NULL,"
+            " settled_at = 1 WHERE household_id = ? AND kind = 'runtime'"
+            " AND settled_at IS NULL",
+            (world.household.id,),
+        )
+        connection.execute(
+            "UPDATE channel_bindings SET published_revision ="
+            " (SELECT current_config_revision FROM households WHERE id = ?)"
+            " WHERE household_id = ? AND published_revision IS NULL",
+            (world.household.id, world.household.id),
+        )
+        # And the revision itself goes live. `config_revisions.status` is the
+        # only fact that answers "which revision is serving" — the household
+        # column answers "which is being rolled out" — so a simulation that
+        # skipped this left every consumer of the real answer seeing nothing
+        # activated at all.
+        connection.execute(
+            "UPDATE config_revisions SET status = 'superseded'"
+            " WHERE household_id = ? AND status = 'active'"
+            " AND revision != (SELECT current_config_revision FROM households"
+            " WHERE id = ?)",
+            (world.household.id, world.household.id),
+        )
+        connection.execute(
+            "UPDATE config_revisions SET status = 'active', activated_at = 1"
+            " WHERE household_id = ? AND revision ="
+            " (SELECT current_config_revision FROM households WHERE id = ?)",
+            (world.household.id, world.household.id),
+        )
+
 
 
 def test_verifying_over_http_deploys_the_revision_it_reports(api_harness) -> None:

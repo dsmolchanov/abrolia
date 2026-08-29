@@ -310,6 +310,25 @@ stranded and is the sweep's to repair.
 
 ### Changes Required
 
+#### 0. Compare against the revision that is SERVING (found during implementation)
+
+**Files**: `control_plane/provisioning/rollout.py`
+
+`find_stale_bindings` read `households.current_config_revision`, and that hid
+the households this sweep matters most for. `schedule_runtime_rollout`
+advances that column when a job is QUEUED, so a rollout that then died left the
+household pointing at a revision nothing ever served — and comparing the table
+against THAT manifest found no divergence, because the dead revision is exactly
+the one containing the change. The sweep reported "nothing to do" for the
+household whose runtime was furthest out of date.
+
+It now joins `config_revisions` on `status = 'active'`. A household that has
+never activated anything is excluded entirely, which is correct rather than
+conservative: it has no runtime authorizing a stale set.
+
+This is the same [R1] correction the plan applied to the migration backfill,
+in a place the plan did not look.
+
 #### 1. Distinguish in-flight from stranded
 
 **Files**: `control_plane/provisioning/rollout.py`
@@ -331,9 +350,9 @@ stranded and is the sweep's to repair.
 
 #### Automated Verification
 
-- [ ] `python3 -m pytest tests/control_plane/test_channel_bindings.py -q` — a household stranded by a failed rollout is reported actionable, and applying repairs it
-- [ ] `python3 -m pytest tests/control_plane/test_provisioning_jobs.py -q` — a household with a rollout in flight is still skipped
-- [ ] `python3 -m pytest -m "not live"`
+- [x] `python3 -m pytest tests/control_plane/test_channel_bindings.py -q` — a household stranded by a failed rollout is reported actionable, and applying repairs it
+- [x] `python3 -m pytest tests/control_plane/test_channel_bindings.py -q` — a household with a rollout in flight is still skipped (`rollout_in_flight`)
+- [x] `python3 -m pytest -m "not live"` (1598 passed)
 
 #### Manual Verification
 

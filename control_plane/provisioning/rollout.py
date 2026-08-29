@@ -33,6 +33,28 @@ class RolloutNotReady(RuntimeError):
     """A rollout was asked for while the household was still settling."""
 
 
+def _open_runtime_job(connection: sqlite3.Connection, household_id: str):
+    """A runtime job this household is still waiting on, or None.
+
+    "In flight" includes a job that has launched and is waiting for its
+    revision to activate: since C3e that job is `pending` with a `not_before`
+    at the token's expiry, and a second rollout scheduled beside it would
+    overwrite the very `current_config_revision` it is waiting to have
+    activated.
+
+    A household with NO such job and a status of `provisioning` is not busy —
+    it is STRANDED, which is a different thing that reads the same from the
+    household row alone.
+    """
+    return connection.execute(
+        "SELECT id FROM provisioning_jobs WHERE household_id = ?"
+        " AND kind = 'runtime'"
+        " AND status IN ('pending','running','waiting_user','outcome_unknown')"
+        " LIMIT 1",
+        (household_id,),
+    ).fetchone()
+
+
 def schedule_runtime_rollout(
     connection: sqlite3.Connection,
     *,
@@ -60,19 +82,29 @@ def schedule_runtime_rollout(
     state = connection.execute(
         "SELECT status FROM households WHERE id = ?", (household_id,)
     ).fetchone()
-    # A rollout may only be scheduled against the settled state its currency
-    # guards require. `_workflow_states_for` accepts `complete` and nothing
-    # else for this operation, so scheduling one while the FIRST rollout is
-    # still in flight enqueues revision N+1, overwrites the household's single
-    # `current_config_revision`, and strands both jobs: the original
-    # `ensure_runtime` no longer matches the revision, and the new one no
-    # longer matches the workflow. Two stranded jobs and, after prepare, a
-    # cleanup that can take the shared runtime with it.
+    # A rollout may not be scheduled while another is IN FLIGHT: a second one
+    # enqueues revision N+1, overwrites the household's single
+    # `current_config_revision`, and strands both jobs — the original no longer
+    # matches the revision, the new one no longer matches the workflow. Two
+    # stranded jobs and, after prepare, a cleanup that can take the shared
+    # runtime with it.
     #
-    # Refusing here is not a limitation to work around later — the owner can
-    # add the member once setup finishes, and until then there is nothing to
-    # roll out onto.
-    if state is None or state["status"] != "active" or workflow.state != "complete":
+    # That is the rule. `status != 'active'` was an APPROXIMATION of it, and
+    # the approximation is what made a stranded household unrepairable: such a
+    # household sits at `provisioning` with no job left to run, so there is
+    # nothing to collide with and nothing to wait for, and refusing it declined
+    # the one action that would fix it. `_open_runtime_job` asks the question
+    # the comment above was always describing.
+    #
+    # Statuses outside these two are refused whatever the queue says: a
+    # `draft`, `onboarding`, `deleting` or `deleted` household is not one a
+    # rollout belongs to at all.
+    if (
+        state is None
+        or state["status"] not in {"active", "provisioning"}
+        or workflow.state != "complete"
+        or _open_runtime_job(connection, household_id) is not None
+    ):
         raise RolloutNotReady(
             "the household is not in a settled state a rollout can be planned against"
         )
@@ -173,15 +205,29 @@ def find_stale_bindings(
     from any cause and not only from that migration. A revocation table would
     have to be written by everything that can revoke, and the one thing that
     already knows the answer is the comparison itself: what the table says now
-    against what the served revision says. `households.current_config_revision`
-    is the revision being served — `schedule_runtime_rollout` advances it and
-    the worker confirms it — so it is the manifest to compare against, not the
-    newest one, which may be planned and not yet deployed.
+    against what the SERVED revision says.
+
+    The served revision is the one `config_revisions` marks `active`, and this
+    originally read `households.current_config_revision` instead. That was
+    wrong and it hid the households this sweep matters most for.
+    `schedule_runtime_rollout` advances that column when a job is QUEUED, so a
+    rollout that then died left the household pointing at a revision nothing
+    ever served — and comparing the table against THAT manifest found no
+    divergence, because the dead revision is exactly the one that contains the
+    change. The sweep reported "nothing to do" for the household whose runtime
+    was furthest out of date.
+
+    `BootstrapService.activate` is the sole writer of `status = 'active'`, and
+    it supersedes the previous one in the same transaction, so there is at most
+    one per household.
     """
     rows = connection.execute(
-        "SELECT id, status, current_config_revision FROM households"
-        " WHERE current_config_revision IS NOT NULL AND current_config_revision > 0"
-        " ORDER BY id"
+        "SELECT h.id AS id, h.status AS status,"
+        " active.revision AS current_config_revision"
+        " FROM households AS h"
+        " JOIN config_revisions AS active ON active.household_id = h.id"
+        "  AND active.status = 'active'"
+        " ORDER BY h.id"
     ).fetchall()
     stale: list[StaleHousehold] = []
     for row in rows:
@@ -214,6 +260,7 @@ def find_stale_bindings(
             bindings_now=now_bindings,
             bindings_served=served,
             blocked_by=_blocked_by(
+                connection,
                 row,
                 onboarding,
                 household_id,
@@ -226,6 +273,7 @@ def find_stale_bindings(
 
 
 def _blocked_by(
+    connection: sqlite3.Connection,
     row,
     onboarding: OnboardingRepository,
     household_id: str,
@@ -256,8 +304,25 @@ def _blocked_by(
     """
     if not has_owner_binding:
         return "owner_binding_retired"
-    if row["status"] != "active":
+    if row["status"] not in {"active", "provisioning"}:
         return f"household_status_{row['status']}"
+    # The distinction this sweep exists to make, and the one it could not make
+    # before: a household at `provisioning` is either BUSY or STRANDED, and the
+    # household row says the same thing for both.
+    #
+    # Busy means a rollout is still in flight and a second would collide with
+    # it. Stranded means the rollout died without handing the household back —
+    # `_restore_settled_household` declines once the provider has been touched,
+    # deliberately, because no database-only write can say what the machine is
+    # carrying. Those households were reported `household_status_provisioning`
+    # and skipped, so the mechanism built to detect this divergence was blind
+    # to precisely the households that had it.
+    #
+    # Repair is a roll FORWARD: planning the next revision and deploying it
+    # converges the machine whatever it holds now, which is a claim this side
+    # can honestly make where "you are back on N-1" is not.
+    if _open_runtime_job(connection, household_id) is not None:
+        return "rollout_in_flight"
     try:
         workflow = onboarding.workflow_for_household(household_id)
     except Exception:

@@ -1864,6 +1864,16 @@ def test_a_rollout_job_leaves_the_onboarding_workflow_where_it_found_it(
             "UPDATE onboarding_workflows SET state = 'complete' WHERE household_id = ?",
             (cp_stack.household.id,),
         )
+        # What activation does to the onboarding runtime job. Since C3e that
+        # job stays open until the revision goes live, and a rollout scheduled
+        # beside it is the collision `schedule_runtime_rollout` refuses — so
+        # the precondition has to be a household that really has finished, not
+        # one whose row merely says `active`.
+        connection.execute(
+            "UPDATE provisioning_jobs SET status = 'succeeded', error_code = NULL,"
+            " settled_at = 1 WHERE household_id = ? AND kind = 'runtime'",
+            (cp_stack.household.id,),
+        )
         planned = cp_stack.make_worker().planner.issue(
             connection, household_id=cp_stack.household.id
         )
