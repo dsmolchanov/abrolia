@@ -105,6 +105,10 @@ class ControlPlaneConfig:
     #: secret: Fly secrets are write-only and the gateway holds no field
     #: cipher, so neither end could read the other's copy.
     gateway_relay_root_key: bytes = field(default=b"", repr=False)
+    #: What the deployed gateway presents to `/internal/v1/bindings/resolve`.
+    #: The gateway's OWN credential — never a household's, and it grants
+    #: nothing but that one question.
+    gateway_lookup_token: str | None = field(default=None, repr=False)
     backup_key: bytes = field(default=b"", repr=False)
     synthetic_only: bool = True
     real_family_data_enabled: bool = False
@@ -370,6 +374,7 @@ class ControlPlaneConfig:
                 if encoded_relay_root
                 else b""
             ),
+            gateway_lookup_token=source.get("ABROLIA_GATEWAY_LOOKUP_TOKEN") or None,
             synthetic_only=source.get("ABROLIA_SYNTHETIC_ONLY", "1") == "1",
             real_family_data_enabled=source.get("REAL_FAMILY_DATA_ENABLED", "0") == "1",
             real_email_enabled=source.get("ABROLIA_REAL_EMAIL_ENABLED", "0") == "1",

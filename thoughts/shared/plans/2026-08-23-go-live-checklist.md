@@ -243,7 +243,12 @@ Ordered slices:
     to a strict-mode gateway, and C5b's `relay_key_absent` is the outcome that
     waits for it.
   - [x] **C5d. Something calls the gateway.** *Done — see the inventory below.*
-  - [ ] **C5e. Something the gateway can read bindings from.** The deploy unit
+  - [x] **C5e. Something the gateway can read bindings from.** *Done — see the
+    inventory below.* Resolved as an authenticated lookup rather than a
+    replicated projection, and the reason is specific: routability changes at
+    exact moments and five slices exist to make them exact, so replication lag
+    would sit inside that decision and re-open them. Original text follows.
+     The deploy unit
     and the store lifecycle it needs. A gateway on its own Fly volume opens a
     database the control plane never wrote to, so it starts, passes its health
     check and routes nobody — every real sender an `unknown_sender`. It holds
@@ -634,6 +639,39 @@ before it persists and a `200` would drop the message during exactly the
 incident the switch was thrown to contain.
 
 **Branches:** `codex/c5d-gateway-entrypoint`.
+
+#### Inventory — C5e the gateway asks and holds nothing
+
+**Files:** `control_plane/bindings_resolution.py`,
+`control_plane/api/internal_bindings.py`, `control_plane/api/app.py`,
+`control_plane/config.py`, `gateway/whatsapp_router.py`, `gateway/app.py`,
+`deploy/gateway/Dockerfile`, `deploy/gateway/fly.toml`,
+`tests/control_plane/test_internal_bindings.py`, `tests/test_gateway_app.py`,
+`tests/test_gateway_routing.py`.
+
+**A lookup, not a projection.** Routability changes at exact moments — C3c's
+activation boundary, C3e's terminal rollout, D1's re-planning, D4 and D5's
+retirement — and five slices exist to make those moments exact. Replication lag
+sits inside that decision and re-opens them: a retired member keeps routing, a
+member staged for a failed revision starts early. A synchronous lookup has no
+lag, and its hot-path dependency is bounded by C5b's terminal/retryable split.
+
+**The rule moved to `bindings_resolution.py` and has exactly two callers** —
+the gateway's local resolver and the endpoint. Two SQL statements answering
+"which household holds this sender" is the C5a defect waiting to happen.
+
+**The gateway now holds no control-plane data at all.** It opens no database:
+two roots, two credentials and its own ingress WAL. C5c's K1 arrived at
+completely — it cannot decrypt a manifest, correlate a keyed digest, or read a
+binding; it can ask about one.
+
+**A lookup that could not be made is retryable**, persisted with no household
+because none was resolved. `_has_provenance` therefore asks about authenticity
+— channel, timestamp, signature — and not about the household: requiring one
+would make a control-plane restart lose messages through the check meant to
+protect them.
+
+**Branches:** `codex/c5e-gateway-binding-lookup`.
 
 #### Inventory — C3d tests that reach what they claim to cover
 

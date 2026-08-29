@@ -17,6 +17,7 @@ from control_plane.api import (
     bindings,
     email,
     households,
+    internal_bindings,
     internal_bootstrap,
     onboarding,
     privacy,
@@ -327,6 +328,7 @@ def create_app(
     app.include_router(email.router)
     app.include_router(privacy.router)
     app.include_router(web.router)
+    app.include_router(internal_bindings.router)
     app.include_router(internal_bootstrap.router)
 
     return app

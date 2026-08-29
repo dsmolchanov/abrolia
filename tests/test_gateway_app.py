@@ -14,6 +14,10 @@ from pathlib import Path
 
 import pytest
 
+from control_plane.bindings_resolution import (
+    BindingLookupUnavailable,
+    ResolvedSender,
+)
 from control_plane.crypto import sender_hmac
 from control_plane.db import open_control_plane_database
 from gateway.app import (
@@ -381,71 +385,158 @@ def test_a_failing_pass_does_not_end_the_scheduler(tmp_path: Path) -> None:
     assert scheduler.failures >= 3
 
 
-def test_a_runtime_reference_outside_the_namespace_never_becomes_a_hostname(
-    tmp_path: Path,
-) -> None:
-    """The deliverer builds a URL from a database column, so it checks it.
+def test_the_gateway_opens_no_control_plane_database(tmp_path: Path) -> None:
+    """C5c's K1, arrived at completely.
 
-    Retryable rather than terminal: a household mid-provisioning has no
-    runtime yet and gets one shortly, and the WAL is what holds the message
-    until it does.
+    C5d's draft opened `/data/control-plane.db` on the gateway's own volume,
+    which the control plane had never written to — so the gateway came up
+    healthy, passed its health check and routed nobody. C5e replaces reading
+    with asking, and the consequence is that the gateway holds no household
+    data of any kind: two roots, one credential and its own WAL.
+
+    Fail-closed and loud without the two settings, because the alternative
+    failure is `lookup_unavailable` on every request — a WAL filling up behind
+    a configuration mistake that looks exactly like an outage.
     """
-    db = _bound(tmp_path)
-    db.connection.execute(
-        "UPDATE households SET runtime_ref = 'evil.example.com' WHERE id = ?",
-        (HOUSEHOLD,),
+    with pytest.raises(ValueError, match="resolves senders through the control plane"):
+        build_router({"ABROLIA_GATEWAY_INGRESS_DB": str(tmp_path / "wal.db")})
+
+
+def test_a_control_plane_that_does_not_answer_is_retryable_not_unknown(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """L2: the two facts are different and the row's fate depends on which.
+
+    "The control plane did not answer" is not "nobody holds this sender".
+    Collapsing them drops a family's message TERMINALLY because a deployment
+    happened to be restarting — and the redeliver worker never sees it, because
+    a terminal outcome deletes the row.
+    """
+    monkeypatch.setenv("ABROLIA_WHATSAPP_SHARED_ENABLED", "1")
+
+    class _Down:
+        def resolve(self, **_kwargs):
+            raise BindingLookupUnavailable("control plane is restarting")
+
+    clock = [1_000_000.0]
+    delivered: list[bytes] = []
+    router = WhatsAppGatewayRouter(
+        resolver=_Down(),
+        relay_keys={HOUSEHOLD: RELAY_KEY},
+        gateway_hmac_key=GATEWAY_KEY,
+        ingress_path=tmp_path / "ingress.db",
+        runtime_deliver=lambda h, p, t, s: delivered.append(p),
+        now_fn=lambda: clock[0],
     )
-    db.connection.commit()
+    body = b'{"message":"during a control-plane restart"}'
+    ts = str(int(clock[0]))
+    status, payload = _call(
+        GatewayApp(router, adapter_token=ADAPTER_TOKEN),
+        _request(body, signature=relay_hmac(RELAY_KEY, body, ts), timestamp=ts),
+    )
+    assert payload == {"status": "lookup_unavailable"}
+    assert status.startswith("200"), "the caller was told to retry what we own"
+    assert _ingress_count(tmp_path / "ingress.db") == 1, (
+        "a control-plane restart dropped the message terminally"
+    )
+
+
+def test_the_runtime_reference_comes_from_the_resolve_that_found_the_household(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """One answer, not two questions that can disagree.
+
+    An earlier draft asked a local `households` table for the runtime after
+    resolving the household elsewhere. Two sources can be answered
+    inconsistently, and the failure that produces is a message routed for one
+    household delivered to the runtime of another.
+
+    Also pinned: a reference outside the managed namespace never becomes a
+    hostname, and is retryable rather than terminal — a household
+    mid-provisioning gets one shortly, and the WAL holds the message until it
+    does.
+    """
+    monkeypatch.setenv("ABROLIA_WHATSAPP_SHARED_ENABLED", "1")
+
+    class _Resolver:
+        def __init__(self, ref):
+            self.ref = ref
+
+        def resolve(self, **_kwargs):
+            return ResolvedSender(household_id=HOUSEHOLD, runtime_ref=self.ref)
 
     class _NeverCalled:
         def post(self, *_a, **_k):  # pragma: no cover - must never run
             raise AssertionError("a request was made to an unmanaged reference")
 
-    deliverer = RuntimeRelayDeliverer(db, client=_NeverCalled())
+    now = 1_000_000.0
+    router = WhatsAppGatewayRouter(
+        resolver=_Resolver("evil.example.com"),
+        relay_keys={HOUSEHOLD: RELAY_KEY},
+        gateway_hmac_key=GATEWAY_KEY,
+        ingress_path=tmp_path / "ingress.db",
+        now_fn=lambda: now,
+    )
+    router.route("+999511234588", "whatsapp", timestamp=str(int(now)))
+    deliverer = RuntimeRelayDeliverer(router, client=_NeverCalled())
     with pytest.raises(RuntimeUnavailable):
         deliverer(HOUSEHOLD, b"{}", "1", "sig")
 
+    # And a managed one is used exactly as resolved.
+    managed = f"synthetic-runtime:{HOUSEHOLD}"
+    router.resolver = _Resolver(managed)
+    router.route("+999511234588", "whatsapp", timestamp=str(int(now)))
+    assert router.runtime_ref(HOUSEHOLD) == managed
 
-def test_the_gateway_refuses_to_invent_a_control_plane_database(tmp_path: Path) -> None:
-    """A gateway pointed at the wrong volume must not come up healthy.
 
-    `open_control_plane_database` migrates, so a missing file becomes a fresh
-    empty one: the gateway starts, answers `/healthz`, and routes nobody —
-    every real sender an `unknown_sender` against a table nothing populated.
-    Indistinguishable from a working deployment until a family's message goes
-    missing.
+def test_the_deploy_unit_gives_the_gateway_no_household_data() -> None:
+    """C5c's K1 at the deployment level, and C5e completes it.
 
-    How the gateway is given a POPULATED database is the open question this
-    slice deliberately leaves — see C5e. Refusing to fabricate one is the part
-    that does not need that answer.
+    A first draft mounted a control-plane database on the gateway's own volume,
+    which the control plane had never written to — the gateway came up healthy
+    and routed nobody. It now asks instead of reading, so the deployment names
+    no database at all, and the gateway holds no household data of any kind.
     """
-    missing = tmp_path / "nowhere" / "control-plane.db"
-    with pytest.raises(FileNotFoundError):
-        build_router({"ABROLIA_GATEWAY_CONTROL_PLANE_DB": str(missing)})
-    assert not missing.exists(), "the gateway created the database it refused"
+    config = Path("deploy/gateway/fly.toml").read_text(encoding="utf-8")
+    for forbidden in (
+        "ABROLIA_ENCRYPTION_KEY",
+        "ABROLIA_LOOKUP_HMAC_KEY",
+        "ABROLIA_TOKEN_HMAC_KEY",
+        "ABROLIA_CONTROL_PLANE_BACKUP_KEY",
+        "ABROLIA_FLY_API_TOKEN",
+        # The database itself, which is the C5e change.
+        "ABROLIA_GATEWAY_CONTROL_PLANE_DB",
+    ):
+        assert f"{forbidden} =" not in config, f"the gateway was given {forbidden}"
+    # Every credential is a Fly secret rather than [env], which is recorded in
+    # the image configuration.
+    for secret in (
+        "ABROLIA_GATEWAY_SENDER_HMAC_KEY",
+        "ABROLIA_GATEWAY_RELAY_ROOT_KEY",
+        "ABROLIA_GATEWAY_LOOKUP_TOKEN",
+        "ABROLIA_GATEWAY_ADAPTER_TOKEN",
+    ):
+        assert f"{secret} =" not in config, f"{secret} was set as [env]"
+    # It asks the control plane, over private transport.
+    assert ".flycast" in config
+    assert 'ABROLIA_WHATSAPP_SHARED_ENABLED = "0"' in config
+    # The only mount is the WAL it owns.
+    assert config.count("[mounts]") == 1
+    assert "gateway-ingress.db" in config
 
 
-@pytest.mark.parametrize("shape", ["symlink", "directory"])
-def test_the_gateway_opens_only_a_real_file_it_named(tmp_path: Path, shape: str) -> None:
-    """No check-then-use: one guarded open, not a test followed by a reopen.
+def test_the_image_installs_the_package_it_runs() -> None:
+    """`python -m gateway.app` needs `gateway` in the distribution.
 
-    The first draft validated with `Path.is_file()` and then let SQLite reopen
-    the same pathname. A symlink passes `is_file()`, and the name can be
-    replaced between the two calls, so the database that got migrated and
-    trusted need not be the entry that was checked — and this process both
-    routes on it and writes migrations to it.
-
-    `O_NOFOLLOW` refuses the link and proves existence in one syscall, and the
-    descriptor is held open across the connect so the inode cannot be swapped
-    out underneath.
+    Package discovery listed only `hermes_cloud*`, `control_plane*` and `web*`,
+    so the wheel built cleanly and the container exited immediately with
+    `No module named gateway` — a deploy unit that cannot start.
     """
-    real = tmp_path / "real-control-plane.db"
-    open_control_plane_database(real).close()
-    target = tmp_path / "named-entry.db"
-    if shape == "symlink":
-        target.symlink_to(real)
-    else:
-        target.mkdir()
+    import tomllib
 
-    with pytest.raises((FileNotFoundError, OSError)):
-        build_router({"ABROLIA_GATEWAY_CONTROL_PLANE_DB": str(target)})
+    with open("pyproject.toml", "rb") as handle:
+        include = tomllib.load(handle)["tool"]["setuptools"]["packages"]["find"]["include"]
+    assert "gateway*" in include
+    dockerfile = Path("deploy/gateway/Dockerfile").read_text(encoding="utf-8")
+    assert "COPY gateway ./gateway" in dockerfile
+    assert 'CMD ["python", "-m", "gateway.app"]' in dockerfile

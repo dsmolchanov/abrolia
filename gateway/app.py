@@ -23,7 +23,6 @@ from __future__ import annotations
 import hmac
 import json
 import os
-import stat
 import threading
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -31,7 +30,11 @@ from typing import Any
 
 import httpx
 
-from control_plane.db import open_control_plane_database
+from control_plane.bindings_resolution import (
+    BindingLookupUnavailable,
+    ResolvedSender,
+    SenderNotRoutable,
+)
 from control_plane.privacy.runtime import RUNTIME_REF
 from gateway.whatsapp_router import (
     GatewayRedeliverWorker,
@@ -50,7 +53,8 @@ MAX_WEBHOOK_BYTES = MAX_WHATSAPP_WEBHOOK_BYTES
 
 ENV_HOST = "ABROLIA_GATEWAY_HOST"
 ENV_PORT = "ABROLIA_GATEWAY_PORT"
-ENV_DB = "ABROLIA_GATEWAY_CONTROL_PLANE_DB"
+ENV_CONTROL_PLANE_URL = "ABROLIA_GATEWAY_CONTROL_PLANE_URL"
+ENV_LOOKUP_TOKEN = "ABROLIA_GATEWAY_LOOKUP_TOKEN"
 ENV_INGRESS = "ABROLIA_GATEWAY_INGRESS_DB"
 ENV_SENDER_KEY = "ABROLIA_GATEWAY_SENDER_HMAC_KEY"
 ENV_RELAY_ROOT = "ABROLIA_GATEWAY_RELAY_ROOT_KEY"
@@ -67,6 +71,73 @@ _REFUSED = frozenset({"hmac_rejected", "timestamp_replay"})
 #: persists anything, so answering 200 would drop the message on the floor
 #: during exactly the incident the switch was thrown to contain.
 _UNAVAILABLE = frozenset({"flag_disabled"})
+
+
+class RemoteBindingResolver:
+    """Asks the control plane who holds a sender.
+
+    The deployed gateway has no `channel_bindings` table. After C5e it has no
+    control-plane data at all — this is the only thing it knows about
+    households, it is asked once per message, and the answer is never cached
+    (L1: a cache with any lifetime is the replicated projection this slice
+    rejected, wearing a different name).
+
+    Transport failure is translated to `BindingLookupUnavailable` HERE, at the
+    layer that knows what a transport failure is. That is what lets the router
+    catch one narrow exception: "the control plane did not answer" is retryable
+    and stays in the WAL, while "nobody holds this sender" is terminal — and a
+    resolver that let an `httpx` error reach the router as something generic
+    would collapse the two.
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        token: str,
+        *,
+        client: httpx.Client | None = None,
+        timeout: float = 5.0,
+    ) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.token = token
+        self.client = client or httpx.Client(timeout=timeout, follow_redirects=False)
+        self.timeout = timeout
+
+    def resolve(
+        self, *, channel: str, external_id: str | None, external_id_hmac: str | None
+    ) -> ResolvedSender:
+        try:
+            response = self.client.post(
+                f"{self.base_url}/internal/v1/bindings/resolve",
+                headers={"Authorization": f"Bearer {self.token}"},
+                json={
+                    "channel": channel,
+                    "external_id": external_id,
+                    "external_id_hmac": external_id_hmac,
+                },
+                timeout=self.timeout,
+            )
+        except (httpx.TimeoutException, httpx.TransportError) as error:
+            raise BindingLookupUnavailable("control plane did not answer") from error
+        if response.status_code == 404:
+            # The one terminal answer. `unknown_sender` and `ambiguous_sender`
+            # share it deliberately, so the reply cannot tell a bound sender
+            # from an unbound one by status.
+            raise SenderNotRoutable("unknown_sender")
+        if response.status_code != 200:
+            # Including 401 and 403: a gateway the control plane refuses is
+            # misconfigured, and dropping every message while that is true
+            # would turn a credential mistake into silent data loss. Retryable,
+            # bounded by `MAX_ATTEMPTS` like anything else.
+            raise BindingLookupUnavailable(f"control plane answered {response.status_code}")
+        try:
+            body = response.json()
+            return ResolvedSender(
+                household_id=str(body["household_id"]),
+                runtime_ref=body.get("runtime_ref"),
+            )
+        except (ValueError, KeyError, TypeError) as error:
+            raise BindingLookupUnavailable("control plane returned an unusable answer") from error
 
 
 class RuntimeUnavailable(RuntimeError):
@@ -87,30 +158,32 @@ class RuntimeRelayDeliverer:
     pilot", which is a reasonable stand-in for a test and a silent message sink
     in a deployment.
 
-    The runtime is addressed the way `control_plane/runtimes/chat_client.py`
-    addresses it — `http://{runtime_ref}.internal:8080` — and the reference is
-    checked against the managed namespace before it becomes a hostname, so a
-    row that somehow held an arbitrary string cannot make this issue a request
-    to it.
+    The runtime reference comes from the SAME resolve that produced the
+    household, carried on the router. Asking a second time — of a second
+    source, as an earlier draft did by querying a local `households` table —
+    can be answered inconsistently with the first, and would deliver a message
+    routed for one household to the runtime of another.
+
+    The reference is checked against the managed namespace before it becomes a
+    hostname, so an answer that somehow held an arbitrary string cannot make
+    this issue a request to it.
     """
 
-    def __init__(self, database, *, client: httpx.Client | None = None, timeout: float = 10.0):
-        self.db = database
+    def __init__(
+        self,
+        router: WhatsAppGatewayRouter,
+        *,
+        client: httpx.Client | None = None,
+        timeout: float = 10.0,
+    ) -> None:
+        self.router = router
         self.client = client or httpx.Client(timeout=timeout, follow_redirects=False)
         self.timeout = timeout
-
-    def runtime_ref(self, household_id: str) -> str | None:
-        rows = self.db.query(
-            "SELECT runtime_ref FROM households WHERE id = ?", (household_id,)
-        )
-        if not rows:
-            return None
-        return rows[0]["runtime_ref"]
 
     def __call__(
         self, household_id: str, payload: bytes, timestamp: str, signature: str
     ) -> None:
-        ref = self.runtime_ref(household_id)
+        ref = self.router.runtime_ref(household_id)
         if not ref or not RUNTIME_REF.fullmatch(ref):
             # No runtime, or a reference outside the managed namespace. Both
             # are retryable rather than terminal: a household mid-provisioning
@@ -349,60 +422,34 @@ def _decode_key(value: str, *, name: str) -> bytes:
 def build_router(env: Mapping[str, str] | None = None) -> WhatsAppGatewayRouter:
     """The router a deployment builds, from configuration alone.
 
-    E6: the two roots and the database, and nothing else. The gateway is not
-    given the field encryption key or the lookup HMAC key, so it cannot
-    decrypt a manifest or correlate any other keyed digest in the system — it
-    can resolve a sender and sign a delivery, which is the whole of its job.
+    IT OPENS NO CONTROL-PLANE DATABASE. C5d's draft did, on the gateway's own
+    volume, which the control plane had never written to — so the gateway came
+    up healthy, passed its health check and routed nobody. C5e replaces that
+    with a question asked of the control plane, and the consequence is that the
+    gateway now holds no household data of any kind: two roots, one credential,
+    and its own ingress WAL.
+
+    That is C5c's K1 arrived at completely. The gateway cannot decrypt a
+    manifest, cannot correlate another keyed digest, and now cannot read a
+    binding either — it can ask about one.
     """
     source = dict(os.environ if env is None else env)
-    path = Path(source.get(ENV_DB, "/data/control-plane.db"))
-    # REFUSE TO CREATE ONE. `open_control_plane_database` migrates, so a
-    # missing file becomes a fresh empty database and the gateway comes up
-    # healthy, answers `/healthz`, and routes nobody — every real sender an
-    # `unknown_sender` against a table that was never populated. That is the
-    # shape of a gateway pointed at the wrong volume, and it is
-    # indistinguishable from a working one until a family's message goes
-    # missing.
-    #
-    # ONE OPEN, not a check and then a second open by the same name. The first
-    # draft of this guard used `Path.is_file()` and then let SQLite reopen the
-    # pathname, which is a check-then-use: a symlink passes `is_file()`, and
-    # the name can be replaced in between, so the database that gets migrated
-    # and trusted need not be the entry that was validated.
-    #
-    # `O_NOFOLLOW` refuses a symlink and proves existence in one syscall, and
-    # the descriptor is held OPEN across the connect below so the inode cannot
-    # be swapped out from under it — replacing the name afterwards leaves this
-    # process holding the file it checked.
-    try:
-        probe = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-    except FileNotFoundError as error:
-        raise FileNotFoundError(
-            f"{ENV_DB} does not name an existing control-plane database: {path}"
-        ) from error
-    except OSError as error:
-        # ELOOP for a symlink, and anything else the entry refuses. The gateway
-        # reads one database and it should be the one an operator named, not
-        # whatever a link happens to point at today.
-        raise FileNotFoundError(
-            f"{ENV_DB} is not a regular control-plane database: {path}"
-        ) from error
-    try:
-        # On the DESCRIPTOR, so this asks about the same inode `O_NOFOLLOW`
-        # just accepted rather than resolving the name a second time. A
-        # directory passes `O_NOFOLLOW` happily and would otherwise reach
-        # SQLite as an unhelpful "unable to open database file".
-        if not stat.S_ISREG(os.fstat(probe).st_mode):
-            raise FileNotFoundError(
-                f"{ENV_DB} is not a regular control-plane database: {path}"
-            )
-        database = open_control_plane_database(path)
-    finally:
-        os.close(probe)
+    base_url = source.get(ENV_CONTROL_PLANE_URL, "").strip()
+    token = source.get(ENV_LOOKUP_TOKEN, "").strip()
+    if not base_url or not token:
+        # FAIL CLOSED, and loudly. A gateway without these cannot answer a
+        # single message, and the failure it would otherwise produce is
+        # `lookup_unavailable` on every request — a WAL filling up behind a
+        # configuration mistake that looks like an outage.
+        raise ValueError(
+            f"{ENV_CONTROL_PLANE_URL} and {ENV_LOOKUP_TOKEN} are required:"
+            " the gateway resolves senders through the control plane"
+        )
     sender_key = source.get(ENV_SENDER_KEY, "").strip()
     relay_root = source.get(ENV_RELAY_ROOT, "").strip()
-    return WhatsAppGatewayRouter(
-        database,
+    resolver = RemoteBindingResolver(base_url, token)
+    router = WhatsAppGatewayRouter(
+        resolver=resolver,
         gateway_hmac_key=(
             _decode_key(sender_key, name=ENV_SENDER_KEY) if sender_key else None
         ),
@@ -410,8 +457,9 @@ def build_router(env: Mapping[str, str] | None = None) -> WhatsAppGatewayRouter:
             _decode_key(relay_root, name=ENV_RELAY_ROOT) if relay_root else None
         ),
         ingress_path=Path(source.get(ENV_INGRESS, "/data/gateway-ingress.db")),
-        runtime_deliver=RuntimeRelayDeliverer(database),
     )
+    router.runtime_deliver = RuntimeRelayDeliverer(router)
+    return router
 
 
 def build_app(env: Mapping[str, str] | None = None) -> GatewayApp:

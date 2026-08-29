@@ -14,6 +14,12 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
+from control_plane.bindings_resolution import (
+    BindingLookupUnavailable,
+    ResolvedSender,
+    SenderNotRoutable,
+    resolve_sender,
+)
 from control_plane.crypto import (  # one implementation, both ends
     RELAY_KEY_LABEL,
     derive_relay_secret,
@@ -190,6 +196,29 @@ class GatewayStore:
         )
 
 
+class LocalBindingResolver:
+    """Reads `channel_bindings` directly, through the shared rule.
+
+    What the gateway did before C5e, and what it still does wherever it has the
+    control-plane database: tests, and a single-machine development run. The
+    rule itself is `control_plane.bindings_resolution.resolve_sender`, so this
+    and the deployed remote resolver cannot answer differently.
+    """
+
+    def __init__(self, database) -> None:
+        self.db = database
+
+    def resolve(
+        self, *, channel: str, external_id: str | None, external_id_hmac: str | None
+    ) -> ResolvedSender:
+        return resolve_sender(
+            self.db.connection,
+            channel=channel,
+            external_id=external_id,
+            external_id_hmac=external_id_hmac,
+        )
+
+
 class WhatsAppGatewayRouter:
     """Narrow relay: sender -> exactly one household via HMAC lookup."""
 
@@ -197,8 +226,9 @@ class WhatsAppGatewayRouter:
 
     def __init__(
         self,
-        db,
+        db=None,
         *,
+        resolver=None,
         relay_keys: dict[str, bytes] | None = None,
         relay_root: bytes | None = None,
         gateway_hmac_key: bytes | None = None,
@@ -206,7 +236,13 @@ class WhatsAppGatewayRouter:
         runtime_deliver=None,
         now_fn=None,
     ) -> None:
+        # One of the two. A gateway with a database resolves locally; a
+        # deployed one has no bindings table and is given a resolver that asks
+        # the control plane. Both go through the same rule.
+        if resolver is None and db is None:
+            raise ValueError("a gateway needs either a database or a resolver")
         self.db = db
+        self.resolver = resolver or LocalBindingResolver(db)
         self.relay_keys = relay_keys or {}
         self.relay_root = relay_root
         self.gateway_hmac_key = gateway_hmac_key
@@ -214,6 +250,8 @@ class WhatsAppGatewayRouter:
         self._store: GatewayStore | None = None
         self.runtime_deliver = runtime_deliver
         self.now_fn = now_fn or time.time
+        #: Filled by `route`, read by the deliverer. See `runtime_ref`.
+        self._runtime_refs: dict[str, str | None] = {}
 
     @property
     def store(self) -> GatewayStore:
@@ -264,7 +302,13 @@ class WhatsAppGatewayRouter:
     def route(
         self, sender: str, channel: str = "whatsapp", *, timestamp: str | None = None
     ) -> GatewayResult:
-        # Timestamp freshness required whenever HMAC mode is active
+        """Which household holds this sender, and may this request ask now.
+
+        Freshness first, then the lookup. The lookup itself is
+        `control_plane.bindings_resolution.resolve_sender` through whichever
+        resolver this gateway was given — reading the database directly, or
+        asking the control plane — so the two cannot answer differently.
+        """
         if self.gateway_hmac_key is not None:
             if timestamp is None:
                 return GatewayResult(status="denied", code="timestamp_replay")
@@ -274,20 +318,11 @@ class WhatsAppGatewayRouter:
                 return GatewayResult(status="denied", code="timestamp_replay")
             if abs(int(self.now_fn()) - ts) > self.REPLAY_WINDOW_SECONDS:
                 return GatewayResult(status="denied", code="timestamp_replay")
-            # Strict HMAC lookup — no plaintext fallback when key configured
-            h = sender_hmac(sender, self.gateway_hmac_key)
-            rows = self.db.query(
-                # `published_revision IS NOT NULL` is C3c: a binding is
-                # routable only once the revision carrying it has ACTIVATED.
-                # Without it a member verified during a rollout was routed to a
-                # runtime still serving the previous revision, whose manifest
-                # had no pair for them — the runtime denied the turn and their
-                # message went nowhere.
-                "SELECT household_id FROM channel_bindings "
-                "WHERE channel = ? AND external_id_hmac = ? "
-                "AND published_revision IS NOT NULL",
-                (channel, h),
-            )
+            # Strict mode: matched by digest, with no plaintext fallback.
+            lookup = {
+                "external_id_hmac": sender_hmac(sender, self.gateway_hmac_key),
+                "external_id": None,
+            }
         else:
             if timestamp is not None:
                 try:
@@ -296,19 +331,38 @@ class WhatsAppGatewayRouter:
                     return GatewayResult(status="denied", code="timestamp_replay")
                 if abs(int(self.now_fn()) - ts) > self.REPLAY_WINDOW_SECONDS:
                     return GatewayResult(status="denied", code="timestamp_replay")
-            rows = self.db.query(
-                # See the strict branch above: staged bindings do not route.
-                "SELECT household_id FROM channel_bindings "
-                "WHERE channel = ? AND external_id = ? "
-                "AND published_revision IS NOT NULL",
-                (channel, sender),
-            )
-        ids = [r["household_id"] for r in rows]
-        if len(ids) == 0:
-            return GatewayResult(status="denied", code="unknown_sender")
-        if len(ids) > 1:
-            return GatewayResult(status="denied", code="ambiguous_sender")
-        return GatewayResult(status="delivered", code="ok", household_id=ids[0])
+            lookup = {"external_id": sender, "external_id_hmac": None}
+        try:
+            resolved = self.resolver.resolve(channel=channel, **lookup)
+        except SenderNotRoutable as refusal:
+            # TERMINAL: nobody holds this sender, or more than one does.
+            return GatewayResult(status="denied", code=refusal.code)
+        except BindingLookupUnavailable:
+            # L2 — RETRYABLE, and the distinction is the point. "The control
+            # plane did not answer" is not "nobody holds this sender", and
+            # collapsing them would drop a family's message terminally because
+            # a deployment happened to be restarting. The row stays in the WAL
+            # and the redeliver worker asks again.
+            #
+            # Caught NARROWLY. A broad `except Exception` here turns a
+            # programming error into a message quietly parked in the WAL and
+            # retried forever rather than a loud failure — which is what it did
+            # while this slice was being written, hiding a NameError as
+            # `lookup_unavailable` until a test disagreed.
+            return GatewayResult(status="denied", code="lookup_unavailable")
+        self._runtime_refs[resolved.household_id] = resolved.runtime_ref
+        return GatewayResult(
+            status="delivered", code="ok", household_id=resolved.household_id
+        )
+
+    def runtime_ref(self, household_id: str) -> str | None:
+        """Where the last resolution said this household's runtime is.
+
+        Carried from the resolve rather than asked separately: a gateway that
+        asked twice could be answered inconsistently across the two, and would
+        deliver a message routed for one revision to the runtime of another.
+        """
+        return self._runtime_refs.get(household_id)
 
     def handle_webhook(
         self,
@@ -344,6 +398,34 @@ class WhatsAppGatewayRouter:
         #
         # A denied route also stops writing a row it would immediately delete.
         routed = self.route(sender, channel, timestamp=timestamp)
+        if routed.code == "lookup_unavailable":
+            # RETRYABLE, so it is persisted — unlike every other denial here,
+            # which is terminal and has nothing worth keeping. The row carries
+            # NO household, because none was resolved: the lookup is precisely
+            # what failed.
+            #
+            # That is safe, and it is the reason `_has_provenance` asks about
+            # authenticity rather than about the household. "Re-routing decides
+            # whether to deliver, never to whom" protects against a stored
+            # answer being contradicted later; where no answer was ever stored
+            # there is nothing to contradict, and whoever holds the sender when
+            # the control plane comes back IS the right recipient.
+            store = self.store
+            ingress_id = store.persist_before_ack(
+                payload,
+                sender,
+                channel=channel,
+                household_id=None,
+                timestamp=timestamp,
+                signature=signature,
+                now=self.now_fn(),
+            )
+            store.defer(
+                ingress_id,
+                error="lookup_unavailable",
+                not_before=self.now_fn() + GatewayRedeliverWorker.BASE_BACKOFF_SECONDS,
+            )
+            return routed
         if routed.status == "denied":
             return routed
         ingress_id = store.persist_before_ack(
@@ -635,10 +717,21 @@ class GatewayRedeliverWorker:
 
     @staticmethod
     def _has_provenance(row) -> bool:
-        """Whether the row can say what it arrived as, and for whom."""
+        """Whether the row can say what it ARRIVED AS — I5's question.
+
+        The household is deliberately not required. A row persisted because the
+        control-plane lookup was unavailable never had one, and dropping it
+        would make a control-plane restart lose messages by way of the check
+        meant to protect them.
+
+        What must be present is what authenticity needs: the channel it arrived
+        on, and the timestamp and signature it arrived with. Without those the
+        row can never be proven to have come from the relay, and the one thing
+        that must not happen is signing it with the real key.
+        """
         return all(
             row[column] is not None
-            for column in ("channel", "household_id", "origin_timestamp", "origin_signature")
+            for column in ("channel", "origin_timestamp", "origin_signature")
         )
 
     def _defer(self, row, now: float, error: str) -> str:
