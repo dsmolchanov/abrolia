@@ -155,8 +155,26 @@ Ordered slices:
   stale revision or runtime ref; drop the revision clause from any of them and
   nothing fails. Needs one authenticated HTTP regression carrying a
   secondary-channel binding through worker, claim and activation, and a
-  parameterized worker regression over both operations × both stale fields ×
-  all four checkpoints.
+  parameterized worker regression over the checkpoints and the fields each one
+  actually reads.
+
+  **Scope narrowed 2026-08-28, by measurement.** This first asked for "both
+  operations × both stale fields × all four checkpoints". Two thirds of that
+  matrix pins nothing, and deleting each clause and counting failures is how
+  that was established rather than argued:
+
+  * the two operations exercise the same clauses. What differs between them is
+    `_workflow_states_for`, which has its own test, so every case ran twice and
+    failed twice for one cause;
+  * the checkpoints do not all read both fields. The bootstrap checkpoint and
+    the reconcile predicate never read `runtime_ref`, so a case asserting they
+    refuse a stale one would assert something untrue — and for reconcile there
+    is no expected reference to compare against at all until the provider has
+    answered.
+
+  What is required is one case per (checkpoint, field that checkpoint reads),
+  which is five plus the reconcile case. Every clause is then pinned by exactly
+  one case.
 
 - [ ] **C4. Make preferences real.** Production write path (API/onboarding);
   consumer that routes replies/fallbacks; self-contained agent-inbox rejection
