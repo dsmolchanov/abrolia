@@ -13,12 +13,15 @@ transport is built once, in `hermes_cloud/cli.py::_pipeline`, so wrapping it
 there is one seam that covers all of them and cannot be forgotten by the next
 one added.
 
-**Only a refusal falls back.** `TransportError` means the channel answered and
-said no. `SendOutcomeUnknown` means the request may well have arrived — a
-second copy by email would be a duplicate message, and worse, it would assert
-a failure nobody can prove. The repository has spent two slices on that
-distinction (C3e's stranded rollouts, the email send store's
-`outcome_unknown`), and it holds here too: unknown is not failure.
+**Only a refusal falls back, and only a definitive one.** Three outcomes, not
+two. `SendOutcomeUnknown` means the request may well have arrived — a second
+copy by email would duplicate it and assert a failure nobody can prove; the
+repository has spent two slices on that distinction (C3e's stranded rollouts,
+the email send store's `outcome_unknown`). A `TransportError` carrying
+`definitive=False` — a 429 or a 5xx — is the channel being busy or broken,
+where a letter about a message that arrives a second later is worse than
+silence. Only `definitive=True` reaches the family's inbox: a blocked bot, a
+chat that no longer exists, an API answering `ok: false`.
 
 **The notice carries no household content.** `docs/privacy/data-map.md` says
 the fallback is link-only, and the reason survives the missing link: email is
@@ -99,7 +102,8 @@ class FallbackTransport:
                 chat=chat, text=text, thread=thread, buttons=buttons
             )
         except TransportError as error:
-            self._refused(error)
+            if error.definitive:
+                self._refused(error)
             raise
 
     def send_document(
@@ -120,7 +124,8 @@ class FallbackTransport:
                 thread=thread,
             )
         except TransportError as error:
-            self._refused(error)
+            if error.definitive:
+                self._refused(error)
             raise
 
     # --- everything else is the channel's own business --------------------

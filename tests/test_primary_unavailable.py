@@ -11,6 +11,7 @@ that happens to satisfy it.
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 import pytest
 
@@ -171,3 +172,78 @@ def test_a_fallback_that_cannot_be_sent_never_replaces_the_channel_s_error(
         transport.send_message(chat="c", text="привет")
 
     assert "ALERT primary_unavailable" in caplog.text, reason
+
+
+@pytest.mark.parametrize("method", ("send_message", "send_document"))
+@pytest.mark.parametrize(
+    ("status", "definitive"),
+    ((403, True), (400, True), (429, False), (500, False), (503, False)),
+)
+def test_a_busy_channel_is_not_a_refusal(method, status, definitive) -> None:
+    """"Not now" is not "no", and only "no" writes to the family.
+
+    `TelegramTransport` raises `TransportError` for every HTTP answer,
+    including the rate limit it hits on a chatty afternoon and the 5xx it hits
+    while Telegram is having an outage. A letter about a message that arrives a
+    second later is worse than silence, and the worker's own retry would repeat
+    it across windows.
+    """
+    error = TransportError(
+        f"sendMessage: HTTP {status}", status=status, definitive=status not in (429, 500, 503)
+    )
+    mail = RecordingMail()
+    transport = _transport(RefusingTransport(error), mail)
+
+    with pytest.raises(TransportError):
+        if method == "send_message":
+            transport.send_message(chat="c", text="привет")
+        else:
+            transport.send_document(chat="c", filename="a.ics", content=b"x")
+
+    assert bool(mail.letters) is definitive
+
+
+@pytest.mark.parametrize(
+    ("status", "definitive"),
+    ((403, True), (404, True), (408, False), (429, False), (502, False)),
+)
+def test_the_transport_classifies_the_status_it_was_given(status, definitive) -> None:
+    """The classification lives with the channel that knows its own statuses.
+
+    Asserted against `TelegramTransport` itself rather than against a fixture's
+    idea of it, because `FallbackTransport` trusts the flag entirely: a channel
+    that mislabels its errors turns the rule above into decoration.
+    """
+    from hermes_cloud.channels.telegram import _definitive
+
+    assert _definitive(status) is definitive
+
+
+def test_no_family_transport_is_built_without_the_fallback_around_it() -> None:
+    """The next outbound path must not be able to forget this one.
+
+    The deployed image runs `hermes_cloud.runtime.service`, which builds no
+    channel transport at all: it serves HTTP and runs the inbound email and
+    Gmail workers, so there is no primary-channel send there to fall back
+    from. The pipeline that does send is built in `hermes_cloud/cli.py`, and
+    that is where the decorator is installed.
+
+    What this pins is the day that changes. Whoever gives the runtime an
+    outbound channel will construct a transport, and this fails until it is
+    wrapped — which is the enforceable half of "route every primary channel
+    through the fallback", the other half being a delivery path that does not
+    exist yet.
+    """
+    package = Path(__file__).resolve().parents[1] / "hermes_cloud"
+    builders = {"TelegramTransport(", "ConsoleTransport("}
+    offenders = sorted(
+        path.relative_to(package).as_posix()
+        for path in package.rglob("*.py")
+        if any(builder in path.read_text(encoding="utf-8") for builder in builders)
+        and "FallbackTransport" not in path.read_text(encoding="utf-8")
+        and path.name not in {"console.py", "telegram.py"}
+    )
+    assert offenders == [], (
+        "these modules build a family-facing transport without wrapping it in"
+        f" FallbackTransport: {', '.join(offenders)}"
+    )

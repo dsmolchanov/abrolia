@@ -138,9 +138,14 @@ class TelegramTransport:
             with urllib.request.urlopen(request, timeout=timeout or self._timeout) as response:
                 body = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as error:
-            # Ответ сервера получен: отправки не было и не будет. Повторять
-            # такое бессмысленно — чаще всего это неверный chat_id или токен.
-            raise TransportError(f"{method}: HTTP {error.code} {error.reason}") from error
+            # Ответ сервера получен: отправки не было. Отличаем «нет» от «не
+            # сейчас»: 429 и 5xx стоит повторить, остальное — решение об этом
+            # сообщении (чаще всего неверный chat_id или заблокированный бот).
+            raise TransportError(
+                f"{method}: HTTP {error.code} {error.reason}",
+                status=error.code,
+                definitive=_definitive(error.code),
+            ) from error
         except urllib.error.URLError as error:
             # Ответа нет: отправка могла дойти до Telegram — исход неизвестен,
             # и молча повторять её нельзя (донорская семантика).
@@ -196,7 +201,11 @@ class TelegramTransport:
             with urllib.request.urlopen(request, timeout=self._timeout) as response:
                 body = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as error:
-            raise TransportError(f"sendDocument: HTTP {error.code} {error.reason}") from error
+            raise TransportError(
+                f"sendDocument: HTTP {error.code} {error.reason}",
+                status=error.code,
+                definitive=_definitive(error.code),
+            ) from error
         except urllib.error.URLError as error:
             raise SendOutcomeUnknown(f"sendDocument: {error}") from error
         if not body.get("ok"):
@@ -221,8 +230,37 @@ class TelegramTransport:
         )
 
 
+#: HTTP statuses that mean "not now" rather than "no". A rate limit and a
+#: server error are the channel being busy or broken, and the message is worth
+#: sending again; everything else in the 4xx range is a decision about THIS
+#: message — a blocked bot, a chat that does not exist — which no retry changes.
+RETRYABLE_STATUSES = frozenset({408, 429})
+
+
 class TransportError(RuntimeError):
-    """Канал отказал явно — отправки не было."""
+    """Канал отказал явно — отправки не было.
+
+    `definitive` distinguishes a refusal from a hiccup, and the distinction is
+    load-bearing rather than informational: `FallbackTransport` writes to the
+    family's email when the channel refuses, and doing that for a 429 would
+    turn Telegram's rate limiter into a stream of "we could not reach you"
+    letters about messages that arrive a second later.
+
+    The default is `True` because the other constructor of this class is
+    Telegram answering `ok: false` — the API considered the message and said
+    no, which is exactly a refusal.
+    """
+
+    def __init__(
+        self, message: str, *, status: int | None = None, definitive: bool = True
+    ) -> None:
+        super().__init__(message)
+        self.status = status
+        self.definitive = definitive
+
+
+def _definitive(status: int) -> bool:
+    return status < 500 and status not in RETRYABLE_STATUSES
 
 
 class SendOutcomeUnknown(RuntimeError):
