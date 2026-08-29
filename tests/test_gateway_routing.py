@@ -98,8 +98,8 @@ def test_per_household_relay_hmac_and_durable_before_ack(tmp_path: Path, monkeyp
     # durable ingress — only delivered after runtime confirm, WAL deleted only then
     delivered: list[tuple[str, bytes, str, str]] = []
 
-    def fake_deliver(household_id, payload, timestamp, signature):
-        delivered.append((household_id, payload, timestamp, signature))
+    def fake_deliver(delivery):
+        delivered.append((delivery.household_id, delivery.payload, delivery.timestamp, delivery.signature))
 
     router2 = WhatsAppGatewayRouter(
         db,
@@ -310,13 +310,13 @@ def test_a_delivery_failure_is_redelivered_on_the_next_run(
     delivered: list[tuple[str, bytes]] = []
     runtime_up = False
 
-    def deliver(household_id, payload, timestamp, signature):
+    def deliver(delivery):
         if not runtime_up:
             raise RuntimeError("runtime refused the delivery")
-        assert verify_relay_hmac(key, payload, timestamp, signature), (
+        assert verify_relay_hmac(key, delivery.payload, delivery.timestamp, delivery.signature), (
             "a redelivery must be signed with the scheme C5a settled on"
         )
-        delivered.append((household_id, payload))
+        delivered.append((delivery.household_id, delivery.payload))
 
     clock = [1_000_000.0]
     router = WhatsAppGatewayRouter(
@@ -371,7 +371,7 @@ def test_a_row_kept_for_a_missing_key_is_delivered_once_the_key_arrives(
         relay_keys={},  # nothing provisioned yet
         gateway_hmac_key=gateway_key,
         ingress_path=tmp_path / "ingress.db",
-        runtime_deliver=lambda h, p, t, s: delivered.append(p),
+        runtime_deliver=lambda d: delivered.append(d.payload),
         now_fn=lambda: clock[0],
     )
     body = b'{"message":"waiting for a key"}'
@@ -408,7 +408,7 @@ def test_a_row_is_dropped_and_counted_once_it_can_no_longer_be_repaired(
 
     clock = [1_000_000.0]
 
-    def always_fails(household_id, payload, timestamp, signature):
+    def always_fails(delivery):
         raise RuntimeError("runtime is never coming back")
 
     router = WhatsAppGatewayRouter(
@@ -446,7 +446,7 @@ def test_a_row_is_dropped_and_counted_once_it_can_no_longer_be_repaired(
         relay_keys={hid: key},
         gateway_hmac_key=gateway_key,
         ingress_path=fresh,
-        runtime_deliver=lambda *a: None,
+        runtime_deliver=lambda d: None,
         now_fn=lambda: clock[0] + GatewayRedeliverWorker.MAX_AGE_SECONDS * 2,
     )
     report = GatewayRedeliverWorker(aged).run_once()
@@ -473,10 +473,10 @@ def test_a_redelivery_is_re_routed_so_a_revoked_sender_does_not_land(
     clock = [1_000_000.0]
     failing = True
 
-    def deliver(household_id, payload, timestamp, signature):
+    def deliver(delivery):
         if failing:
             raise RuntimeError("not yet")
-        delivered.append(payload)
+        delivered.append(delivery.payload)
 
     router = WhatsAppGatewayRouter(
         db,
@@ -534,10 +534,10 @@ def test_a_rebound_sender_does_not_carry_the_previous_households_message(
     delivered: list[tuple[str, bytes]] = []
     failing = True
 
-    def deliver(household_id, payload, timestamp, signature):
+    def deliver(delivery):
         if failing:
             raise RuntimeError("not yet")
-        delivered.append((household_id, payload))
+        delivered.append((delivery.household_id, delivery.payload))
 
     clock = [1_000_000.0]
     router = WhatsAppGatewayRouter(
@@ -594,7 +594,7 @@ def test_a_payload_retained_without_a_key_is_proven_before_it_is_signed(
         relay_keys={},  # C5c has not run
         gateway_hmac_key=gateway_key,
         ingress_path=tmp_path / "ingress.db",
-        runtime_deliver=lambda h, p, t, s: delivered.append(p),
+        runtime_deliver=lambda d: delivered.append(d.payload),
         now_fn=lambda: clock[0],
     )
     forged = b'{"message":"never signed by the relay"}'
@@ -648,7 +648,7 @@ def test_a_row_that_cannot_say_what_it_arrived_as_is_dropped(
         relay_keys={hid: key},
         gateway_hmac_key=gateway_key,
         ingress_path=path,
-        runtime_deliver=lambda h, p, t, s: delivered.append(p),
+        runtime_deliver=lambda d: delivered.append(d.payload),
         now_fn=lambda: 1_000_000.0,
     )
     report = GatewayRedeliverWorker(router).run_once()
@@ -680,10 +680,10 @@ def test_the_kill_switch_stops_the_worker_and_the_backlog_survives_it(
     delivered: list[bytes] = []
     failing = True
 
-    def deliver(household_id, payload, timestamp, signature):
+    def deliver(delivery):
         if failing:
             raise RuntimeError("not yet")
-        delivered.append(payload)
+        delivered.append(delivery.payload)
 
     clock = [1_000_000.0]
     router = WhatsAppGatewayRouter(
@@ -734,10 +734,10 @@ def test_the_worker_reads_the_same_wal_the_router_writes_by_default(
     delivered: list[bytes] = []
     failing = True
 
-    def deliver(household_id, payload, timestamp, signature):
+    def deliver(delivery):
         if failing:
             raise RuntimeError("not yet")
-        delivered.append(payload)
+        delivered.append(delivery.payload)
 
     clock = [1_000_000.0]
     router = WhatsAppGatewayRouter(  # NO ingress_path — the deployed shape
@@ -793,10 +793,10 @@ def test_a_retained_telegram_row_is_rerouted_on_the_channel_it_arrived_on(
     delivered: list[bytes] = []
     failing = True
 
-    def deliver(household_id, payload, timestamp, signature):
+    def deliver(delivery):
         if failing:
             raise RuntimeError("not yet")
-        delivered.append(payload)
+        delivered.append(delivery.payload)
 
     clock = [1_000_000.0]
     router = WhatsAppGatewayRouter(
@@ -847,7 +847,7 @@ def test_a_row_is_never_on_disk_without_the_household_it_was_accepted_for(
 
     clock = [1_000_000.0]
 
-    def killed(household_id, payload, timestamp, signature):
+    def killed(delivery):
         raise KeyboardInterrupt("SIGKILL mid-delivery")
 
     router = WhatsAppGatewayRouter(
@@ -877,7 +877,7 @@ def test_a_row_is_never_on_disk_without_the_household_it_was_accepted_for(
         relay_keys={hid: key},
         gateway_hmac_key=gateway_key,
         ingress_path=tmp_path / "ingress.db",
-        runtime_deliver=lambda h, p, t, s: delivered.append(p),
+        runtime_deliver=lambda d: delivered.append(d.payload),
         now_fn=lambda: clock[0] + GatewayRedeliverWorker.BASE_BACKOFF_SECONDS + 1,
     )
     report = GatewayRedeliverWorker(restarted).run_once()
@@ -907,10 +907,10 @@ def test_the_brake_stops_the_rest_of_the_batch_not_just_the_next_one(
     delivered: list[bytes] = []
     failing = True
 
-    def deliver(household_id, payload, timestamp, signature):
+    def deliver(delivery):
         if failing:
             raise RuntimeError("not yet")
-        delivered.append(payload)
+        delivered.append(delivery.payload)
         # The operator throws the switch while this first delivery is running.
         monkeypatch.setenv("ABROLIA_WHATSAPP_SHARED_ENABLED", "0")
 
@@ -970,7 +970,7 @@ def test_the_brake_does_not_spend_the_attempts_of_a_keyless_row(
         relay_keys={},  # C5c has not run
         gateway_hmac_key=gateway_key,
         ingress_path=tmp_path / "ingress.db",
-        runtime_deliver=lambda h, p, t, s: delivered.append(p),
+        runtime_deliver=lambda d: delivered.append(d.payload),
         now_fn=lambda: clock[0],
     )
     body = b'{"message":"queued with no key, during an incident"}'
@@ -1029,12 +1029,12 @@ def test_a_slow_delivery_does_not_expire_the_rows_behind_it(
     delivered: list[bytes] = []
     failing = True
 
-    def deliver(household_id, payload, timestamp, signature):
+    def deliver(delivery):
         if failing:
             raise RuntimeError("not yet")
         # This delivery blocks for longer than the replay window.
         clock[0] += WhatsAppGatewayRouter.REPLAY_WINDOW_SECONDS + 100
-        delivered.append(payload)
+        delivered.append(delivery.payload)
 
     router = WhatsAppGatewayRouter(
         db,
@@ -1081,7 +1081,7 @@ def test_a_backoff_is_measured_from_after_the_attempt_that_failed(
     clock = [1_000_000.0]
     blocked_for = 600.0
 
-    def slow_then_fail(household_id, payload, timestamp, signature):
+    def slow_then_fail(delivery):
         clock[0] += blocked_for
         raise RuntimeError("the runtime took a long time to say no")
 
@@ -1148,7 +1148,7 @@ def test_the_brake_stops_delivery_but_not_cleanup(tmp_path: Path, monkeypatch) -
         relay_keys={hid: key},
         gateway_hmac_key=gateway_key,
         ingress_path=path,
-        runtime_deliver=lambda h, p, t, s: (_ for _ in ()).throw(
+        runtime_deliver=lambda d: (_ for _ in ()).throw(
             AssertionError("nothing may be sent while the switch is off")
         ),
         now_fn=lambda: clock[0],
@@ -1185,7 +1185,7 @@ def test_one_unprocessable_row_does_not_take_the_batch_with_it(
         relay_keys={hid: key},
         gateway_hmac_key=gateway_key,
         ingress_path=tmp_path / "ingress.db",
-        runtime_deliver=lambda h, p, t, s: delivered.append(p),
+        runtime_deliver=lambda d: delivered.append(d.payload),
         now_fn=lambda: clock[0],
     )
     poison, healthy = b'{"message":"poison"}', b'{"message":"healthy"}'

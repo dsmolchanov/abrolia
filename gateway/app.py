@@ -37,6 +37,7 @@ from control_plane.bindings_resolution import (
 )
 from control_plane.privacy.runtime import RUNTIME_REF
 from gateway.whatsapp_router import (
+    Delivery,
     GatewayRedeliverWorker,
     GatewayResult,
     WhatsAppGatewayRouter,
@@ -158,11 +159,13 @@ class RuntimeRelayDeliverer:
     pilot", which is a reasonable stand-in for a test and a silent message sink
     in a deployment.
 
-    The runtime reference comes from the SAME resolve that produced the
-    household, carried on the router. Asking a second time — of a second
-    source, as an earlier draft did by querying a local `households` table —
-    can be answered inconsistently with the first, and would deliver a message
-    routed for one household to the runtime of another.
+    The runtime reference arrives IN the delivery, from the same resolve that
+    produced the household. Two earlier drafts got this wrong in different
+    ways: one queried a local `households` table, a second source that can be
+    answered inconsistently with the first; the other cached the reference on
+    the router, which the WSGI thread and the redeliver scheduler share, so two
+    resolutions around a runtime transition could overwrite it between the
+    route and the read. Carried per delivery, there is nothing to interleave.
 
     The reference is checked against the managed namespace before it becomes a
     hostname, so an answer that somehow held an arbitrary string cannot make
@@ -171,19 +174,15 @@ class RuntimeRelayDeliverer:
 
     def __init__(
         self,
-        router: WhatsAppGatewayRouter,
         *,
         client: httpx.Client | None = None,
         timeout: float = 10.0,
     ) -> None:
-        self.router = router
         self.client = client or httpx.Client(timeout=timeout, follow_redirects=False)
         self.timeout = timeout
 
-    def __call__(
-        self, household_id: str, payload: bytes, timestamp: str, signature: str
-    ) -> None:
-        ref = self.router.runtime_ref(household_id)
+    def __call__(self, delivery: Delivery) -> None:
+        ref = delivery.runtime_ref
         if not ref or not RUNTIME_REF.fullmatch(ref):
             # No runtime, or a reference outside the managed namespace. Both
             # are retryable rather than terminal: a household mid-provisioning
@@ -197,10 +196,10 @@ class RuntimeRelayDeliverer:
                     "Content-Type": "application/json",
                     # The names the runtime reads — `HTTP_X_RELAY_SIGNATURE`
                     # and `HTTP_X_RELAY_TIMESTAMP` in its WSGI environ.
-                    "X-Relay-Signature": signature,
-                    "X-Relay-Timestamp": timestamp,
+                    "X-Relay-Signature": delivery.signature,
+                    "X-Relay-Timestamp": delivery.timestamp,
                 },
-                content=payload,
+                content=delivery.payload,
                 timeout=self.timeout,
             )
         except (httpx.TimeoutException, httpx.TransportError) as error:
@@ -458,7 +457,7 @@ def build_router(env: Mapping[str, str] | None = None) -> WhatsAppGatewayRouter:
         ),
         ingress_path=Path(source.get(ENV_INGRESS, "/data/gateway-ingress.db")),
     )
-    router.runtime_deliver = RuntimeRelayDeliverer(router)
+    router.runtime_deliver = RuntimeRelayDeliverer()
     return router
 
 

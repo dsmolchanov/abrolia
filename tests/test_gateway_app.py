@@ -29,6 +29,7 @@ from gateway.app import (
     build_router,
 )
 from gateway.whatsapp_router import (
+    Delivery,
     GatewayRedeliverWorker,
     WhatsAppGatewayRouter,
     relay_hmac,
@@ -121,7 +122,7 @@ def test_a_signed_request_for_a_bound_sender_reaches_the_runtime(
     monkeypatch.setenv("ABROLIA_WHATSAPP_SHARED_ENABLED", "1")
     delivered: list[tuple[str, bytes]] = []
     now = 1_000_000.0
-    router = _router(tmp_path, deliver=lambda h, p, t, s: delivered.append((h, p)), now=now)
+    router = _router(tmp_path, deliver=lambda d: delivered.append((d.household_id, d.payload)), now=now)
     body = b'{"message":"through the front door"}'
     ts = str(int(now))
 
@@ -169,7 +170,7 @@ def test_an_unknown_sender_is_indistinguishable_from_a_delivery(
     """
     monkeypatch.setenv("ABROLIA_WHATSAPP_SHARED_ENABLED", "1")
     now = 1_000_000.0
-    router = _router(tmp_path, deliver=lambda h, p, t, s: None, now=now)
+    router = _router(tmp_path, deliver=lambda d: None, now=now)
     body = b'{"message":"nobody"}'
     ts = str(int(now))
     app = GatewayApp(router, adapter_token=ADAPTER_TOKEN)
@@ -230,10 +231,10 @@ def test_a_delivery_failure_is_owned_by_the_gateway_not_the_caller(
     delivered: list[bytes] = []
     failing = True
 
-    def deliver(household_id, payload, timestamp, signature):
+    def deliver(delivery):
         if failing:
             raise RuntimeUnavailable("runtime is down")
-        delivered.append(payload)
+        delivered.append(delivery.payload)
 
     router = _router(tmp_path, deliver=deliver)
     router.now_fn = lambda: clock[0]
@@ -425,7 +426,7 @@ def test_a_control_plane_that_does_not_answer_is_retryable_not_unknown(
         relay_keys={HOUSEHOLD: RELAY_KEY},
         gateway_hmac_key=GATEWAY_KEY,
         ingress_path=tmp_path / "ingress.db",
-        runtime_deliver=lambda h, p, t, s: delivered.append(p),
+        runtime_deliver=lambda d: delivered.append(d.payload),
         now_fn=lambda: clock[0],
     )
     body = b'{"message":"during a control-plane restart"}'
@@ -477,16 +478,26 @@ def test_the_runtime_reference_comes_from_the_resolve_that_found_the_household(
         ingress_path=tmp_path / "ingress.db",
         now_fn=lambda: now,
     )
-    router.route("+999511234588", "whatsapp", timestamp=str(int(now)))
-    deliverer = RuntimeRelayDeliverer(router, client=_NeverCalled())
+    routed = router.route("+999511234588", "whatsapp", timestamp=str(int(now)))
+    assert routed.runtime_ref == "evil.example.com", "the resolve's answer is carried"
+    deliverer = RuntimeRelayDeliverer(client=_NeverCalled())
     with pytest.raises(RuntimeUnavailable):
-        deliverer(HOUSEHOLD, b"{}", "1", "sig")
+        deliverer(
+            Delivery(
+                household_id=HOUSEHOLD,
+                runtime_ref=routed.runtime_ref,
+                payload=b"{}",
+                timestamp="1",
+                signature="sig",
+            )
+        )
 
-    # And a managed one is used exactly as resolved.
+    # And a managed one is carried through to the delivery unchanged.
     managed = f"synthetic-runtime:{HOUSEHOLD}"
     router.resolver = _Resolver(managed)
-    router.route("+999511234588", "whatsapp", timestamp=str(int(now)))
-    assert router.runtime_ref(HOUSEHOLD) == managed
+    assert router.route(
+        "+999511234588", "whatsapp", timestamp=str(int(now))
+    ).runtime_ref == managed
 
 
 def test_the_deploy_unit_gives_the_gateway_no_household_data() -> None:

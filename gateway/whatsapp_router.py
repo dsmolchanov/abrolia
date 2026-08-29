@@ -57,6 +57,9 @@ class GatewayResult:
     #: body be laundered into the runtime once a key appeared.
     code: str
     household_id: str | None = None
+    #: Where the resolve says this household's runtime is. Carried on the
+    #: result so a delivery uses the answer that routed it.
+    runtime_ref: str | None = None
 
 
 def relay_hmac(household_key: bytes, body: bytes, timestamp: str) -> str:
@@ -250,8 +253,6 @@ class WhatsAppGatewayRouter:
         self._store: GatewayStore | None = None
         self.runtime_deliver = runtime_deliver
         self.now_fn = now_fn or time.time
-        #: Filled by `route`, read by the deliverer. See `runtime_ref`.
-        self._runtime_refs: dict[str, str | None] = {}
 
     @property
     def store(self) -> GatewayStore:
@@ -350,19 +351,12 @@ class WhatsAppGatewayRouter:
             # while this slice was being written, hiding a NameError as
             # `lookup_unavailable` until a test disagreed.
             return GatewayResult(status="denied", code="lookup_unavailable")
-        self._runtime_refs[resolved.household_id] = resolved.runtime_ref
         return GatewayResult(
-            status="delivered", code="ok", household_id=resolved.household_id
+            status="delivered",
+            code="ok",
+            household_id=resolved.household_id,
+            runtime_ref=resolved.runtime_ref,
         )
-
-    def runtime_ref(self, household_id: str) -> str | None:
-        """Where the last resolution said this household's runtime is.
-
-        Carried from the resolve rather than asked separately: a gateway that
-        asked twice could be answered inconsistently across the two, and would
-        deliver a message routed for one revision to the runtime of another.
-        """
-        return self._runtime_refs.get(household_id)
 
     def handle_webhook(
         self,
@@ -466,7 +460,15 @@ class WhatsAppGatewayRouter:
         # Deliver to runtime — only delete WAL after confirmed delivery
         try:
             if self.runtime_deliver:
-                self.runtime_deliver(routed.household_id, payload, timestamp, signature)
+                self.runtime_deliver(
+                    Delivery(
+                        household_id=routed.household_id,
+                        runtime_ref=routed.runtime_ref,
+                        payload=payload,
+                        timestamp=timestamp,
+                        signature=signature,
+                    )
+                )
             # If no explicit deliver fn, successful HMAC is the delivery proof for this pilot
         except Exception:
             # The runtime may come back. Retryable, and named for what happened
@@ -481,6 +483,32 @@ class WhatsAppGatewayRouter:
             )
         store.mark_delivered(ingress_id)
         return routed
+
+
+@dataclass(frozen=True)
+class Delivery:
+    """One message on its way to one runtime, with the answer that routed it.
+
+    A single object rather than five positional arguments, and the runtime
+    reference travels IN it rather than beside it.
+
+    It lived on the router as a `{household_id: runtime_ref}` dict, which was
+    two mistakes at once. It was a process-lifetime cache, which L1 forbids
+    outright. And the WSGI thread and the redeliver scheduler share one router,
+    so two resolutions for the same household around a runtime transition could
+    overwrite the entry between the route and the read — sending the first
+    message to the second resolution's runtime.
+
+    Carried per delivery, there is no shared state to interleave, and the
+    reference that gets used is by construction the one the resolve produced.
+    """
+
+    household_id: str
+    #: What the resolve said, not what the router last heard.
+    runtime_ref: str | None
+    payload: bytes
+    timestamp: str
+    signature: str
 
 
 @dataclass(frozen=True)
@@ -690,15 +718,30 @@ class GatewayRedeliverWorker:
                 # dedupes on the relay provenance it carries, which is why this
                 # slice adds no second idempotency mechanism beside it.
                 self.router.runtime_deliver(
-                    routed.household_id,
-                    row["payload"],
-                    stamp,
-                    relay_hmac(key, row["payload"], stamp),
+                    Delivery(
+                        household_id=routed.household_id,
+                        runtime_ref=routed.runtime_ref,
+                        payload=row["payload"],
+                        timestamp=stamp,
+                        signature=relay_hmac(key, row["payload"], stamp),
+                    )
                 )
-        except Exception:
+        except RuntimeError as error:
+            # NARROW, deliberately. A broad `except Exception` here catches a
+            # `TypeError` from building the delivery and reports it as a
+            # runtime that would not answer — a programming mistake parked in
+            # the WAL and retried forever instead of failing loudly. It did
+            # exactly that while this slice was being written, twice.
+            #
+            # `RuntimeError` is what the deliverer raises for an unreachable
+            # runtime (`gateway.app.RuntimeUnavailable`); a test double raising
+            # something else to mean the same thing is re-raised rather than
+            # silently reinterpreted.
+            #
             # I2: measured from AFTER the attempt. A delivery that blocked for
             # a minute before failing has already spent that minute, and
             # backing off from before it would retry immediately.
+            del error
             return self._defer(row, self.router.now_fn(), "runtime_unavailable")
         self.store.mark_delivered(ingress_id)
         return "delivered"
