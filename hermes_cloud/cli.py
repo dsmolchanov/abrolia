@@ -16,6 +16,7 @@ from pathlib import Path
 import httpx
 
 from hermes_cloud.channels.console import ConsoleTransport
+from hermes_cloud.channels.fallback import FallbackTransport
 from hermes_cloud.channels.telegram import TelegramTransport
 from hermes_cloud.core.approvals import ApprovalStore
 from hermes_cloud.core.config import load_config, load_dotenv
@@ -82,6 +83,19 @@ def _pipeline(args: argparse.Namespace, database) -> Pipeline:
     mail = _mail(config, database, email_binding)
     whatsapp = _whatsapp()
     household = _household()
+    # The one place the family-facing transport is built, which is why the
+    # fallback wraps it HERE: the pipeline, the scheduler and this module reach
+    # the family from 28 call sites, and a branch at each would be 28 chances
+    # to forget. Wrapped even without a fallback address configured, so that
+    # the missing configuration is reported when a channel actually refuses
+    # rather than silently turning the feature off at startup.
+    transport = FallbackTransport(
+        transport,
+        mail=mail,
+        fallback=config.email_fallback,
+        channel="telegram" if use_telegram else "console",
+        household_id=household.household_id,
+    )
     return Pipeline(
         approvals=approvals,
         reminders=reminders,

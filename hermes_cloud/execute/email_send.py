@@ -53,6 +53,9 @@ logger = logging.getLogger(__name__)
 DEFAULT_HOST = "smtp.gmail.com"
 DEFAULT_PORT = 465
 ENV_KILL_SWITCH = "HERMES_EMAIL_SEND"
+#: The approval id a system notice carries. Not a real approval, and named so
+#: that nothing downstream reads it as one.
+NOTICE_APPROVAL_ID = "system-notice"
 # Домен для Message-ID: не резолвится намеренно (RFC 2606), а идентичность
 # письма всё равно наша.
 MESSAGE_ID_DOMAIN = "hermes-cloud.invalid"
@@ -302,6 +305,30 @@ class EmailSender:
         )
         self.binding_store = binding_store
         self.send_store = send_store
+
+    def send_notice(
+        self, letter: Outgoing, *, notice_id: str
+    ) -> EmailDeliveryReceipt:
+        """Send a message nobody approved, through the path that gates egress.
+
+        A fallback notice is not an approved letter — no human staged it, and
+        it exists precisely because the family could not be reached where they
+        normally are. It still goes through `send`, because everything `send`
+        enforces applies to it: the outgoing-mail kill switch is an operator
+        brake and a notice that ignored it would be egress the operator
+        believes is stopped; the binding checks keep it from leaving under a
+        retired identity; and the send store makes a repeat harmless.
+
+        `NOTICE_APPROVAL_ID` is a named constant rather than a borrowed
+        approval id, so nothing downstream — a header, a receipt, an operator
+        reading the store — can mistake this for something a person agreed to.
+
+        `notice_id` is the effect id, and choosing it is how a caller controls
+        repetition: the store settles by effect id, so a caller that derives
+        one per failure sends a letter per failure, and a caller that derives
+        one per window sends one letter for the window.
+        """
+        return self.send(letter, approval_id=NOTICE_APPROVAL_ID, effect_id=notice_id)
 
     def send(
         self,
