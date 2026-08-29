@@ -38,6 +38,7 @@ def test_migrations_are_ordered_and_idempotent(tmp_path: Path) -> None:
             "0008_runtime_health_ownership.sql",
             "0009_channel_binding_challenges.sql",
             "0010_channel_binding_chat_id.sql",
+            "0011_channel_binding_published.sql",
         ]
         assert database.migrate() == []
         assert database.pragma() == {
@@ -120,8 +121,10 @@ def test_0010_repairs_what_has_provenance_and_retires_what_does_not(
                 " 'synthetic-adult', 'adult', 'digest', 'o', 9e9, 0, NULL, 1)"
             )
 
-        # It runs at all, which the rewrite did not.
-        assert database.migrate() == ["0010_channel_binding_chat_id.sql"]
+        # It runs at all, which the rewrite did not. Membership rather than
+        # equality: every later migration applies in the same batch, and this
+        # case is about 0010's behaviour, not about how many follow it.
+        assert "0010_channel_binding_chat_id.sql" in database.migrate()
 
         rows = database.query(
             "SELECT id, household_id, external_id, chat_id FROM channel_bindings"
@@ -293,3 +296,96 @@ def test_startup_lock_rejects_a_second_process(tmp_path: Path) -> None:
         assert accepted.returncode == 0
     finally:
         owner.close()
+
+
+def test_0011_backfills_from_the_revision_that_is_actually_serving(
+    tmp_path: Path,
+) -> None:
+    """C3c Phase 1: the backfill keys on `config_revisions.status`.
+
+    The obvious key is `households.current_config_revision`, and it is wrong.
+    `schedule_runtime_rollout` advances that column when the job is QUEUED, so
+    a household mid-rollout carries a revision nothing is serving yet.
+    Backfilling from it would publish bindings against a revision the runtime
+    has never seen — the exact confusion this column exists to remove.
+
+    Three households, three shapes, one migration.
+    """
+    staged = tmp_path / "migrations"
+    staged.mkdir()
+    for script in sorted(MIGRATIONS_DIR.glob("*.sql")):
+        if script.name.startswith("0011"):
+            break
+        (staged / script.name).write_text(script.read_text(encoding="utf-8"))
+
+    database = ControlPlaneDatabase(tmp_path / "control-plane.db")
+    try:
+        database.migrate(staged)
+        with database.write() as connection:
+            for household, current in (
+                # Settled: serving revision 3, nothing in flight.
+                ("h1", 3),
+                # Mid-rollout: serving 3, but `current_config_revision` already
+                # names 4 because the job is queued.
+                ("h2", 4),
+                # Never activated anything.
+                ("h3", 1),
+            ):
+                connection.execute(
+                    "INSERT INTO households (id, slug, status, created_at,"
+                    " updated_at, current_config_revision) VALUES (?, ?,"
+                    " 'active', 1, 1, ?)",
+                    (household, f"hh-{household}", current),
+                )
+            for household, revision, status in (
+                ("h1", 3, "active"),
+                ("h2", 3, "active"),
+                ("h2", 4, "issued"),
+                ("h3", 1, "issued"),
+            ):
+                connection.execute(
+                    "INSERT INTO config_revisions (id, household_id, revision,"
+                    " schema_version, manifest_ciphertext, encryption_key_version,"
+                    " manifest_sha256, status, created_at) VALUES (?, ?, ?, 1,"
+                    " X'00', 'v1', ?, ?, 1)",
+                    (
+                        f"{household}-r{revision}",
+                        household,
+                        revision,
+                        f"{household}{revision}" + "0" * (64 - len(household) - 1),
+                        status,
+                    ),
+                )
+            for household in ("h1", "h2", "h3"):
+                connection.execute(
+                    "INSERT INTO channel_bindings (id, household_id, channel,"
+                    " external_id, chat_id, actor_id, role, verified_at,"
+                    " verified_by_actor_id) VALUES (?, ?, 'telegram', ?, ?, ?,"
+                    " 'owner', 1, ?)",
+                    (
+                        f"b-{household}",
+                        household,
+                        f"99000000{household[-1]}",
+                        f"-10099000010{household[-1]}",
+                        f"99000000{household[-1]}",
+                        f"99000000{household[-1]}",
+                    ),
+                )
+
+        assert "0011_channel_binding_published.sql" in database.migrate()
+
+        published = dict(
+            (row["household_id"], row["published_revision"])
+            for row in database.query(
+                "SELECT household_id, published_revision FROM channel_bindings"
+            )
+        )
+        # The settled household publishes at the revision it serves.
+        assert published["h1"] == 3
+        # The mid-rollout household publishes at 3 — what it SERVES — and not
+        # at 4, which is only what it is rolling out.
+        assert published["h2"] == 3
+        # Nothing is serving h3, so nothing of its is routable.
+        assert published["h3"] is None
+    finally:
+        database.close()

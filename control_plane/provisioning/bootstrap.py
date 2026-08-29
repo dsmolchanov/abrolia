@@ -428,6 +428,24 @@ class BootstrapService:
                 " updated_at = ? WHERE id = ?",
                 (config_revision, now, household_id),
             )
+            # Publishing the bindings this revision carries, in the same
+            # transaction that makes the revision live. A binding is written
+            # STAGED by `verify_challenge` and is not routable until here: the
+            # gateway matches a sender with no revision predicate of its own,
+            # so before this a new member's traffic reached a runtime still
+            # serving the previous revision, whose manifest has no pair for
+            # them.
+            #
+            # Scoped to this household, deliberately spelled out rather than
+            # left to the reader: `published_revision IS NULL` alone would
+            # publish every staged binding in the deployment, handing another
+            # household's pending member a routable identity on the strength
+            # of this one activating.
+            connection.execute(
+                "UPDATE channel_bindings SET published_revision = ?"
+                " WHERE household_id = ? AND published_revision IS NULL",
+                (config_revision, household_id),
+            )
             workflow = WorkflowRecord(
                 workflow_row["id"],
                 workflow_row["household_id"],

@@ -177,10 +177,10 @@ already correct.
 
 #### Automated Verification
 
-- [ ] `python3 -m pytest tests/control_plane/test_db.py -q` — migration applies and is listed
-- [ ] `python3 -m pytest tests/control_plane/test_bootstrap.py -q` — activation publishes only its own household's rows
-- [ ] `python3 -m pytest -m "not live"` — no behaviour change yet
-- [ ] `ruff check .`
+- [x] `python3 -m pytest tests/control_plane/test_db.py -q` — migration applies and is listed
+- [x] `python3 -m pytest tests/control_plane/test_bootstrap.py -q` — activation publishes only its own household's rows
+- [x] `python3 -m pytest -m "not live"` — no behaviour change yet (1582 passed)
+- [x] `ruff check .`
 
 #### Manual Verification
 

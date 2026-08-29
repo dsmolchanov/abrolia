@@ -143,6 +143,12 @@ class BindingRecord:
     role: str
     verified_at: float
     verified_by_actor_id: str
+    #: The revision whose activation made this binding routable, or None while
+    #: it is still STAGED. A staged binding is written, and projected into the
+    #: manifest being planned, but the gateway will not route to it — the
+    #: runtime serving the previous revision has no pair for that member, so
+    #: routing them there sends their message nowhere.
+    published_revision: int | None = None
 
 
 class ChannelBindingsRepository(Repository):
@@ -205,6 +211,11 @@ class ChannelBindingsRepository(Repository):
             role=row["role"],
             verified_at=float(row["verified_at"]),
             verified_by_actor_id=row["verified_by_actor_id"],
+            published_revision=(
+                None
+                if row["published_revision"] is None
+                else int(row["published_revision"])
+            ),
         )
 
     # --- writing ---------------------------------------------------------
@@ -786,9 +797,16 @@ class ChannelBindingsRepository(Repository):
         # written here. `test_hmac_column_stays_null_until_c5_provisions_the_key`
         # pins it so the gap fails a test rather than a delivery.
         connection.execute(
+            # `published_revision` is NULL — STAGED. The row exists, the
+            # planner will project it into the revision being planned, and the
+            # gateway will not route to it until `BootstrapService.activate`
+            # publishes that revision. Writing it routable here is the defect
+            # C3c exists to close: the runtime still serving N-1 has no pair
+            # for this member, so their traffic would arrive and be denied.
             "INSERT INTO channel_bindings (id, household_id, channel, external_id,"
             " chat_id, external_id_hmac, actor_id, role, verified_at,"
-            " verified_by_actor_id) VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)",
+            " verified_by_actor_id, published_revision)"
+            " VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, NULL)",
             (
                 row_id,
                 household_id,

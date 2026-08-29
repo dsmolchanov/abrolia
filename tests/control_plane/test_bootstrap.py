@@ -902,3 +902,56 @@ def test_a_rollout_that_touched_the_provider_is_not_declared_active(
 
     # Declined to guess: still provisioning, and honestly so.
     assert active.households.get(household_id).status == "provisioning"
+
+
+def test_activation_publishes_only_its_own_households_staged_bindings(
+    api_harness,
+) -> None:
+    """C3c Phase 1: publication is scoped to the household activating.
+
+    A binding is written STAGED and becomes routable here. The scoping is the
+    part worth asserting rather than assuming: `published_revision IS NULL`
+    alone would publish every staged binding in the deployment, handing another
+    household's pending member a routable identity on the strength of this one
+    activating — and the gateway resolves senders across the whole table, so
+    that is a cross-tenant effect, not an untidy one.
+    """
+    runtime = _provision_runtime(api_harness)
+    active = api_harness.container
+
+    # A second household with a staged binding of its own, which this
+    # activation must not touch.
+    other_account = active.accounts.create_verified("other@family.test")
+    other = active.households.create_for_owner(other_account.id)
+    with active.database.write() as connection:
+        connection.execute(
+            "INSERT INTO channel_bindings (id, household_id, channel, external_id,"
+            " chat_id, actor_id, role, verified_at, verified_by_actor_id,"
+            " published_revision) VALUES ('b-other', ?, 'telegram', '990000777',"
+            " '-100990000777', '990000777', 'owner', 1, '990000777', NULL)",
+            (other.id,),
+        )
+
+    def staged(household_id: str):
+        return [
+            row["published_revision"]
+            for row in active.database.query(
+                "SELECT published_revision FROM channel_bindings"
+                " WHERE household_id = ?",
+                (household_id,),
+            )
+        ]
+
+    assert staged(runtime.world.household.id) == [None]
+    assert staged(other.id) == [None]
+
+    binding = _binding(runtime)
+    active.bootstrap.claim(runtime.raw_token, **binding)
+    active.bootstrap.activate(
+        runtime.raw_token, **binding, activated_sha256=runtime.manifest_sha256
+    )
+
+    assert staged(runtime.world.household.id) == [runtime.revision]
+    assert staged(other.id) == [None], (
+        "activation published a binding belonging to another household"
+    )
