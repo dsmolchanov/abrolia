@@ -5,137 +5,139 @@ created_at: "2026-08-29"
 repository: abrolia
 parent_plans:
   - thoughts/shared/plans/2026-08-23-go-live-checklist.md
+research:
+  - thoughts/shared/research/2026-08-29-binding-routability-and-revision-activation.md
 scope: c3c-c3e
 data_policy: synthetic-only-until-explicit-gates
 ---
 
 # C3c + C3e — activation is the boundary, and nothing waits for it
 
-The checklist carries these as two items. They are one defect with two
-consumers, and writing them apart would build two overlapping lifecycles for
-the same event.
+Grounded in
+`thoughts/shared/research/2026-08-29-binding-routability-and-revision-activation.md`,
+which traced the whole path first. Three of its findings changed this design;
+they are marked **[R]**.
 
-`BootstrapService.activate` is the moment a revision becomes the one being
-served: it sets `config_revisions.status = 'active'`, supersedes the previous
-revision, and moves the household to `active`. Everything about "which
-configuration is real" is decided there.
+## The defect
 
-Two things do not wait for it.
+`BootstrapService.activate` is the only writer of `config_revisions.status =
+'active'` and of `households.status = 'active'` (`bootstrap.py:416-430`). It is
+where a revision becomes real. Two consumers never ask:
 
-* **The gateway** (C3c). `verify_challenge` commits the binding row
-  immediately, and `whatsapp_router` resolves a sender with
-  `SELECT household_id FROM channel_bindings WHERE channel = ? AND external_id = ?`
-  — no revision predicate. So between the write and activation, the new
-  member's traffic is routed to a runtime still serving N−1, whose manifest
-  has no pair for them. The runtime denies it and the message goes nowhere.
-* **The rollout job** (C3e). `_settle_runtime_ready` settles `succeeded`
-  immediately after launch. A runtime that never claims its token, or whose
-  activation is rejected, leaves the household at `provisioning` on revision N
-  with a succeeded job `lease` will never revisit.
+* **the gateway** resolves a sender with no revision predicate at all
+  (`whatsapp_router.py:114, :127`), so a binding routes the instant
+  `verify_challenge` commits it — to a runtime still serving N−1, whose
+  manifest has no pair for that member;
+* **the runtime job** settles `succeeded` at launch (`worker.py:2959-2966`) and
+  writes nothing to `households.status`, so a runtime that never activates
+  leaves the household at `provisioning` with a job `lease` will never return
+  (`jobs.py:167-175`).
 
-One event, two consumers that ignore it. That is the slice.
+One event, two consumers ignoring it. That is one slice, not two.
 
-## What already exists, and must not be rebuilt
+## What the research changed
 
-`config_revisions.status` is already a lifecycle:
-`planned → issued → claimed → active → superseded | revoked`
-(`0001_control_plane.sql:224`). There is already an authoritative answer to
-"which revision is serving", and `activate` is already the single writer of it.
+**[R1] There is no single "serving revision" fact to consult.**
+`households.current_config_revision` is advanced by `schedule_runtime_rollout`
+at QUEUE time (`rollout.py:99-103`), so during a rollout it names a revision
+that is not active. Only `config_revisions.status` answers "serving". Any
+predicate added below must key on the revision row, not the household column —
+the obvious shortcut is wrong.
 
-Neither half below needs a new notion of activation. They need to *read* the
-one that exists.
+**[R2] C3e is three stranding shapes, not the two the checklist records.** The
+third is a `reprovision_runtime` job failing at the consent precondition:
+`_block_for_missing_content_restriction` settles it `failed` and returns before
+any household write, because the workflow is `complete` (`worker.py:607-617`).
+It is not reachable by `reconcile` either (`worker.py:1911-1912`).
 
-## D1. A binding is routable only once a revision carrying it is active
+**[R3] D1's sweep cannot repair what C3e strands.** `_blocked_by` refuses any
+household that is not `active` (`rollout.py:228-267`), so exactly the
+households left at `provisioning` are reported and skipped (`:305-308`). The
+mechanism built to detect divergence is blind to the divergence this slice
+causes. Fixing C3e is what makes D1's sweep able to reach them.
 
-The gateway cannot answer this by reading the manifest. `WhatsAppGatewayRouter`
-is constructed with the database, the relay keys and the sender HMAC key
-(`whatsapp_router.py:87-89`) — no field cipher — so a manifest is opaque to it
-by construction, and giving it one would hand the routing layer the household's
-plaintext configuration to answer a yes/no question. It needs a fact on the row
-it already queries.
+## Design
+
+### D1. A binding is routable only once a revision carrying it is active
+
+The gateway cannot read a manifest — it is constructed with the database, relay
+keys and sender HMAC key and no field cipher (`whatsapp_router.py:87-89`) — so
+it needs a fact on the row it already queries.
 
 ```sql
 ALTER TABLE channel_bindings ADD COLUMN published_revision INTEGER;
 ```
 
-* `verify_challenge` writes the row with `published_revision` NULL — staged.
-  The planner projects staged rows into the manifest exactly as now, because
-  the revision being planned is what will publish them.
-* `activate` sets `published_revision = <revision>` for every binding of that
-  household that is still staged.
+* `verify_challenge` writes it NULL: staged. The planner keeps projecting
+  staged rows, because the revision being planned is what will publish them.
+* `activate` sets `published_revision = <revision>` for that household's staged
+  rows, in the transaction that already flips the revision (`bootstrap.py:416-430`).
 * The gateway adds `AND published_revision IS NOT NULL` to both lookups.
 
-Why a revision number rather than a boolean: it answers "published by what",
-which is what a rollback needs in order to retire only what a failed revision
-staged.
+A revision number rather than a boolean, so a rollback can retire only what a
+given revision staged.
 
-**Terminal rollback retires what it staged.** A rollout that fails terminally
-must clear the staged rows it created, or the member is unroutable forever AND
-their sender stays taken: `issue_challenge` refuses a tuple this household
-already holds ("already bound to that member"), and `_reject_foreign_holder`
-refuses it to every other household. So the owner cannot re-invite them and
-nobody else can claim the identity either. This is the half most likely to be
-dropped, and it is the one that turns a delay into a dead end.
+**Terminal rollback must retire what it staged.** Nothing today writes
+`channel_bindings` on any failure path **[R]** — the only non-erasure deletes
+are on the planning path (`bindings.py:377-385`). A staged row left behind is
+not a delay but a dead end: `issue_challenge` refuses a tuple this household
+already holds, and `_reject_foreign_holder` refuses it to every other, so the
+member can never be re-invited and nobody else can claim the identity.
 
-## D2. A rollout is not succeeded until the revision is active
+### D2. A rollout is not succeeded until the revision is active
 
-`_settle_runtime_ready` stops settling `succeeded` at launch. The job stays
-non-terminal until `activate` runs, and `activate` settles it.
+`_settle_runtime_ready` stops settling at launch. The job stays non-terminal,
+and `activate` settles it — which also gives activation the link to the job it
+currently lacks entirely (`activate` passes `related_job_id=None` and never
+touches `provisioning_jobs` for the runtime job) **[R]**.
 
-The job is therefore reachable by `lease` while it waits, which is the point:
-a runtime that never claims its token leaves work a worker will come back to
-rather than a succeeded row nothing revisits.
-
-**Scoped deliberately to pre-mutation certainty.** After a failure that reached
-the provider, the Machine may already carry N's configuration, and no
-database-only write can honestly say which revision is serving. C3b narrowed
-its recovery to pre-mutation failures for exactly this reason and that
-narrowing stands. Reconverging the provider — asking the runtime what it is
-actually running — needs a capability the provisioner protocol does not have,
-and is not in this slice. What IS in scope is that the job stays open, so the
-uncertain case is visible as unfinished rather than recorded as done.
-
-## The window this does not close
-
-A binding is staged the moment it is verified and published when the revision
-activates. Between those, the member cannot be routed — that is the point —
-but they also cannot be told why. The endpoint already returns the revision;
-surfacing "pending activation" to the owner is a product decision, not this
-slice.
+Scoped to pre-mutation certainty, as C3b was: after a failure that reached the
+provider, no database-only write can honestly say which revision is serving.
+Reconverging the provider needs a capability the provisioner protocol does not
+have and is **not** in this slice. What is in scope is that the uncertain case
+stays visible as unfinished rather than recorded as done.
 
 ## Risks
 
-* **Ordering.** D1 and D2 must land together. Publishing on activation while
-  the job still settles at launch means a rollout that never activates leaves
-  bindings staged forever with no job to retire them — strictly worse than
-  today, where they are at least routable.
-* **The gateway predicate is a deny.** A migration that leaves existing rows
-  NULL makes every current household unroutable. `0011` must backfill
-  `published_revision = households.current_config_revision` for bindings of
-  households that are `active`, and only those.
-* **`lease` must not spin.** A job left open pending activation will be
-  re-leased. It needs a not-before or a waiting status, or the worker busy-
-  loops on a household that is waiting for a runtime to call in.
+* **Both halves must land together.** Publishing on activation while the job
+  still settles at launch leaves staged rows with no job to retire them —
+  strictly worse than today, where they are at least routable.
+* **The gateway predicate is a deny.** `0011` must backfill
+  `published_revision` for existing bindings of households whose revision is
+  `active`, or every current household goes dark. Key the backfill on
+  `config_revisions.status`, not on `households.current_config_revision` **[R1]**.
+* **`lease` must not spin** on a job left open pending activation: it needs a
+  `not_before` or a waiting status.
+* **Bootstrap tokens expire** (default 1h, `worker.py:174`) and nothing sweeps
+  an expired one back into a household status. A job held open pending an
+  activation that can no longer happen needs a terminal path, or shape 3 is
+  replaced by a job that waits forever.
 
 ## Acceptance
 
-1. **A staged binding does not route.** Verify a binding; assert the gateway
-   answers `unknown_sender` for that sender until activation, and resolves it
-   afterwards.
-2. **Activation publishes exactly its own household's staged rows**, and does
-   not touch another household's.
-3. **A terminal rollout failure retires what it staged**, and the sender can
-   be issued again afterwards.
-4. **A rollout that never activates leaves the job open**, and the household
-   is not `active` — asserted through the worker, not by reading a status the
-   test wrote.
-5. **The migration leaves every existing household routable.** A database at
-   `0010` with an active household and bindings routes identically before and
-   after.
-6. **The worker does not spin** on a job waiting for activation.
+1. A staged binding does not route; it routes after activation.
+2. Activation publishes only its own household's staged rows.
+3. A terminal rollout failure retires what it staged, and the sender can be
+   issued again afterwards.
+4. A rollout that never activates leaves the job open and the household not
+   `active` — asserted through the worker, not by reading a status the test wrote.
+5. The migration leaves every existing household routable, keyed on
+   `config_revisions.status='active'`.
+6. The worker does not spin on a job awaiting activation.
+7. A household stranded by a failed rollout is reachable by
+   `reconcile_stale_bindings` rather than skipped **[R3]**.
 
-Criterion 5 is the one that breaks production if skipped, and criterion 3 is
-the one that turns a bug into a support ticket.
+Criterion 5 breaks production if skipped; criterion 3 turns a bug into a
+support ticket.
+
+## Deliberately not here
+
+* **Reconverging the provider** after a failure that reached it — needs a
+  protocol capability that does not exist.
+* **An expired-token sweep.** `observability.py:125-128` already counts
+  `expired_bootstrap` as a health blocker and nothing acts on it; that is its
+  own item.
+* **Telling the owner a member is pending activation.** Product decision.
 
 #### Inventory — C3c and C3e activation boundary
 
@@ -150,7 +152,6 @@ the one that turns a bug into a support ticket.
 
 **Branches:** `codex/c3c-c3e-activation-boundary`.
 
-One slice, not two. Both halves hang off `BootstrapService.activate`, and
-splitting them would mean two mechanisms for one event — plus a window where
-one half is live and the other is not, which the Risks section shows is worse
+One slice. Both halves hang off `activate`, and splitting them leaves a window
+where one is live and the other is not — which the Risks section shows is worse
 than either end state.
