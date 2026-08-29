@@ -326,6 +326,8 @@ looking at whose row it was.
 `control_plane/migrations/0011_channel_preference_fallback.sql`,
 `control_plane/api/onboarding.py`, `control_plane/email/service.py`,
 `control_plane/privacy/export.py`,
+`control_plane/providers/email/google_oauth.py`,
+`tests/control_plane/email/test_google_oauth.py`,
 `control_plane/provisioning/planner.py`, `tests/control_plane/conftest.py`,
 `tests/control_plane/test_api.py`,
 `tests/control_plane/test_export_delete.py`,
@@ -365,6 +367,15 @@ selection refusal above reached a JSON client as a 500 while the browser
 route — which redirects on any `ValueError` — showed the family exactly what
 it should. It is a `MailboxRefused` now, answered 409 with its own text the
 way `api/bindings.py` answers a `BindingError`.
+
+`control_plane/providers/email/google_oauth.py` is the third consumer, and the
+one that could not be fixed with the other two: `gmail_agent` reaches selection
+with NO address, because the address exists only once Google grants it. Its
+callback compared the grant with the initiating account alone, so an adult or a
+second owner could connect the mailbox the fallback owner is reached at. The
+rule is now written once — `owner_contact_query` in `email/service.py` — and
+executed by each path in the style it already uses, because two spellings of
+one rule is how the third consumer got forgotten in the first place.
 
 **Branches:** `codex/c4a-preferences-writer`.
 

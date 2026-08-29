@@ -75,12 +75,15 @@ class FailingSecretSink(InMemorySecretSink):
         raise RuntimeError("synthetic sink failure")
 
 
-def _service(cp_stack, client, sink=None, *, clock=lambda: 1_800_000_100.0):
+def _service(
+    cp_stack, client, sink=None, *, clock=lambda: 1_800_000_100.0, test_users=None
+):
     config = replace(
         cp_stack.config,
         google_oauth_client_id="synthetic-google-client",
         google_oauth_client_secret="synthetic-google-client-secret",
-        google_oauth_test_users=(cp_stack.account.recovery_email.casefold(),),
+        google_oauth_test_users=test_users
+        or (cp_stack.account.recovery_email.casefold(),),
     ).validate()
     return GoogleOAuthService(
         config=config,
@@ -391,3 +394,69 @@ def test_recovery_mailbox_match_is_revoked(cp_stack) -> None:
             session_id=cp_stack.session.id,
         )
     assert client.revoked == ["synthetic-refresh-credential"]
+
+
+def test_another_owners_recovery_mailbox_is_revoked_too(cp_stack) -> None:
+    """C4a's rule, on the one path that cannot ask it at selection.
+
+    `EmailIdentityService.select` refuses a mailbox equal to an active owner's
+    contact address, and `gmail_agent` reaches it with no address at all — the
+    address exists only once Google has granted it. So a second owner (or an
+    adult acting for the household) could connect the very mailbox the
+    FALLBACK owner is reached at, and the refusal would arrive from
+    `DesiredSpecPlanner.issue` long after the credential was installed.
+
+    The neighbouring case covers the INITIATOR's own mailbox. This one is a
+    different rule with the same remedy: the fallback is chosen from every
+    active owner, so the question has to be asked about all of them.
+    """
+    second = cp_stack.accounts.create_verified("second-owner@family.test")
+    with cp_stack.database.write() as connection:
+        connection.execute(
+            "INSERT INTO household_memberships (account_id, household_id, role,"
+            " status, created_at, accepted_at) VALUES (?, ?, 'owner', 'active',"
+            " ?, ?)",
+            (second.id, cp_stack.household.id, 1_800_000_000.0, 1_800_000_000.0),
+        )
+
+    client = FakeGoogleClient()
+    client.exchange = lambda **_kwargs: GoogleTokenGrant(
+        subject="google-subject-second-owner",
+        email=second.recovery_email,
+        scopes=GMAIL_EMAIL_SCOPES,
+        refresh_credential="synthetic-refresh-credential",
+        access_token="synthetic-access-token",
+    )
+    service = _service(
+        cp_stack,
+        client,
+        test_users=(
+            cp_stack.account.recovery_email.casefold(),
+            second.recovery_email.casefold(),
+        ),
+    )
+    provider = GoogleOAuthProvisioner(service)
+    _select_gmail(cp_stack, provider, service.secret_sink)
+    workflow = cp_stack.onboarding.workflow_for_household(cp_stack.household.id)
+    started = service.start(
+        household_id=cp_stack.household.id,
+        account_id=cp_stack.account.id,
+        session_id=cp_stack.session.id,
+        workflow_version=workflow.version,
+    )
+    state = parse_qs(urlparse(started.authorization_url).query)["state"][0]
+
+    with pytest.raises(ProviderRejected, match="dedicated mailbox"):
+        service.callback(
+            state=state,
+            code="synthetic-code",
+            household_id=cp_stack.household.id,
+            account_id=cp_stack.account.id,
+            session_id=cp_stack.session.id,
+        )
+
+    # Revoked before anything durable: no credential reached the sink.
+    assert client.revoked == ["synthetic-refresh-credential"]
+    assert not service.secret_sink.contains(
+        service._namespace_ref(cp_stack.household.id), GMAIL_EMAIL_SECRET_BINDING
+    )
