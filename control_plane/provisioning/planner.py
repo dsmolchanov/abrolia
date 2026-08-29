@@ -4,6 +4,7 @@ import hmac
 import sqlite3
 from dataclasses import dataclass
 
+from control_plane.channel_preferences import ChannelPreferencesRepository
 from control_plane.privacy.consent import (
     consent_version_and_sha,
     required_consent_purposes,
@@ -39,12 +40,14 @@ class DesiredSpecPlanner:
         onboarding: OnboardingRepository,
         configs: ConfigRepository,
         bindings: ChannelBindingsRepository,
+        preferences: ChannelPreferencesRepository,
     ) -> None:
         self.accounts = accounts
         self.households = households
         self.onboarding = onboarding
         self.configs = configs
         self.bindings = bindings
+        self.preferences = preferences
 
     def issue(
         self,
@@ -164,6 +167,30 @@ class DesiredSpecPlanner:
             external_id=actor_id,
             chat_id=chat_id,
             actor_id=actor_id,
+        )
+        # The preference row is seeded from the SAME result, for the reason the
+        # owner binding is: a household that has proved a channel should not
+        # depend on some later endpoint to record where it is reached. C4's
+        # audit found this table with a schema, constraints, and no writer at
+        # all, which reads as working code until something looks for a row.
+        #
+        # `primary_channel` is written here rather than made settable, because
+        # `channels.primary` below is built from this same `channel_public`.
+        # Two records of one fact disagree the moment either moves, and the way
+        # to change the channel is to re-run the step that proves it — which
+        # already retires the bindings it supersedes.
+        #
+        # The fallback is the owner's account, not their address: what makes an
+        # address usable is `accounts.email_verified_at`, and that is a fact
+        # about the account. `set_household` refuses one that is not an active
+        # owner here, or whose verified contact IS this household's agent
+        # inbox — the self-ingestion loop 0006 named and nothing enforced.
+        self.preferences.set_household(
+            connection,
+            household_id=household_id,
+            primary_channel=primary,
+            fallback_account_id=account.id,
+            verified_at=account.email_verified_at,
         )
         bound = self.bindings.verified(connection, household_id=household_id)
         # Order carries meaning: the owner leads `family`, then adults in the

@@ -181,6 +181,35 @@ Ordered slices:
   (replace dead `_validate_no_self_ingestion`, persist the fallback ref);
   permanent-failure → short email fallback sender + `primary_unavailable`
   emission (`observability.py:104` label exists, never emitted).
+  **Split 2026-08-29 into C4a and C4b**, because the write path and the
+  consumer answer different questions and the second is larger than the audit
+  read.
+
+- [ ] **C4a. Give `channel_preferences` a writer, and a fallback it can check.**
+  The table has had a schema, CHECKs and an index since `0006` and no writer at
+  all — `container.py` never even built the repository, so no code path could
+  have written a row. Seeded now by `DesiredSpecPlanner.issue` from the same
+  `primary_channel` result it builds `channels.primary` from.
+  **`primary_channel` is a projection, not a second choice**, and no endpoint
+  sets it: two records of one fact disagree the moment either moves, which is
+  the conflation C3a spent five rounds removing from `channel_bindings`, and
+  the way to change the channel is to re-run the step that proves it.
+  **The fallback is a reference, not a copy**: `0011` adds
+  `fallback_account_id`, the address stays in `accounts`, and the
+  self-ingestion rule is answered by comparing `recovery_email_lookup_hmac`
+  with the household's live `email_identities.address_lookup_hmac` — same
+  `LookupHasher`, so no decryption and nothing supplied by the caller. That
+  replaces `_validate_no_self_ingestion`, which read a row, described in
+  comments what a real check would need, and returned None.
+
+- [ ] **C4b. The consumer, and the alert nobody emits.** Route replies and
+  fallbacks through the preference; permanent-failure → short email fallback
+  sender; emit `primary_unavailable` (`hermes_cloud/core/observability.py:106`
+  — the label exists and nothing has ever emitted it, exactly as
+  `budget_exceeded` did before C1). Its first question is one C4a deliberately
+  did not answer: the runtime reads a manifest, not the control plane's
+  tables, so a preference reaches it either as a manifest projection — which
+  makes changing one a revision, with C3b's rollout behind it — or not at all.
 - [ ] **C5. Gateway plumbing.** Redeliver-from-`gateway_ingress` worker (rows
   are written and never read back); reconcile outbound HMAC scheme between
   `relay_hmac` (signs `body|ts`) and `verify_webhook` (bare body) — they
@@ -290,6 +319,31 @@ being correct at that moment — the exporter that never read it, the projection
 that assumed one binding per actor, the seeding that matched a tuple without
 looking at whose row it was.
 
+
+#### Inventory — C4a preferences writer
+
+**Files:** `control_plane/channel_preferences.py`, `control_plane/container.py`,
+`control_plane/migrations/0011_channel_preference_fallback.sql`,
+`control_plane/provisioning/planner.py`, `tests/control_plane/conftest.py`,
+`tests/control_plane/test_channel_preferences.py`,
+`tests/control_plane/test_consent_withdrawal.py`,
+`tests/control_plane/test_db.py`, `tests/control_plane/test_manifest.py`.
+
+`container.py` is here because the repository was never constructed in
+production — which is the mechanical reason the table had no writer, and worth
+recording rather than fixing silently. The four test files beyond the
+preferences one are the planner's construction sites and the migration ledger:
+`DesiredSpecPlanner` gains an argument, so `conftest.py` and the two modules
+that build one directly move with it, and `test_db.py` names every migration in
+order.
+
+`tests/control_plane/test_channel_preferences.py` is rewritten rather than
+extended. Its cases passed the repository both halves of the comparison —
+`set_household(..., fallback_email=X, agent_inbox=Y)` — so the self-ingestion
+case proved that two arguments can be compared and nothing about whether the
+system knows its own inbox.
+
+**Branches:** `codex/c4a-preferences-writer`.
 
 #### Inventory — C3b revision rollout
 

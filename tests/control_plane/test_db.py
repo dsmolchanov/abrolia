@@ -38,6 +38,7 @@ def test_migrations_are_ordered_and_idempotent(tmp_path: Path) -> None:
             "0008_runtime_health_ownership.sql",
             "0009_channel_binding_challenges.sql",
             "0010_channel_binding_chat_id.sql",
+            "0011_channel_preference_fallback.sql",
         ]
         assert database.migrate() == []
         assert database.pragma() == {
@@ -120,8 +121,12 @@ def test_0010_repairs_what_has_provenance_and_retires_what_does_not(
                 " 'synthetic-adult', 'adult', 'digest', 'o', 9e9, 0, NULL, 1)"
             )
 
-        # It runs at all, which the rewrite did not.
-        assert database.migrate() == ["0010_channel_binding_chat_id.sql"]
+        # It runs at all, which the rewrite did not. Everything from 0010
+        # onward applies here — `migrate()` reads the real directory while the
+        # staged one stops short of it — so this names the migration under test
+        # rather than the whole tail, which would need editing for every
+        # migration that follows.
+        assert database.migrate()[0] == "0010_channel_binding_chat_id.sql"
 
         rows = database.query(
             "SELECT id, household_id, external_id, chat_id FROM channel_bindings"
