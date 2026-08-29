@@ -31,11 +31,14 @@ from hermes_cloud.ingest.whatsapp_webhook import (
     WhatsAppWebhookReceiver,
     WhatsAppWebhookRejected,
     sign_webhook,
+    verify_webhook,
 )
 from hermes_cloud.runner.card import ACTION_CONFIRM, KIND_BUNDLE, KIND_WHATSAPP
 from hermes_cloud.runner.pipeline import Pipeline
 from hermes_cloud.runner.tools import REGISTRY, Services
 
+#: The relay's send time, bound INTO the signature — see `sign_webhook`.
+TS = "1800000000"
 SECRET = "synthetic-household-relay-secret"
 INSTANCE = "family-a"
 
@@ -67,8 +70,8 @@ def test_signed_inbound_is_durable_deduplicated_and_email_shaped(tmp_path: Path)
             instance=INSTANCE,
         )
 
-        first = receiver.receive(body, sign_webhook(body, SECRET))
-        second = receiver.receive(body, sign_webhook(body, SECRET))
+        first = receiver.receive(body, sign_webhook(body, SECRET, TS), TS, now=float(TS))
+        second = receiver.receive(body, sign_webhook(body, SECRET, TS), TS, now=float(TS))
 
         assert first.created is True
         assert second.created is False
@@ -99,7 +102,7 @@ def test_normalized_relay_shape_is_accepted(tmp_path: Path) -> None:
             EventStore(database),
             signing_secret=SECRET,  # gitleaks:allow -- synthetic fixture
             instance=INSTANCE,
-        ).receive(body, sign_webhook(body, SECRET))
+        ).receive(body, sign_webhook(body, SECRET, TS), TS, now=float(TS))
         assert accepted.created is True
         assert accepted.event.external_id.endswith(":normalized-1")
 
@@ -113,7 +116,7 @@ def test_webhook_fails_closed_for_missing_or_bad_hmac(tmp_path: Path, signature:
             instance=INSTANCE,
         )
         with pytest.raises(WhatsAppWebhookRejected) as caught:
-            receiver.receive(inbound_payload(), signature)
+            receiver.receive(inbound_payload(), signature, TS, now=float(TS))
         assert caught.value.status_code == 401
         assert EventStore(database).counts() == {}
 
@@ -239,7 +242,7 @@ def test_known_family_dialogue_runs_under_context_and_stages_the_reply(tmp_path:
             EventStore(database),
             signing_secret=SECRET,  # gitleaks:allow -- synthetic fixture
             instance=INSTANCE,
-        ).receive(body, sign_webhook(body, SECRET))
+        ).receive(body, sign_webhook(body, SECRET, TS), TS, now=float(TS))
         transport = FakeTransport()
         household = Household(
             household_id="home",
@@ -269,3 +272,52 @@ def test_known_family_dialogue_runs_under_context_and_stages_the_reply(tmp_path:
         assert approval.payload["items"][0]["to"] == "+999123456"
         assert len(transport.messages) == 1
         assert any(label.startswith("✅") for label, _data in transport.messages[0].buttons)
+
+
+def test_the_gateway_and_the_runtime_agree_on_one_signature(tmp_path) -> None:
+    """C5a: the two ends are verified against EACH OTHER, not against a fixture.
+
+    They disagreed. `gateway.whatsapp_router.relay_hmac` signed
+    `body|timestamp` while `verify_webhook` verified the bare body, so the
+    runtime rejected every delivery the gateway signed — no WhatsApp message
+    could reach a household at all. Both sides had passing tests, because each
+    signed and verified with its own helper: the fixture agreed with the code
+    and the code disagreed with the other end.
+
+    This case is the only one that can see it, so it imports both.
+    """
+    from gateway.whatsapp_router import relay_hmac
+
+    key = "synthetic-household-relay-secret"
+    body = inbound_payload()
+    signature = relay_hmac(key.encode(), body, TS)
+
+    # No exception is the assertion: the runtime accepts what the gateway signs.
+    verify_webhook(body, signature, key, TS, now=float(TS))
+
+
+def test_a_replayed_body_cannot_be_given_a_fresh_timestamp(tmp_path) -> None:
+    """Why the timestamp is signed rather than merely checked.
+
+    A signature over the body alone leaves the timestamp unauthenticated, so a
+    captured body can be replayed indefinitely by attaching a current one and
+    every freshness check ever added would pass it. Binding the timestamp is
+    what makes refusing a stale one mean something.
+    """
+    from gateway.whatsapp_router import relay_hmac
+
+    key = "synthetic-household-relay-secret"
+    body = inbound_payload()
+    captured = relay_hmac(key.encode(), body, TS)
+
+    # The same body, re-presented much later with a current timestamp and the
+    # signature that was valid then.
+    later = str(int(TS) + 10_000)
+    with pytest.raises(WhatsAppWebhookRejected) as refused:
+        verify_webhook(body, captured, key, later, now=float(later))
+    assert refused.value.code == "unauthorized"
+
+    # And the original timestamp no longer passes freshness.
+    with pytest.raises(WhatsAppWebhookRejected) as stale:
+        verify_webhook(body, captured, key, TS, now=float(later))
+    assert stale.value.code == "timestamp_replay"

@@ -626,7 +626,9 @@ class RuntimeService:
             raise RuntimeNotReady("WhatsApp runtime configuration is incomplete")
         return WhatsAppRuntimeConfig(instance=instance, relay_secret=relay_secret)
 
-    def receive_whatsapp_webhook(self, payload: bytes, signature: str):
+    def receive_whatsapp_webhook(
+        self, payload: bytes, signature: str, timestamp: str
+    ):
         manifest = self.require_ready()
         config = self._whatsapp_config(manifest)
         with open_database(self.database_path) as database:
@@ -634,7 +636,7 @@ class RuntimeService:
                 EventStore(database),
                 signing_secret=config.relay_secret,
                 instance=config.instance,
-            ).receive(payload, signature)
+            ).receive(payload, signature, timestamp)
 
     def _web_chat(self, method: str, body: bytes) -> Probe:
         """One authenticated chat turn; the hoisted bearer gate already ran."""
@@ -842,8 +844,13 @@ class RuntimeService:
         if not isinstance(payload, bytes) or len(payload) != length:
             return Probe(400, {"status": "invalid_request"})
         signature = str(environ.get("HTTP_X_RELAY_SIGNATURE") or "")
+        # The gateway has always had this to send — `runtime_deliver` is called
+        # with it — and this end never read it, which is why the two HMAC
+        # schemes could drift apart unnoticed: nothing here could have verified
+        # the timestamp even if it had wanted to.
+        timestamp = str(environ.get("HTTP_X_RELAY_TIMESTAMP") or "")
         try:
-            accepted = self.receive_whatsapp_webhook(payload, signature)
+            accepted = self.receive_whatsapp_webhook(payload, signature, timestamp)
         except WhatsAppWebhookRejected as error:
             return Probe(error.status_code, {"status": error.code})
         except RuntimeNotReady:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import time
 from dataclasses import dataclass
 from email import policy
 from email.message import EmailMessage
@@ -34,15 +35,54 @@ class WhatsAppInbound:
     instance: str
 
 
-def sign_webhook(payload: bytes, secret: str) -> str:
-    return hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
+#: How far apart the relay's clock and this runtime's may be before a delivery
+#: is refused. The gateway enforces the same window on the way in
+#: (`WhatsAppGatewayRouter.REPLAY_WINDOW_SECONDS`); this is the other end of
+#: the same check, and it is what makes the signature's timestamp worth
+#: binding.
+REPLAY_WINDOW_SECONDS = 300
 
 
-def verify_webhook(payload: bytes, signature: str, secret: str) -> None:
-    if not secret or not signature:
+def sign_webhook(payload: bytes, secret: str, timestamp: str) -> str:
+    """Sign the body AND the timestamp, which is what the gateway sends.
+
+    This used to sign the bare body while `gateway.whatsapp_router.relay_hmac`
+    signed `body|timestamp`, so the two rejected each other and no WhatsApp
+    delivery could be verified at all — proven by running one through both.
+
+    The gateway's scheme is the one kept, and not merely because it was there
+    first. A signature over the body alone leaves the timestamp unauthenticated,
+    so anyone replaying a captured body may attach a fresh timestamp and pass
+    every freshness check ever added. Binding the timestamp is what makes
+    refusing a stale one mean something.
+    """
+    return hmac.new(
+        secret.encode(), payload + b"|" + timestamp.encode(), hashlib.sha256
+    ).hexdigest()
+
+
+def verify_webhook(
+    payload: bytes,
+    signature: str,
+    secret: str,
+    timestamp: str,
+    *,
+    now: float | None = None,
+) -> None:
+    if not secret or not signature or not timestamp:
         raise WhatsAppWebhookRejected("unauthorized", 401)
+    # Freshness BEFORE the digest, so a stale delivery is refused as stale
+    # rather than as a forgery — they are different operator problems, and the
+    # relay retrying against a skewed clock is the likelier one.
+    try:
+        sent_at = int(timestamp)
+    except ValueError:
+        raise WhatsAppWebhookRejected("timestamp_replay", 401) from None
+    current = time.time() if now is None else now
+    if abs(int(current) - sent_at) > REPLAY_WINDOW_SECONDS:
+        raise WhatsAppWebhookRejected("timestamp_replay", 401)
     supplied = signature.removeprefix("sha256=").strip().lower()
-    expected = sign_webhook(payload, secret)
+    expected = sign_webhook(payload, secret, timestamp)
     if len(supplied) != len(expected) or not hmac.compare_digest(supplied, expected):
         raise WhatsAppWebhookRejected("unauthorized", 401)
 
@@ -139,8 +179,17 @@ class WhatsAppWebhookReceiver:
         self.signing_secret = signing_secret
         self.instance = instance
 
-    def receive(self, payload: bytes, signature: str) -> Accepted:
-        verify_webhook(payload, signature, self.signing_secret)
+    def receive(
+        self,
+        payload: bytes,
+        signature: str,
+        timestamp: str,
+        *,
+        now: float | None = None,
+    ) -> Accepted:
+        verify_webhook(
+            payload, signature, self.signing_secret, timestamp, now=now
+        )
         inbound = parse_webhook(payload, expected_instance=self.instance)
         return self.store.append(
             source="whatsapp",
