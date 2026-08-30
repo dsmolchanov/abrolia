@@ -367,7 +367,7 @@ Ordered slices:
 
 **Files:** `tests/test_plan_commands.py`, `tests/test_check_fixtures.py`, `.gitignore`.
 
-**Branches:** `fix/plan-commands-and-web-binding-gate`.
+**Branches:** `fix/plan-commands-and-web-binding-gate`, `fix/plan-guard-shell-spellings`.
 
 Review on #101 found C6's own fix incomplete: the acceptance commands under
 boxes were corrected, the Cross-Phase block was not, and the commit asserted
@@ -402,6 +402,26 @@ a command works without running it in the context the plan sends a reader to.
   (`--all`, exits 0, actually scans) from the CI-only one, and
   `tests/test_check_fixtures.py` pins both contexts so a plan cannot promise
   behaviour the script does not have.
+
+**Round 3, 2026-08-31.** The guard shipped twice with holes, and the second
+round's fix had the same shape as the first: a regex over raw text recognises
+only the spellings its author pictured. `_PATH_ARGUMENT` anchored on a bare
+`tests/` prefix, so `pytest "tests/x"` and `pytest ./tests/x` — ordinary shell,
+both accepted by pytest — matched nothing and a stale target written either way
+stayed invisible.
+
+Now tokenised with `shlex`, so quoting and `./` are handled by the same rules
+the shell uses rather than by a pattern. The fallback for an unbalanced quote
+strips the quote characters itself, so prose inside a fence degrades toward
+SEEING a path rather than passing one through.
+
+The deeper fix is the coverage. Until this round the guard was exercised only by
+whatever the plans happened to contain — which is exactly why both holes
+shipped: no plan had a quoted target, so nothing failed when the parser could
+not read one. `referenced_paths` is now a named function with its own
+parameterized tests over five spellings × missing file and directory, plus the
+no-false-positive and case-selector cases. A guard whose only coverage is the
+data it currently governs proves the data is clean, not that the guard works.
 
 #### Inventory — C1 + C2, with the O1 evidence they shipped beside
 
