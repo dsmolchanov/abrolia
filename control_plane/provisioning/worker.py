@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import secrets
+import sqlite3
 import time
 from contextlib import suppress
 from dataclasses import dataclass
@@ -1058,33 +1059,40 @@ class ProvisioningWorker:
             )
             if row is not None:
                 return True
-        except Exception:
+        except sqlite3.Error:
+            # A failed receipt read falls safe to the live sink proof below;
+            # anything that is not a database condition propagates (C6b).
             pass
         try:
             contains = getattr(self.secret_sink, "contains", None)
-            if callable(contains) and contains(namespace_ref, binding_ref):
-                # Create receipt for future reclaim without needing live inspection.
-                try:
-                    with self.jobs.db.write() as connection:
-                        connection.execute(
-                            "INSERT OR IGNORE INTO email_secret_installs"
-                            " (job_id, household_id, secret_name, namespace_ref, installed_at, created_at)"
-                            " VALUES (?, ?, ?, ?, ?, ?)",
-                            (
-                                job.id,
-                                job.household_id,
-                                binding_ref,
-                                namespace_ref,
-                                self.clock(),
-                                self.clock(),
-                            ),
-                        )
-                except Exception:
-                    pass
-                return True
+            proven = bool(callable(contains) and contains(namespace_ref, binding_ref))
         except Exception:
+            # The sink contract is that `contains` answers rather than raises;
+            # a double that raises anyway means "no proof", never "installed".
             return False
-        return False
+        if not proven:
+            return False
+        # Create receipt for future reclaim without needing live inspection.
+        try:
+            with self.jobs.db.write() as connection:
+                connection.execute(
+                    "INSERT OR IGNORE INTO email_secret_installs"
+                    " (job_id, household_id, secret_name, namespace_ref, installed_at, created_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        job.id,
+                        job.household_id,
+                        binding_ref,
+                        namespace_ref,
+                        self.clock(),
+                        self.clock(),
+                    ),
+                )
+        except sqlite3.Error:
+            # The live sink already proves installation; a later reclaim
+            # reconstructs the receipt via contains().
+            pass
+        return True
 
     def _stage_email_secret(
         self,
@@ -1136,7 +1144,7 @@ class ProvisioningWorker:
                         self.clock(),
                     ),
                 )
-        except Exception:
+        except sqlite3.Error:
             # If the receipt write fails, the live sink still proves installation;
             # a later reclaim will reconstruct the receipt via contains().
             pass
