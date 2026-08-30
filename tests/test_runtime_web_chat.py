@@ -465,3 +465,28 @@ def test_the_upgrade_fallback_does_not_open_web_to_anyone_else(
     assert status == 403
     assert payload == {"status": "web_seat_not_authorized"}
     assert stub.calls == []
+
+
+def test_a_modern_manifest_refuses_an_owner_presenting_the_wrong_room(
+    tmp_path: Path,
+) -> None:
+    """The bridge is for manifests that predate seats, not for drift.
+
+    A manifest that DOES carry a verified web binding has an exact pair to
+    check, and an owner arriving with a different one is precisely the case the
+    pair exists to refuse. Rewriting their chat to `web-chat` and granting owner
+    capabilities would answer drift by trusting the control plane, which is the
+    trust C3f removed. Found in review on #109.
+    """
+    service, _ = _active_runtime(tmp_path)  # fixture manifest HAS a web seat
+    stub = StubLoop()
+    service._web_chat_loop = lambda database, config: stub
+
+    status, payload = _chat(
+        service,
+        payload={"text": "привет", "actor_id": WEB_ACTOR, "chat_id": "web:elsewhere"},
+    )
+
+    assert status == 403
+    assert payload == {"status": "web_seat_not_authorized"}
+    assert stub.calls == []

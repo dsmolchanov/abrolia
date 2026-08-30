@@ -144,7 +144,18 @@ def _changed_paths() -> list[str] | None:
 
 
 #: The branches a step is implemented by, beside that step's `**Files:**`.
-_BRANCHES = re.compile(r"^\*\*Branches:\*\*(.*)$", re.MULTILINE)
+#:
+#: To the end of the PARAGRAPH, not the end of the line — the same correction
+#: `_INVENTORY` above already carries, and for the same reason. A step
+#: implemented by several branches wraps its list, and anchoring to `$` read
+#: only the first line: the branch was declared, in the file, on the line
+#: below, and the check reported "0 plan steps claim the branch". Failing
+#: closed is the right direction to be wrong in and it was still wrong, and
+#: fixing it for `**Files:**` while leaving the sibling regex is how the same
+#: defect gets found twice.
+_BRANCHES = re.compile(
+    r"^\*\*Branches:\*\*(.*?)(?=\n[ \t]*\n|\Z)", re.MULTILINE | re.DOTALL
+)
 #: Any markdown heading, which is what separates one step from the next.
 _HEADING = re.compile(r"^#{2,6} .*$", re.MULTILINE)
 
@@ -410,3 +421,28 @@ def test_a_wrapped_inventory_is_read_in_full(tmp_path) -> None:
     # The paragraph, and not a word past it: prose below an inventory is not a
     # declaration, or a plan could accidentally declare anything it discusses.
     assert "a/not_declared.py" not in patterns
+
+
+def test_a_wrapped_branches_line_is_read_whole(tmp_path: Path) -> None:
+    """A step implemented by several branches wraps, and all of them count.
+
+    `_BRANCHES` was anchored to end-of-line, so the second line of a wrapped
+    list was invisible and a branch declared in the file reported as
+    undeclared. `_INVENTORY` had already been corrected for exactly this; the
+    sibling had not.
+    """
+    plan = tmp_path / "plan.md"
+    plan.write_text(
+        "## Step\n\n"
+        "**Files:** `control_plane/api/web.py`.\n\n"
+        "**Branches:** `branch-one`, `branch-two`,\n"
+        "`branch-three`.\n\n"
+        "## Next\n",
+        encoding="utf-8",
+    )
+
+    steps = _steps(tmp_path)
+    assert len(steps) == 1
+    _name, patterns, branches = steps[0]
+    assert patterns == {"control_plane/api/web.py"}
+    assert branches == {"branch-one", "branch-two", "branch-three"}

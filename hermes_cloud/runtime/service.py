@@ -743,7 +743,19 @@ class RuntimeService:
             #
             # This is a bridge, not a design. It ends when every household's
             # serving manifest carries its seat.
-            if actor_id != manifest.actors.owner:
+            #
+            # Gated on the manifest carrying NO web binding at all, which is
+            # what "predates seats" actually means. Without that gate the
+            # bridge also caught a CURRENT manifest whose web binding simply
+            # did not match the pair being presented — control-plane drift —
+            # and answered it by rewriting the chat and granting owner
+            # capabilities, where the whole point of the pair is to fail closed
+            # on exactly that. Found in review on #109.
+            serves_web = any(
+                binding.channel == "web" and binding.verified
+                for binding in manifest.channel_bindings
+            )
+            if serves_web or actor_id != manifest.actors.owner:
                 raise WebSeatDenied(actor_id)
             chat_id = LEGACY_OWNER_WEB_CHAT
             allowed_chats = allowed_chats | {chat_id}

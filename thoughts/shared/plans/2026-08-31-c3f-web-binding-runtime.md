@@ -128,7 +128,10 @@ bindings, the primary and the seat, and the activation-scoping case counts them.
 Round 2 adds: `control_plane/migrations/0014_backfill_web_seats.sql`,
 `control_plane/privacy/export.py`, `control_plane/api/bindings.py`,
 `tests/control_plane/test_db.py`, `tests/control_plane/test_binding_api.py`,
-`tests/control_plane/test_export_delete.py`.
+`tests/control_plane/test_export_delete.py`. Round 3 adds
+`tests/test_runtime_web_chat.py` and `tests/control_plane/test_plan_inventory.py` —
+the latter because a wrapped `**Branches:**` line was invisible to the scope
+lint, which is how this branch's own declaration read as missing.
 
 **Branches:** `feat/c3f-web-binding-runtime`, `fix/c3f-seat-continuity-and-upgrade`,
 `fix/c3f-owner-web-fallback`.
@@ -226,6 +229,18 @@ stays closed rather than opening by accident.
 
 It is a bridge, not a design, and it ends when every household's serving
 manifest carries its seat.
+
+**Narrowed after review on #109.** The first version ran for ANY unverified
+owner pair, so it also caught a CURRENT manifest whose web binding simply did
+not match what the control plane forwarded — drift — and answered it by
+rewriting the chat and granting owner capabilities, which is exactly what the
+pair exists to refuse. Gated now on the manifest carrying no verified web
+binding at all, which is what "predates seats" actually means.
+
+**And the scope lint could not see this branch.** `_BRANCHES` was anchored to
+end-of-line, so a wrapped list read only its first line and a branch declared
+in this file reported as undeclared. `_INVENTORY` had already been corrected for
+exactly that; the sibling had not, which is how one defect gets found twice.
 
 ### Still open on C3f
 
