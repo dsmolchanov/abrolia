@@ -111,7 +111,9 @@ Non-blocker debt: codex/phase-4-real-actions dirty file + untracked landing not 
 
 **Files:**
 - Upstream `nerve-cloud/internal/cloudapi/handler_keys.go` + `internal/store/*` + `go test ./...`
-- Local `control_plane/providers/email/*.py`, `control_plane/provisioning/worker.py`, `control_plane/provisioning/secrets.py`, `control_plane/migrations/0003_*` (if needed), `tests/control_plane/email/*`
+- Local `control_plane/providers/email/*.py`, `control_plane/provisioning/worker.py`, `control_plane/provisioning/secrets.py`, `control_plane/migrations/0003_*` (if needed), `tests/control_plane/email/*`, `tests/control_plane/test_provisioning_jobs.py` (the B-02 convergence regressions live beside the SIGKILL/reclaim harness there, not under `email/` — see the acceptance note)
+
+**Branches:** `fix/b02-receipt-convergence-regression`
 
 **Changes:**
 1. **Upstream B-01:** Resolve requested `org_id` against authenticated tenant; reject A→B service-token request with 403; add negative HTTP test `TestServiceToken_CrossOrgRejected` (A billing token requests B's org). Abrolia side adds adapter assertion that tenant never calls `/v1/service-tokens`.
