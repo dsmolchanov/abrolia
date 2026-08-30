@@ -599,38 +599,38 @@ documented verification could reject correct output, or rely on precision the
 implementation deliberately does not claim. `docs/onboarding-runbook.md` now
 carries the state-by-state contract.
 
-- [ ] `channel_preferences` table exists; household-row primary/fallback; fallback is verified owner email not agent inbox; source-channel reply + permanent-failure fallback + `outcome_unknown` no-duplicate:
+- [x] `channel_preferences` table exists; household-row primary/fallback; fallback is verified owner email not agent inbox; source-channel reply + permanent-failure fallback + `outcome_unknown` no-duplicate:
 
 ```bash
-pytest tests/test_channel_preferences.py -q
+pytest tests/control_plane/test_channel_preferences.py tests/test_primary_unavailable.py -q
 ```
 
-- [ ] Channel binding once-owner-authorized; `RunContext` never trusts client payload; second adult separate binding:
+- [x] Channel binding once-owner-authorized; `RunContext` never trusts client payload; second adult separate binding:
 
 ```bash
-pytest tests/test_channel_bindings.py -q
+pytest tests/control_plane/test_channel_bindings.py tests/control_plane/test_binding_api.py tests/test_runcontext.py -q
 ```
 
-- [ ] Shared gateway narrow multi-tenant: exact mapping, unknown/ambiguous deny, durable before ACK, per-household HMAC:
+- [x] Shared gateway narrow multi-tenant: exact mapping, unknown/ambiguous deny, durable before ACK, per-household HMAC:
 
 ```bash
-pytest tests/test_gateway_routing.py tests/test_whatsapp.py -q
+pytest tests/test_gateway_routing.py tests/test_gateway_app.py tests/test_whatsapp.py -q
 ```
 
-- [ ] Minimal Web authenticated chat + PWA manifest; push stays fake-only / `P11` `⏳+disabled`:
+- [x] Minimal Web authenticated chat + PWA manifest; push stays fake-only / `P11` `⏳+disabled`:
 
 ```bash
-pytest tests/test_web_channel.py -q
+pytest tests/test_web_channel.py tests/control_plane/test_web_chat_api.py tests/test_runtime_web_chat.py -q
 ```
 
-- [ ] Observability: structured logs without content, `/health` fields, alerts defined:
+- [x] Observability: structured logs without content, `/health` fields, alerts defined:
 
 ```bash
-pytest tests/test_observability.py -q
+pytest tests/control_plane/test_observability.py -q
 rg -n "content|prompt|secret|token" control_plane/observability.py  # expect: no content logging
 ```
 
-- [ ] Cost caps: per-household/day counter + soft-limit degradation message:
+- [x] Cost caps: per-household/day counter + soft-limit degradation message:
 
 ```bash
 pytest tests/test_cost_caps.py -q
@@ -639,7 +639,7 @@ pytest tests/test_cost_caps.py -q
 - [ ] Full pilot onboarding on `abrolia-synthetic` synthetic household `≤ 60 min` per `docs/onboarding-runbook.md` (step1 `email` + step2 `whatsapp` + step3 `primary` checks + primary switch without history loss), recorded with `household_id`, `config_revision`/`hash`, binding IDs, `channel_preferences` row.
 
 ```bash
-pytest tests/test_onboarding.py tests/test_google_oauth.py -q
+pytest tests/control_plane/test_onboarding_state.py tests/control_plane/email/test_google_oauth.py -q
 pytest -p no:cacheprovider -m "not live" -q
 ```
 
@@ -739,16 +739,33 @@ python -m check_fixtures --all --require-deny  # private deny-list in CI
 
 ### Phase F Acceptance Criteria
 
-- [ ] Six per-provider flags exist, `default off`, fail-closed, independently togglable; flag toggle tested mid-run.
+- [x] Per-provider flags exist, `default off`, fail-closed, independently
+  togglable; flag toggle tested mid-run. **Count corrected 2026-08-30: FOUR,
+  not six.** #69/#70 retired `ABROLIA_MANAGED_EMAIL_ENABLED`,
+  `ABROLIA_WHATSAPP_DEDICATED_ENABLED` and `ABROLIA_WEB_PUSH_ENABLED` — each
+  had no call site and a stronger live counterpart. What remains is
+  `ABROLIA_REAL_EMAIL_ENABLED`, `ABROLIA_BYO_EMAIL_ENABLED`,
+  `ABROLIA_GMAIL_ENABLED`, `ABROLIA_WHATSAPP_SHARED_ENABLED`
+  (`control_plane/feature_flags.py:37-40`), and
+  `test_every_declared_flag_gates_a_call_site` is what keeps the count honest.
 
 ```bash
-pytest tests/test_config.py -k flag -q
+pytest tests/test_feature_flags.py -q
 pytest tests/control_plane/test_config.py -q
 ```
 
-- [ ] Rollout order documented in `docs/onboarding-runbook.md` with per-transition prerequisites (Phase A + C1 + `go test` + `pytest -m "not live"` + one manual live gate).
+- [x] Rollout order documented in `docs/onboarding-runbook.md` with per-transition prerequisites (Phase A + C1 + `go test` + `pytest -m "not live"` + one manual live gate).
 
-- [ ] Flag matrix doctested; `git diff --check` + `ruff` + `gitleaks --all` + `check_fixtures --all --require-deny` green on the F branch.
+- [ ] Flag matrix doctested; `git diff --check` + `ruff` +
+  `gitleaks detect --log-opts="--all"` + `check_fixtures --all --require-deny`
+  green on the F branch. **This box can only be closed by CI (noted
+  2026-08-30).** Every other gate passes locally, but
+  `check_fixtures --all --require-deny` exits **2** on a developer machine — it
+  REFUSES to run without the private deny-patterns file
+  (`HERMES_EXTRA_DENY_FILE`, `~/.config/hermes-cloud/deny-patterns.txt`), which
+  only CI supplies. Local evidence at 2026-08-30: suite 1686 green,
+  `git diff --check` clean, `ruff` clean, `gitleaks` no leaks over 170 commits,
+  `check_fixtures --all` (without the flag) clean.
 
 ```bash
 pytest -p no:cacheprovider -m "not live" -q
@@ -756,7 +773,7 @@ ruff check .
 gitleaks detect --no-git --source . 2>&1 | head -n 20
 ```
 
-- [ ] `eu-strict` fail-closed still green (Phase A test):
+- [x] `eu-strict` fail-closed still green (Phase A test) — re-run 2026-08-30, exit 0:
 
 ```bash
 pytest -k eu_strict -q
@@ -764,8 +781,23 @@ pytest -k eu_strict -q
 
 ## Cross-Phase Verification Commands (for E/F PRs)
 
+> **Collection caution, found 2026-08-30.** When passing EXPLICIT file paths,
+> do not interleave `tests/` and `tests/control_plane/` files in one pytest
+> invocation — group them by root. Interleaving loses
+> `tests/control_plane/conftest.py`'s fixtures for the control_plane files
+> collected after the switch, and it surfaces as
+> `fixture 'api_harness' not found` — an ERROR, not a failure, so a box could
+> look "run" while nothing ran. Reproduced minimally with the same three files
+> in two orders: `control_plane → tests/ → control_plane` exits 1, the grouped
+> order exits 0. The repo has no `__init__.py` in either test directory, uses
+> `--import-mode=importlib`, and carries four duplicate basenames across the
+> two roots (`test_backup.py`, `test_db.py`, `test_runtime_dsar.py`,
+> `chaos_child.py`). Directory-based runs are unaffected — the full non-live
+> suite is green — and every command in this plan is grouped safely and was
+> re-run as written on 2026-08-30.
+
 ```bash
-# Full non-live suite (record counts in PR body — expect 626+ in control_plane + 215+ hermetic)
+# Full non-live suite (record counts in PR body — 1686 across 91 files at 2026-08-30)
 pytest -p no:cacheprovider -m "not live" -q
 
 # Phase D suites

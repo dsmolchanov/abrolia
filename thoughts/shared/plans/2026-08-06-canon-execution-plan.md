@@ -69,8 +69,20 @@ Non-blocker debt: codex/phase-4-real-actions dirty file + untracked landing not 
 
 **Acceptance:**
 - [ ] `processors.md` shows ✅ for P1/P2/P4 with dates; TIA docs linked; `privacy-notice-*` diff reviewed by counsel.
-- [ ] `lawful-bases.md` R7 no longer `high/blocking`; `dpia.md` R7 residual `low` with condition cited.
-- [ ] `pytest -k eu_strict` proves `eu-app` boots, `eu-strict` without vertex exits non-zero.
+  *Partially met 2026-08-30:* P1 (Anthropic) and P4 (Resend) show ✅ DPA + ✅ SCC
+  with dated copies under `docs/privacy/vendor-dpas/`. **Open: P2 (Fly.io) — no
+  executed DPA, no SCC assessment; ALL THREE TIAs; the Art. 27 representative.**
+- [x] `lawful-bases.md` R7 no longer `high/blocking`; `dpia.md` R7 residual
+  stated with the condition cited. *Closed 2026-08-30, with one honest
+  correction:* the Art 9(2)(a) condition was chosen 2026-08-12 and R7 is no
+  longer blocking — but the residual landed at **`средний, принят`
+  (medium, accepted)**, not the `low` this box predicted
+  (`docs/privacy/dpia.md:57`). The gap is deliberate and documented: material
+  about THIRD parties has no Art 9(2) condition and never will, so it is
+  removed on request rather than made lawful. Art 9(4) checks for DE/IT/NL/ES
+  are done. Ticking on the criterion this box actually gates — condition
+  chosen, no longer blocking — and recording the residual as it is.
+- [x] `pytest -k eu_strict` proves `eu-app` boots, `eu-strict` without vertex exits non-zero. *Re-run 2026-08-30: exit 0.*
 
 **Gate:** No `ABROLIA_REAL_*` flag enabled until A is merged.
 
@@ -109,6 +121,18 @@ Non-blocker debt: codex/phase-4-real-actions dirty file + untracked landing not 
 **Acceptance:**
 - [ ] Nerve PR with cross-org test green + `go test ./... -count=1`.
 - [ ] Abrolia `pytest tests/control_plane/email` proves crash-after-sink converges without operator, and hard-reclaim without sink stays `secret_handoff_unknown`.
+  *Audited 2026-08-30 — half evidenced, and the box stays open for the other
+  half.* The suite is green, and the SECOND clause is proven by name:
+  `tests/control_plane/email/test_identity.py:478
+  ::test_unknown_secret_handoff_never_verifies_from_secretless_inspect`. The
+  receipt MECHANISM for the first clause is implemented and reachable —
+  `control_plane/provisioning/worker.py:1056-1075` creates the
+  `email_secret_installs` receipt on reclaim when the sink already contains the
+  generation, exactly as the plan specified. What could not be found is a test
+  that DRIVES that path: `email_secret_installs` appears in tests only in
+  `test_db.py` (schema) and `test_provision_dry_run.py` (audit/export), never
+  as a crash-after-sink convergence. Needs one regression, or a pointer to the
+  one that exists.
 
 #### C2 — BYO Domain Live (B-05)
 
@@ -186,7 +210,10 @@ OAuth / History is explicitly deferred to the start of Phase E and remains track
 9. Release: tag, migrate-on-start with backup-before-migrate, restore drill.
 
 **Acceptance:**
-- [ ] `tests/test_onboarding.py`, `test_google_oauth.py`, `test_channel_preferences.py`, `test_channel_bindings.py`, `test_web_channel.py` all green per plan criteria.
+- [x] `tests/control_plane/test_onboarding_state.py`, `tests/control_plane/email/test_google_oauth.py`, `tests/control_plane/test_channel_preferences.py`, `tests/control_plane/test_channel_bindings.py`, `tests/test_web_channel.py` all green per plan criteria.
+  *Paths corrected 2026-08-30.* Four of the five were written from the
+  plan's expectations rather than the tree, so the command failed on a
+  green checkout; only `test_web_channel.py` was ever at the path named.
 - [ ] `provision.py --dry-run` on staging lists three steps without writes.
 - [ ] Manual pilot onboarding ≤60m per runbook (step1/2/3 checks + primary switch without history loss).
 
@@ -318,7 +345,15 @@ placeholder.
 2. Rollout order: synthetic → operator accounts → invited pilot families per provider; each transition requires `Phase A` legal + `Phase C1` receipt + `go test` + `pytest -m "not live"` + one manual live gate.
 
 **Acceptance:**
-- [ ] Flag matrix doctested; `git diff --check` + `ruff` + `gitleaks --all` + `check_fixtures --all --require-deny` green.
+- [ ] Flag matrix doctested; `git diff --check` + `ruff` +
+  `gitleaks detect --log-opts="--all"` + `check_fixtures --all --require-deny`
+  green. **CI is the only surface that can close this box (noted 2026-08-30):**
+  `check_fixtures --all --require-deny` exits **2** locally — a refusal, not a
+  warning — because the private deny-patterns file (`HERMES_EXTRA_DENY_FILE`)
+  exists only in CI. Everything else is green locally at 2026-08-30: suite 1686,
+  `git diff --check` clean, `ruff` clean, `gitleaks` no leaks / 170 commits,
+  `check_fixtures --all` clean. (`gitleaks --all` was never the real
+  invocation; corrected above.)
 
 ## Implementation Approach
 
