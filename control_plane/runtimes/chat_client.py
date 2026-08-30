@@ -42,9 +42,19 @@ class PrivateRuntimeWebChatClient:
         runtime_ref: str,
         *,
         actor_id: str,
-        role: str,
+        chat_id: str,
         text: str,
     ) -> dict[str, Any]:
+        """Forward one turn as TRUSTED PROVENANCE: who, and in which room.
+
+        C3f replaced `role` with `chat_id` here, and the swap is the point
+        rather than a rename. A role is a CONCLUSION, and sending it meant the
+        runtime believed a claim this side computed — the same shape that once
+        let a failed membership lookup hand the caller `owner`. The runtime now
+        derives the role from its own manifest, and what travels is the pair
+        the manifest can check: the member's actor and the conversation they
+        hold, both read from a published binding rather than from the request.
+        """
         if not RUNTIME_REF.fullmatch(runtime_ref):
             raise RuntimeBoundaryError("runtime reference is outside the managed namespace")
         token = self.token_hasher.digest(f"runtime-dsar:{runtime_ref}")
@@ -55,7 +65,7 @@ class PrivateRuntimeWebChatClient:
                     "Authorization": f"Bearer {token}",
                     "Content-Type": "application/json",
                 },
-                json={"text": text, "actor_id": actor_id, "role": role},
+                json={"text": text, "actor_id": actor_id, "chat_id": chat_id},
                 timeout=self.timeout,
             )
         except (httpx.TimeoutException, httpx.TransportError) as error:

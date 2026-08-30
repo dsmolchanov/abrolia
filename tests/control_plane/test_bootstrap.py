@@ -948,7 +948,10 @@ def test_activation_publishes_only_its_own_households_staged_bindings(
             )
         ]
 
-    assert staged(runtime.world.household.id) == [None]
+    # Two staged rows for the PROVISIONED household: its primary binding and
+    # the C3f web seat the planner seeds. The second household is built by the
+    # raw insert above and has exactly the one row it was given.
+    assert staged(runtime.world.household.id) == [None, None]
     assert staged(other.id) == [None]
 
     binding = _binding(runtime)
@@ -957,7 +960,7 @@ def test_activation_publishes_only_its_own_households_staged_bindings(
         runtime.raw_token, **binding, activated_sha256=runtime.manifest_sha256
     )
 
-    assert staged(runtime.world.household.id) == [runtime.revision]
+    assert staged(runtime.world.household.id) == [runtime.revision] * 2
     assert staged(other.id) == [None], (
         "activation published a binding belonging to another household"
     )

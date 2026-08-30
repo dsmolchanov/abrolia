@@ -56,6 +56,12 @@ actor_id = "synthetic-owner"
 chat_id = "synthetic-chat"
 verified = true
 
+[[channel_bindings]]
+channel = "web"
+actor_id = "synthetic-owner"
+chat_id = "web:synthetic-owner"
+verified = true
+
 [email]
 agent_inbox = "runtime@abrolia.test"
 fallback = "owner@example.test"
@@ -94,11 +100,13 @@ class StubLoop:
         return SimpleNamespace(text="готово", input_tokens=11, output_tokens=7)
 
 
-def _active_runtime(tmp_path: Path) -> tuple[RuntimeService, Path]:
+def _active_runtime(
+    tmp_path: Path, *, manifest_toml: str | None = None
+) -> tuple[RuntimeService, Path]:
     manifest_path = tmp_path / "household.toml"
     activation_path = tmp_path / "runtime-activation.json"
     database_path = tmp_path / "hermes.db"
-    content = _manifest_toml()
+    content = manifest_toml or _manifest_toml()
     manifest = parse_runtime_manifest(content)
     manifest_path.write_text(content, encoding="utf-8")
     write_activation_state(
@@ -123,13 +131,20 @@ def _active_runtime(tmp_path: Path) -> tuple[RuntimeService, Path]:
     return service, database_path
 
 
+#: The seat the fixture manifest verifies for web.
+WEB_ACTOR = "synthetic-owner"
+WEB_CHAT = "web:synthetic-owner"
+
+
 def _chat(service: RuntimeService, *, token=None, payload=None) -> tuple[int, dict]:
     captured: dict[str, object] = {}
 
     def start_response(status: str, headers: list[tuple[str, str]]) -> None:
         captured["status"] = int(status.split()[0])
 
-    body_bytes = json.dumps(payload or {"text": "привет", "role": "owner"}).encode()
+    body_bytes = json.dumps(
+        payload or {"text": "привет", "actor_id": WEB_ACTOR, "chat_id": WEB_CHAT}
+    ).encode()
     environ = {
         "PATH_INFO": "/internal/v1/web/chat",
         "REQUEST_METHOD": "POST",
@@ -168,16 +183,30 @@ def test_web_chat_validates_text_before_any_model_work(tmp_path: Path) -> None:
     stub = StubLoop()
     service._web_chat_loop = lambda database, config: stub
 
-    empty_status, empty_payload = _chat(service, payload={"text": "   ", "role": "owner"})
-    long_status, long_payload = _chat(
-        service, payload={"text": "а" * 2001, "role": "owner"}
+    seat = {"actor_id": WEB_ACTOR, "chat_id": WEB_CHAT}
+    empty_status, empty_payload = _chat(service, payload={"text": "   ", **seat})
+    long_status, long_payload = _chat(service, payload={"text": "а" * 2001, **seat})
+    # C3f: no pair at all is a malformed request, not a refused member.
+    no_seat_status, no_seat_payload = _chat(service, payload={"text": "привет"})
+    # A pair the manifest does not verify IS a refused member, and it is
+    # refused BEFORE the model is called: an unverified pair yields
+    # ROLE_UNKNOWN, so answering would spend a turn on a reply that could do
+    # nothing.
+    stranger_status, stranger_payload = _chat(
+        service,
+        payload={
+            "text": "привет",
+            "actor_id": "synthetic-stranger",
+            "chat_id": "web:synthetic-stranger",
+        },
     )
-    no_role_status, no_role_payload = _chat(service, payload={"text": "привет"})
 
     assert empty_status == 400 and empty_payload == {"status": "text_required"}
     assert long_status == 400 and long_payload == {"status": "text_too_long"}
-    assert no_role_status == 403
-    assert no_role_payload == {"status": "owner_role_required"}
+    assert no_seat_status == 400
+    assert no_seat_payload == {"status": "binding_required"}
+    assert stranger_status == 403
+    assert stranger_payload == {"status": "web_seat_not_authorized"}
     assert stub.calls == []
 
 
@@ -190,7 +219,10 @@ def test_web_chat_runs_the_dialogue_loop_and_records_usage(tmp_path: Path) -> No
 
     assert status == 200
     assert payload == {"reply": "готово"}
-    assert stub.calls == [("owner", "synthetic-owner", "web-chat", "привет")]
+    # C3f: the role is DERIVED from the manifest — `role_for` matches
+    # `actors.owner` — and the chat is the seat's own room rather than the
+    # synthesized `web-chat` every household used to share.
+    assert stub.calls == [("owner", WEB_ACTOR, WEB_CHAT, "привет")]
     with open_database(database_path) as database:
         row = UsageStore(database).get(HOUSEHOLD_ID, today_utc())
     assert row is not None
@@ -231,3 +263,126 @@ def test_web_chat_reports_not_ready_without_activation(tmp_path: Path) -> None:
     assert status == 503
     assert payload == {"status": "runtime_not_ready"}
     assert stub.calls == []
+
+
+# --------------------------------------------------------------------------
+# C3f: the second adult, and the two ends agreeing on one payload.
+# --------------------------------------------------------------------------
+
+ADULT_ACTOR = "synthetic-adult"
+ADULT_CHAT = "web:synthetic-adult"
+
+def _manifest_with_adult() -> str:
+    """The fixture manifest plus a second adult holding their own web seat.
+
+    Rehashed rather than edited in place: `config_sha256` is computed over the
+    body, so changing the text without recomputing produces a manifest the
+    runtime refuses with `ManifestHashMismatch` — which is the check doing its
+    job, and it caught this the first time.
+    """
+    body = _manifest_toml()
+    body = body[: body.index('config_sha256')] + body[
+        body.index("\n", body.index("config_sha256")) + 1 :
+    ]
+    body = body.replace(
+        'family = ["synthetic-owner"]',
+        'family = ["synthetic-owner", "synthetic-adult"]',
+    ) + f'''
+[[channel_bindings]]
+channel = "web"
+actor_id = "{ADULT_ACTOR}"
+chat_id = "{ADULT_CHAT}"
+verified = true
+'''
+    digest = compute_config_sha256(body)
+    return body.replace(
+        "schema_version = 1\n",
+        f'schema_version = 1\nconfig_sha256 = "{digest}"\n',
+    )
+
+
+def test_a_second_adults_web_seat_speaks_as_themselves(tmp_path: Path) -> None:
+    """The defect C3f closes, stated as a test.
+
+    `_web_chat` refused every role but `owner`, and `web_chat_turn` attributed
+    every turn to `manifest.actors.owner` — so an adult holding a verified,
+    published web binding could not speak at all, and if they somehow had, they
+    would have spoken as the owner.
+    """
+    service, _ = _active_runtime(tmp_path, manifest_toml=_manifest_with_adult())
+    stub = StubLoop()
+    service._web_chat_loop = lambda database, config: stub
+
+    status, payload = _chat(
+        service, payload={"text": "привет", "actor_id": ADULT_ACTOR,
+                          "chat_id": ADULT_CHAT}
+    )
+
+    assert status == 200
+    role, actor, chat, _text = stub.calls[0]
+    # Their OWN actor, and `family` rather than `owner`: the role is derived
+    # from the manifest's actor directory, so it is a fact about the household
+    # rather than a claim that travelled with the request.
+    assert (role, actor, chat) == ("family", ADULT_ACTOR, ADULT_CHAT)
+
+
+def test_an_adult_cannot_borrow_the_owners_chat(tmp_path: Path) -> None:
+    """Cross-pairs stay denied: a known actor in another member's room."""
+    service, _ = _active_runtime(tmp_path, manifest_toml=_manifest_with_adult())
+    stub = StubLoop()
+    service._web_chat_loop = lambda database, config: stub
+
+    status, payload = _chat(
+        service,
+        payload={"text": "привет", "actor_id": ADULT_ACTOR, "chat_id": WEB_CHAT},
+    )
+
+    assert status == 403
+    assert payload == {"status": "web_seat_not_authorized"}
+    assert stub.calls == []
+
+
+def test_the_control_planes_payload_is_the_one_this_runtime_reads(
+    tmp_path: Path,
+) -> None:
+    """One payload through BOTH ends, because C5a is what happens otherwise.
+
+    There the gateway signed `body|timestamp` and the runtime verified the bare
+    body — each side had passing tests, each with its own helper, and no
+    WhatsApp message could reach a household. Asserting each end's idea of the
+    contract separately is exactly what did not catch it.
+
+    So this builds the request with the REAL control-plane client and feeds the
+    bytes it produced to the real runtime handler. Rename a field on either
+    side and this fails.
+    """
+    import httpx
+
+    from control_plane.crypto import LookupHasher
+    from control_plane.runtimes.chat_client import PrivateRuntimeWebChatClient
+
+    sent: dict[str, bytes] = {}
+
+    def _capture(request: httpx.Request) -> httpx.Response:
+        sent["body"] = request.content
+        return httpx.Response(200, json={"reply": "готово"})
+
+    client = PrivateRuntimeWebChatClient(
+        LookupHasher(b"k" * 32),
+        client=httpx.Client(transport=httpx.MockTransport(_capture)),
+    )
+    client.send(
+        "abrolia-hh-" + "a" * 26,
+        actor_id=WEB_ACTOR,
+        chat_id=WEB_CHAT,
+        text="привет",
+    )
+
+    service, _ = _active_runtime(tmp_path)
+    stub = StubLoop()
+    service._web_chat_loop = lambda database, config: stub
+
+    status, _payload = _chat(service, payload=json.loads(sent["body"]))
+
+    assert status == 200, "the runtime could not read what the control plane sent"
+    assert stub.calls[0][:3] == ("owner", WEB_ACTOR, WEB_CHAT)

@@ -21,7 +21,7 @@ from control_plane.provisioning.manifest import (
     manifest_sha256,
 )
 from control_plane.repositories.accounts import AccountsRepository
-from control_plane.repositories.bindings import ChannelBindingsRepository
+from control_plane.repositories.bindings import ChannelBindingsRepository, web_seat_chat_id
 from control_plane.repositories.configs import ConfigRepository, ConfigRevisionRecord
 from control_plane.repositories.households import HouseholdsRepository
 from control_plane.repositories.onboarding import OnboardingRepository
@@ -170,7 +170,46 @@ class DesiredSpecPlanner:
             external_id=actor_id,
             chat_id=chat_id,
             actor_id=actor_id,
+            # The primary channel identifies the owner by its own sender, so it
+            # carries no account — except when the primary IS web, which has no
+            # sender to identify anyone by.
+            account_id=account.id if primary == "web" else None,
         )
+        # C3f: the owner's WEB SEAT, seeded here for the same reason the
+        # primary binding and the preference row are — a household that has
+        # proved a channel should not depend on a later endpoint to record
+        # where it is reached.
+        #
+        # Before this, web chat did not consult bindings at all: the runtime
+        # hardcoded `manifest.actors.owner` and refused every other role, so
+        # requiring a seat without seeding one would have taken web away from
+        # every household that already has it.
+        #
+        # The seat is bound under the owner's OWN actor, not a new identity.
+        # `_insert` requires `actor_id == external_id`, and an actor is a
+        # per-channel sender here — so minting a separate web actor would put
+        # the owner in `actors.family` twice AND stop `role_for` matching
+        # `actors.owner`, quietly demoting the owner to `ROLE_FAMILY` on web
+        # and taking export and deletion with it. Reusing the actor keeps one
+        # person one member; `account_id` carries the mapping instead.
+        #
+        # AFTER the primary, and through its own reconciler: a genuine owner
+        # reset retires every owner row, and this call then re-establishes the
+        # seat from the same authoritative account.
+        if primary != "web":
+            self.bindings.ensure_owner_web_seat(
+                connection,
+                household_id=household_id,
+                actor_id=actor_id,
+                # The seat's OWN conversation, not the primary channel's. They
+                # were briefly the same value and that is a real bug: the
+                # runtime builds `RunContext.chat_id` from the pair it matched,
+                # so a web turn would have been attributed to the family's
+                # Telegram chat — the wrong room for scope, replies and every
+                # later `knows_binding` comparison.
+                chat_id=web_seat_chat_id(actor_id),
+                account_id=account.id,
+            )
         # The preference row is seeded from the SAME result, for the reason the
         # owner binding is: a household that has proved a channel should not
         # depend on some later endpoint to record where it is reached. C4's

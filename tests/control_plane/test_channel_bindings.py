@@ -13,7 +13,7 @@ from dataclasses import replace
 
 import pytest
 
-from control_plane.repositories.bindings import BindingError
+from control_plane.repositories.bindings import BindingError, web_seat_chat_id
 from tests.control_plane.conftest import BASE_TIME
 
 
@@ -403,6 +403,17 @@ def test_the_retention_sweep_retires_a_challenge_nobody_answered(cp_stack) -> No
 # --- the second adult, all the way into the manifest -----------------------
 
 from control_plane.models import StepKind, synthetic_channel_identity  # noqa: E402
+
+
+def owner_web_seat(cp_stack) -> tuple[str, str]:
+    """C3f: the owner's web seat, which the planner seeds on every household.
+
+    Web has no gateway, so a seat is reached through an account rather than a
+    sender. It is bound under the owner's OWN actor — a separate web actor
+    would put one person in `actors.family` twice and stop `role_for` matching
+    `actors.owner`, demoting the owner on web.
+    """
+    return owner_actor(cp_stack), web_seat_chat_id(owner_actor(cp_stack))
 from control_plane.provisioning.manifest import DesiredHouseholdSpecV1  # noqa: E402
 from control_plane.provisioning.manifest_toml import manifest_to_toml  # noqa: E402
 from control_plane.provisioning.rollout import schedule_runtime_rollout  # noqa: E402
@@ -475,9 +486,16 @@ def test_the_owners_binding_is_seeded_into_the_table_planning_writes_it(
     """
     spec = _provisioned(cp_stack)
 
-    rows = cp_stack.database.query("SELECT * FROM channel_bindings")
-    assert len(rows) == 1
-    assert rows[0]["role"] == "owner"
+    rows = cp_stack.database.query(
+        "SELECT * FROM channel_bindings ORDER BY channel"
+    )
+    # Two now, both the owner's: the primary channel and the C3f web seat.
+    assert [(row["channel"], row["role"]) for row in rows] == [
+        ("telegram", "owner"),
+        ("web", "owner"),
+    ]
+    assert rows[1]["account_id"] == cp_stack.account.id
+    rows = [row for row in rows if row["channel"] == "telegram"]
     # Three names, each from the field that means it: the owner's SENDER is
     # onboarding's `actor_id` — which becomes `actors.owner` and is what
     # `message.from.id` is compared against — and the CHAT is its `chat_id`.
@@ -489,9 +507,9 @@ def test_the_owners_binding_is_seeded_into_the_table_planning_writes_it(
     # And the manifest is the same fact, not a second one.
     assert spec.actors.owner == owner_actor(cp_stack)
     assert spec.actors.family == (owner_actor(cp_stack),)
-    assert [binding.chat_id for binding in spec.channel_bindings] == [
-        owner_chat(cp_stack)
-    ]
+    assert sorted(binding.chat_id for binding in spec.channel_bindings) == sorted(
+        [owner_chat(cp_stack), web_seat_chat_id(owner_actor(cp_stack))]
+    )
 
 
 def test_two_members_share_one_chat_and_the_revision_still_starts(
@@ -559,6 +577,7 @@ def test_two_members_share_one_chat_and_the_revision_still_starts(
     # rather than the manifest happening to carry exactly one chat.
     assert runtime.primary_chat_id == household_chat
     assert runtime.verified_actor_chat_pairs == frozenset({
+        owner_web_seat(cp_stack),
         (owner_actor(cp_stack), household_chat),
         (ADULT, household_chat),
     })
@@ -620,6 +639,7 @@ def test_relaxing_uniqueness_did_not_relax_the_pair_check(cp_stack) -> None:
     # allowlist — the pair is the only thing standing between "chat_id may now
     # repeat" and "any known actor is authorized in any known chat".
     assert runtime.verified_actor_chat_pairs == frozenset({
+        owner_web_seat(cp_stack),
         (owner, household_chat),
         (ADULT, household_chat),
         (PHONE, PHONE_CHAT),
@@ -627,7 +647,9 @@ def test_relaxing_uniqueness_did_not_relax_the_pair_check(cp_stack) -> None:
     assert (owner, PHONE_CHAT) not in runtime.verified_actor_chat_pairs
     # `allowed_chats` widened, exactly as the plan said it would. It is now the
     # weaker check, and nothing authorizes from it while pairs are present.
-    assert runtime.allowed_chats == frozenset({household_chat, PHONE_CHAT})
+    assert runtime.allowed_chats == frozenset({
+        household_chat, PHONE_CHAT, web_seat_chat_id(owner_actor(cp_stack)),
+    })
 
 
 def test_an_adult_on_another_channel_is_bound_and_the_runtime_can_start_it(
@@ -675,6 +697,7 @@ def test_an_adult_on_another_channel_is_bound_and_the_runtime_can_start_it(
     # One chat to speak into; the adult authorized from their own channel.
     assert runtime.primary_chat_id == owner_chat(cp_stack)
     assert runtime.verified_actor_chat_pairs == frozenset({
+        owner_web_seat(cp_stack),
         (owner_actor(cp_stack), owner_chat(cp_stack)),
         # The pair is (sender, conversation) and the two are different strings
         # on WhatsApp. This assertion used to read `(ADULT, "+999511234")`,
@@ -700,7 +723,9 @@ def test_replanning_without_a_new_binding_leaves_the_manifest_identical(
     assert _shape(second) == _shape(first)
     assert second.config_revision == first.config_revision + 1
     # Seeding is idempotent: replanning must not add a duplicate owner row.
-    assert len(cp_stack.database.query("SELECT id FROM channel_bindings")) == 1
+    # Two rows, not one: the primary binding and the C3f web seat, and
+    # `ensure_owner_web_seat` is idempotent for the same reason.
+    assert len(cp_stack.database.query("SELECT id FROM channel_bindings")) == 2
 
 
 def test_reprovisioning_the_primary_channel_retires_what_it_replaces(
@@ -837,6 +862,10 @@ def test_the_owner_appears_in_family_once_though_two_things_name_them(
     is the sender-to-actor mapping design C3a deliberately does not build.
     """
     _provisioned(cp_stack)
+    # Outside the write below: `create_verified` opens its own transaction.
+    web_adult = cp_stack.accounts.create_verified(
+        "web-adult@family.test", now=BASE_TIME
+    )
     with cp_stack.database.write() as connection:
         # Distinct verification times on purpose. `verified()` orders by
         # `(verified_at, id)`, and `id` is a fresh UUID — so two bindings
@@ -845,9 +874,19 @@ def test_the_owner_appears_in_family_once_though_two_things_name_them(
         # projection does not promise. It is stable for a given database,
         # which is what `config_sha256` needs; it is not predictable across
         # them, which is what a test would need.
-        for offset, (channel, external_id, chat) in enumerate((
-            ("whatsapp", PHONE, PHONE_CHAT),
-            ("web", "synthetic-web-seat", "synthetic-web-seat"),
+        # C3f: a web seat names the ACCOUNT that reaches it, because web has no
+        # gateway and no self-identifying sender. It has to be a real active
+        # member, so the adult taking the web seat gets an account here rather
+        # than borrowing the owner's.
+        connection.execute(
+            "INSERT INTO household_memberships (account_id, household_id, role,"
+            " status, created_at, accepted_at) VALUES (?, ?, 'adult', 'active',"
+            " ?, ?)",
+            (web_adult.id, cp_stack.household.id, BASE_TIME, BASE_TIME),
+        )
+        for offset, (channel, external_id, chat, account) in enumerate((
+            ("whatsapp", PHONE, PHONE_CHAT, None),
+            ("web", "synthetic-web-seat", "synthetic-web-seat", web_adult.id),
         )):
             issued = cp_stack.bindings.issue_challenge(
                 connection,
@@ -858,6 +897,7 @@ def test_the_owner_appears_in_family_once_though_two_things_name_them(
                 actor_id=external_id,
                 role="adult",
                 issued_by_actor_id=owner_actor(cp_stack),
+                account_id=account,
                 now=BASE_TIME + 100,
             )
             cp_stack.bindings.verify_challenge(
@@ -880,7 +920,8 @@ def test_the_owner_appears_in_family_once_though_two_things_name_them(
     assert spec.actors.family == (
         owner_actor(cp_stack), PHONE, "synthetic-web-seat",
     )
-    assert len(spec.channel_bindings) == 3
+    # Three members' bindings plus the owner's web seat.
+    assert len(spec.channel_bindings) == 4
     # Two senders, two members: the honest projection of what the runtime can
     # actually tell apart.
     assert len(set(spec.actors.family)) == len(spec.actors.family)
@@ -1082,11 +1123,15 @@ def test_redeeming_one_invitation_leaves_the_others_standing(cp_stack) -> None:
     # A real owner-state change still invalidates them, which is the only case
     # where the generation actually moved.
     with cp_stack.database.write() as connection:
+        # C3f: a web seat names the account that reaches it. The owner's own
+        # account is an active member and serves here — this case is about
+        # challenge invalidation, not about who holds the seat.
         pending = cp_stack.bindings.issue_challenge(
             connection, household_id=hid, channel="web",
             external_id="synthetic-web-seat", actor_id="synthetic-web-seat",
             chat_id="synthetic-web-seat",
-            role="adult", issued_by_actor_id=OWNER, now=BASE_TIME + 4,
+            role="adult", issued_by_actor_id=OWNER,
+            account_id=cp_stack.account.id, now=BASE_TIME + 4,
         )
         cp_stack.bindings.ensure_owner_binding(
             connection, household_id=hid, channel="telegram",
@@ -1487,7 +1532,11 @@ def test_a_second_household_can_provision_and_routes_to_itself(cp_stack) -> None
     rows = {
         row["household_id"]: row
         for row in cp_stack.database.query(
+            # Primary channel only: every household also holds a C3f web
+            # seat now, and this case is about per-household routing of the
+            # channel the gateway matches.
             "SELECT household_id, external_id, chat_id FROM channel_bindings"
+            " WHERE channel != 'web'"
         )
     }
     assert set(rows) == {cp_stack.household.id, second.id}
@@ -2508,7 +2557,10 @@ def test_a_terminal_failure_retires_the_members_it_staged(cp_stack) -> None:
             connection, household_id=cp_stack.household.id
         )
     assert retired == 1
-    assert [r.actor_id for r in rows] == [owner]
+    # The owner's primary binding and their web seat both survive: retirement
+    # takes staged MEMBERS, never the owner's own rows.
+    assert [r.actor_id for r in rows] == [owner, owner]
+    assert sorted(r.channel for r in rows) == ["telegram", "web"]
 
     # And the identity is free again, which is the whole point.
     with cp_stack.database.write() as connection:
@@ -2826,3 +2878,44 @@ def test_the_upgrade_path_repairs_a_pre_key_database_before_strict_lookup(
     assert gateway.route(
         sender, "whatsapp", timestamp=str(int(now))
     ).household_id == cp_stack.household.id, "the household stayed dark after the repair"
+
+
+def test_rotating_the_primary_actor_leaves_the_web_room_alone(cp_stack) -> None:
+    """C3f round two: a web conversation is not a projection of another channel.
+
+    `web_seat_chat_id` derived the room from the owner's actor and the planner
+    recomputed it on every plan, so re-running the primary-channel step onto a
+    new Telegram account silently RENAMED a web conversation that nothing had
+    re-verified — moving every `RunContext.chat_id` consumer with it. Found in
+    review on #106.
+
+    The room is minted once and kept. Only a seat that does not exist yet gets
+    a new one.
+    """
+    _provisioned(cp_stack)
+    before = cp_stack.database.query_one(
+        "SELECT chat_id, actor_id FROM channel_bindings"
+        " WHERE household_id = ? AND channel = 'web'",
+        (cp_stack.household.id,),
+    )
+
+    rotated = "synthetic-owner.rotated"
+    with cp_stack.database.write() as connection:
+        cp_stack.bindings.ensure_owner_web_seat(
+            connection,
+            household_id=cp_stack.household.id,
+            actor_id=rotated,
+            chat_id=web_seat_chat_id(rotated),
+            account_id=cp_stack.account.id,
+        )
+        after = connection.execute(
+            "SELECT chat_id, actor_id FROM channel_bindings"
+            " WHERE household_id = ? AND channel = 'web'",
+            (cp_stack.household.id,),
+        ).fetchone()
+
+    assert after["actor_id"] == rotated, "the seat follows the owner's actor"
+    assert after["chat_id"] == before["chat_id"], (
+        "the room is durable — renaming it would move a conversation nothing "
+        "re-verified"
+    )

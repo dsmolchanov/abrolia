@@ -86,6 +86,16 @@ from hermes_cloud.runtime.bootstrap import (
     state_matches_manifest,
 )
 
+
+class WebSeatDenied(Exception):
+    """This actor/chat pair is not verified by the manifest being served.
+
+    Its own type rather than a bare refusal: `_web_chat` answers 403 for this
+    and 503 for a runtime that is merely not ready, and collapsing them told a
+    member their household was down when it had in fact declined them.
+    """
+
+
 ENV_RUNTIME_HOST = "HERMES_RUNTIME_HOST"
 ENV_RUNTIME_PORT = "HERMES_RUNTIME_PORT"
 ENV_BOOTSTRAP_RETRY_SECONDS = "HERMES_BOOTSTRAP_RETRY_SECONDS"
@@ -647,53 +657,78 @@ class RuntimeService:
         if not isinstance(request, dict):
             return Probe(400, {"status": "invalid_request"})
         text = str(request.get("text") or "").strip()
-        role = str(request.get("role") or "")
+        # C3f: the PAIR, not a role. What arrives is provenance the control
+        # plane read off a published web binding — who is speaking and in which
+        # conversation — and the role is derived below from this process's own
+        # manifest. A role that travelled on the wire was a conclusion computed
+        # somewhere else and believed here.
+        actor_id = str(request.get("actor_id") or "").strip()
+        chat_id = str(request.get("chat_id") or "").strip()
         if not text:
             return Probe(400, {"status": "text_required"})
         if len(text) > 2000:
             return Probe(400, {"status": "text_too_long"})
-        # Until C3 gives web a real channel-binding lifecycle there is no
-        # account→actor mapping to trust, so only owners get chat and effects
-        # attribute to the manifest's own owner actor. Fail closed for every
-        # other role rather than guessing an identity.
-        if role != "owner":
-            return Probe(403, {"status": "owner_role_required"})
+        if not actor_id or not chat_id:
+            return Probe(400, {"status": "binding_required"})
         try:
-            reply = self.web_chat_turn(text)
+            reply = self.web_chat_turn(text, actor_id=actor_id, chat_id=chat_id)
+        except WebSeatDenied:
+            # The manifest has no such verified pair: this member is not
+            # authorized on web at this revision. Fail closed rather than
+            # falling back to the owner, which is what the previous version
+            # effectively did for everyone it let through.
+            return Probe(403, {"status": "web_seat_not_authorized"})
         except RuntimeNotReady:
             return Probe(503, {"status": "runtime_not_ready"})
         except Exception:
             return Probe(503, {"status": "chat_unavailable"})
         return Probe(200, {"reply": reply})
 
-    def web_chat_turn(self, text: str) -> str:
+    def web_chat_turn(self, text: str, *, actor_id: str, chat_id: str) -> str:
         """Route one web-chat turn through the shared dialogue loop.
 
         The loop lives here, not in the control plane: this process owns the
         household's budget counter, so the cap is enforced at the call site
         exactly as on every other channel. `EffectJournal` binds to an open
         database connection, so loop and usage store are rebuilt per turn.
+
+        C3f: the actor and chat come from a published web binding, and the ROLE
+        is derived here from the manifest. Raises `WebSeatDenied` when the pair
+        is not one the manifest verifies.
         """
         manifest = self.require_ready()
         # Explicit path, not env discovery: this process serves exactly one
         # manifest, so language/model must come from it even if the env var
         # wiring drifts.
         config = load_config(env=self.env, manifest_path=self.manifest_path)
-        # The bearer gate on /internal/v1/* IS the transport verification here:
+        # The bearer gate on /internal/v1/* is the TRANSPORT verification:
         # only the control plane can reach this process, and it authenticated
-        # the human before proxying. The manifest's verified pairs cover
-        # telegram today, so carrying them verbatim would deny web entirely —
-        # C3 moves web into the manifest when bindings get a lifecycle.
+        # the human before proxying. What it may not do is tell this process
+        # who that human is allowed to be — so the manifest's own verified
+        # pairs are carried verbatim, exactly as every other channel does, and
+        # the role falls out of `role_for`.
+        #
+        # This used to synthesize `allowed_chats={"web-chat"}` and attribute
+        # every turn to `manifest.actors.owner`, which is why a second adult
+        # with a verified web binding could not speak at all and why the owner
+        # was the only identity web could ever produce.
         household = Household(
             household_id=manifest.household_id,
             owner=manifest.actors.owner,
             family=frozenset(manifest.actors.family),
-            allowed_chats=frozenset({"web-chat"}),
+            guests=frozenset(manifest.actors.guests),
+            allowed_chats=manifest.allowed_chats,
+            verified_bindings=manifest.verified_actor_chat_pairs,
         )
+        # Asked BEFORE the model call, not after: `build_run_context` answers an
+        # unverified pair with `ROLE_UNKNOWN` and no capabilities, which would
+        # spend a model turn to produce a reply that could do nothing.
+        if (actor_id, chat_id) not in manifest.verified_actor_chat_pairs:
+            raise WebSeatDenied(actor_id)
         context = build_run_context(
             household=household,
-            actor_id=manifest.actors.owner,
-            chat_id="web-chat",
+            actor_id=actor_id,
+            chat_id=chat_id,
         )
         daily_cap_usd = parse_daily_cap_usd(self.env.get(ENV_COST_CAP_USD_PER_DAY))
         with open_database(self.database_path) as database:

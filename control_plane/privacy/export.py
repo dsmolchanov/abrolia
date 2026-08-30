@@ -244,8 +244,14 @@ class HouseholdExporter:
         # the row below.
         channel_bindings = self._rows(
             "channel_bindings",
+            # `account_id` (C3f) is the mapping that says WHICH member holds a
+            # web seat. In a household with two adults the export could not
+            # otherwise answer "which of these bindings is mine", though the
+            # database knows — and that is the question a subject access
+            # request exists to answer.
             "SELECT channel, external_id, chat_id, actor_id, role, verified_at,"
-            " verified_by_actor_id FROM channel_bindings WHERE household_id = ?"
+            " verified_by_actor_id, account_id FROM channel_bindings"
+            " WHERE household_id = ?"
             " ORDER BY verified_at, id",
             (household_id,),
         )

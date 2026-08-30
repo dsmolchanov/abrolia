@@ -681,3 +681,84 @@ def test_verifying_over_http_deploys_the_revision_it_reports(api_harness) -> Non
     owner_actor, _ = synthetic_channel_identity(world.household.id)
     actors = {b["actor_id"] for b in manifest["channel_bindings"]}
     assert actors == {owner_actor, WA_SENDER}
+
+
+def test_an_adults_web_seat_is_reachable_through_the_api(api_harness) -> None:
+    """C3f round two: the flow the feature exists for, over HTTP.
+
+    `issue_challenge` began refusing a web challenge without `account_id`, and
+    the only product caller never accepted or passed the field — so every
+    attempt to create a second adult's web seat answered 409 before writing a
+    challenge, and C3f's headline capability was unreachable in production.
+    Found in review on #106, and the reason this test goes through the endpoint
+    rather than the repository: the repository half was already green.
+    """
+    owner = api_harness.create_principal("seat-owner@family.test")
+    adult = api_harness.create_principal("seat-adult@family.test")
+    api_harness.authenticate(owner)
+    # Fully onboarded: verification schedules a rollout, which a household that
+    # cannot yet be issued refuses — so a half-set-up fixture would fail here
+    # for a reason that has nothing to do with seats.
+    _finish_onboarding(api_harness, owner)
+    with api_harness.container.database.write() as connection:
+        connection.execute(
+            "DELETE FROM household_memberships WHERE account_id = ?",
+            (adult.account.id,),
+        )
+        connection.execute(
+            "INSERT INTO household_memberships (account_id, household_id, role,"
+            " status, created_at, accepted_at) VALUES (?, ?, 'adult', 'active', 1, 1)",
+            (adult.account.id, owner.household.id),
+        )
+
+    api_harness.authenticate(owner)
+    seat = {
+        "channel": "web",
+        "external_id": "synthetic-adult-seat",
+        "chat_id": "web:synthetic-adult-seat",
+        "actor_id": "synthetic-adult-seat",
+    }
+
+    # Without the account there is no member to attribute the seat to, and the
+    # refusal says so rather than writing a seat nothing can reach.
+    missing = api_harness.client.post(
+        CHALLENGES, json=seat, headers=api_harness.mutation_headers
+    )
+    assert missing.status_code == 409
+    assert "account" in missing.json()["detail"]
+
+    # An account that is not a member of this household cannot be given one:
+    # the seat is what authorizes a turn.
+    stranger = api_harness.create_principal(email="stranger@family.test")
+    foreign = api_harness.client.post(
+        CHALLENGES,
+        json={**seat, "account_id": stranger.account.id},
+        headers=api_harness.mutation_headers,
+    )
+    assert foreign.status_code == 409
+    assert "active member" in foreign.json()["detail"]
+
+    issued = api_harness.client.post(
+        CHALLENGES,
+        json={**seat, "account_id": adult.account.id},
+        headers=api_harness.mutation_headers,
+    )
+    assert issued.status_code == 200
+
+    verified = api_harness.client.post(
+        VERIFY,
+        json={"code": issued.json()["code"]},
+        headers=api_harness.mutation_headers,
+    )
+    assert verified.status_code == 200, verified.json()
+
+    row = api_harness.container.database.query_one(
+        "SELECT account_id, actor_id, chat_id FROM channel_bindings"
+        " WHERE household_id = ? AND channel = 'web' AND role = 'adult'",
+        (owner.household.id,),
+    )
+    # The seat carries the ADULT's account, not the owner's — the owner
+    # redeems the code on their behalf, so the principal at redemption is the
+    # wrong person by construction and the challenge is what remembers.
+    assert row["account_id"] == adult.account.id
+    assert row["actor_id"] == "synthetic-adult-seat"
