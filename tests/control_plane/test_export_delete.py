@@ -847,6 +847,14 @@ def test_the_export_carries_the_household_s_channel_bindings(cp_stack) -> None:
     ]
     assert bindings[1]["verified_by_actor_id"] == "synthetic-owner"
 
+    # C3f: `account_id` is the mapping that says WHICH member holds a seat, and
+    # a household with two adults could not otherwise answer "which of these is
+    # mine" from its own export though the database knows. Present on every
+    # binding — NULL on the gateway channels, where the sender identifies
+    # itself and no account is involved, which is itself the honest answer.
+    assert all("account_id" in binding for binding in bindings)
+    assert [binding["account_id"] for binding in bindings] == [None, None]
+
     # A credential never rides along: the keyed lookup digest adds nothing for
     # the reader, and the challenge table is export=False by classification.
     serialized = json.dumps(document)

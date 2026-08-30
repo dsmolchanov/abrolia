@@ -55,6 +55,17 @@ class ChallengeRequest(BaseModel):
     #: the previous one could not represent at all.
     chat_id: str = Field(min_length=1, max_length=128)
     actor_id: str = Field(min_length=1, max_length=128)
+    #: WHICH member this seat belongs to, and only on `web`.
+    #:
+    #: Required there because web has no gateway and no self-identifying
+    #: sender: the turn arrives on an authenticated session, so the account is
+    #: the only identity in hand. Refused on every other channel, where the
+    #: sender identifies itself and an account would imply a mapping nothing
+    #: reads. The repository enforces both, and also that the account is an
+    #: ACTIVE member of this household — the seat is what authorizes a turn, so
+    #: accepting an arbitrary id here would let an owner hand household
+    #: capabilities to any account they could type.
+    account_id: str | None = Field(default=None, max_length=64)
 
 
 class VerifyRequest(BaseModel):
@@ -99,6 +110,7 @@ async def issue_binding_challenge(
                 actor_id=payload.actor_id,
                 role="adult",
                 issued_by_actor_id=owner,
+                account_id=payload.account_id,
             )
         except BindingError as error:
             raise HTTPException(http_status.HTTP_409_CONFLICT, str(error)) from error
