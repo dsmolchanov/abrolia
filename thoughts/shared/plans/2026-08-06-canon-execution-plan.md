@@ -122,7 +122,7 @@ Non-blocker debt: codex/phase-4-real-actions dirty file + untracked landing not 
 
 **Acceptance:**
 - [ ] Nerve PR with cross-org test green + `go test ./... -count=1`.
-- [x] Abrolia `pytest tests/control_plane/email` proves crash-after-sink converges without operator, and hard-reclaim without sink stays `secret_handoff_unknown`.
+- [x] Abrolia `pytest tests/control_plane/email tests/control_plane/test_provisioning_jobs.py` proves crash-after-sink converges without operator, and hard-reclaim without sink stays `secret_handoff_unknown`.
   *Audited 2026-08-30 — half evidenced, and the box stays open for the other
   half.* The suite is green, and the SECOND clause is proven by name:
   `tests/control_plane/email/test_identity.py:478
@@ -149,6 +149,36 @@ Non-blocker debt: codex/phase-4-real-actions dirty file + untracked landing not 
   the SIGKILL/reclaim harness is. The bare `except Exception` around the
   receipt I/O flagged in the 2026-08-30 validation was narrowed to
   `sqlite3.Error` in the same change (the C6b shape).
+  *Narrowed 2026-08-30, by Codex review on #108, and the narrowing is right.*
+  The tick stands on what this line gates — the two named proofs exist and
+  drive the mechanism — but the mechanism they prove is WEAKER than this
+  step's own Changes item 2 specified: the proof is name-scoped, not
+  generation-scoped. The acceptance command above was also corrected in the
+  same pass to collect the file the proofs live in; as first written it
+  stayed green with both regressions deleted. See the open box below.
+
+- [ ] **Generation-scoped convergence — "no generation → no `verified`"
+  (opened 2026-08-30 by Codex review on #108).** Changes item 2 specified
+  `email_secret_installs {job_id, generation, secret_name, installed_at,
+  sink_digest}`; the shipped schema (`0005`) carries neither `generation` nor
+  `sink_digest`, and the reclaim proof consumes only the binding NAME:
+  `_email_secret_installed` asks the sink `contains(namespace_ref,
+  binding_ref)` and looks receipts up by `job_id` alone. Consequence: if
+  generation N−1's secret survives in the namespace (incomplete teardown, a
+  crash window) and generation N's job reconciles with empty one-time
+  material, the name-only probe answers "installed", a receipt is written for
+  N, and `_finish_step` marks N verified while the runtime holds N−1's
+  credentials — verified-but-stale, on the P0 real-email path. Closes when a
+  non-secret generation identifier travels through provider output, sink
+  installation/proof (a versioned marker where the sink cannot attest
+  values), and the receipt schema; neither a live probe nor a receipt is
+  accepted unless it matches the current job's generation; and one
+  parameterized regression covers both consumers (live-sink and
+  durable-receipt) with an old and a new generation, asserting N stays
+  unverified on N−1's remains. This is its own slice, not a fix commit: it
+  changes a provider contract, the sink protocol, and a schema, which is the
+  C6a→C6b / C3f shape — review found scope inside a fix, and the scope gets a
+  plan rather than a patch.
 
 #### C2 — BYO Domain Live (B-05)
 
