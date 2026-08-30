@@ -130,7 +130,8 @@ Round 2 adds: `control_plane/migrations/0014_backfill_web_seats.sql`,
 `tests/control_plane/test_db.py`, `tests/control_plane/test_binding_api.py`,
 `tests/control_plane/test_export_delete.py`.
 
-**Branches:** `feat/c3f-web-binding-runtime`, `fix/c3f-seat-continuity-and-upgrade`.
+**Branches:** `feat/c3f-web-binding-runtime`, `fix/c3f-seat-continuity-and-upgrade`,
+`fix/c3f-owner-web-fallback`.
 
 ## Acceptance
 
@@ -186,3 +187,54 @@ rather than fixing twice. Each layer was correct and tested in isolation — the
 repository enforced the rule, the planner seeded the seat — and neither
 question "who calls this, and what happens to the callers that already exist"
 was asked. C5a is the same shape one layer down.
+
+## Round 3, 2026-08-31 — the round-2 fixes did not reach the deciding layer
+
+Review on #107 found two, both correct, and both of them say the previous
+round's fixes did not do what their PR body claimed. Recorded in that shape
+because it is the useful lesson: each fix was applied at the layer I was looking
+at rather than the layer that decides.
+
+1. **The backfilled seat was invisible to the runtime.** `0014` publishes a row,
+   and the runtime authorizes only from `manifest.verified_actor_chat_pairs` in
+   the manifest it BOOTED — deployed at activation, built before web seats
+   existed. `0014` touches no manifest, so the 403 moved one layer down instead
+   of going away. #107 is merged and its body claims otherwise.
+2. **The room preservation never runs.** `DesiredSpecPlanner.issue` reconciles
+   the primary FIRST, and a changed owner sends that through
+   `_retire_superseded`, which deletes every owner row including the seat. The
+   preservation lookup then finds nothing and mints a new room. The regression
+   written for it called the helper directly and passed while the defect was
+   fully open — the C3d class, in the test written to escape it.
+
+**Also wrong and worth recording:** `0014` keys on
+`households.current_config_revision`, the exact column
+`test_0011_backfills_from_the_revision_that_is_actually_serving` documents as
+the wrong one, having been read in this same session. Nothing reads the VALUE
+today — `routable_web_seat` and `retire_staged_members` test only nullness — so
+it is a provenance inaccuracy rather than a live bug, and it is left recorded
+rather than corrected by a migration nobody needs yet.
+
+### What shipped instead of a fourth patch
+
+An **owner-only upgrade fallback**, chosen by the operator over building the
+fleet reconciliation now. When the booted manifest carries no pair for the
+forwarded seat, the OWNER — and nobody else — keeps the web chat they had, on
+the room they had (`web-chat`, named as a constant so an owner's history does
+not move on upgrade). An adult is still refused, so the second-adult surface
+stays closed rather than opening by accident.
+
+It is a bridge, not a design, and it ends when every household's serving
+manifest carries its seat.
+
+### Still open on C3f
+
+- **The fleet reconciliation.** Re-issue and ACTIVATE a revision per existing
+  household so the seats become real. This is the honest fix for finding 1 and
+  it is a slice of its own — queued, async, per-household, with failure
+  handling. Key it on `config_revisions.status = 'active'`, not on
+  `current_config_revision`.
+- **Room preservation across the planner's reset path** (finding 2), which needs
+  the seat's room carried across `_retire_superseded` rather than re-derived
+  after it — and a regression that rotates through `DesiredSpecPlanner.issue`,
+  with an assertion that the rotation actually happened.
