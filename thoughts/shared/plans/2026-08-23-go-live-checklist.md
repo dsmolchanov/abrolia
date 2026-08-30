@@ -20,21 +20,32 @@ green in `thoughts/shared/implementations/2026-08-23-canon-execution-plan-valida
 
 ## Why the doors are still locked (the one-paragraph version)
 
-`docs/privacy/processors.md:3` states no DPA is signed and no transfer mechanism
-is executed — B-07 is open, so the data policy remains synthetic-only. Every
-product flag is off by design. And three Phase E surfaces are half-built in ways
-the unticked checkboxes understate: nothing in production writes or reads
-`channel_preferences`, the `channel_bindings` lifecycle (challenge → verify)
-does not exist despite its schema and runtime enforcement being done, and the
-web chat answers with echo fallbacks because its model path was never wired.
-This checklist sequences closing those, then the staged flips the runbook
-already fixes.
+**Updated 2026-08-30.** Track C is closed; the doors are now held by Track O
+alone.
+
+`docs/privacy/processors.md:3` states that DPA + SCC are in effect for P1
+(Anthropic) and P4 (Resend), and that **P2 (Fly.io) has no executed DPA, no TIA,
+and no Art. 27 representative**. B-07 is therefore still open and the data
+policy remains synthetic-only. Every product flag is off by design.
+
+The three half-built Phase E surfaces this paragraph originally named are done:
+`channel_preferences` has a writer and a consumer (C4a/C4b), the
+`channel_bindings` challenge → verify lifecycle exists and is staged/published
+against the revision that authorizes it (C3/C3a/C3c), and the web chat runs on
+the household runtime's own model loop (C2). What remains is operator work —
+the legal pack, a release tag and restore drill, and the per-transition live
+batteries — then the staged flips the runbook already fixes.
 
 ## Track O — Operator/legal gates (cannot be delegated; block ALL real data)
 
 - [ ] **O1. Legal pack signatures (B-07, P0).** DPA 28(3) + SCC module 2 + TIA
-  for P1 Anthropic, P2 Fly.io, P4 Resend (`docs/privacy/processors.md` §§2–4,
-  every row ⏳ today); Art 9(2)(a) condition recorded by counsel;
+  for P1 Anthropic, P2 Fly.io, P4 Resend. **Partially executed as of
+  2026-08-30**: P1 and P4 carry ✅ DPA + ✅ SCC (incorporated by reference,
+  copies committed under `docs/privacy/vendor-dpas/`); **P2 Fly.io remains ⏳ on
+  all three**, and every TIA is still ⏳, as is the Art. 27 representative. The
+  Art 9(2)(a) condition was recorded by counsel 2026-08-12
+  (`docs/privacy/dpia.md` R7). Remaining for this box: the Fly.io DPA, the
+  TIAs, and the Art. 27 appointment;
   `processors.md` registry updated with dates ONLY AFTER signature (canon
   Phase A rule). Gate: nothing in Track R starts before this box is ticked.
 - [ ] **O2. Release tag + restore drill.** Zero git tags exist today. Tag the
@@ -51,7 +62,20 @@ already fixes.
 
 ## Track C — Code closure (synthetic-safe; ordered by dependency and leverage)
 
-True-state summary from the 2026-08-23 audit:
+True-state summary from the 2026-08-23 audit. **Every row below was closed
+between 2026-08-23 and 2026-08-29** by the slices listed against it; the table
+is kept as the record of what the audit found, not as current state:
+
+| Surface | Closed by |
+|---|---|
+| Cost caps | C1 — `budget_exceeded` emitted at all three uncapped call sites |
+| Observability | C1 + C4b — `budget_exceeded` and `primary_unavailable` now actually emitted |
+| Web chat | C2 — runtime model loop, CSRF, e2e tests |
+| Channel prefs | C4a + C4b — writer, fallback reference, consumer |
+| Channel bindings | C3 + C3a + C3c — challenge lifecycle, sender/chat split, staged/published |
+| Shared WA gateway | C5a–C5e — one signature, WAL reader, relay key, entrypoint, lookup |
+
+The original audit rows:
 
 | Surface | Storage/schema | Enforcement/runtime | Lifecycle/wiring | Verdict |
 |---|---|---|---|---|
@@ -64,7 +88,7 @@ True-state summary from the 2026-08-23 audit:
 
 Ordered slices:
 
-- [ ] **C1. Cap every model call; emit the alerts that exist.** *(TODAY)*
+- [x] **C1. Cap every model call; emit the alerts that exist.** *(TODAY)*
   `is_over_budget` guards only `pipeline.py:284`. The WhatsApp dialogue
   (`pipeline.py:443`), Telegram dialogue (`pipeline.py:566`) and web channel
   (`hermes_cloud/channels/web.py:44`) call the model unchecked and unrecorded.
@@ -73,14 +97,14 @@ Ordered slices:
   instead of a model call; web mirrors it; `budget_exceeded` becomes the first
   actually-emitted member of `hermes_cloud/core/observability.py::ALERTS`.
   Prove in `tests/test_cost_caps.py`.
-- [ ] **C2. Wire the web chat to a real model path.** Decide the seam first:
+- [x] **C2. Wire the web chat to a real model path.** Decide the seam first:
   `control_plane/api/web.py:306` asks for `active.web_loop` which nothing sets,
   and `control_plane/` deliberately never imports the runtime runner. Either
   the household runtime serves chat (WSGI route beside `/health`) or the
   control plane proxies to it — a small design pass, then implementation.
   Same pass: add the same-origin/CSRF checks every sibling form endpoint has
   (`api/web.py:35-67` vs the bare :261-275), and the authenticated e2e test.
-- [ ] **C3. The binding lifecycle.** Challenge → owner verification → row write
+- [x] **C3. The binding lifecycle.** Challenge → owner verification → row write
   with real `verified_at/verified_by_actor_id`; lift the `synthetic-`-only
   restriction on external IDs (`models.py:232-237`) per channel with format
   validation; second-adult binding flow (planner currently hardcodes
@@ -90,7 +114,7 @@ Ordered slices:
   slice and the reason is structural — see C3a below. What C3 delivers is the
   writer, the challenge lifecycle, and the manifest as a projection of the
   table.
-- [ ] **C3a. Separate a sender's identity from the chat it speaks in.**
+- [x] **C3a. Separate a sender's identity from the chat it speaks in.**
   *Design written 2026-08-27:
   `thoughts/shared/plans/2026-08-27-c3a-sender-identity-and-chat.md`.*
   `channel_bindings.external_id` answers two incompatible questions:
@@ -107,7 +131,7 @@ Ordered slices:
   projection, runtime manifest — moved together. Blocks the second adult on
   the primary channel; adults on other channels already work.
 
-- [ ] **C3b. Roll a revision out to an already-active household.**
+- [x] **C3b. Roll a revision out to an already-active household.**
   *Design written 2026-08-27:
   `thoughts/shared/plans/2026-08-27-c3b-revision-rollout.md`. Sequencing
   corrected there — C3b now waits on C3a, because its acceptance criterion
@@ -120,7 +144,7 @@ Ordered slices:
   — first-time semantics that a live household gaining a member should not
   inherit. Re-provisioning is its own lifecycle, not a copied block.
 
-- [ ] **C3c. A binding must not route before the revision that authorizes it.**
+- [x] **C3c. A binding must not route before the revision that authorizes it.**
   `gateway/whatsapp_router.py:113-116, 126-129` resolves a sender with no
   household or revision predicate, and `verify_challenge` commits the row
   immediately. So between the write and activation the gateway routes the new
@@ -132,7 +156,7 @@ Ordered slices:
   `BootstrapService.activate` publishes the revision, and a terminal rollback
   retires them. Its own slice because it is a lifecycle, not a predicate.
 
-- [ ] **C3e. A rollout is not terminal until a revision is active.** Two
+- [x] **C3e. A rollout is not terminal until a revision is active.** Two
   stranding paths this slice does NOT close, both found in review and both
   needing a lifecycle rather than a patch. (1) `_settle_runtime_ready` settles
   `succeeded` right after launch, so a runtime that never claims its token, or
@@ -146,7 +170,7 @@ Ordered slices:
   deliberately narrowed to pre-mutation failures so it never asserts what it
   cannot know.
 
-- [ ] **C3d. Tests that reach what they claim to cover.** Two C3b regressions
+- [x] **C3d. Tests that reach what they claim to cover.** Two C3b regressions
   assert the right things without touching the path they are named for. The
   rollout test calls the repository, planner and `schedule_runtime_rollout`
   directly, bypassing `verify_binding_challenge` — delete the endpoint's
@@ -176,7 +200,7 @@ Ordered slices:
   which is five plus the reconcile case. Every clause is then pinned by exactly
   one case.
 
-- [ ] **C4. Make preferences real.** Production write path (API/onboarding);
+- [x] **C4. Make preferences real.** Production write path (API/onboarding);
   consumer that routes replies/fallbacks; self-contained agent-inbox rejection
   (replace dead `_validate_no_self_ingestion`, persist the fallback ref);
   permanent-failure → short email fallback sender + `primary_unavailable`
@@ -185,7 +209,7 @@ Ordered slices:
   consumer answer different questions and the second is larger than the audit
   read.
 
-- [ ] **C4a. Give `channel_preferences` a writer, and a fallback it can check.**
+- [x] **C4a. Give `channel_preferences` a writer, and a fallback it can check.**
   The table has had a schema, CHECKs and an index since `0006` and no writer at
   all — `container.py` never even built the repository, so no code path could
   have written a row. Seeded now by `DesiredSpecPlanner.issue` from the same
@@ -202,7 +226,7 @@ Ordered slices:
   replaces `_validate_no_self_ingestion`, which read a row, described in
   comments what a real check would need, and returned None.
 
-- [ ] **C4b. The consumer, and the alert nobody emits.** Route replies and
+- [x] **C4b. The consumer, and the alert nobody emits.** Route replies and
   fallbacks through the preference; permanent-failure → short email fallback
   sender; emit `primary_unavailable` (`hermes_cloud/core/observability.py:106`
   — the label exists and nothing has ever emitted it, exactly as
@@ -210,7 +234,7 @@ Ordered slices:
   did not answer: the runtime reads a manifest, not the control plane's
   tables, so a preference reaches it either as a manifest projection — which
   makes changing one a revision, with C3b's rollout behind it — or not at all.
-- [ ] **C5. Gateway plumbing.** Redeliver-from-`gateway_ingress` worker (rows
+- [x] **C5. Gateway plumbing.** Redeliver-from-`gateway_ingress` worker (rows
   are written and never read back); HTTP entrypoint + narrow deploy unit;
   relay-key provisioning path.
 
@@ -229,7 +253,7 @@ Ordered slices:
 
   Remaining, as three slices:
 
-  - [ ] **C5b. The ingress WAL is read back.** `GatewayStore` persists before
+  - [x] **C5b. The ingress WAL is read back.** `GatewayStore` persists before
     ACK and deletes on delivery, and nothing between those ever reads a row —
     durability that was written and never spent. Also splits `hmac_rejected`,
     which answered four different questions and decided the row's fate by
@@ -264,7 +288,7 @@ Ordered slices:
     deliberately left uncalled rather than inventing a scheduler for a process
     that does not exist yet.
 
-- [ ] **C5a. One signature between the gateway and the runtime.** *Done — see
+- [x] **C5a. One signature between the gateway and the runtime.** *Done — see
   the inventory below.* `relay_hmac` signed `body|timestamp` and
   `verify_webhook` verified the bare body, so the runtime rejected every
   delivery the gateway signed and no WhatsApp message could reach a household
@@ -280,7 +304,31 @@ Ordered slices:
   `X-Relay-Timestamp` — which the gateway has always sent and this end never
   read, the reason the drift went unnoticed — verifies `body|timestamp`, and
   enforces the same replay window the gateway does.
-- [ ] **C6. Box hygiene.** Update `phase-DE-pilot.md` checkboxes to the audited
+- [x] **C6a. A successful activation is not a stale projection.** *Added to
+  this list 2026-08-30 — the slice merged as #96 with an inventory below but no
+  box, so the checklist could not show it.* `_runtime_projection_is_current`
+  required `household_status = 'provisioning'` and a workflow in
+  `{runtime_provisioning, activating}` — the exact pair that SUCCESSFUL
+  activation ends, so a job whose revision went live read as "not current".
+  Found while reviewing #86 and deliberately not patched there.
+- [x] **C6b. A retry path catches only the failures it is prepared for.**
+  *Added to this list 2026-08-30 — merged as #97, same reason.* Deferred out of
+  C6a, which said auditing it there would be a second change hiding inside the
+  first. Three defects in the C5 slices shared one shape: a broad `except`
+  around an operation with a RETRY POLICY turns a `NameError` or `TypeError`
+  into a silent, permanent retry — a programming error wearing a transient
+  error's clothes.
+- [x] **C6. Box hygiene.** *Done 2026-08-30.* `phase-DE-pilot.md` went from 12
+  open boxes to 3 (the two operator items and the CI-only gate box); its six
+  Phase E acceptance commands now name tests that exist; the flag box was
+  corrected from "six" to the four that survived #69/#70; and the stale
+  "expect 626+ / 215+" suite counts were replaced with the measured 1686. In
+  this file, thirteen merged slices were ticked, C6a/C6b gained the boxes they
+  never had, and the opening paragraph and audit table — both of which still
+  described the three half-built surfaces as current — were rewritten. In
+  `canon-execution-plan.md`, four wrong test paths were fixed and the A/E boxes
+  the evidence supports were closed. Original text: update
+  `phase-DE-pilot.md` checkboxes to the audited
   truth (several `[ ]` are done-but-renamed — e.g. flags boxes closed by #70,
   preferences storage landed in `control_plane/migrations/0006` not
   `hermes_cloud/core/migrations/0008`), so the acceptance commands name tests
