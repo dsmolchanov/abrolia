@@ -367,7 +367,7 @@ Ordered slices:
 
 **Files:** `tests/test_plan_commands.py`, `tests/test_check_fixtures.py`, `.gitignore`.
 
-**Branches:** `fix/plan-commands-and-web-binding-gate`, `fix/plan-guard-shell-spellings`.
+**Branches:** `fix/plan-commands-and-web-binding-gate`, `fix/plan-guard-shell-spellings`, `fix/plan-guard-narrow-contract`.
 
 Review on #101 found C6's own fix incomplete: the acceptance commands under
 boxes were corrected, the Cross-Phase block was not, and the commit asserted
@@ -422,6 +422,27 @@ not read one. `referenced_paths` is now a named function with its own
 parameterized tests over five spellings × missing file and directory, plus the
 no-false-positive and case-selector cases. A guard whose only coverage is the
 data it currently governs proves the data is clean, not that the guard works.
+
+**Round 4, 2026-08-31 — scope stated instead of chased, by operator decision.**
+Review found `shlex` keeps an operator attached to the word before it, so
+`pytest tests/x.py; echo done` tokenised as `tests/x.py;` and the guard reported
+an EXISTING file as missing. Correct, and the fourth round on one function.
+
+Two facts sized it: the failure is a false POSITIVE — the opposite direction
+from the class this guard exists to catch, and loud rather than silent — and
+there were zero such lines in any plan. The form every plan does use
+(`… 2>&1 | head`) parses correctly, because a space-separated redirection is its
+own word.
+
+So the guard stopped trying to be a shell. The supported form is now STATED —
+plan commands are space-separated — and an operator flush against a path is
+reported as the style error it is, naming the missing space rather than blaming
+a file that exists. Three rounds had each shaved one spelling and found another
+waiting; a bounded rule the plans already follow ends that, where a better
+parser would only have moved the edge.
+
+Pinned by five operators × the attached form, and by the space-separated forms
+the plans actually use, `2>&1` among them.
 
 #### Inventory — C1 + C2, with the O1 evidence they shipped beside
 
