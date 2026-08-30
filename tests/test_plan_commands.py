@@ -21,6 +21,17 @@ Scope is deliberately narrow: paths inside fenced blocks, which is where a
 reader finds something to paste. Prose and `**Files:**` inventories name files a
 plan INTENDS to create, and `tests/control_plane/test_plan_inventory.py` already
 governs those.
+
+**The contract: plan commands are space-separated.** This guard is not a shell,
+and three rounds of review were spent discovering that trying to be one has no
+end — each round shaved another spelling (`*.py` only, then unquoted only, then
+operators attached to a path) and the next was always waiting. So the scope is
+now stated rather than chased: an operator written flush against a path
+(`pytest tests/x.py; echo`) is reported as a STYLE error naming the fix, not
+parsed around. That converts an unbounded parsing problem into a bounded rule
+the plans already follow — there is no such line in any plan today — and keeps
+the guard's real job, catching stale paths, from drifting behind a shell parser
+nobody asked for.
 """
 
 from __future__ import annotations
@@ -37,6 +48,11 @@ PLANS = REPOSITORY / "thoughts" / "shared" / "plans"
 
 #: Directories this guard governs. A path argument under either must resolve.
 _GOVERNED = ("tests/", "scripts/")
+
+#: A governed path with a shell operator written flush against it, which
+#: `shlex` keeps attached to the word: `tests/x.py;` rather than `tests/x.py`.
+#: Reported as a style error, per the contract in the module docstring.
+_ATTACHED_OPERATOR = re.compile(r"(?:tests|scripts)/[\w./-]*[;|&<>()]")
 
 
 def referenced_paths(line: str) -> list[str]:
@@ -101,10 +117,22 @@ def test_every_referenced_path_in_a_plan_command_exists(plan: Path) -> None:
     half, because pytest answers "no tests ran" rather than an error.
     """
     broken: list[str] = []
+    unreadable: list[str] = []
     for number, line in _command_lines(plan):
+        # Checked BEFORE parsing: an attached operator makes the token
+        # unreadable, and reporting "tests/x.py; does not exist" would send the
+        # author looking for a missing file instead of a missing space.
+        if _ATTACHED_OPERATOR.search(line):
+            unreadable.append(f"{plan.name}:{number}: {line.strip()}")
+            continue
         for reference in referenced_paths(line):
             if not (REPOSITORY / reference).exists():
                 broken.append(f"{plan.name}:{number}: {reference}")
+    assert not unreadable, (
+        "plan commands are space-separated (see this module's docstring). Put a "
+        "space before `;` `|` `&` `>` `<` so the path can be read:\n  "
+        + "\n  ".join(unreadable)
+    )
     assert not broken, (
         "plan command blocks name paths that do not exist, so these gates exit "
         "without running anything:\n  " + "\n  ".join(broken)
@@ -210,3 +238,61 @@ def test_an_unbalanced_quote_falls_back_instead_of_failing_the_plan() -> None:
     assert referenced_paths('echo "tests/test_plan_commands.py') == [
         "tests/test_plan_commands.py"
     ]
+
+
+# --------------------------------------------------------------------------
+# The contract: space-separated commands, and a style error when they are not.
+#
+# Round four of review found that `shlex` keeps an operator attached to the
+# word before it, so `pytest tests/x.py; echo done` tokenised as
+# `tests/x.py;` and the guard reported an existing file as missing. Rather than
+# teach this module more shell — the previous three rounds each shaved one
+# spelling and found another waiting — the supported form is now stated, and a
+# violation is reported as what it is.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "operator", [";", "|", "&", ">", "<"], ids=["semicolon", "pipe", "amp", "gt", "lt"]
+)
+def test_an_operator_flush_against_a_path_is_a_style_error_not_a_missing_file(
+    operator: str, tmp_path: Path
+) -> None:
+    """The author is told to add a space, not sent hunting for a missing file."""
+    plan = tmp_path / "plan.md"
+    plan.write_text(
+        f"```bash\npytest tests/test_plan_commands.py{operator}cat\n```\n",
+        encoding="utf-8",
+    )
+    lines = [line for _, line in _command_lines(plan)]
+    assert lines, "the fixture must produce a command line"
+    assert _ATTACHED_OPERATOR.search(lines[0]), (
+        f"an operator flush against a path ({operator!r}) must be caught before "
+        "the path is parsed, or the guard blames a file that exists"
+    )
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "pytest tests/test_plan_commands.py ; echo done",
+        "pytest tests/test_plan_commands.py | cat",
+        "pytest tests/test_plan_commands.py 2>&1 | head",
+        'pytest -p no:cacheprovider -m "not live" -q',
+        "pytest tests/control_plane -q && ruff check .",
+    ],
+    ids=["semicolon", "pipe", "redirect-then-pipe", "marker", "and-then"],
+)
+def test_the_space_separated_forms_the_plans_actually_use_are_accepted(
+    line: str,
+) -> None:
+    """The contract must not reject what every plan already writes.
+
+    `2>&1` is the case worth pinning: the redirection is its own word, so it is
+    space-separated and legal, and only a path with the operator glued to it is
+    a violation.
+    """
+    assert not _ATTACHED_OPERATOR.search(line), (
+        "this is an ordinary space-separated command and must not be reported "
+        "as a style error"
+    )
