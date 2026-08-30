@@ -20,8 +20,11 @@ green in `thoughts/shared/implementations/2026-08-23-canon-execution-plan-valida
 
 ## Why the doors are still locked (the one-paragraph version)
 
-**Updated 2026-08-30, corrected 2026-08-31.** Track C is closed **except C3f**;
-the doors are otherwise held by Track O alone. The first version of this line
+**Updated 2026-08-31.** Track C is closed; the doors are held by Track O alone.
+
+C3f closed the same day it was opened, and the correction that opened it stands
+as written below — the 2026-08-30 validation filed the web-binding gap as a nit
+and declared the track closed in the same pass, and review on #101 refused that. The first version of this line
 said Track C was closed outright, which review on #101 refused — correctly, and
 against evidence already in this repository: the 2026-08-30 validation report
 flagged the web-binding gap as unfinished canon scope in the same pass that
@@ -39,8 +42,7 @@ The three half-built Phase E surfaces this paragraph originally named are done:
 against the revision that authorizes it (C3/C3a/C3c), and the web chat runs on
 the household runtime's own model loop (C2). What remains is operator work —
 the legal pack, a release tag and restore drill, and the per-transition live
-batteries — plus C3f, the one code gap this table's closure claim glossed over.
-Then the staged flips the runbook already fixes.
+batteries — then the staged flips the runbook already fixes.
 
 ## Track O — Operator/legal gates (cannot be delegated; block ALL real data)
 
@@ -80,6 +82,7 @@ is kept as the record of what the audit found, not as current state:
 | Channel prefs | C4a + C4b — writer, fallback reference, consumer |
 | Channel bindings | C3 + C3a + C3c — challenge lifecycle, sender/chat split, staged/published |
 | Shared WA gateway | C5a–C5e — one signature, WAL reader, relay key, entrypoint, lookup |
+| Web bindings | C3f — the seat, the account mapping, and the role the runtime derives |
 
 The original audit rows:
 
@@ -206,7 +209,8 @@ Ordered slices:
   which is five plus the reconcile case. Every clause is then pinned by exactly
   one case.
 
-- [ ] **C3f. The web binding the runtime never reads.** *Opened 2026-08-31 by
+- [x] **C3f. The web binding the runtime never reads.** *Done 2026-08-31 —
+  `thoughts/shared/plans/2026-08-31-c3f-web-binding-runtime.md`.* *Opened 2026-08-31 by
   review on #101; the gap itself was recorded in the 2026-08-30 validation
   report and wrongly filed as a nit.* `web` is a first-class binding channel
   (`control_plane/repositories/bindings.py:94`, `models.py:260`) and the

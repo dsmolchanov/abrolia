@@ -19,9 +19,16 @@ class StubChatClient:
         self.reply = "готово"
         self.error: Exception | None = None
 
-    def send(self, runtime_ref: str, *, actor_id: str, role: str, text: str) -> dict[str, Any]:
+    def send(
+        self, runtime_ref: str, *, actor_id: str, chat_id: str, text: str
+    ) -> dict[str, Any]:
         self.calls.append(
-            {"runtime_ref": runtime_ref, "actor_id": actor_id, "role": role, "text": text}
+            {
+                "runtime_ref": runtime_ref,
+                "actor_id": actor_id,
+                "chat_id": chat_id,
+                "text": text,
+            }
         )
         if self.error is not None:
             raise self.error
@@ -33,6 +40,36 @@ def _attach_runtime(harness, household_id: str) -> None:
         connection.execute(
             "UPDATE households SET runtime_ref = ? WHERE id = ?",
             (VALID_REF, household_id),
+        )
+
+
+#: The actor and chat a seeded web seat carries, as the planner writes them.
+SEAT_ACTOR = "synthetic-owner.web"
+SEAT_CHAT = "web:synthetic-owner.web"
+
+
+def _publish_web_seat(harness, household_id: str, account_id: str) -> None:
+    """C3f: give this account a ROUTABLE web seat.
+
+    Published, not merely verified: `routable_web_seat` applies C3c's
+    predicate, so a staged seat is deliberately not reachable and a test that
+    forgot to publish one would otherwise look like a bug in the endpoint.
+    """
+    with harness.container.database.write() as connection:
+        connection.execute(
+            "INSERT INTO channel_bindings (id, household_id, channel, external_id,"
+            " chat_id, actor_id, role, verified_at, verified_by_actor_id,"
+            " published_revision, account_id)"
+            " VALUES (?, ?, 'web', ?, ?, ?, 'owner', 1, ?, 1, ?)",
+            (
+                f"seat-{account_id}",
+                household_id,
+                SEAT_ACTOR,
+                SEAT_CHAT,
+                SEAT_ACTOR,
+                SEAT_ACTOR,
+                account_id,
+            ),
         )
 
 
@@ -76,6 +113,7 @@ def test_web_message_proxies_to_household_runtime(api_harness) -> None:
     stub = StubChatClient()
     api_harness.container.web_chat = stub
     _attach_runtime(api_harness, world.household.id)
+    _publish_web_seat(api_harness, world.household.id, world.account.id)
 
     response = api_harness.client.post(
         "/api/web/message",
@@ -85,14 +123,21 @@ def test_web_message_proxies_to_household_runtime(api_harness) -> None:
 
     assert response.status_code == 200
     assert response.json() == {"reply": "готово", "status": "staged"}
+    # C3f: what crosses the boundary is the SEAT — the member's actor and the
+    # conversation they hold, both read from a published web binding. The
+    # account id and the role used to travel here, and the runtime believed
+    # both; it now derives the role from its own manifest.
     assert stub.calls == [
         {
             "runtime_ref": VALID_REF,
-            "actor_id": world.account.id,
-            "role": "owner",
+            "actor_id": SEAT_ACTOR,
+            "chat_id": SEAT_CHAT,
             "text": "собери повестку",
         }
     ]
+    assert world.account.id not in str(stub.calls), (
+        "the account id is the lookup key, not the runtime's idea of who spoke"
+    )
 
 
 def test_web_message_maps_boundary_errors_to_honest_unavailable(api_harness) -> None:
@@ -102,6 +147,7 @@ def test_web_message_maps_boundary_errors_to_honest_unavailable(api_harness) -> 
     stub.error = RuntimeBoundaryError("stub failure")
     api_harness.container.web_chat = stub
     _attach_runtime(api_harness, world.household.id)
+    _publish_web_seat(api_harness, world.household.id, world.account.id)
 
     response = api_harness.client.post(
         "/api/web/message", json={"text": "привет"}, headers=api_harness.mutation_headers
@@ -128,6 +174,7 @@ def test_the_role_fails_closed_when_membership_cannot_be_established(
     world = api_harness.create_principal()
     api_harness.authenticate(world)
     _attach_runtime(api_harness, world.household.id)
+    _publish_web_seat(api_harness, world.household.id, world.account.id)
     stub = StubChatClient()
     api_harness.container.web_chat = stub
 
@@ -178,6 +225,7 @@ def test_an_oversized_body_is_refused_before_it_is_parsed(api_harness) -> None:
     world = api_harness.create_principal()
     api_harness.authenticate(world)
     _attach_runtime(api_harness, world.household.id)
+    _publish_web_seat(api_harness, world.household.id, world.account.id)
     api_harness.container.web_chat = StubChatClient()
 
     huge = "я" * (200 * 1024)
@@ -201,15 +249,18 @@ def test_a_slow_runtime_does_not_stall_unrelated_requests(api_harness) -> None:
     world = api_harness.create_principal()
     api_harness.authenticate(world)
     _attach_runtime(api_harness, world.household.id)
+    _publish_web_seat(api_harness, world.household.id, world.account.id)
 
     release = threading.Event()
     entered = threading.Event()
 
     class BlockingChatClient(StubChatClient):
-        def send(self, runtime_ref, *, actor_id, role, text):
+        def send(self, runtime_ref, *, actor_id, chat_id, text):
             entered.set()
             assert release.wait(timeout=10), "the blocked call was never released"
-            return super().send(runtime_ref, actor_id=actor_id, role=role, text=text)
+            return super().send(
+                runtime_ref, actor_id=actor_id, chat_id=chat_id, text=text
+            )
 
     api_harness.container.web_chat = BlockingChatClient()
 
