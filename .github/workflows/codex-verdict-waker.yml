@@ -54,7 +54,7 @@ jobs:
     concurrency:
       group: codex-verdict-waker-${{ github.event.issue.number }}
       cancel-in-progress: true
-    uses: dsmolchanov/codex-review-gate/.github/workflows/codex-verdict-waker.yml@ca09ef98cf178bc1258a18ab806bc2d6f0e78cfe
+    uses: dsmolchanov/codex-review-gate/.github/workflows/codex-verdict-waker.yml@656910056514570ab1fe0c94c122d2cbfcb1bbb4
     permissions:
       # A called workflow's permissions cannot exceed its caller's, so the
       # re-run scope has to be granted here. Nothing else: the waker decides
