@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import base64
 import importlib.util
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -804,3 +806,46 @@ def test_shipped_email_fixture_is_synthetic() -> None:
     scannable = checker.read_scannable(fixture)
     assert scannable.opaque_parts == ()
     assert [f.render() for f in checker.scan_scannable(scannable, path=str(fixture))] == []
+
+
+# --------------------------------------------------------------------------
+# The two contexts the plans document, pinned so a plan cannot promise a
+# command that does not behave that way.
+#
+# Review on #102 caught a plan telling a developer to run
+# `--require-deny` locally with a comment claiming it "checks the public
+# sanitizer". It does not: without the private deny-list the flag REFUSES,
+# exiting 2 without scanning anything. Both plans now split the local and CI
+# invocations, and these two cases are what keep that split honest.
+# --------------------------------------------------------------------------
+
+
+def _run_sanitizer(*arguments: str) -> subprocess.CompletedProcess[str]:
+    """Run the sanitizer with the private deny-list definitively absent."""
+    repository = Path(__file__).resolve().parents[1]
+    environment = dict(os.environ)
+    environment.pop("HERMES_EXTRA_DENY_FILE", None)
+    return subprocess.run(
+        [sys.executable, "scripts/check_fixtures.py", *arguments],
+        cwd=repository,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_public_sanitizer_runs_locally_without_the_private_deny_list() -> None:
+    """The LOCAL command in the plans: exits 0 and actually scans."""
+    result = _run_sanitizer("--all")
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_require_deny_refuses_rather_than_degrading_without_the_deny_list() -> None:
+    """The CI command: a refusal, not a warning, and never a silent pass.
+
+    Exit 2 is the whole point — a gate that cannot enforce its rule must not
+    report success. If this ever becomes 0, the plans' CI-only note is wrong
+    and `--require-deny` has started passing without the list it exists for.
+    """
+    result = _run_sanitizer("--all", "--require-deny")
+    assert result.returncode == 2, result.stdout + result.stderr

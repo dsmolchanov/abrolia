@@ -166,7 +166,17 @@ No functional deviations. Four bookkeeping ones, and the first would bite:
 
 ### Potential Issues
 
-1. **A stale deferral: the runtime ignores web channel bindings.** `web` is a
+1. **A stale deferral: the runtime ignores web channel bindings.**
+   **Escalated 2026-08-31 by review on #101, and the escalation was right.**
+   This entry closed by calling the gap "not a security hole — it fails closed",
+   and then the same session wrote "Track C is closed" into the go-live
+   checklist. Those two statements cannot both stand: a promotion gated on the
+   second would ship with the canon-promised second-adult Web flow unusable.
+   The gap is also one step worse than described here — `api/web.py:322-329`
+   resolves the caller's REAL membership role and forwards it, so an `adult`
+   reaches `_web_chat` and is refused by role, rather than Web simply being
+   owner-only by omission. Now tracked as an OPEN slice, **C3f**, and the
+   closure claim is narrowed accordingly. Original text follows. `web` is a
    first-class binding channel (`repositories/bindings.py:94`,
    `models.py:260`, `provisioning/manifest.py:25`) and the manifest carries
    verified web bindings. But `hermes_cloud/runtime/service.py:669
@@ -358,3 +368,35 @@ and all nine rewritten acceptance commands are grouped by root and were re-run
 as written. A caution is recorded in `phase-DE-pilot.md` above the Cross-Phase
 Verification Commands. Worth fixing properly at the harness level rather than
 by convention, since the failure mode is silence.
+
+**2026-08-31 — review on #101 found two [BLOCKER]s, both mine.**
+
+The PR merged before the verdict landed (this repository carries the
+`review-lane-fast` topic, so green CI auto-merges and the Codex check posts
+findings without holding the merge). Both findings were correct and are fixed in
+a follow-up.
+
+1. **Stale verification targets survived the commit that claimed to fix them.**
+   I corrected the acceptance commands under boxes and then wrote a caution note
+   saying "every command in this plan ... was re-run as written", which was
+   false: `phase-DE-pilot.md`'s Cross-Phase block still named four nonexistent
+   Phase E files and a nonexistent `tests/test_config.py`, and Step F4 invoked
+   `python -m check_fixtures`, which has no module entry point. Two sibling
+   plans carried the same defect (`phase-A` the sanitizer line, `phase-C` three
+   BYO test files that were planned and never written — their coverage having
+   consolidated into `test_nerve_byo_domain.py`). Worth stating plainly: my own
+   scan missed these because it paired code fences with a non-greedy regex that
+   silently skipped regions, and I trusted its empty result over reading the
+   file.
+2. **"Track C is closed" contradicted this report's own Potential Issue 1.**
+   See the amended entry above.
+
+**The invariant, not the instances.** This defect class has now cost three
+passes — the checklist's `C6` box, canon's four wrong paths, and these. Per
+`AGENTS.md`, a class that keeps returning is a missing rule, so
+`tests/test_plan_commands.py` now asserts that every `tests/**`/`scripts/**`
+path and every `python -m` module inside a fenced plan block resolves. It was
+checked in both directions: reintroducing each of Codex's two defects makes it
+fail, naming the plan and line. The failure being silent is what earns it a
+test — `pytest missing_file.py` exits 4 and prints no test failures, so a gate
+that proves nothing still looks like it ran.

@@ -20,8 +20,13 @@ green in `thoughts/shared/implementations/2026-08-23-canon-execution-plan-valida
 
 ## Why the doors are still locked (the one-paragraph version)
 
-**Updated 2026-08-30.** Track C is closed; the doors are now held by Track O
-alone.
+**Updated 2026-08-30, corrected 2026-08-31.** Track C is closed **except C3f**;
+the doors are otherwise held by Track O alone. The first version of this line
+said Track C was closed outright, which review on #101 refused — correctly, and
+against evidence already in this repository: the 2026-08-30 validation report
+flagged the web-binding gap as unfinished canon scope in the same pass that
+declared the track closed. A promotion gated on that sentence would have shipped
+with the second adult unable to use Web at all.
 
 `docs/privacy/processors.md:3` states that DPA + SCC are in effect for P1
 (Anthropic) and P4 (Resend), and that **P2 (Fly.io) has no executed DPA, no TIA,
@@ -34,7 +39,8 @@ The three half-built Phase E surfaces this paragraph originally named are done:
 against the revision that authorizes it (C3/C3a/C3c), and the web chat runs on
 the household runtime's own model loop (C2). What remains is operator work —
 the legal pack, a release tag and restore drill, and the per-transition live
-batteries — then the staged flips the runbook already fixes.
+batteries — plus C3f, the one code gap this table's closure claim glossed over.
+Then the staged flips the runbook already fixes.
 
 ## Track O — Operator/legal gates (cannot be delegated; block ALL real data)
 
@@ -200,6 +206,29 @@ Ordered slices:
   which is five plus the reconcile case. Every clause is then pinned by exactly
   one case.
 
+- [ ] **C3f. The web binding the runtime never reads.** *Opened 2026-08-31 by
+  review on #101; the gap itself was recorded in the 2026-08-30 validation
+  report and wrongly filed as a nit.* `web` is a first-class binding channel
+  (`control_plane/repositories/bindings.py:94`, `models.py:260`) and the
+  manifest carries verified web bindings — but the runtime does not consume
+  them. `control_plane/api/web.py::web_message` resolves the caller's REAL
+  membership role and forwards it (`api/web.py:322-329`, and it fails closed
+  rather than defaulting to owner), while
+  `hermes_cloud/runtime/service.py::_web_chat` rejects every role but `owner`
+  and `web_chat_turn` hardcodes `manifest.actors.owner` with
+  `allowed_chats={"web-chat"}` instead of deriving the pair from the published
+  binding. So a verified adult Web binding is unusable end to end.
+
+  The comment at `runtime/service.py:655` defers this to "C3 ... when bindings
+  get a lifecycle" — a condition C3a and C3c satisfied, which is precisely how
+  the deferral came to read as current while being stale. Canon Phase E item 4
+  names Web among the channels whose binding derives `RunContext`, so this is
+  promised scope, not an enhancement.
+
+  Closes when the runtime derives the actor and chat from the published Web
+  binding and an owner/adult regression carries both roles through the whole
+  flow — or when the plan explicitly narrows Web to owner-only and says why.
+
 - [x] **C4. Make preferences real.** Production write path (API/onboarding);
   consumer that routes replies/fallbacks; self-contained agent-inbox rejection
   (replace dead `_validate_no_self_ingestion`, persist the fallback ref);
@@ -333,6 +362,46 @@ Ordered slices:
   preferences storage landed in `control_plane/migrations/0006` not
   `hermes_cloud/core/migrations/0008`), so the acceptance commands name tests
   that exist. Stale boxes mislead exactly like the retired flags did.
+
+#### Inventory — C6 the commands a plan tells you to run
+
+**Files:** `tests/test_plan_commands.py`, `tests/test_check_fixtures.py`, `.gitignore`.
+
+**Branches:** `fix/plan-commands-and-web-binding-gate`.
+
+Review on #101 found C6's own fix incomplete: the acceptance commands under
+boxes were corrected, the Cross-Phase block was not, and the commit asserted
+that every command had been re-run. Three plans carried the defect
+(`phase-DE-pilot` four Phase E files + `tests/test_config.py` + `python -m
+check_fixtures`, `phase-A` the same sanitizer line, `phase-C` three BYO test
+files planned and never written).
+
+Third occurrence of the class, so it is a rule rather than another fix:
+`tests/test_plan_commands.py` asserts every `tests/**`, `scripts/**` and
+`python -m` reference inside a fenced plan block resolves. Verified in both
+directions — reintroducing each defect fails the test with plan and line.
+
+The failure mode is why it is worth a test: `pytest a_missing_file.py` exits 4
+and prints no test failures, so a gate that proves nothing looks exactly like a
+gate that passed, and the box above it still gets ticked by whoever ran it.
+
+`.gitignore` gains `.DS_Store`, which a `git add -A` had swept into the commit.
+
+**Round 2, 2026-08-31.** Review found the guard itself half-built and one of the
+fixes dishonest, and both were the same mistake as the round before — asserting
+a command works without running it in the context the plan sends a reader to.
+
+* `_TEST_PATH` matched only `*.py`, so DIRECTORY targets were invisible.
+  `pytest tests/control_plane/email -k byo` is the form five plan commands use,
+  and a stale directory exits "no tests ran" — quieter than a stale file. The
+  guard now validates every `tests/**` and `scripts/**` argument, file or
+  directory, and the mutation case is a missing directory.
+* The sanitizer line was changed to a command that still cannot run locally:
+  `--require-deny` exits 2 without the private deny-list, which this same
+  session had documented twice. Both plans now split the LOCAL invocation
+  (`--all`, exits 0, actually scans) from the CI-only one, and
+  `tests/test_check_fixtures.py` pins both contexts so a plan cannot promise
+  behaviour the script does not have.
 
 #### Inventory — C1 + C2, with the O1 evidence they shipped beside
 

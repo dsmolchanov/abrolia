@@ -209,9 +209,13 @@ Each case must be recorded in the Phase 2 validation addendum `thoughts/shared/i
 
 ```bash
 pytest tests/control_plane/email -k byo -q
-pytest tests/control_plane/email/test_byo_reload_resume.py -q
-pytest tests/control_plane/email/test_byo_dns_advance.py -q
-pytest tests/control_plane/email/test_byo_domain_race.py -q
+# Path corrected 2026-08-31: the three files this block named were planned and
+# never created — the coverage consolidated into one module, and the commands
+# below exited 4 (file not found) rather than running anything.
+pytest tests/control_plane/email/test_nerve_byo_domain.py -q
+#   reload/resume  -> test_dns_records_resume_until_all_checks_are_active
+#   verified DNS   -> test_dns_status_polls_automatically_with_bounded_backoff
+#   domain race    -> test_same_normalized_domain_cannot_be_claimed_by_another_household
 ```
 
 Each hermetic test must prove the contract without a real Nerve (fake Nerve in `conftest.py`).
