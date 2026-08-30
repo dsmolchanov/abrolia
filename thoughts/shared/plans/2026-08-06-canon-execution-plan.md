@@ -120,7 +120,7 @@ Non-blocker debt: codex/phase-4-real-actions dirty file + untracked landing not 
 
 **Acceptance:**
 - [ ] Nerve PR with cross-org test green + `go test ./... -count=1`.
-- [ ] Abrolia `pytest tests/control_plane/email` proves crash-after-sink converges without operator, and hard-reclaim without sink stays `secret_handoff_unknown`.
+- [x] Abrolia `pytest tests/control_plane/email` proves crash-after-sink converges without operator, and hard-reclaim without sink stays `secret_handoff_unknown`.
   *Audited 2026-08-30 — half evidenced, and the box stays open for the other
   half.* The suite is green, and the SECOND clause is proven by name:
   `tests/control_plane/email/test_identity.py:478
@@ -133,6 +133,20 @@ Non-blocker debt: codex/phase-4-real-actions dirty file + untracked landing not 
   `test_db.py` (schema) and `test_provision_dry_run.py` (audit/export), never
   as a crash-after-sink convergence. Needs one regression, or a pointer to the
   one that exists.
+  *Closed 2026-08-30, same day.* The regression exists, in two halves, and both
+  were checked in the failing direction before being trusted:
+  `tests/control_plane/test_provisioning_jobs.py
+  ::test_reclaim_after_converged_sink_write_records_durable_receipt` (reconcile
+  converges from the live sink's `contains` and WRITES the receipt — breaking
+  the `INSERT` fails it) and
+  `::test_durable_receipt_alone_settles_reclaim_without_live_sink` (a receipt
+  row alone settles reclaim with the sink denying and `contains` never
+  consulted — deadening the lookup fails it). They live beside the
+  crash-window siblings in `test_provisioning_jobs.py`, not under
+  `tests/control_plane/email` as this line predicted, because that is where
+  the SIGKILL/reclaim harness is. The bare `except Exception` around the
+  receipt I/O flagged in the 2026-08-30 validation was narrowed to
+  `sqlite3.Error` in the same change (the C6b shape).
 
 #### C2 — BYO Domain Live (B-05)
 
