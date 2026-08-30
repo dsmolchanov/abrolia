@@ -282,7 +282,12 @@ Expected: `eu-strict` without `HERMES_VERTEX_EU_ENABLED` → `RuntimeError` / no
 pytest -p no:cacheprovider -m "not live" -q
 ruff check .
 gitleaks detect --no-git --source . 2>&1 | head
-python -m check_fixtures --all --require-deny  # private deny-list in CI; local run checks public sanitizer
+# Local: the public sanitizer. Exits 0 and is what a developer can actually run.
+python3 scripts/check_fixtures.py --all
+# CI ONLY: adds the private deny-list. Without HERMES_EXTRA_DENY_FILE this
+# REFUSES rather than degrading — exit 2, no scan — so it proves nothing locally.
+# Contract pinned by tests/test_check_fixtures.py::test_require_deny_*.
+python3 scripts/check_fixtures.py --all --require-deny
 ```
 
 ### Gate

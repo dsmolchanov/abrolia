@@ -734,7 +734,12 @@ Validate before any flag flip PR:
 git diff --check
 ruff check .
 gitleaks detect --no-git --source . 2>&1 | head
-python -m check_fixtures --all --require-deny  # private deny-list in CI
+# Local: the public sanitizer. Exits 0 and is what a developer can actually run.
+python3 scripts/check_fixtures.py --all
+# CI ONLY: adds the private deny-list. Without HERMES_EXTRA_DENY_FILE this
+# REFUSES rather than degrading — exit 2, no scan — so it proves nothing locally.
+# Contract pinned by tests/test_check_fixtures.py::test_require_deny_*.
+python3 scripts/check_fixtures.py --all --require-deny
 ```
 
 ### Phase F Acceptance Criteria
@@ -793,8 +798,16 @@ pytest -k eu_strict -q
 > `--import-mode=importlib`, and carries four duplicate basenames across the
 > two roots (`test_backup.py`, `test_db.py`, `test_runtime_dsar.py`,
 > `chaos_child.py`). Directory-based runs are unaffected — the full non-live
-> suite is green — and every command in this plan is grouped safely and was
-> re-run as written on 2026-08-30.
+> suite is green — and every command under an acceptance box is grouped safely
+> and was re-run as written on 2026-08-30.
+>
+> **Corrected 2026-08-31.** That sentence first said "every command in this
+> plan", which was false: it covered only the commands under boxes, and the
+> Cross-Phase block below still named four nonexistent Phase E files, a
+> nonexistent `tests/test_config.py`, and `python -m check_fixtures`, which
+> has no module entry point and exits `No module named check_fixtures`.
+> Found by review on #101. Every command in this file now resolves, and
+> `tests/test_plan_commands.py` is what keeps that true.
 
 ```bash
 # Full non-live suite (record counts in PR body — 1686 across 91 files at 2026-08-30)
@@ -804,13 +817,16 @@ pytest -p no:cacheprovider -m "not live" -q
 pytest tests/test_bundle.py tests/test_supersession.py tests/test_gcal.py tests/test_email_send.py tests/test_whatsapp.py tests/test_media_ingest.py tests/test_scheduler.py -q
 
 # Phase E pilotization
-pytest tests/test_onboarding.py tests/test_google_oauth.py tests/test_channel_preferences.py tests/test_channel_bindings.py tests/test_web_channel.py -q
+pytest tests/control_plane/test_onboarding_state.py tests/control_plane/email/test_google_oauth.py \
+  tests/control_plane/test_channel_preferences.py tests/control_plane/test_channel_bindings.py \
+  tests/control_plane/test_binding_api.py -q
+pytest tests/test_web_channel.py tests/test_runtime_web_chat.py tests/test_primary_unavailable.py -q
 
 # Provision dry-run smoke (operator)
 python -m control_plane.onboarding.provision --dry-run --household 00000000-0000-4000-a000-000000000001 2>&1 | head -n 80
 
 # Phase F gates
-pytest tests/test_config.py -k flag -q
+pytest tests/test_feature_flags.py -q
 pytest -k eu_strict -q
 ruff check .
 gitleaks detect --no-git --source . 2>&1 | head -n 20
