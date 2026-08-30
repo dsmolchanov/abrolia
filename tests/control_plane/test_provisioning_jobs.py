@@ -782,6 +782,127 @@ def test_secret_canary_is_confined_to_sink_across_sink_crash_and_public_surfaces
     assert canary not in log_stream.getvalue()
 
 
+def _email_job_stuck_outcome_unknown(cp_stack) -> tuple[dict, str]:
+    """An email job whose secret handoff died between the provider's answer
+    and any local record — the B-02 crash window."""
+    cp_stack.complete_profile()
+    cp_stack.service.select(
+        cp_stack.household.id,
+        StepKind.EMAIL,
+        EMAIL_SELECTION,
+        context=cp_stack.context(),
+        now=BASE_TIME + 2,
+    )
+    job = cp_stack.database.query_one(
+        "SELECT id, intent_key FROM provisioning_jobs WHERE kind = 'email_identity'"
+    )
+    identity_id = cp_stack.jobs.request(job["id"])["email_identity_id"]
+    crashed = DeterministicFakeProvisioner("email", behavior="unknown")
+    registry = ProviderRegistry()
+    registry.register("fake-email", crashed)
+    unknown = cp_stack.make_worker(providers=registry, now=BASE_TIME + 3).run_once()
+    assert unknown is not None and unknown.status == "outcome_unknown"
+    return job, identity_id
+
+
+def _handoff_already_settled_provider(
+    job: dict, identity_id: str
+) -> DeterministicFakeProvisioner:
+    """A provider whose reconcile answers: identity exists, one-time secret
+    already handed off — empty material, binding declared."""
+    provider = DeterministicFakeProvisioner("email")
+    provider.resources[job["intent_key"]] = ProvisionResult(
+        external_ref=f"synthetic-email:{identity_id}",
+        public_result={
+            "agent_inbox": "family-agent@" + "abrolia.com",
+            "provider": "synthetic",
+            "provider_refs": {"identity_id": identity_id},
+            "secret_binding_ref": SYNTHETIC_EMAIL_SECRET_BINDING,
+        },
+        secret_material=SecretMaterial(),
+    )
+    return provider
+
+
+def test_reclaim_after_converged_sink_write_records_durable_receipt(
+    cp_stack,
+) -> None:
+    """Canon C1's first proof (B-02): a crash after `SecretSink.write`
+    converges on reconcile without an operator — and the convergence writes
+    the `email_secret_installs` receipt the crashed process never got to."""
+    job, identity_id = _email_job_stuck_outcome_unknown(cp_stack)
+
+    contains_calls: list[tuple[str, str]] = []
+
+    class ConvergedSink(InMemorySecretSink):
+        # The prior process installed the secret before dying; only the live
+        # sink knows.
+        def contains(self, runtime_ref, name):
+            contains_calls.append((runtime_ref, name))
+            return name == SYNTHETIC_EMAIL_SECRET_BINDING
+
+    provider = _handoff_already_settled_provider(job, identity_id)
+    registry = ProviderRegistry()
+    registry.register("fake-email", provider)
+    assert cp_stack.database.query_one("SELECT 1 FROM email_secret_installs") is None
+
+    settled = cp_stack.make_worker(
+        providers=registry, secret_sink=ConvergedSink(), now=BASE_TIME + 5
+    ).reconcile(job["id"])
+
+    assert settled.status == "succeeded"
+    assert provider.ensure_calls == 0
+    assert contains_calls
+    receipt = cp_stack.database.query_one(
+        "SELECT * FROM email_secret_installs WHERE job_id = ?", (job["id"],)
+    )
+    assert receipt is not None
+    assert receipt["household_id"] == cp_stack.household.id
+    assert receipt["secret_name"] == SYNTHETIC_EMAIL_SECRET_BINDING
+    assert receipt["namespace_ref"] == contains_calls[0][0]
+
+
+def test_durable_receipt_alone_settles_reclaim_without_live_sink(cp_stack) -> None:
+    """The receipt's stated purpose is reclaim WITHOUT live inspection: once a
+    row exists, reconcile must settle from it even when the sink denies —
+    otherwise the durable half of B-02 proves nothing."""
+    job, identity_id = _email_job_stuck_outcome_unknown(cp_stack)
+
+    with cp_stack.database.write() as connection:
+        connection.execute(
+            "INSERT INTO email_secret_installs"
+            " (job_id, household_id, secret_name, namespace_ref, installed_at, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                job["id"],
+                cp_stack.household.id,
+                SYNTHETIC_EMAIL_SECRET_BINDING,
+                f"synthetic-runtime:{cp_stack.household.id}",
+                BASE_TIME + 3,
+                BASE_TIME + 3,
+            ),
+        )
+
+    contains_calls: list[tuple[str, str]] = []
+
+    class DeniedSink(InMemorySecretSink):
+        def contains(self, runtime_ref, name):
+            contains_calls.append((runtime_ref, name))
+            return False
+
+    provider = _handoff_already_settled_provider(job, identity_id)
+    registry = ProviderRegistry()
+    registry.register("fake-email", provider)
+
+    settled = cp_stack.make_worker(
+        providers=registry, secret_sink=DeniedSink(), now=BASE_TIME + 5
+    ).reconcile(job["id"])
+
+    assert settled.status == "succeeded"
+    assert provider.ensure_calls == 0
+    assert contains_calls == []
+
+
 def test_issued_runtime_job_rechecks_current_content_restriction_receipt(
     cp_stack,
 ) -> None:
