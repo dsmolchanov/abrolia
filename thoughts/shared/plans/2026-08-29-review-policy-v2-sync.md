@@ -18,9 +18,29 @@ invariant that still described the pre-reusable-gate contract.
 **Files:** `.github/workflows/codex-review-window.yml`, `AGENTS.md`,
 `CLAUDE.md`, `AGENTS.repo-invariants.md`.
 
-**Branches:** `chore/plaintalk-dev-agent-policy-v2`.
+Merged 2026-08-29; the branch name is reused by Step 2, which now carries the
+branch claim — exactly one step may claim a branch.
 
 Applied by `bootstrap-dsmolchanov-repo.sh --all` from dsmolchanov/dev-agent
 (see docs/architecture-plan.md there, "two review lanes" enhancement), plus a
 follow-up commit updating the stale merge-authorisation invariant to the v2
 contract.
+
+## Step 2 — gate v3: the verdict waker and the round cap (2026-08-30)
+
+The gate moved again (dsmolchanov/codex-review-gate v3, pin 6569100): it holds
+a runner ~2 minutes instead of 15 wherever a verdict waker is active — a Codex
+clean-summary comment re-runs the gate's PR-bound run, since a comment event
+alone can never satisfy the required check — and keeps the long window until
+the waker has merged here. Past the three-round budget the gate merges over
+open P1s and files them as one review-debt issue per PR (P0 blocks on every
+round), which is why the calling stub now grants `issues: write`, and
+`actions: read` for the waker probe.
+
+**Files:** `.github/workflows/codex-review-window.yml`,
+`.github/workflows/codex-verdict-waker.yml`.
+
+**Branches:** `chore/plaintalk-dev-agent-policy-v2`.
+
+Applied by `bootstrap-dsmolchanov-repo.sh --gate-only` from
+dsmolchanov/dev-agent; the two stubs pin the same revision in lockstep.
