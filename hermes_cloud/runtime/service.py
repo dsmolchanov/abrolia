@@ -86,6 +86,11 @@ from hermes_cloud.runtime.bootstrap import (
     state_matches_manifest,
 )
 
+#: The room every household's owner used before web bindings existed. Kept as
+#: a constant because the upgrade fallback below has to name exactly the value
+#: the pre-C3f runtime used, or an owner's web history moves on upgrade.
+LEGACY_OWNER_WEB_CHAT = "web-chat"
+
 
 class WebSeatDenied(Exception):
     """This actor/chat pair is not verified by the manifest being served.
@@ -712,19 +717,57 @@ class RuntimeService:
         # every turn to `manifest.actors.owner`, which is why a second adult
         # with a verified web binding could not speak at all and why the owner
         # was the only identity web could ever produce.
+        # Asked BEFORE the model call, not after: `build_run_context` answers an
+        # unverified pair with `ROLE_UNKNOWN` and no capabilities, which would
+        # spend a model turn to produce a reply that could do nothing.
+        allowed_chats = manifest.allowed_chats
+        verified = manifest.verified_actor_chat_pairs
+        if (actor_id, chat_id) not in verified:
+            # UPGRADE FALLBACK, and deliberately narrow.
+            #
+            # C3f made the manifest the authority for web, which is right — but
+            # a manifest is deployed at ACTIVATION, and every household that was
+            # already running had one built before web seats existed. Migration
+            # `0014` publishes a seat row for them, and the runtime could not
+            # see it: the control plane forwarded a pair no deployed manifest
+            # carried, so the 403 the migration set out to remove simply moved
+            # one layer down. Found in review on #107, after that PR claimed to
+            # have fixed it.
+            #
+            # The honest fix is a fleet-wide reconciliation that re-issues and
+            # ACTIVATES a revision per household, which is a lifecycle this code
+            # does not have. Until it does, the OWNER — and only the owner —
+            # keeps the web chat they had before C3f, on the room they had
+            # before it. Everyone else is refused, so the second-adult surface
+            # stays closed rather than being opened by accident.
+            #
+            # This is a bridge, not a design. It ends when every household's
+            # serving manifest carries its seat.
+            #
+            # Gated on the manifest carrying NO web binding at all, which is
+            # what "predates seats" actually means. Without that gate the
+            # bridge also caught a CURRENT manifest whose web binding simply
+            # did not match the pair being presented — control-plane drift —
+            # and answered it by rewriting the chat and granting owner
+            # capabilities, where the whole point of the pair is to fail closed
+            # on exactly that. Found in review on #109.
+            serves_web = any(
+                binding.channel == "web" and binding.verified
+                for binding in manifest.channel_bindings
+            )
+            if serves_web or actor_id != manifest.actors.owner:
+                raise WebSeatDenied(actor_id)
+            chat_id = LEGACY_OWNER_WEB_CHAT
+            allowed_chats = allowed_chats | {chat_id}
+            verified = verified | {(actor_id, chat_id)}
         household = Household(
             household_id=manifest.household_id,
             owner=manifest.actors.owner,
             family=frozenset(manifest.actors.family),
             guests=frozenset(manifest.actors.guests),
-            allowed_chats=manifest.allowed_chats,
-            verified_bindings=manifest.verified_actor_chat_pairs,
+            allowed_chats=allowed_chats,
+            verified_bindings=verified,
         )
-        # Asked BEFORE the model call, not after: `build_run_context` answers an
-        # unverified pair with `ROLE_UNKNOWN` and no capabilities, which would
-        # spend a model turn to produce a reply that could do nothing.
-        if (actor_id, chat_id) not in manifest.verified_actor_chat_pairs:
-            raise WebSeatDenied(actor_id)
         context = build_run_context(
             household=household,
             actor_id=actor_id,

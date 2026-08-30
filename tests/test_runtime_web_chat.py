@@ -386,3 +386,107 @@ def test_the_control_planes_payload_is_the_one_this_runtime_reads(
 
     assert status == 200, "the runtime could not read what the control plane sent"
     assert stub.calls[0][:3] == ("owner", WEB_ACTOR, WEB_CHAT)
+
+
+def _manifest_without_web() -> str:
+    """A manifest as it was built BEFORE web seats existed.
+
+    This is what every household already running carries: activation deployed
+    it, and no migration can change it.
+    """
+    body = _manifest_toml()
+    body = body[: body.index("config_sha256")] + body[
+        body.index("\n", body.index("config_sha256")) + 1 :
+    ]
+    body = body.replace(
+        '''[[channel_bindings]]
+channel = "web"
+actor_id = "synthetic-owner"
+chat_id = "web:synthetic-owner"
+verified = true
+
+''',
+        "",
+    )
+    digest = compute_config_sha256(body)
+    return body.replace(
+        "schema_version = 1\n",
+        f'schema_version = 1\nconfig_sha256 = "{digest}"\n',
+    )
+
+
+def test_an_upgraded_household_keeps_the_owners_web_chat(tmp_path: Path) -> None:
+    """The outage #107 claimed to close and did not.
+
+    `0014` publishes a seat row, and the runtime authorizes from its BOOTED
+    manifest — which, for a household that was already running, was built
+    before web seats existed. So the control plane forwarded a pair no deployed
+    manifest carried and the 403 moved one layer down instead of going away.
+
+    Until a fleet-wide reconciliation re-issues and activates a revision per
+    household, the owner keeps the chat they had, on the room they had.
+    """
+    service, _ = _active_runtime(tmp_path, manifest_toml=_manifest_without_web())
+    stub = StubLoop()
+    service._web_chat_loop = lambda database, config: stub
+
+    status, _payload = _chat(
+        service,
+        payload={"text": "привет", "actor_id": WEB_ACTOR, "chat_id": WEB_CHAT},
+    )
+
+    assert status == 200
+    role, actor, chat, _text = stub.calls[0]
+    # The room is the PRE-C3F one, not the seat's: an owner's web history must
+    # not move because an upgrade ran.
+    assert (role, actor, chat) == ("owner", WEB_ACTOR, "web-chat")
+
+
+def test_the_upgrade_fallback_does_not_open_web_to_anyone_else(
+    tmp_path: Path,
+) -> None:
+    """The fallback is a bridge for the OWNER, not an open door.
+
+    A household whose manifest predates web seats has no way to authorize a
+    second adult — that is exactly what the fleet reconciliation is for — so an
+    adult is refused here rather than admitted on the strength of the control
+    plane having asked.
+    """
+    service, _ = _active_runtime(tmp_path, manifest_toml=_manifest_without_web())
+    stub = StubLoop()
+    service._web_chat_loop = lambda database, config: stub
+
+    status, payload = _chat(
+        service,
+        payload={"text": "привет", "actor_id": "synthetic-adult-seat",
+                 "chat_id": "web:synthetic-adult-seat"},
+    )
+
+    assert status == 403
+    assert payload == {"status": "web_seat_not_authorized"}
+    assert stub.calls == []
+
+
+def test_a_modern_manifest_refuses_an_owner_presenting_the_wrong_room(
+    tmp_path: Path,
+) -> None:
+    """The bridge is for manifests that predate seats, not for drift.
+
+    A manifest that DOES carry a verified web binding has an exact pair to
+    check, and an owner arriving with a different one is precisely the case the
+    pair exists to refuse. Rewriting their chat to `web-chat` and granting owner
+    capabilities would answer drift by trusting the control plane, which is the
+    trust C3f removed. Found in review on #109.
+    """
+    service, _ = _active_runtime(tmp_path)  # fixture manifest HAS a web seat
+    stub = StubLoop()
+    service._web_chat_loop = lambda database, config: stub
+
+    status, payload = _chat(
+        service,
+        payload={"text": "привет", "actor_id": WEB_ACTOR, "chat_id": "web:elsewhere"},
+    )
+
+    assert status == 403
+    assert payload == {"status": "web_seat_not_authorized"}
+    assert stub.calls == []
