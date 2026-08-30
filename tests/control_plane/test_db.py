@@ -41,6 +41,7 @@ def test_migrations_are_ordered_and_idempotent(tmp_path: Path) -> None:
             "0011_channel_preference_fallback.sql",
             "0012_channel_binding_published.sql",
             "0013_channel_binding_account.sql",
+            "0014_backfill_web_seats.sql",
         ]
         assert database.migrate() == []
         assert database.pragma() == {
@@ -491,3 +492,107 @@ def test_the_rehearsal_does_not_leave_a_copy_of_the_database_behind(
     assert not work_dir.exists(), (
         "a copy of the control-plane database outlived the rehearsal"
     )
+
+
+def test_0014_gives_existing_households_the_web_seat_0013_assumed(
+    tmp_path: Path,
+) -> None:
+    """C3f round two: the upgrade path 0013 did not have.
+
+    0013 added the columns and the planner seeded a seat for households planned
+    AFTER it. Everything already running got neither, and `web_message`
+    requires one — so the upgrade turned working web chat into 403 for every
+    existing household. Nothing re-plans on upgrade
+    (`control_plane/provisioning/rollout.py` says so outright), which is why
+    "they will get one on their next revision" was a hope rather than a
+    migration.
+
+    Three shapes, one migration:
+
+    * `h1` — primary telegram, no web row at all. The common case.
+    * `h2` — primary WEB, whose row predates `account_id`, so the column is
+      NULL and `routable_web_seat` misses it.
+    * `h3` — never activated anything, and must NOT be given a seat: there is
+      no revision to publish it against and no onboarding result to derive it
+      from.
+    """
+    staged = tmp_path / "migrations"
+    staged.mkdir()
+    for script in sorted(MIGRATIONS_DIR.glob("*.sql")):
+        if script.name.startswith("0014"):
+            break
+        (staged / script.name).write_text(script.read_text(encoding="utf-8"))
+
+    database = ControlPlaneDatabase(tmp_path / "control-plane.db")
+    try:
+        database.migrate(staged)
+        with database.write() as connection:
+            for household, revision in (("h1", 3), ("h2", 2), ("h3", 0)):
+                connection.execute(
+                    "INSERT INTO households (id, slug, status, created_at,"
+                    " updated_at, current_config_revision) VALUES (?, ?,"
+                    " 'active', 1, 1, ?)",
+                    (household, f"hh-{household}", revision),
+                )
+                connection.execute(
+                    "INSERT INTO accounts (id, recovery_email_ciphertext,"
+                    " recovery_email_lookup_hmac, encryption_key_version, status,"
+                    " created_at, updated_at, email_verified_at) VALUES (?, X'00',"
+                    " ?, 'v1', 'active', 1, 1, 1)",
+                    (f"acct-{household}", f"hmac-{household}"),
+                )
+                connection.execute(
+                    "INSERT INTO household_memberships (account_id, household_id,"
+                    " role, status, created_at, accepted_at) VALUES (?, ?,"
+                    " 'owner', 'active', 1, 1)",
+                    (f"acct-{household}", household),
+                )
+            # h1 and h3: an owner binding on a gateway channel.
+            for household in ("h1", "h3"):
+                connection.execute(
+                    "INSERT INTO channel_bindings (id, household_id, channel,"
+                    " external_id, chat_id, actor_id, role, verified_at,"
+                    " verified_by_actor_id, published_revision) VALUES (?, ?,"
+                    " 'telegram', ?, ?, ?, 'owner', 5, ?, 1)",
+                    (
+                        f"b-{household}", household, f"actor-{household}",
+                        f"chat-{household}", f"actor-{household}",
+                        f"actor-{household}",
+                    ),
+                )
+            # h2: primary web, written before `account_id` existed.
+            connection.execute(
+                "INSERT INTO channel_bindings (id, household_id, channel,"
+                " external_id, chat_id, actor_id, role, verified_at,"
+                " verified_by_actor_id, published_revision, account_id) VALUES"
+                " ('b-h2', 'h2', 'web', 'actor-h2', 'web:actor-h2', 'actor-h2',"
+                " 'owner', 5, 'actor-h2', 2, NULL)"
+            )
+
+        assert database.migrate() == ["0014_backfill_web_seats.sql"]
+
+        seats = {
+            row["household_id"]: row
+            for row in database.query(
+                "SELECT household_id, actor_id, chat_id, account_id,"
+                " published_revision FROM channel_bindings WHERE channel = 'web'"
+            )
+        }
+
+        # h1 gained a seat, ROUTABLE against the revision it is serving —
+        # staged would have left exactly the 403 this migration removes.
+        assert seats["h1"]["account_id"] == "acct-h1"
+        assert seats["h1"]["actor_id"] == "actor-h1"
+        assert seats["h1"]["chat_id"] == "web:actor-h1"
+        assert seats["h1"]["published_revision"] == 3
+
+        # h2 kept its row and its room, and gained the account it was missing.
+        assert seats["h2"]["account_id"] == "acct-h2"
+        assert seats["h2"]["chat_id"] == "web:actor-h2"
+
+        # h3 has activated nothing, so there is no revision to publish a seat
+        # against. Giving it one would assert something untrue about what is
+        # serving.
+        assert "h3" not in seats
+    finally:
+        database.close()

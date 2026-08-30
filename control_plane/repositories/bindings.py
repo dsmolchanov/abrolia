@@ -395,6 +395,12 @@ class ChannelBindingsRepository(Repository):
             and existing["role"] == "owner"
             and existing["actor_id"] == actor_id
             and existing["chat_id"] == chat_id
+            # C3f: and the same ACCOUNT. Without this a primary-web row written
+            # before `account_id` existed read as "the same owner state" on
+            # every plan, so the column stayed NULL and the seat lookup never
+            # found it — the household kept its 403 through any number of
+            # revisions. Found in review on #106.
+            and existing["account_id"] == account_id
         ):
             # Genuinely the same owner state: nothing to reconcile, and
             # nothing to invalidate. An earlier revision of this method also
@@ -474,14 +480,26 @@ class ChannelBindingsRepository(Repository):
         why a separate web actor would demote the owner on web.
         """
         now = time.time() if now is None else now
-        external_id, chat_id, actor_id = self._canonical_pair(
-            "web", external_id=actor_id, chat_id=chat_id, actor_id=actor_id
-        )
         existing = connection.execute(
             "SELECT * FROM channel_bindings WHERE household_id = ?"
             " AND channel = 'web' AND role = 'owner' ORDER BY verified_at, id",
             (household_id,),
         ).fetchall()
+        # The ROOM IS DURABLE. `chat_id` is only ever minted for a seat that
+        # does not exist yet; an existing seat keeps the conversation it has.
+        #
+        # It used to be recomputed from the actor on every plan, which coupled
+        # the web room to the PRIMARY channel's sender: an owner re-running the
+        # primary-channel step onto a new Telegram account silently renamed a
+        # web conversation that nothing had re-verified, moving every
+        # `RunContext.chat_id` consumer with it. Found in review on #106. A
+        # conversation identity is a durable fact about a room, not a
+        # projection of whoever currently speaks in another one.
+        seat = existing[0] if existing else None
+        chat_id = str(seat["chat_id"]) if seat is not None else chat_id
+        external_id, chat_id, actor_id = self._canonical_pair(
+            "web", external_id=actor_id, chat_id=chat_id, actor_id=actor_id
+        )
         for row in existing:
             if (
                 row["actor_id"] == actor_id

@@ -2878,3 +2878,44 @@ def test_the_upgrade_path_repairs_a_pre_key_database_before_strict_lookup(
     assert gateway.route(
         sender, "whatsapp", timestamp=str(int(now))
     ).household_id == cp_stack.household.id, "the household stayed dark after the repair"
+
+
+def test_rotating_the_primary_actor_leaves_the_web_room_alone(cp_stack) -> None:
+    """C3f round two: a web conversation is not a projection of another channel.
+
+    `web_seat_chat_id` derived the room from the owner's actor and the planner
+    recomputed it on every plan, so re-running the primary-channel step onto a
+    new Telegram account silently RENAMED a web conversation that nothing had
+    re-verified — moving every `RunContext.chat_id` consumer with it. Found in
+    review on #106.
+
+    The room is minted once and kept. Only a seat that does not exist yet gets
+    a new one.
+    """
+    _provisioned(cp_stack)
+    before = cp_stack.database.query_one(
+        "SELECT chat_id, actor_id FROM channel_bindings"
+        " WHERE household_id = ? AND channel = 'web'",
+        (cp_stack.household.id,),
+    )
+
+    rotated = "synthetic-owner.rotated"
+    with cp_stack.database.write() as connection:
+        cp_stack.bindings.ensure_owner_web_seat(
+            connection,
+            household_id=cp_stack.household.id,
+            actor_id=rotated,
+            chat_id=web_seat_chat_id(rotated),
+            account_id=cp_stack.account.id,
+        )
+        after = connection.execute(
+            "SELECT chat_id, actor_id FROM channel_bindings"
+            " WHERE household_id = ? AND channel = 'web'",
+            (cp_stack.household.id,),
+        ).fetchone()
+
+    assert after["actor_id"] == rotated, "the seat follows the owner's actor"
+    assert after["chat_id"] == before["chat_id"], (
+        "the room is durable — renaming it would move a conversation nothing "
+        "re-verified"
+    )

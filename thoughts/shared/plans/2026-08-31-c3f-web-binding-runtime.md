@@ -125,8 +125,12 @@ account (authenticated session)
 `tests/control_plane/test_channel_bindings.py`,
 `tests/control_plane/test_bootstrap.py` — every household now stages TWO
 bindings, the primary and the seat, and the activation-scoping case counts them.
+Round 2 adds: `control_plane/migrations/0014_backfill_web_seats.sql`,
+`control_plane/privacy/export.py`, `control_plane/api/bindings.py`,
+`tests/control_plane/test_db.py`, `tests/control_plane/test_binding_api.py`,
+`tests/control_plane/test_export_delete.py`.
 
-**Branches:** `feat/c3f-web-binding-runtime`.
+**Branches:** `feat/c3f-web-binding-runtime`, `fix/c3f-seat-continuity-and-upgrade`.
 
 ## Acceptance
 
@@ -147,3 +151,38 @@ bindings, the primary and the seat, and the activation-scoping case counts them.
       together, so the two ends cannot drift as they did in C5a.
       (`test_the_control_planes_payload_is_the_one_this_runtime_reads`, checked
       in both directions: renaming `chat_id` on the client fails it.)
+
+## Round 2, 2026-08-31 — four blockers, and one of them was already live
+
+Review on #106 found four, all correct. The first was a REGRESSION on `main`
+rather than an omission, which is worth stating plainly: this slice shipped
+something that broke working software.
+
+1. **Existing households got 403.** `0013` added columns and the planner seeded
+   a seat for households planned after it; everything already running got
+   neither, and `web_message` requires one. The plan said they would "regain web
+   on their next revision through the C3b rollout" — but nothing re-plans on
+   upgrade, as `provisioning/rollout.py` states outright, so that was a hope and
+   not a migration path. `0014` backfills: a seat for households with none, and
+   the missing account for primary-web rows written before the column existed.
+   Published against the revision each household is already serving, because a
+   staged backfill would leave exactly the 403 it exists to remove.
+2. **The web room was a projection of another channel.** `web_seat_chat_id`
+   derived it from the owner's actor and the planner recomputed it every plan,
+   so re-running the primary-channel step onto a new Telegram account silently
+   renamed a web conversation nothing had re-verified. The room is now minted
+   once and kept; only a seat that does not exist yet gets a new one.
+3. **The API could not create an adult's seat.** `issue_challenge` began
+   requiring `account_id` and the only product caller neither accepted nor
+   passed it, so every attempt answered 409 — the feature's headline capability
+   was unreachable in production while its repository half was green. That is
+   the specific reason the new regression goes through the endpoint.
+4. **The export omitted the seat's account.** `account_id` is the mapping that
+   says which member holds a seat; a household with two adults could not answer
+   "which of these is mine" from its own subject access export.
+
+**What connects 1 and 3:** both are the same mistake, which is worth naming
+rather than fixing twice. Each layer was correct and tested in isolation — the
+repository enforced the rule, the planner seeded the seat — and neither
+question "who calls this, and what happens to the callers that already exist"
+was asked. C5a is the same shape one layer down.
