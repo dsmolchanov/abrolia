@@ -93,6 +93,26 @@ CHALLENGE_ROLES = ("adult",)
 
 CHANNELS = ("telegram", "whatsapp", "web")
 
+
+def web_seat_chat_id(actor_id: str) -> str:
+    """The conversation a member holds on the web channel.
+
+    Per MEMBER, not per household: two adults on web are two conversations, and
+    `RunContext.chat_id` is what scopes a turn and what `knows_binding`
+    compares. Sharing one value would put both members in the same room and
+    make either indistinguishable from the other at the point authorization is
+    decided.
+
+    Derived from the ACTOR rather than the account, and that is not a detail.
+    The first version returned `web:{account_id}` and
+    `test_verified_inputs_create_encrypted_account_free_manifest` caught it
+    immediately: chat ids are projected into the manifest, which is deliberately
+    account-free, so keying on the account would have published an account
+    identifier to every runtime. The actor is already in the manifest as
+    `actors.owner`, so deriving from it adds no information that was not there.
+    """
+    return f"web:{actor_id}"
+
 #: How many challenges a household may have outstanding at once, and how many
 #: members it may bind. Both are bounds on a collection an authenticated owner
 #: can grow one request at a time: every issued challenge is a stored row, and
@@ -249,6 +269,46 @@ class ChannelBindingsRepository(Repository):
         ).fetchone()
         return None if row is None else str(row["actor_id"])
 
+    def routable_web_seat(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        household_id: str,
+        account_id: str,
+    ) -> tuple[str, str] | None:
+        """The `(actor_id, chat_id)` this ACCOUNT speaks as on web, or `None`.
+
+        Web has no gateway and therefore no self-identifying sender: the turn
+        arrives on an authenticated session, so the account is the only identity
+        in hand. `account_id` (migration `0013`) carries that mapping, leaving
+        `external_id` and `actor_id` meaning what they mean on every other
+        channel — the person's own identity.
+
+        Reading the ACCOUNT out of `external_id` was this slice's first design
+        and it is why `_insert` is worth re-reading before adding a channel:
+        `_reject_actor_that_is_not_the_sender` would have forced
+        `actor_id = account_id` too, giving the owner a second actor identity
+        and downgrading them to `ROLE_FAMILY` on web.
+
+        `published_revision IS NOT NULL` is C3c's routability predicate, the
+        same one `resolve_sender` applies at the gateway. A seat verified while
+        a rollout is still in flight is NOT routable: the runtime is serving the
+        previous revision, whose manifest has no pair for it, so admitting the
+        turn would produce a denial the member cannot see the reason for.
+
+        `None` is a refusal to guess, and every caller must treat it as one.
+        """
+        row = connection.execute(
+            "SELECT actor_id, chat_id FROM channel_bindings"
+            " WHERE household_id = ? AND channel = 'web' AND account_id = ?"
+            "   AND published_revision IS NOT NULL"
+            " ORDER BY verified_at, id LIMIT 1",
+            (household_id, account_id),
+        ).fetchone()
+        if row is None or row["chat_id"] is None:
+            return None
+        return str(row["actor_id"]), str(row["chat_id"])
+
     @staticmethod
     def _record(row: sqlite3.Row) -> BindingRecord:
         chat_id = row["chat_id"]
@@ -287,6 +347,7 @@ class ChannelBindingsRepository(Repository):
         external_id: str,
         chat_id: str,
         actor_id: str,
+        account_id: str | None = None,
         now: float | None = None,
     ) -> BindingRecord:
         """Make `channel_bindings` match the authoritative owner state.
@@ -380,6 +441,72 @@ class ChannelBindingsRepository(Repository):
             role="owner",
             verified_at=now,
             verified_by_actor_id=actor_id,
+            account_id=account_id,
+        )
+
+    def ensure_owner_web_seat(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        household_id: str,
+        actor_id: str,
+        chat_id: str,
+        account_id: str,
+        now: float | None = None,
+    ) -> BindingRecord:
+        """The owner's WEB seat, reconciled without disturbing anything else.
+
+        Deliberately NOT `ensure_owner_binding`. That method calls
+        `_retire_superseded`, which deletes every owner row and every
+        outstanding challenge — correct for re-running the primary-channel
+        step, and destructive here: calling it a second time for the web seat
+        wiped the primary binding that had just been written, and the manifest
+        refused the revision with "primary channel needs a verified binding".
+        Reproduced before this method existed.
+
+        Order is what makes the pair correct. The planner reconciles the
+        primary FIRST, so a genuine owner reset retires the old web seat along
+        with everything else, and this call then re-establishes it from the same
+        authoritative account. A seat is therefore never older than the owner
+        state it belongs to.
+
+        The seat is bound under the owner's own `actor_id` — see the planner for
+        why a separate web actor would demote the owner on web.
+        """
+        now = time.time() if now is None else now
+        external_id, chat_id, actor_id = self._canonical_pair(
+            "web", external_id=actor_id, chat_id=chat_id, actor_id=actor_id
+        )
+        existing = connection.execute(
+            "SELECT * FROM channel_bindings WHERE household_id = ?"
+            " AND channel = 'web' AND role = 'owner' ORDER BY verified_at, id",
+            (household_id,),
+        ).fetchall()
+        for row in existing:
+            if (
+                row["actor_id"] == actor_id
+                and row["chat_id"] == chat_id
+                and row["account_id"] == account_id
+            ):
+                # Same seat: the planner runs on every revision, and a second
+                # revision must not depend on whether a first one ran.
+                return self._record(row)
+        connection.execute(
+            "DELETE FROM channel_bindings WHERE household_id = ?"
+            " AND channel = 'web' AND role = 'owner'",
+            (household_id,),
+        )
+        return self._insert(
+            connection,
+            household_id=household_id,
+            channel="web",
+            external_id=external_id,
+            chat_id=chat_id,
+            actor_id=actor_id,
+            role="owner",
+            verified_at=now,
+            verified_by_actor_id=actor_id,
+            account_id=account_id,
         )
 
     @staticmethod
@@ -503,6 +630,7 @@ class ChannelBindingsRepository(Repository):
         role: str,
         issued_by_actor_id: str,
         chat_id: str,
+        account_id: str | None = None,
         now: float | None = None,
         ttl_seconds: float = CHALLENGE_TTL_SECONDS,
     ) -> IssuedChallenge:
@@ -570,6 +698,35 @@ class ChannelBindingsRepository(Repository):
                 if self._as_identity(channel, held["actor_id"]) == actor_id
                 else "this channel is already bound to another member"
             )
+        # C3f. Web has no gateway, so a seat is reached through an ACCOUNT
+        # rather than a self-identifying sender, and the owner names which
+        # member they are inviting. Required there and refused everywhere else:
+        # a Telegram or WhatsApp binding that carried an account would imply a
+        # mapping nothing reads, and an unread field is how the retired flags
+        # came to gate nothing.
+        if channel == "web":
+            if not account_id:
+                raise BindingError(
+                    "a web binding needs the account it belongs to — web has no"
+                    " sender to identify the member by"
+                )
+            member = connection.execute(
+                "SELECT 1 FROM household_memberships"
+                " WHERE household_id = ? AND account_id = ? AND status = 'active'",
+                (household_id, account_id),
+            ).fetchone()
+            # An account that is not an active member cannot be given a seat.
+            # The seat is what authorizes a turn, so accepting one here would
+            # let an owner hand household capabilities to any account id they
+            # could type.
+            if member is None:
+                raise BindingError(
+                    "that account is not an active member of this household"
+                )
+        elif account_id:
+            raise BindingError(
+                f"a {channel} binding is identified by its sender, not an account"
+            )
         open_challenges = connection.execute(
             "SELECT COUNT(*) AS total FROM channel_binding_challenges"
             " WHERE household_id = ? AND consumed_at IS NULL AND expires_at > ?",
@@ -582,8 +739,9 @@ class ChannelBindingsRepository(Repository):
         connection.execute(
             "INSERT INTO channel_binding_challenges (id, household_id, channel,"
             " external_id, chat_id, actor_id, role, code_hash,"
-            " issued_by_actor_id, expires_at, attempts, consumed_at, created_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?)",
+            " issued_by_actor_id, expires_at, attempts, consumed_at, created_at,"
+            " account_id)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?)",
             (
                 row_id,
                 household_id,
@@ -596,6 +754,7 @@ class ChannelBindingsRepository(Repository):
                 issued_by_actor_id,
                 now + ttl_seconds,
                 now,
+                account_id,
             ),
         )
         record = ChallengeRecord(
@@ -702,6 +861,10 @@ class ChannelBindingsRepository(Repository):
             role=row["role"],
             verified_at=now,
             verified_by_actor_id=owner_actor_id,
+            # The seat's account comes from the CHALLENGE, not from whoever is
+            # redeeming: the owner redeems on the member's behalf, so the
+            # principal here is the wrong person by construction.
+            account_id=row["account_id"],
         )
 
     # --- internals -------------------------------------------------------
@@ -868,6 +1031,7 @@ class ChannelBindingsRepository(Repository):
         role: str,
         verified_at: float,
         verified_by_actor_id: str,
+        account_id: str | None = None,
     ) -> BindingRecord:
         # Every write passes here, so the identity invariant is checked here as
         # well as at issue time. `issue_challenge` refuses early so that nobody
@@ -901,10 +1065,14 @@ class ChannelBindingsRepository(Repository):
             # publishes that revision. Writing it routable here is the defect
             # C3c exists to close: the runtime still serving N-1 has no pair
             # for this member, so their traffic would arrive and be denied.
+            # `account_id` is C3f and is NULL on every channel that has a
+            # gateway: there the sender identifies itself and no account is
+            # involved. Web has no gateway, so the seat records which account
+            # speaks through it.
             "INSERT INTO channel_bindings (id, household_id, channel, external_id,"
             " chat_id, external_id_hmac, actor_id, role, verified_at,"
-            " verified_by_actor_id, published_revision)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+            " verified_by_actor_id, published_revision, account_id)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)",
             (
                 row_id,
                 household_id,
@@ -916,6 +1084,7 @@ class ChannelBindingsRepository(Repository):
                 role,
                 verified_at,
                 verified_by_actor_id,
+                account_id,
             ),
         )
         return BindingRecord(

@@ -311,10 +311,16 @@ async def web_message(
     household_rec = active.households.current_for_account(principal.account_id)
     # Authorization FAILS CLOSED. This defaulted to "owner" — so a database
     # error, or a membership row removed between the household lookup and this
-    # one, handed the caller the owner role. The runtime maps that role onto
-    # `manifest.actors.owner`, whose tools include data export and deletion, so
-    # the default granted the most power at exactly the moment authorization
-    # could not be established. An unavailable answer is not an affirmative one.
+    # one, handed the caller the owner role — and the runtime then mapped that
+    # role onto `manifest.actors.owner`, whose tools include data export and
+    # deletion, so the default granted the most power at exactly the moment
+    # authorization could not be established. An unavailable answer is not an
+    # affirmative one.
+    #
+    # C3f removed the second half of that: no role travels any more, and the
+    # runtime derives one from its own manifest. This check stays because it
+    # answers a different question — whether the caller is a member here at
+    # all — which the seat lookup below assumes rather than establishes.
     rows = active.database.query(
         "SELECT account_id, role FROM household_memberships"
         " WHERE household_id = ? AND status='active'",
@@ -332,6 +338,27 @@ async def web_message(
             http_status.HTTP_503_SERVICE_UNAVAILABLE,
             "assistant runtime is not provisioned",
         )
+    # C3f. The membership check above establishes that this account belongs to
+    # the household; it does not establish WHO the runtime should attribute the
+    # turn to. That comes from the account's own published web binding, and
+    # nothing else in this request can supply it: `actor_id` used to be the
+    # account id and `role` a string this side computed, and the runtime
+    # believed both.
+    #
+    # `routable_web_seat` applies C3c's routability predicate, so a seat
+    # verified while a rollout is still in flight is refused here rather than
+    # arriving at a runtime whose manifest has no pair for it.
+    seat = active.bindings.routable_web_seat(
+        active.database.connection,
+        household_id=household_rec.id,
+        account_id=principal.account_id,
+    )
+    if seat is None:
+        raise HTTPException(
+            http_status.HTTP_403_FORBIDDEN,
+            "this account has no web seat in the active revision",
+        )
+    seat_actor_id, seat_chat_id = seat
     from control_plane.privacy.runtime import RuntimeBoundaryError
 
     try:
@@ -343,8 +370,8 @@ async def web_message(
             partial(
                 active.web_chat.send,
                 household_rec.runtime_ref,
-                actor_id=principal.account_id,
-                role=role,
+                actor_id=seat_actor_id,
+                chat_id=seat_chat_id,
                 text=text,
             )
         )

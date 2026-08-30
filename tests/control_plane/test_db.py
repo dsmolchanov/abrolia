@@ -40,6 +40,7 @@ def test_migrations_are_ordered_and_idempotent(tmp_path: Path) -> None:
             "0010_channel_binding_chat_id.sql",
             "0011_channel_preference_fallback.sql",
             "0012_channel_binding_published.sql",
+            "0013_channel_binding_account.sql",
         ]
         assert database.migrate() == []
         assert database.pragma() == {
