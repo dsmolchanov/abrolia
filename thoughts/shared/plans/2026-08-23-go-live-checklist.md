@@ -56,6 +56,49 @@ batteries — then the staged flips the runbook already fixes.
   TIAs, and the Art. 27 appointment;
   `processors.md` registry updated with dates ONLY AFTER signature (canon
   Phase A rule). Gate: nothing in Track R starts before this box is ticked.
+#### Inventory — O0 the deploy gate that blocked its own remedy
+
+**Files:** `.github/workflows/deploy-production.yml`,
+`deploy/control-plane/readyz-deploy-gate.jq`,
+`tests/control_plane/test_deploy_gate.py`, `tests/test_deploy_workflow.py`,
+`docs/onboarding-runbook.md`.
+
+**Branches:** `fix/deploy-gate-backup-deadlock`.
+
+Found 2026-08-31 while checking why a merged PR had not shipped: **production
+deploys had been failing for nine days**, and every merge since 2026-08-22 —
+C3f, C5, C6, B-02 — is sitting on `main` unshipped.
+
+`/readyz` reports `backup_stale` past 26 hours
+(`MAXIMUM_BACKUP_AGE_SECONDS`, `control_plane/api/app.py:38`). The archive is
+written at CONTAINER START by the Dockerfile's `migrate --backup-first`, and
+while the service runs it cannot be written at all: the backup CLI takes the
+process lock and refuses with "Stop the service first."
+(`control_plane/cli.py:274-278`). So a deploy is the only thing that refreshes
+the backup — and the deploy gate required a fresh backup.
+
+The timeline is exact: last success 2026-08-22 09:34Z, first failure
+2026-08-23 11:59Z (26.4 hours later, the first attempt past the threshold),
+then fourteen consecutive failures, none of which reached `flyctl`. The app was
+healthy throughout — `/healthz` 200, workers RUNNING, no pending jobs. Only the
+backup clock had run out.
+
+`backup_stale` is now the one blocker that does not hold a deploy, because it
+is a reason TO deploy. Every other blocker still does: a database, volume,
+worker or provider problem is a state a deploy makes worse. The predicate lives
+in a `.jq` file that the workflow and the test both read, so the gate and its
+test cannot drift.
+
+- [ ] **O0a. Backups must not depend on deploys.** *Opened 2026-08-31 by the
+  above, and deliberately NOT fixed with it — this needs a design, not a cron
+  entry.* The only backup path runs at container start, and the CLI refuses to
+  run beside a live service, so today the system can only back up by
+  RESTARTING. That is why the 26-hour alarm was really measuring deploy
+  cadence, and why it will fire again on any quiet day. The honest options are
+  an in-process periodic backup (the serving process already holds the lock) or
+  a scheduled restart; both are real work and neither is a workflow file.
+  Until one lands, `/readyz` reports `not_ready` on any day without a deploy.
+
 - [ ] **O2. Release tag + restore drill.** Zero git tags exist today. Tag the
   release, then repeat the Phase B isolated backup/restore procedure on the
   Phase E schema (now incl. `channel_preferences`/`channel_bindings`/usage
