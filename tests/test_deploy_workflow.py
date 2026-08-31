@@ -291,7 +291,7 @@ def test_fly_deploy_uses_the_root_context_and_pinned_target() -> None:
         "--remote-only --yes --ha=false --wait-timeout 10m"
     ) in control_plane
     setup = raw.index("Install the pinned Fly CLI")
-    readiness = raw.index("Require a ready control plane before mutation")
+    readiness = raw.index("Require a deployable control plane before mutation")
     recheck = raw.index(
         "Recheck main immediately before publishing the control plane"
     )
@@ -299,7 +299,18 @@ def test_fly_deploy_uses_the_root_context_and_pinned_target() -> None:
     assert setup < readiness < recheck < deploy
     preflight = raw[readiness:recheck]
     assert "https://app.abrolia.com/readyz" in preflight
-    assert '.status == "ready"' in preflight
+    # The predicate is NOT inlined here any more. It lives in a file that this
+    # gate and `tests/control_plane/test_deploy_gate.py` both read, so the
+    # question "may we deploy onto this?" has one answer rather than a copy in
+    # a workflow and a copy in a test that can drift apart.
+    assert "deploy/control-plane/readyz-deploy-gate.jq" in preflight
+    # `curl --fail` would discard the body on the 503 this gate now has to
+    # READ: the blocker list is the whole answer. Its absence is the fix, so it
+    # is asserted rather than left to survive by luck. Matched on the
+    # invocation, not the bare flag, because the step's own comment names it.
+    assert "curl --fail" not in preflight
+    # A non-readiness answer is still a refusal.
+    assert 'test "$code" = 200 || test "$code" = 503' in preflight
 
 
 def test_live_verification_is_required_for_both_frontends() -> None:

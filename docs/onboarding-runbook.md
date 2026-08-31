@@ -461,7 +461,10 @@ Alerts (operator-visible, not auto-page in pilot):
 - `DLQ > 0` — provisioning jobs `failed` without reconcile
 - `sticky executing` — job `running` > 10 min without lease renewal
 - `primary unavailable` — routing fallback triggered
-- `backup stale` — `backup_age_hours > 26h`
+- `backup stale` — `backup_age_hours > 26h`. Does NOT hold a production
+  deploy (2026-08-31): the archive is written at container start, so a
+  deploy is what CLEARS this rather than something it needs cleared.
+  Every other readiness blocker still refuses the deploy.
 - `budget exceeded` — per-household/day cost cap hit (see `hermes_cloud/core/usage.py`)
 
 ## Phase F — Release gating & rollout order (per-provider kill switches)

@@ -172,16 +172,26 @@ jobs:
         uses: superfly/flyctl-actions/setup-flyctl@ed8efb33836e8b2096c7fd3ba1c8afe303ebbff1
         with:
           version: 0.4.58
-      - name: Require a ready control plane before mutation
+      - name: Require a deployable control plane before mutation
         run: |
           set -euo pipefail
-          readiness="$(
-            curl --fail --silent --show-error --location \
+          # `--fail` is deliberately absent: a 503 here is the answer, not an
+          # error, and discarding the body threw away the one field that says
+          # WHY. The predicate lives in a file so this gate and
+          # `tests/control_plane/test_deploy_gate.py` cannot drift apart.
+          body="$(mktemp)"
+          code="$(
+            curl --silent --show-error --location \
               --retry 5 --retry-all-errors --retry-delay 2 \
               --connect-timeout 10 --max-time 30 \
+              --output "$body" --write-out '%{http_code}' \
               https://app.abrolia.com/readyz
           )"
-          jq -e '.status == "ready"' <<<"$readiness" >/dev/null
+          cat "$body"
+          # Anything but a served readiness answer is still a refusal: a 500, a
+          # 404 or an empty body means this is not the control plane replying.
+          test "$code" = 200 || test "$code" = 503
+          jq -e -f deploy/control-plane/readyz-deploy-gate.jq "$body" >/dev/null
       - name: Recheck main immediately before publishing the control plane
         env:
           DEPLOY_SHA: ${{ github.event.workflow_run.head_sha }}
