@@ -66,7 +66,8 @@ batteries — then the staged flips the runbook already fixes.
 `tests/control_plane/test_required_config.py`.
 
 **Branches:** `fix/deploy-gate-backup-deadlock`,
-`fix/deploy-required-secrets-preflight`, `fix/deploy-verify-same-predicate`.
+`fix/deploy-required-secrets-preflight`, `fix/deploy-verify-same-predicate`,
+`fix/readyz-gate-status-contract`.
 
 **Round 2, 2026-08-31 — what the gate fix uncovered.** Removing the mask let a
 deploy through for the first time since 2026-08-22, and the new image would not
@@ -133,6 +134,42 @@ is a reason TO deploy. Every other blocker still does: a database, volume,
 worker or provider problem is a state a deploy makes worse. The predicate lives
 in a `.jq` file that the workflow and the test both read, so the gate and its
 test cannot drift.
+
+**Round 4, 2026-08-31 — the exception inherited a hole, and the deploy shipped.**
+Consolidating both ends onto one predicate was right, and it carried one thing
+the post-deploy check had been doing for free: rejecting a body that states no
+readiness status at all. The `backup_stale` arm tested only the blocker list,
+so `{"blockers":["backup_stale"]}` and `{"status":"broken","blockers":
+["backup_stale"]}` were both read as a green light — on the surface that
+previously refused them, so this was a real loss of coverage rather than a
+theoretical one. Codex raised it as a P1 `[BLOCKER]` on #115; the
+`review-lane-fast` topic meant the finding did not hold the merge, so it landed
+on `main` and was fixed forward in #117. The arm now names the status it
+excuses, both consumers inherit it from the one file, and two regressions land
+with it: the malformed-status cases as a parameterized class, and a guard that
+the workflow still evaluates this filter at both ends rather than growing a
+second inline spelling.
+
+**Shipped 2026-08-31 19:26Z.** Run `33430439419`: authorize, control plane and
+landing all green — the first successful production deploy since 2026-08-22,
+ending nine days in which every merge sat on `main` unshipped. The control
+plane came up on the new image (machine `85e649c449e9e8`), `/healthz` reports
+`healthy` with no blockers, and `/readyz` reports `not_ready` with
+`backup_stale` alone, which is exactly the shape the gate now accepts at both
+ends.
+
+**Still open after the deploy, and not a gate defect.** `backup_stale` did not
+clear, and will not: `create_pre_migrate_backup` returns `None` when no
+migration is pending (`control_plane/backup.py:75-76`), so the boot-time
+archive is written only by a deploy that happens to carry one. This step
+already said as much in Round 3 — "a backup that only a migration-carrying
+deploy can produce" — but the consequence is now observable rather than
+predicted: production's newest archive is ~237 hours old and ageing, and no
+deploy will refresh it on its own. The gate is right to stop blocking on it;
+the durability gap behind it is a separate decision (always snapshot at boot,
+against the 1 GB volume and the crash-loop protection that `_reusable_
+pre_migrate_backup` exists to provide) and belongs to Track R rather than to
+this step.
 
 - [ ] **O0a. Backups must not depend on deploys.** *Opened 2026-08-31 by the
   above, and deliberately NOT fixed with it — this needs a design, not a cron
