@@ -108,3 +108,74 @@ def test_the_payload_production_actually_served_is_accepted() -> None:
         "blockers": ["backup_stale"],
     }
     assert _deployable(served)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        # No status at all: this is not a readiness answer.
+        {"blockers": ["backup_stale"]},
+        # A status this gate does not know. `backup_stale` is only benign
+        # while the control plane itself says it is merely not ready; a body
+        # claiming anything else is claiming something this gate cannot read.
+        {"status": "broken", "blockers": ["backup_stale"]},
+        {"status": "degraded", "blockers": ["backup_stale"]},
+        {"status": None, "blockers": ["backup_stale"]},
+        # `ready` is spelled exactly, or not at all.
+        {"status": "READY", "blockers": []},
+        {"status": "ready ", "blockers": []},
+    ],
+    ids=[
+        "status-missing",
+        "status-broken",
+        "status-degraded",
+        "status-null",
+        "ready-wrong-case",
+        "ready-trailing-space",
+    ],
+)
+def test_a_body_that_does_not_state_a_readiness_status_is_refused(
+    payload: dict,
+) -> None:
+    """The `backup_stale` exception is not a hole for malformed bodies.
+
+    The exception arm once tested only the blocker list, so a 503 body with no
+    `status` — or with one this gate has never heard of — took the benign
+    branch. The post-deploy check that used to reject both was replaced by
+    this filter, so the permissiveness would have reached a surface that
+    previously refused it.
+    """
+    assert not _deployable(payload)
+
+
+def test_both_ends_of_the_deploy_read_this_one_filter() -> None:
+    """The reason a single file exists, asserted rather than trusted.
+
+    The pre-deploy gate and the post-deploy verification are two consumers of
+    one question. They drifted once — the post-deploy copy kept asking
+    `.status == "ready"` behind `curl --fail` after the pre-deploy gate was
+    fixed — and a deploy that fully succeeded reported failure for nine days.
+    A second spelling appearing in the workflow is that defect returning, so
+    the count is pinned here.
+    """
+    workflow = (
+        REPOSITORY / ".github" / "workflows" / "deploy-production.yml"
+    ).read_text()
+    filter_path = "deploy/control-plane/readyz-deploy-gate.jq"
+
+    assert workflow.count(f"jq -e -f {filter_path}") == 2, (
+        "both the pre-deploy gate and the post-deploy verification must "
+        "evaluate the shared filter"
+    )
+    # Comments are excluded deliberately: the workflow explains this exact
+    # drift by quoting the predicate it used to spell inline, and the prose
+    # that records a defect must not read as the defect.
+    executable = "\n".join(
+        line
+        for line in workflow.splitlines()
+        if not line.lstrip().startswith("#")
+    )
+    assert '.status == "ready"' not in executable, (
+        "a readiness predicate spelled inline in the workflow is the drift "
+        f"this filter exists to prevent — put it in {filter_path}"
+    )

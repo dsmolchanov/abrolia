@@ -24,8 +24,18 @@
 # `backup_stale` is therefore a reason TO deploy, not a reason to refuse one.
 # Every other blocker still holds: a database, volume, worker or provider
 # problem is a state a deploy would make worse, not better.
+#
+# Both arms name the status they accept. The exception arm below once tested
+# only the blocker list, so `{"blockers":["backup_stale"]}` with no status at
+# all — or with `"status":"broken"` — was read as a green light. That is the
+# one shape this gate must never guess about: a body that does not state a
+# readiness status is not a readiness answer, and a status this gate does not
+# know is not one it may treat as the benign case. The stricter post-deploy
+# check that used to catch it was replaced by this file, so the exception had
+# to grow the status test rather than inherit a permissive one.
 (.status == "ready")
 or (
-  ((.blockers // []) | length) > 0
+  .status == "not_ready"
+  and ((.blockers // []) | length) > 0
   and (((.blockers // []) - ["backup_stale"]) | length) == 0
 )
