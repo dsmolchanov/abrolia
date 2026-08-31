@@ -172,6 +172,39 @@ jobs:
         uses: superfly/flyctl-actions/setup-flyctl@ed8efb33836e8b2096c7fd3ba1c8afe303ebbff1
         with:
           version: 0.4.58
+      - name: Require every boot-critical secret before mutation
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          # `ABROLIA_RUNTIME_MODEL_API_KEY` became required at boot and was
+          # named in no deploy configuration, so nothing checked it until a
+          # machine tried to start. Production was down for the difference.
+          #
+          # Resolved against the app's Fly secrets OR `fly.toml [env]`, because
+          # a name is satisfied by either and demanding a secret for a
+          # non-secret would teach operators to paper over this check.
+          : "${FLY_API_TOKEN:?production-control-plane FLY_API_TOKEN is not configured}"
+          present="$(
+            flyctl secrets list -a abrolia-control-plane-synthetic --json \
+              | jq -r '.[].name'
+          )"
+          missing=()
+          while read -r name; do
+            [ -n "$name" ] || continue
+            case "$name" in \#*) continue ;; esac
+            if grep -qx -- "$name" <<<"$present"; then continue; fi
+            if grep -qE "^[[:space:]]*$name[[:space:]]*=" deploy/control-plane/fly.toml; then
+              continue
+            fi
+            missing+=("$name")
+          done < <(sed 's/#.*//' deploy/control-plane/required-runtime-config.txt | tr -d '\r')
+          if [ "${#missing[@]}" -gt 0 ]; then
+            printf 'missing boot-critical configuration: %s\n' "${missing[*]}" >&2
+            echo "set it with: flyctl secrets set <NAME>=... -a abrolia-control-plane-synthetic" >&2
+            exit 1
+          fi
+          echo "all boot-critical configuration is present"
       - name: Require a deployable control plane before mutation
         run: |
           set -euo pipefail

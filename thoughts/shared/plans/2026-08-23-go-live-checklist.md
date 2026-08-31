@@ -61,9 +61,42 @@ batteries — then the staged flips the runbook already fixes.
 **Files:** `.github/workflows/deploy-production.yml`,
 `deploy/control-plane/readyz-deploy-gate.jq`,
 `tests/control_plane/test_deploy_gate.py`, `tests/test_deploy_workflow.py`,
-`docs/onboarding-runbook.md`.
+`docs/onboarding-runbook.md`,
+`deploy/control-plane/required-runtime-config.txt`,
+`tests/control_plane/test_required_config.py`.
 
-**Branches:** `fix/deploy-gate-backup-deadlock`.
+**Branches:** `fix/deploy-gate-backup-deadlock`,
+`fix/deploy-required-secrets-preflight`.
+
+**Round 2, 2026-08-31 — what the gate fix uncovered.** Removing the mask let a
+deploy through for the first time since 2026-08-22, and the new image would not
+boot: `ABROLIA_RUNTIME_MODEL_API_KEY` became required at boot in #71
+(2026-08-25) and was set nowhere. The machine crash-looped ten times and
+stopped, so production went DOWN — the readiness gate had been accidentally
+shielding a deployment that was already broken, and the shield was always going
+to fail the moment anyone deployed.
+
+Restored by setting the secret (operator-run; the value never entered this
+repository or a transcript). Now guarded:
+`deploy/control-plane/required-runtime-config.txt` lists every boot-critical
+name, and the deploy resolves each against the app's Fly secrets or
+`fly.toml [env]` BEFORE it mutates anything.
+
+The list is proved by execution, not by copying the rules:
+`tests/control_plane/test_required_config.py` removes each name from an
+otherwise-valid production environment and asserts the boot actually refuses —
+so a name that stops being required fails the suite rather than quietly
+over-demanding. Writing it that way immediately found one over-declaration:
+`ABROLIA_CONTROL_PLANE_BACKUP_KEY` does NOT refuse `serve`, and is conditionally
+fatal instead — the machine starts fine until a deploy carries a migration, and
+then `migrate --backup-first` fails closed and it will not start at all.
+
+Dry-running the check against the real app before shipping found a second bug in
+it: `flyctl secrets list --json` returns `name`, not `Name`, so the first
+version reported EVERY secret missing and would have failed every deploy — a
+safety check that becomes a new outage. Both directions are now verified against
+production: all names present today, and the historical absence of
+`ABROLIA_RUNTIME_MODEL_API_KEY` is caught by name.
 
 Found 2026-08-31 while checking why a merged PR had not shipped: **production
 deploys had been failing for nine days**, and every merge since 2026-08-22 —

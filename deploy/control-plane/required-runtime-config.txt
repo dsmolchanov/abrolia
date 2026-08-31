@@ -1,0 +1,30 @@
+# Every configuration name the production control plane needs AT BOOT.
+#
+# `ABROLIA_RUNTIME_MODEL_API_KEY` cost nine days of outage by being absent from
+# this list because this list did not exist. It became required in #71, was
+# named in no deploy configuration, and nothing noticed until a machine tried
+# to start — which nothing did, because a separate gate was refusing every
+# deploy. The failure surfaced only when that gate was fixed, and it surfaced
+# as production going down rather than as a red check.
+#
+# A name here is checked before `flyctl deploy` mutates anything, against the
+# app's Fly secrets and its `fly.toml [env]`. It is not a copy of the rules in
+# `control_plane/config.py`: `tests/control_plane/test_required_config.py`
+# removes each name from an otherwise-valid production environment and asserts
+# the boot actually refuses, so an entry that stopped being required fails the
+# suite rather than quietly over-demanding.
+#
+# Blank lines and `#` comments are ignored.
+
+# Secrets — set with `flyctl secrets set`, never in fly.toml.
+ABROLIA_ENCRYPTION_KEY
+ABROLIA_LOOKUP_HMAC_KEY
+ABROLIA_TOKEN_HMAC_KEY
+ABROLIA_CONTROL_PLANE_BACKUP_KEY
+FLY_API_TOKEN
+ABROLIA_RUNTIME_IMAGE
+ABROLIA_RUNTIME_MODEL_API_KEY
+
+# Non-secret settings — carried in fly.toml [env].
+ABROLIA_FLY_ORG
+ABROLIA_INTERNAL_BOOTSTRAP_HOST

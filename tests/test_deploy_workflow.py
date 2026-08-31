@@ -227,7 +227,17 @@ def test_provider_credentials_are_fail_closed_and_isolated() -> None:
 
     secret_references = re.findall(r"secrets\.([A-Z0-9_]+)", TEXT)
     variable_references = re.findall(r"vars\.([A-Z0-9_]+)", TEXT)
-    assert secret_references == ["VERCEL_TOKEN", "VERCEL_TOKEN", "FLY_API_TOKEN"]
+    # `FLY_API_TOKEN` twice, and the same token both times: the boot-critical
+    # configuration preflight calls `flyctl secrets list` before the deploy
+    # step calls `flyctl deploy`. The point of this assertion is that the
+    # workflow reaches for no OTHER secret, so a second use of one already
+    # authorized here is a change to record rather than a widening.
+    assert secret_references == [
+        "VERCEL_TOKEN",
+        "VERCEL_TOKEN",
+        "FLY_API_TOKEN",
+        "FLY_API_TOKEN",
+    ]
     assert variable_references == [
         "VERCEL_ORG_ID",
         "VERCEL_PROJECT_ID",
@@ -235,7 +245,11 @@ def test_provider_credentials_are_fail_closed_and_isolated() -> None:
         "VERCEL_PROJECT_ID",
     ]
     assert landing.count("secrets.VERCEL_TOKEN") == 2
-    assert control_plane.count("secrets.FLY_API_TOKEN") == 1
+    # Twice: the boot-critical configuration preflight reads the app's secret
+    # NAMES before the deploy step mutates anything. Same token, two steps —
+    # the isolation this test protects is which credential the job may reach
+    # for, not how many times it reaches for it.
+    assert control_plane.count("secrets.FLY_API_TOKEN") == 2
     assert "secrets." not in _job("authorize-release")
 
     assert "prj_" not in TEXT
@@ -291,12 +305,26 @@ def test_fly_deploy_uses_the_root_context_and_pinned_target() -> None:
         "--remote-only --yes --ha=false --wait-timeout 10m"
     ) in control_plane
     setup = raw.index("Install the pinned Fly CLI")
+    # Boot-critical configuration is checked FIRST, and before anything is
+    # mutated: `ABROLIA_RUNTIME_MODEL_API_KEY` was required at boot, named in
+    # no deploy configuration, and discovered only when a machine tried to
+    # start — nine days late, as an outage rather than a red check.
+    secrets = raw.index("Require every boot-critical secret before mutation")
     readiness = raw.index("Require a deployable control plane before mutation")
     recheck = raw.index(
         "Recheck main immediately before publishing the control plane"
     )
     deploy = raw.index("flyctl deploy .")
-    assert setup < readiness < recheck < deploy
+    assert setup < secrets < readiness < recheck < deploy
+    preconditions = raw[secrets:readiness]
+    # Read from the manifest rather than a list inlined here, so a name added
+    # to one is added to both.
+    assert "deploy/control-plane/required-runtime-config.txt" in preconditions
+    # `.name`, lowercase: `flyctl secrets list --json` returns `name`, and
+    # `.Name` yielded null for every entry — which reported EVERY secret
+    # missing and would have failed every deploy. Caught by running the check
+    # against the real app before shipping it.
+    assert "jq -r '.[].name'" in preconditions
     preflight = raw[readiness:recheck]
     assert "https://app.abrolia.com/readyz" in preflight
     # The predicate is NOT inlined here any more. It lives in a file that this
