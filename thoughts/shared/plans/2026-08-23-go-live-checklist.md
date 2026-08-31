@@ -66,7 +66,7 @@ batteries — then the staged flips the runbook already fixes.
 `tests/control_plane/test_required_config.py`.
 
 **Branches:** `fix/deploy-gate-backup-deadlock`,
-`fix/deploy-required-secrets-preflight`.
+`fix/deploy-required-secrets-preflight`, `fix/deploy-verify-same-predicate`.
 
 **Round 2, 2026-08-31 — what the gate fix uncovered.** Removing the mask let a
 deploy through for the first time since 2026-08-22, and the new image would not
@@ -90,6 +90,18 @@ over-demanding. Writing it that way immediately found one over-declaration:
 `ABROLIA_CONTROL_PLANE_BACKUP_KEY` does NOT refuse `serve`, and is conditionally
 fatal instead — the machine starts fine until a deploy carries a migration, and
 then `migrate --backup-first` fails closed and it will not start at all.
+
+**Round 3, 2026-08-31 — the same fix, one step later.** The deploy after #114
+preflighted, gated, mutated and came up HEALTHY on v44 — and still reported
+failure, because the POST-deploy verification kept the two defects the
+pre-deploy gate had just been fixed for: `curl --fail` dying on the 503, and
+`.status == "ready"` demanding a backup that only a migration-carrying deploy
+can produce.
+
+An instance was fixed and the invariant was not, which is the third time that
+shape has appeared in this stretch of work. Both ends now read one predicate
+file, and `test_both_ends_of_the_deploy_ask_the_same_readiness_question` pins
+that they keep doing so.
 
 Dry-running the check against the real app before shipping found a second bug in
 it: `flyctl secrets list --json` returns `name`, not `Name`, so the first

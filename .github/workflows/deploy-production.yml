@@ -260,8 +260,26 @@ jobs:
           health="$(fetch https://app.abrolia.com/healthz)"
           jq -e '.status == "healthy"' <<<"$health" >/dev/null
 
-          readiness="$(fetch https://app.abrolia.com/readyz)"
-          jq -e '.status == "ready"' <<<"$readiness" >/dev/null
+          # The SAME predicate the pre-deploy gate uses, and for the same
+          # reason. This asked `.status == "ready"` behind `--fail`, so it died
+          # on the 503 that `backup_stale` produces — a condition a deploy
+          # cannot clear unless it happens to carry a migration. The pre-deploy
+          # gate was fixed for exactly this and this copy was left behind, so
+          # the deploy succeeded and the workflow reported failure anyway.
+          #
+          # One file, both ends: a second spelling of "is this control plane
+          # all right" is how the two drift.
+          readyz_body="$(mktemp)"
+          readyz_code="$(
+            curl --silent --show-error --location \
+              --retry 12 --retry-all-errors --retry-delay 5 \
+              --connect-timeout 10 --max-time 30 \
+              --output "$readyz_body" --write-out '%{http_code}' \
+              https://app.abrolia.com/readyz
+          )"
+          cat "$readyz_body"
+          test "$readyz_code" = 200 || test "$readyz_code" = 503
+          jq -e -f deploy/control-plane/readyz-deploy-gate.jq "$readyz_body" >/dev/null
 
           start="$(fetch https://app.abrolia.com/start)"
           grep -F 'data-abrolia-logo="handwritten-a"' <<<"$start"

@@ -341,6 +341,23 @@ def test_fly_deploy_uses_the_root_context_and_pinned_target() -> None:
     assert 'test "$code" = 200 || test "$code" = 503' in preflight
 
 
+def test_both_ends_of_the_deploy_ask_the_same_readiness_question() -> None:
+    """The pre-deploy gate and the post-deploy check share one predicate.
+
+    They did not. The gate was corrected for the `backup_stale` loop and the
+    verification kept `.status == "ready"` behind `curl --fail`, so a deploy
+    that preflighted, gated, mutated and came up healthy still reported
+    failure — and the fix looked complete because the half that was tested was
+    the half that had been fixed.
+    """
+    control_plane = _job("deploy-control-plane")
+    assert control_plane.count("deploy/control-plane/readyz-deploy-gate.jq") == 2
+    # Neither end may go back to demanding a fresh backup. Matched on the
+    # INVOCATION, because the steps' comments name the old predicate to explain
+    # why it is gone.
+    assert """jq -e '.status == "ready"'""" not in control_plane
+
+
 def test_live_verification_is_required_for_both_frontends() -> None:
     landing = _job("deploy-landing")
     control_plane = _job("deploy-control-plane")

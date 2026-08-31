@@ -1,4 +1,11 @@
-# Is this control plane safe to DEPLOY ONTO?
+# Is this control plane all right?
+#
+# Asked at BOTH ends of a deploy: before, "may I mutate this?", and after,
+# "did what I just shipped come up?" One file, because two spellings of the
+# same question drift — and did: the pre-deploy gate was fixed for the loop
+# below while the post-deploy verification kept asking `.status == "ready"`
+# behind `curl --fail`, so a deploy that fully succeeded still reported
+# failure.
 #
 # Not the same question as "is it fully ready", and conflating the two is what
 # killed production deploys for nine days.
