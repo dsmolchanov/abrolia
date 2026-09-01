@@ -43,6 +43,7 @@ def test_migrations_are_ordered_and_idempotent(tmp_path: Path) -> None:
             "0013_channel_binding_account.sql",
             "0014_backfill_web_seats.sql",
             "0015_email_secret_install_generation.sql",
+            "0016_boot_archive_outcome.sql",
         ]
         assert database.migrate() == []
         assert database.pragma() == {
@@ -573,6 +574,7 @@ def test_0014_gives_existing_households_the_web_seat_0013_assumed(
         assert database.migrate() == [
             "0014_backfill_web_seats.sql",
             "0015_email_secret_install_generation.sql",
+            "0016_boot_archive_outcome.sql",
         ]
 
         seats = {

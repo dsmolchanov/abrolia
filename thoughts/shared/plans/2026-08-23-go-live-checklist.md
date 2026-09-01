@@ -74,13 +74,19 @@ batteries — then the staged flips the runbook already fixes.
 `tests/control_plane/test_migrate_on_start.py`,
 `docs/control-plane-restore.md`,
 `docs/canon-closure-runbook.md`,
-`tests/test_canon_closure_runbook.py`.
+`tests/test_canon_closure_runbook.py`, `control_plane/observability.py`,
+`control_plane/api/app.py`, `control_plane/models.py`,
+`control_plane/migrations/0016_boot_archive_outcome.sql`,
+`tests/control_plane/test_db.py`, `tests/control_plane/test_observability.py`,
+`tests/control_plane/test_schema_contract.py`,
+`tests/control_plane/test_export_delete.py`.
 
 **Branches:** `fix/deploy-gate-backup-deadlock`,
 `fix/deploy-required-secrets-preflight`, `fix/deploy-verify-same-predicate`,
 `fix/readyz-gate-status-contract`, `fix/boot-durability-archive`,
 `docs/canon-closure-operator-runbook`,
-`docs/runbook-completeness-and-rollout-gates`.
+`docs/runbook-completeness-and-rollout-gates`,
+`fix/boot-archive-failure-is-visible`.
 
 **Round 2, 2026-08-31 — what the gate fix uncovered.** Removing the mask let a
 deploy through for the first time since 2026-08-22, and the new image would not

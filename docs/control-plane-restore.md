@@ -86,6 +86,41 @@ Three properties an operator should know:
   them anything except a `boot-` prefix — the runbook's
   `control-plane-<date>.cpb` is safe.
 
+### When it is skipped, how you find out
+
+Because the archive is skipped rather than fatal, a writer that fails at every
+boot used to look exactly like a healthy system. It no longer does. The boot
+records what it did, and `/healthz` and `/readyz` report it:
+
+| `checks.backup_writer` | Meaning |
+|---|---|
+| `written` | an archive was taken at the last boot |
+| `skipped_interval` | one was taken recently enough; healthy |
+| `failed` | the last boot could NOT write one |
+| `not_observed` | no boot has recorded an attempt yet |
+
+`failed` also raises the readiness blocker `backup_writer_failed`. The deploy
+gate excuses it — a deploy cannot fix a directory the service may not write
+to, and gating on it would repeat the deadlock `backup_stale` caused — so it
+never blocks a release, but it is always named.
+
+**`backup: stale` with `backup_writer: ok` is a quiet week. `backup: stale`
+with `backup_writer: failed` means the system cannot take a restore point at
+all.** Those two were indistinguishable, and that is what let production run
+ten days with no archive while every deploy reported success.
+
+One cause is worth knowing because the deployment invites it: `/data` is
+`chown`ed to `abrolia` at image build time, but the Fly volume mounts over
+that directory, and `flyctl ssh console` logs in as **root**. A `backups/`
+directory created by an operator's own `abrolia-control-plane backup` is
+therefore root-owned, while the service runs as uid 10001 — everything else
+behaves, and only the write fails. The remedy is on the volume, not in a
+deploy:
+
+```bash
+flyctl ssh console -a <app> -C "sh -c 'chown -R 10001:10001 /data/backups'"
+```
+
 Both the snapshot and the rollback restore stream through disk in bounded
 chunks, so neither is limited by the Machine's 512 MiB of RAM. The intermediate
 image is written to ephemeral storage rather than beside the database — putting

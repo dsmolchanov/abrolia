@@ -182,8 +182,29 @@ stderr and nowhere else:
 flyctl logs -a abrolia-control-plane-synthetic | grep 'boot archive skipped'
 ```
 
-Leading hypothesis is directory ownership on `/data/backups`; issue #121 has
-the full candidate list and the check commands.
+Leading hypothesis is directory ownership on `/data/backups`, and the
+Dockerfile makes it likely: `/data` is `chown`ed to `abrolia` at **image build
+time**, but the Fly volume mounts OVER that directory at runtime, so the chown
+never applies to it — and `flyctl ssh console` logs in as **root**, so a
+`backups/` created by an operator's manual archive is root-owned while the
+service runs as uid 10001.
+
+Confirm with (note the `sh -c`; `ssh console -C` execs directly and will not
+accept `;` separators):
+
+```bash
+flyctl ssh console -a abrolia-control-plane-synthetic \
+  -C "sh -c 'id; ls -ld /data /data/backups'"
+```
+
+If `/data/backups` is root-owned, the remedy is
+`chown -R 10001:10001 /data/backups` on the volume — **not** a deploy, which
+is why the deploy gate is right to keep shipping over it.
+
+The boot now names this case rather than reporting it as "no room": it is a
+distinct `BootArchiveDirectoryNotWritable`, whose message states the remedy,
+and the readiness payload reports `backup_writer: failed` with a
+`backup_writer_failed` blocker. Issue #121 has the remaining candidate list.
 
 Beyond that diagnosis, go-live **O0a** remains open on its own terms: the only
 backup path still runs at container start, so the system can only back up by

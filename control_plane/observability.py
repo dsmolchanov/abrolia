@@ -70,6 +70,12 @@ class HealthSnapshot:
     unknown_outcomes: int | None
     expired_bootstrap_tokens: int | None
     backup_age_seconds: float | None
+    #: What the last boot archive attempt did, or None when none is recorded.
+    #: `backup_age_seconds` cannot carry this: a stale archive means "no deploy
+    #: lately" — benign, and the reason the deploy gate stopped blocking on it
+    #: — OR "the writer is broken", which is not benign. They need different
+    #: names to be actionable.
+    boot_archive_outcome: str | None = None
 
     def liveness_blockers(self) -> tuple[str, ...]:
         blockers: list[str] = []
@@ -96,6 +102,14 @@ class HealthSnapshot:
             and self.backup_age_seconds > maximum_backup_age_seconds
         ):
             blockers.append("backup_stale")
+        if self.boot_archive_outcome == "failed":
+            # Named separately from `backup_stale` on purpose. The deploy gate
+            # excuses both — a deploy is not the remedy for either, and gating
+            # on them is what deadlocked production for nine days — but this
+            # one has to be SAYABLE. It appears in the blocker list the deploy
+            # workflow prints and an operator scans, which is the visibility
+            # that was missing while a broken writer looked healthy.
+            blockers.append("backup_writer_failed")
         return tuple(blockers)
 
 
@@ -104,7 +118,11 @@ class HealthReporter:
         self.database = database
 
     def snapshot(
-        self, *, backup_completed_at: float | None = None, now: float | None = None
+        self,
+        *,
+        backup_completed_at: float | None = None,
+        boot_archive_outcome: str | None = None,
+        now: float | None = None,
     ) -> HealthSnapshot:
         now = time.time() if now is None else now
         volume_ok, volume_free_bytes = self._volume_status()
@@ -145,7 +163,18 @@ class HealthReporter:
             unknown,
             bootstrap,
             age,
+            boot_archive_outcome,
         )
+
+    def latest_boot_archive_outcome(self) -> str | None:
+        """What the boot recorded, without exposing the detail string."""
+        try:
+            row = self.database.query_one(
+                "SELECT outcome FROM boot_archive_attempts WHERE id = 1"
+            )
+        except sqlite3.Error:
+            return None
+        return None if row is None else str(row["outcome"])
 
     def latest_backup_completed_at(self) -> float | None:
         """Return the newest conventional archive mtime without exposing its path."""

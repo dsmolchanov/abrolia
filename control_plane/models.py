@@ -309,6 +309,13 @@ class TableClassification:
 # registry with sqlite_master so adding a table without a privacy decision fails.
 TABLE_CLASSIFICATION: dict[str, TableClassification] = {
     "schema_migrations": TableClassification(False, False, "service", "schema versions"),
+    # No subject data by construction: a timestamp, an outcome enum, and a
+    # reason string describing the volume — never a household, an address or a
+    # secret value. Service state, classified like the migration ledger beside
+    # it, and single-row so there is nothing to age out.
+    "boot_archive_attempts": TableClassification(
+        False, False, "service", "boot archive outcome; no subject data"
+    ),
     "accounts": TableClassification(True, True, "account+30d"),
     "households": TableClassification(True, True, "account+30d"),
     "household_profiles": TableClassification(True, True, "account+30d"),

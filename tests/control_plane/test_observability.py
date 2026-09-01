@@ -256,6 +256,9 @@ def test_health_endpoints_report_safe_operational_state(api_harness) -> None:
         "volume": "ok",
         "workers": "running",
         "backup": "not_observed",
+        # The writer's own state, distinct from the archive's age. A fresh
+        # harness has recorded no boot attempt, which is neither ok nor failed.
+        "backup_writer": "not_observed",
         "providers": api_harness.container.providers.health(),
     }
     assert payload["metrics"]["volume_free_bytes"] > 0

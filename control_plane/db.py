@@ -271,6 +271,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         BackupError,
         create_boot_archive,
         create_pre_migrate_backup,
+        record_boot_archive_attempt,
     )
     from control_plane.config import decode_key_material
 
@@ -354,6 +355,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                 archive = create_boot_archive(database, backup_key=backup_key)
             except (BackupError, OSError) as error:
                 print(f"boot archive skipped: {error}", file=sys.stderr)
+                # Durably, because stderr is where this went unnoticed for ten
+                # days. `/readyz` reads it back and names the condition, so a
+                # writer that fails at every boot stops being indistinguishable
+                # from a system that simply has not been deployed lately.
+                record_boot_archive_attempt(
+                    database, outcome="failed", detail=str(error), now=None
+                )
+            else:
+                record_boot_archive_attempt(
+                    database,
+                    outcome="written" if archive else "skipped_interval",
+                    detail=str(archive) if archive else "",
+                    now=None,
+                )
         print(json.dumps(
             {
                 "applied": applied,

@@ -4682,3 +4682,135 @@ def test_the_boot_archive_is_reported_in_the_migrate_result(
     # The second boot is inside the interval, and says so by reporting none.
     assert _boot(tmp_path, monkeypatch) == 0
     assert json.loads(capsys.readouterr().out)["archive"] is None
+
+
+# --- A failing writer has to be sayable --------------------------------------
+#
+# Three correct decisions composed into silence: the deploy gate excuses
+# `backup_stale` (#111, and rightly — gating on it deadlocked production for
+# nine days), the boot archive is non-fatal (#118, and rightly — a full volume
+# must not be an outage), and the reason went only to stderr. A writer failing
+# at every boot then looked exactly like a healthy system that had not been
+# deployed lately.
+
+pytestmark_not_root = pytest.mark.skipif(
+    os.getuid() == 0, reason="root ignores the mode bits this test relies on"
+)
+
+
+@pytestmark_not_root
+def test_an_unwritable_archive_directory_is_its_own_condition(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """The shape production is actually in, and why it needs its own name.
+
+    A Fly volume mounts OVER the image's `/data`, so the Dockerfile's
+    build-time `chown` never touches it, and `flyctl ssh console` logs in as
+    root — so a `backups/` created by an operator's manual archive is
+    root-owned while the service runs as uid 10001. Everything then behaves:
+    `mkdir(exist_ok=True)` succeeds, the free-space check passes, and only the
+    write fails. Reporting that as "no room" would send an operator to the
+    wrong remedy.
+    """
+    from control_plane.backup import BootArchiveDirectoryNotWritable
+
+    assert _boot(tmp_path, monkeypatch) == 0
+    archives = tmp_path / "backups"
+    for existing in archives.glob("boot-*.cpb"):
+        existing.unlink()
+    archives.chmod(0o500)
+    capsys.readouterr()
+
+    try:
+        assert _boot(tmp_path, monkeypatch) == 0, "an unwritable directory stopped the boot"
+        message = capsys.readouterr().err
+        assert "boot archive skipped" in message
+        assert "not writable" in message
+        assert "chown" in message, "the message must name the remedy"
+        assert list(archives.glob("boot-*.cpb")) == []
+    finally:
+        archives.chmod(0o700)
+
+    # And it is a distinct exception, not folded into the full-volume case.
+    database = ControlPlaneDatabase(tmp_path / "control-plane.db")
+    try:
+        archives.chmod(0o500)
+        with pytest.raises(BootArchiveDirectoryNotWritable):
+            backup_module.create_boot_archive(
+                database, backup_key=BACKUP_KEY_BYTES, minimum_interval_seconds=0
+            )
+    finally:
+        archives.chmod(0o700)
+        database.close()
+
+
+def _recorded_outcome(tmp_path) -> tuple[str, str] | None:
+    database = ControlPlaneDatabase(tmp_path / "control-plane.db")
+    try:
+        row = database.query_one(
+            "SELECT outcome, detail FROM boot_archive_attempts WHERE id = 1"
+        )
+        return None if row is None else (row["outcome"], row["detail"])
+    finally:
+        database.close()
+
+
+def test_the_boot_records_what_the_attempt_actually_did(tmp_path, monkeypatch) -> None:
+    """`written`, `skipped_interval` and `failed` are three different facts.
+
+    `backup_stale` collapses them: a stale archive means "no deploy lately" —
+    benign, and the reason the gate stopped blocking — or "the writer is
+    broken", which is not. Recording the attempt is what separates them.
+    """
+    assert _boot(tmp_path, monkeypatch) == 0
+    outcome, detail = _recorded_outcome(tmp_path)
+    assert outcome == "written"
+    assert detail.endswith(".cpb")
+
+    # Second boot inside the interval: skipped, and NOT a failure.
+    assert _boot(tmp_path, monkeypatch) == 0
+    outcome, _detail = _recorded_outcome(tmp_path)
+    assert outcome == "skipped_interval", (
+        "a healthy skip must not be recorded as a failure, or the signal that "
+        "means 'broken' would fire on every quiet restart"
+    )
+
+
+@pytestmark_not_root
+def test_a_failing_writer_is_named_in_readiness(tmp_path, monkeypatch) -> None:
+    """The visibility that was missing, asserted through the real snapshot."""
+    from control_plane.api.app import MAXIMUM_BACKUP_AGE_SECONDS
+    from control_plane.observability import HealthReporter
+
+    assert _boot(tmp_path, monkeypatch) == 0
+    archives = tmp_path / "backups"
+    for existing in archives.glob("boot-*.cpb"):
+        existing.unlink()
+    archives.chmod(0o500)
+    try:
+        assert _boot(tmp_path, monkeypatch) == 0
+    finally:
+        archives.chmod(0o700)
+
+    assert _recorded_outcome(tmp_path)[0] == "failed"
+
+    database = ControlPlaneDatabase(tmp_path / "control-plane.db")
+    try:
+        reporter = HealthReporter(database)
+        snapshot = reporter.snapshot(
+            backup_completed_at=reporter.latest_backup_completed_at(),
+            boot_archive_outcome=reporter.latest_boot_archive_outcome(),
+        )
+    finally:
+        database.close()
+
+    blockers = snapshot.readiness_blockers(
+        maximum_backup_age_seconds=MAXIMUM_BACKUP_AGE_SECONDS
+    )
+    assert "backup_writer_failed" in blockers, (
+        "a writer that fails at every boot is indistinguishable from a quiet "
+        "week unless readiness says so by name"
+    )
+    # And it is NOT reported merely as an old archive, which is the conflation
+    # that hid it: the archive here is minutes old, not stale at all.
+    assert "backup_stale" not in blockers

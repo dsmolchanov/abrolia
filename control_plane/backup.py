@@ -125,6 +125,21 @@ BOOT_ARCHIVE_PREFIX = "boot-"
 BOOT_ARCHIVE_SUFFIX = ".cpb"
 
 
+class BootArchiveDirectoryNotWritable(BackupError):
+    """The archive directory exists and this process cannot write to it.
+
+    Its own class because it is not the same problem as a full volume and does
+    not have the same remedy. A Fly volume is mounted OVER the image's `/data`,
+    so the Dockerfile's build-time `chown` does not apply to it, and
+    `flyctl ssh console` logs in as root — so a `backups/` directory created by
+    an operator taking a manual archive is root-owned, while the service runs
+    as uid 10001. Everything then behaves: `mkdir(exist_ok=True)` succeeds, the
+    free-space check passes, and only the write fails.
+
+    A deploy cannot fix it. An operator running `chown` can.
+    """
+
+
 def boot_archive_directory(database: ControlPlaneDatabase) -> Path:
     """Where `/readyz` looks for the newest archive.
 
@@ -184,6 +199,7 @@ def create_boot_archive(
     except OSError as error:
         raise BackupError(f"could not create {directory}: {error}") from error
 
+    _require_writable_directory(directory)
     _require_room_for_archive(database, directory)
 
     stamp = int(moment)
@@ -200,6 +216,35 @@ def create_boot_archive(
     written = create_backup(database, target, backup_key=backup_key)
     _prune_boot_archives(directory, retain=retain)
     return written
+
+
+def record_boot_archive_attempt(
+    database: ControlPlaneDatabase,
+    *,
+    outcome: str,
+    detail: str,
+    now: float | None = None,
+) -> None:
+    """Record what the last boot archive attempt did, for `/readyz` to read.
+
+    Never raises. This runs on the boot path, and a health-reporting write that
+    could stop a container from starting would be a worse bug than the one it
+    reports. A lost row degrades to the previous behaviour — silence — rather
+    than to an outage.
+    """
+    moment = time.time() if now is None else now
+    try:
+        with database.write() as connection:
+            connection.execute(
+                "INSERT INTO boot_archive_attempts"
+                " (id, attempted_at, outcome, detail) VALUES (1, ?, ?, ?)"
+                " ON CONFLICT (id) DO UPDATE SET"
+                " attempted_at = excluded.attempted_at,"
+                " outcome = excluded.outcome, detail = excluded.detail",
+                (moment, outcome, detail[:1024]),
+            )
+    except sqlite3.Error:
+        return
 
 
 def _boot_archives(directory: Path) -> list[Path]:
@@ -230,6 +275,31 @@ def _newest_boot_archive_mtime(directory: Path) -> float | None:
         except OSError:
             continue
     return max(mtimes, default=None)
+
+
+def _require_writable_directory(directory: Path) -> None:
+    """Prove the directory is writable by creating a file, not by asking.
+
+    `os.access` answers from the permission bits and the process's ids, which
+    is not the same question: it is wrong under ACLs, wrong on a read-only
+    mount, and wrong whenever something other than mode stands in the way. The
+    archive is about to create a file there, so the probe creates one.
+    """
+    probe = directory / f".boot-archive-probe-{os.getpid()}"
+    try:
+        with open(probe, "xb"):
+            pass
+    except OSError as error:
+        raise BootArchiveDirectoryNotWritable(
+            f"{directory} is not writable by uid {os.getuid()} ({error});"
+            " an archive cannot be written there. If the directory is owned by"
+            " another user — an operator's manual backup taken over `ssh"
+            " console` creates it as root — the remedy is `chown` on the"
+            " volume, not a deploy."
+        ) from error
+    finally:
+        with contextlib.suppress(OSError):
+            probe.unlink()
 
 
 def _require_room_for_archive(database: ControlPlaneDatabase, directory: Path) -> None:
