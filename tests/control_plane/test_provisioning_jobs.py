@@ -708,9 +708,12 @@ def test_secret_canary_is_confined_to_sink_across_sink_crash_and_public_surfaces
         # `fly secrets import`.
         def contains(self, runtime_ref, name):
             names_path = sink_path.with_name(sink_path.name + ".names")
-            if sink_path.is_file() and names_path.is_file():
-                if name in names_path.read_text(encoding="utf-8").split():
-                    return True
+            if (
+                sink_path.is_file()
+                and names_path.is_file()
+                and name in names_path.read_text(encoding="utf-8").split()
+            ):
+                return True
             return super().contains(runtime_ref, name)
 
         def get(self, runtime_ref, name):
