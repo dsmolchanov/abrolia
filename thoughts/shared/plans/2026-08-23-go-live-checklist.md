@@ -46,6 +46,11 @@ batteries — then the staged flips the runbook already fixes.
 
 ## Track O — Operator/legal gates (cannot be delegated; block ALL real data)
 
+> **Sequenced runbook: `docs/canon-closure-runbook.md`** (added 2026-09-01).
+> Every remaining open canon box in one dependency-ordered list, with the
+> acceptance artifact or command each is measured by, each command run against
+> the checkout before being written down. Track O's boxes are O1–O7 there.
+
 - [ ] **O1. Legal pack signatures (B-07, P0).** DPA 28(3) + SCC module 2 + TIA
   for P1 Anthropic, P2 Fly.io, P4 Resend. **Partially executed as of
   2026-08-30**: P1 and P4 carry ✅ DPA + ✅ SCC (incorporated by reference,
@@ -67,11 +72,13 @@ batteries — then the staged flips the runbook already fixes.
 `control_plane/backup.py`, `control_plane/db.py`,
 `deploy/control-plane/Dockerfile`,
 `tests/control_plane/test_migrate_on_start.py`,
-`docs/control-plane-restore.md`.
+`docs/control-plane-restore.md`,
+`docs/canon-closure-runbook.md`.
 
 **Branches:** `fix/deploy-gate-backup-deadlock`,
 `fix/deploy-required-secrets-preflight`, `fix/deploy-verify-same-predicate`,
-`fix/readyz-gate-status-contract`, `fix/boot-durability-archive`.
+`fix/readyz-gate-status-contract`, `fix/boot-durability-archive`,
+`docs/canon-closure-operator-runbook`.
 
 **Round 2, 2026-08-31 — what the gate fix uncovered.** Removing the mask let a
 deploy through for the first time since 2026-08-22, and the new image would not
