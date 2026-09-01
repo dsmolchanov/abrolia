@@ -1145,24 +1145,46 @@ class ProvisioningWorker:
         record in the runtime namespace that a household's data was here, and
         it accumulates one entry per re-provisioning.
 
-        The receipts say which markers exist, so nothing has to be guessed
-        from a naming convention. Returns False if any deletion failed, which
-        the callers already treat as `secret_cleanup_unknown` rather than as
-        an erasure that succeeded.
+        Receipts are NOT the authority here, and cannot be.
+        `_record_email_secret_receipt` tolerates a `sqlite3.Error` by design —
+        the live marker still proves installation — so a marker can be
+        installed with no row describing it. Cleanup driven from receipts
+        alone would then select nothing, report success, and leave that marker
+        installed permanently: erasure that says it removed everything while a
+        durable record of the household's presence stays in the namespace.
+
+        The generation IS the provisioning job that installed it, so every
+        marker this household could have is derivable from its own
+        `email_identity` jobs whether or not a receipt survived. Receipts are
+        still consulted, because they name the marker verbatim and so cover a
+        row whose job has since been pruned.
+
+        Returns False if any deletion failed, which the callers already treat
+        as `secret_cleanup_unknown` rather than as an erasure that succeeded.
         """
+        markers: set[str] = set()
         try:
-            rows = self.jobs.db.query(
+            for row in self.jobs.db.query(
+                "SELECT id FROM provisioning_jobs"
+                " WHERE household_id = ? AND kind = 'email_identity'",
+                (household_id,),
+            ):
+                markers.add(
+                    email_secret_generation_marker(binding_ref, str(row["id"]))
+                )
+            for row in self.jobs.db.query(
                 "SELECT marker_name FROM email_secret_installs"
                 " WHERE household_id = ? AND secret_name = ?"
                 " AND marker_name <> ''",
                 (household_id, binding_ref),
-            )
+            ):
+                markers.add(str(row["marker_name"]))
         except sqlite3.Error:
             return False
         complete = True
-        for row in rows:
+        for marker in sorted(markers):
             try:
-                self.secret_sink.delete(namespace_ref, row["marker_name"])
+                self.secret_sink.delete(namespace_ref, marker)
             except Exception:
                 complete = False
         return complete

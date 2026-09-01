@@ -118,7 +118,8 @@ Non-blocker debt: codex/phase-4-real-actions dirty file + untracked landing not 
   `tests/control_plane/test_db.py`, `tests/control_plane/chaos_child.py` (the B-02 convergence regressions live beside the SIGKILL/reclaim harness there, not under `email/` — see the acceptance note)
 
 **Branches:** `fix/b02-receipt-convergence-regression`,
-`feat/c1-generation-scoped-convergence`
+`feat/c1-generation-scoped-convergence`,
+`fix/marker-erasure-independent-of-receipts`
 
 **Changes:**
 1. **Upstream B-01:** Resolve requested `org_id` against authenticated tenant; reject A→B service-token request with 403; add negative HTTP test `TestServiceToken_CrossOrgRejected` (A billing token requests B's org). Abrolia side adds adapter assertion that tenant never calls `/v1/service-tokens`.
