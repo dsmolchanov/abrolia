@@ -40,7 +40,28 @@ round), which is why the calling stub now grants `issues: write`, and
 **Files:** `.github/workflows/codex-review-window.yml`,
 `.github/workflows/codex-verdict-waker.yml`.
 
-**Branches:** `chore/plaintalk-dev-agent-policy-v2`.
+Merged 2026-08-30; the branch name is reused by Step 3, which now carries
+the branch claim — exactly one step may claim a branch.
 
 Applied by `bootstrap-dsmolchanov-repo.sh --gate-only` from
 dsmolchanov/dev-agent; the two stubs pin the same revision in lockstep.
+
+## Step 3 — gate v3.3: the waker re-enters on a formal review (2026-09-01)
+
+A Codex verdict delivered as a FORMAL REVIEW left a stale failed gate run on the
+commit: the gate's own re-entry starts a new check run while the earlier run
+that failed for want of a verdict stays, and GitHub's status rollup counts the
+red one — the pull request reports BLOCKED with a green run of the same context
+beside it. Gate revision `ae5d20884828bee1bdec72fcca998d1d6ed1c2c6`
+(codex-review-gate#9) adds the `pull_request_review` trigger to the waker,
+accepts either event shape in its guard and concurrency group, and drains every
+stale gate run for the head — serialized, because the gate's concurrency group
+is `cancel-in-progress` and back-to-back re-runs would cancel each other.
+
+**Files:** `.github/workflows/codex-verdict-waker.yml`,
+`.github/workflows/codex-review-window.yml`.
+
+**Branches:** `chore/plaintalk-dev-agent-policy-v2`.
+
+Applied by `bootstrap-dsmolchanov-repo.sh --gate-only` from dsmolchanov/dev-agent;
+the two stubs pin the same revision in lockstep.
