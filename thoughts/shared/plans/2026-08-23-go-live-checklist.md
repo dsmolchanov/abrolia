@@ -71,7 +71,7 @@ batteries — then the staged flips the runbook already fixes.
 
 **Branches:** `fix/deploy-gate-backup-deadlock`,
 `fix/deploy-required-secrets-preflight`, `fix/deploy-verify-same-predicate`,
-`fix/readyz-gate-status-contract`.
+`fix/readyz-gate-status-contract`, `fix/boot-durability-archive`.
 
 **Round 2, 2026-08-31 — what the gate fix uncovered.** Removing the mask let a
 deploy through for the first time since 2026-08-22, and the new image would not
