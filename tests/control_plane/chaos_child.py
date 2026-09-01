@@ -92,6 +92,22 @@ def _projection(database_path: Path) -> None:
     raise AssertionError("projection failpoint was not reached")
 
 
+def _installed_names_path(sink_path: Path) -> Path:
+    """Where the durable sink fake records the names it holds.
+
+    A separate file from the value: the tests assert the credential bytes at
+    `sink_path` directly, and the names are sink metadata, not the secret.
+    """
+    return sink_path.with_name(sink_path.name + ".names")
+
+
+def _installed_names(sink_path: Path) -> frozenset[str]:
+    path = _installed_names_path(sink_path)
+    if not path.is_file():
+        return frozenset()
+    return frozenset(path.read_text(encoding="utf-8").split())
+
+
 def _sink_commit(database_path: Path, sink_path: Path) -> None:
     """Pause after durable sink commit but before the worker records its receipt."""
 
@@ -110,18 +126,28 @@ def _sink_commit(database_path: Path, sink_path: Path) -> None:
             )
 
     class CheckpointFileSink:
+        # A sink retains EVERY name it was handed, and the email handoff hands
+        # it two in one installation: the credential and the generation marker
+        # that proves which provisioning generation installed it. Recording
+        # only the credential would model a state the sink cannot be in, and
+        # the crash this simulates would then look unconverged for a reason
+        # that has nothing to do with the crash.
         def install(self, runtime_ref, material):
             values = {name: bytes(value) for name, value in material.items()}
             sink_path.write_bytes(values[SYNTHETIC_EMAIL_SECRET_BINDING])
             sink_path.chmod(0o600)
+            _installed_names_path(sink_path).write_text(
+                "\n".join(sorted(values)), encoding="utf-8"
+            )
             material.clear()
             _checkpoint()
 
         def contains(self, runtime_ref, name):
-            return name == SYNTHETIC_EMAIL_SECRET_BINDING and sink_path.is_file()
+            return sink_path.is_file() and name in _installed_names(sink_path)
 
         def delete(self, runtime_ref, name):
             sink_path.unlink(missing_ok=True)
+            _installed_names_path(sink_path).unlink(missing_ok=True)
 
     active = _container(database_path)
     providers = ProviderRegistry()

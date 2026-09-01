@@ -15,6 +15,8 @@ from control_plane.email.contracts import EmailFailureKind, EmailProviderError
 from control_plane.email.models import (
     SYNTHETIC_EMAIL_SECRET_BINDING,
     EmailIdentityStatus,
+    email_secret_generation_marker,
+    email_secret_sink_digest,
 )
 from control_plane.models import StepKind, StepStatus
 from control_plane.observability import StructuredLogger
@@ -700,9 +702,15 @@ def test_secret_canary_is_confined_to_sink_across_sink_crash_and_public_surfaces
     assert canary not in child_stderr
 
     class DurableFileSink(InMemorySecretSink):
+        # Mirrors the crashed process's sink: it holds every name that one
+        # installation handed it — the credential AND the generation marker
+        # beside it — because that is what `install` writes in a single
+        # `fly secrets import`.
         def contains(self, runtime_ref, name):
-            if name == binding and sink_path.is_file():
-                return True
+            names_path = sink_path.with_name(sink_path.name + ".names")
+            if sink_path.is_file() and names_path.is_file():
+                if name in names_path.read_text(encoding="utf-8").split():
+                    return True
             return super().contains(runtime_ref, name)
 
         def get(self, runtime_ref, name):
@@ -834,12 +842,21 @@ def test_reclaim_after_converged_sink_write_records_durable_receipt(
 
     contains_calls: list[tuple[str, str]] = []
 
+    installed = {
+        SYNTHETIC_EMAIL_SECRET_BINDING,
+        # The generation marker the crashed install wrote beside it. Both names
+        # travel in one installation, so a sink that holds the credential holds
+        # this too — and it is what makes the convergence THIS generation's
+        # rather than any generation's.
+        email_secret_generation_marker(SYNTHETIC_EMAIL_SECRET_BINDING, job["id"]),
+    }
+
     class ConvergedSink(InMemorySecretSink):
         # The prior process installed the secret before dying; only the live
         # sink knows.
         def contains(self, runtime_ref, name):
             contains_calls.append((runtime_ref, name))
-            return name == SYNTHETIC_EMAIL_SECRET_BINDING
+            return name in installed
 
     provider = _handoff_already_settled_provider(job, identity_id)
     registry = ProviderRegistry()
@@ -860,6 +877,15 @@ def test_reclaim_after_converged_sink_write_records_durable_receipt(
     assert receipt["household_id"] == cp_stack.household.id
     assert receipt["secret_name"] == SYNTHETIC_EMAIL_SECRET_BINDING
     assert receipt["namespace_ref"] == contains_calls[0][0]
+    # The receipt is generation-scoped, and says so durably: a later job
+    # reconciling against these remains reads a generation that is not its own.
+    assert receipt["generation"] == job["id"]
+    assert receipt["marker_name"] == email_secret_generation_marker(
+        SYNTHETIC_EMAIL_SECRET_BINDING, job["id"]
+    )
+    assert receipt["sink_digest"] == email_secret_sink_digest(
+        receipt["namespace_ref"], receipt["marker_name"]
+    )
 
 
 def test_durable_receipt_alone_settles_reclaim_without_live_sink(cp_stack) -> None:
@@ -868,18 +894,26 @@ def test_durable_receipt_alone_settles_reclaim_without_live_sink(cp_stack) -> No
     otherwise the durable half of B-02 proves nothing."""
     job, identity_id = _email_job_stuck_outcome_unknown(cp_stack)
 
+    namespace_ref = f"synthetic-runtime:{cp_stack.household.id}"
+    marker = email_secret_generation_marker(
+        SYNTHETIC_EMAIL_SECRET_BINDING, job["id"]
+    )
     with cp_stack.database.write() as connection:
         connection.execute(
             "INSERT INTO email_secret_installs"
-            " (job_id, household_id, secret_name, namespace_ref, installed_at, created_at)"
-            " VALUES (?, ?, ?, ?, ?, ?)",
+            " (job_id, household_id, secret_name, namespace_ref, installed_at,"
+            " created_at, generation, marker_name, sink_digest)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 job["id"],
                 cp_stack.household.id,
                 SYNTHETIC_EMAIL_SECRET_BINDING,
-                f"synthetic-runtime:{cp_stack.household.id}",
+                namespace_ref,
                 BASE_TIME + 3,
                 BASE_TIME + 3,
+                job["id"],
+                marker,
+                email_secret_sink_digest(namespace_ref, marker),
             ),
         )
 
@@ -901,6 +935,150 @@ def test_durable_receipt_alone_settles_reclaim_without_live_sink(cp_stack) -> No
     assert settled.status == "succeeded"
     assert provider.ensure_calls == 0
     assert contains_calls == []
+
+
+# The generation that installed a secret is the only one it can prove. A
+# name-only probe answered a weaker question: generation N-1's credential
+# surviving an incomplete teardown carries the SAME binding name, so an empty
+# reconciliation of generation N read "installed", wrote itself a receipt, and
+# settled verified while the runtime still held N-1's credentials —
+# verified-but-stale, on the P0 real-email path.
+#
+# Both proofs are covered, because both were name-only, and fixing one would
+# leave the other as the way in. The `fresh` column is not decoration: without
+# it this passes just as well if nothing converges at all.
+@pytest.mark.parametrize("consumer", ("live-sink", "durable-receipt"))
+@pytest.mark.parametrize("generation", ("stale", "fresh"))
+def test_convergence_is_scoped_to_the_generation_that_installed_the_secret(
+    cp_stack, consumer: str, generation: str
+) -> None:
+    job, identity_id = _email_job_stuck_outcome_unknown(cp_stack)
+    namespace_ref = f"synthetic-runtime:{cp_stack.household.id}"
+
+    # A real earlier provisioning of this identity: its own job id, hence its
+    # own generation and its own marker.
+    previous_job_id = "00000000-0000-4000-8000-0000000000n1".replace("n", "0")
+    installing_generation = (
+        job["id"] if generation == "fresh" else previous_job_id
+    )
+    marker = email_secret_generation_marker(
+        SYNTHETIC_EMAIL_SECRET_BINDING, installing_generation
+    )
+
+    if consumer == "live-sink":
+        # The namespace still holds a credential under the shared binding name
+        # and the marker of whichever generation installed it.
+        present = {SYNTHETIC_EMAIL_SECRET_BINDING, marker}
+
+        class RemainsSink(InMemorySecretSink):
+            def contains(self, runtime_ref, name):
+                return name in present
+
+        sink = RemainsSink()
+    else:
+        # Nothing live at all: the durable half has to answer alone, and must
+        # answer for its own generation only.
+        class DeniesEverything(InMemorySecretSink):
+            def contains(self, runtime_ref, name):
+                return False
+
+        sink = DeniesEverything()
+        # `job_id` is a foreign key, so a receipt always references a real job
+        # and one belonging to a DIFFERENT job is simply not found by the
+        # lookup. The case worth proving is therefore the one the key cannot
+        # exclude: a row filed against THIS job that records another
+        # generation. If the lookup consulted `job_id` alone — as `0005` did —
+        # this row would settle the job.
+        with cp_stack.database.write() as connection:
+            connection.execute(
+                "INSERT INTO email_secret_installs"
+                " (job_id, household_id, secret_name, namespace_ref,"
+                " installed_at, created_at, generation, marker_name,"
+                " sink_digest)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    job["id"],
+                    cp_stack.household.id,
+                    SYNTHETIC_EMAIL_SECRET_BINDING,
+                    namespace_ref,
+                    BASE_TIME + 3,
+                    BASE_TIME + 3,
+                    installing_generation,
+                    marker,
+                    email_secret_sink_digest(namespace_ref, marker),
+                ),
+            )
+
+    provider = _handoff_already_settled_provider(job, identity_id)
+    registry = ProviderRegistry()
+    registry.register("fake-email", provider)
+
+    settled = cp_stack.make_worker(
+        providers=registry, secret_sink=sink, now=BASE_TIME + 5
+    ).reconcile(job["id"])
+
+    # The provider is never re-driven either way: this is about what the
+    # existing installation proves, not about issuing new material.
+    assert provider.ensure_calls == 0
+
+    if generation == "fresh":
+        assert settled.status == "succeeded"
+        return
+
+    assert settled.status == "outcome_unknown"
+    assert settled.error_code == "secret_handoff_unknown"
+    assert cp_stack.jobs.get(job["id"]).status == "outcome_unknown"
+    identity = cp_stack.email_identities.get(identity_id)
+    assert identity.status != EmailIdentityStatus.VERIFIED, (
+        "generation N verified on generation N-1's credentials"
+    )
+
+
+def test_a_legacy_receipt_without_a_generation_proves_nothing(cp_stack) -> None:
+    """`0005` rows carry no generation, and the migration defaults them empty.
+
+    An empty default is only safe because it can never equal a job id. If the
+    backfill ever grew a "sensible" default — the job's own id, say — every
+    pre-existing row would start certifying a generation nobody verified, and
+    the hole this closes would reopen underneath the schema that closed it.
+    """
+    job, identity_id = _email_job_stuck_outcome_unknown(cp_stack)
+
+    with cp_stack.database.write() as connection:
+        connection.execute(
+            "INSERT INTO email_secret_installs"
+            " (job_id, household_id, secret_name, namespace_ref, installed_at,"
+            " created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                job["id"],
+                cp_stack.household.id,
+                SYNTHETIC_EMAIL_SECRET_BINDING,
+                f"synthetic-runtime:{cp_stack.household.id}",
+                BASE_TIME + 3,
+                BASE_TIME + 3,
+            ),
+        )
+    row = cp_stack.database.query_one(
+        "SELECT generation FROM email_secret_installs WHERE job_id = ?",
+        (job["id"],),
+    )
+    assert row["generation"] == "", "the migration default stopped being inert"
+
+    class DeniesEverything(InMemorySecretSink):
+        def contains(self, runtime_ref, name):
+            return False
+
+    provider = _handoff_already_settled_provider(job, identity_id)
+    registry = ProviderRegistry()
+    registry.register("fake-email", provider)
+
+    settled = cp_stack.make_worker(
+        providers=registry, secret_sink=DeniesEverything(), now=BASE_TIME + 5
+    ).reconcile(job["id"])
+
+    assert settled.status == "outcome_unknown"
+    assert settled.error_code == "secret_handoff_unknown"
 
 
 def test_issued_runtime_job_rechecks_current_content_restriction_receipt(

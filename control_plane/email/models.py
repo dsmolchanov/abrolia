@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Literal
@@ -36,6 +37,73 @@ GMAIL_EMAIL_SCOPES = tuple(sorted((
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/gmail.send",
 )))
+
+
+# --- Generation-scoped secret handoff (B-02) -------------------------------
+
+# The suffix that turns a binding name into its generation marker. The Fly
+# secret sink can attest that a NAME exists and nothing whatever about the
+# value behind it, so a generation that must be provable to that sink has to
+# live in a name.
+EMAIL_SECRET_GENERATION_MARKER_INFIX = "_GEN_"
+
+# `SECRET_NAME` allows 128 characters. The longest binding is 31
+# (`ABROLIA_NERVE_EMAIL_CREDENTIALS`), the infix is 5, so the digest is bounded
+# well inside the limit while staying long enough that two generations do not
+# collide.
+EMAIL_SECRET_GENERATION_DIGEST_CHARS = 32
+
+
+def email_secret_generation(job_id: str) -> str:
+    """The generation a receipt and a marker must agree on.
+
+    The provisioning job that installed the material IS the generation. It is
+    stable across that job's own retries and reconciliations — which is what
+    lets a crash after the sink write converge without an operator — and it is
+    necessarily different for a later re-provisioning of the same identity,
+    which is what stops generation N-1's surviving secret from answering for
+    generation N.
+
+    Deriving it from anything the provider chooses would let the party whose
+    freshness is in question certify its own freshness. The control plane
+    assigns it.
+    """
+    if not isinstance(job_id, str) or not job_id:
+        raise ValueError("a secret generation needs the job that installed it")
+    return job_id
+
+
+def email_secret_generation_marker(binding_ref: str, generation: str) -> str:
+    """The secret NAME whose presence proves this generation was installed.
+
+    Hashed rather than embedded: a job id is not constrained to the uppercase
+    alphabet `SECRET_NAME` requires, and a name is the one part of a secret
+    that leaks into `fly secrets list` output, operator terminals and support
+    transcripts. The digest is not a confidentiality measure — a job id is not
+    a secret — it is what makes the name well-formed and fixed-length.
+    """
+    if not isinstance(binding_ref, str) or not binding_ref:
+        raise ValueError("a generation marker needs its binding")
+    digest = hashlib.sha256(
+        f"{binding_ref}\x00{email_secret_generation(generation)}".encode()
+    ).hexdigest()[:EMAIL_SECRET_GENERATION_DIGEST_CHARS]
+    return (
+        f"{binding_ref}{EMAIL_SECRET_GENERATION_MARKER_INFIX}{digest.upper()}"
+    )
+
+
+def email_secret_sink_digest(namespace_ref: str, marker_name: str) -> str:
+    """What the receipt claims the sink was holding, over NON-secret inputs.
+
+    Explicitly not a digest of the secret value. No value reaches this process
+    after installation, and a sink that cannot attest values cannot be asked to
+    prove one. This digests what was actually attested — the namespace and the
+    marker that carries the generation — so a receipt can be checked against
+    the sink it describes rather than merely believed.
+    """
+    return hashlib.sha256(
+        f"{namespace_ref}\x00{marker_name}".encode()
+    ).hexdigest()
 
 
 class EmptyEmailProviderRefs(BaseModel):
