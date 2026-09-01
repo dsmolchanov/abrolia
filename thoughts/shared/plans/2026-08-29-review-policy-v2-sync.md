@@ -65,3 +65,40 @@ is `cancel-in-progress` and back-to-back re-runs would cancel each other.
 
 Applied by `bootstrap-dsmolchanov-repo.sh --gate-only` from dsmolchanov/dev-agent;
 the two stubs pin the same revision in lockstep.
+
+## Step 4 — gate v3.4: the waker probe reads a trigger, and review debt is one issue per finding (2026-09-01)
+
+Two changes over Step 3's revision.
+
+The waker-liveness probe read `state: active` at a fixed workflow path to decide
+whether a late verdict could re-enter the gate, and took the short 120s window
+where it could. That state is equally true of the reusable HOST, which is
+`workflow_call` only and can never be started by an event — so a repository
+whose file at that path is the host took the short window with nothing able to
+wake it, and every clean verdict there needed a manual re-run. The probe now
+also reads the default-branch file and requires an `issue_comment` trigger in
+its `on:` block, comments stripped first so the host's own prose cannot satisfy
+it. Failure direction is unchanged: either read failing means "no waker", which
+costs minutes and never the merge.
+
+Review debt is now recorded one issue per finding. A degraded round that merges
+over still-open P1s used to file one bundled issue per pull request, which is
+open or closed for everything in it — a single fixed finding could not be
+retired without either closing its unfixed siblings or leaving the issue open as
+a reminder of nothing in particular. Each deferred finding gets its own issue,
+keyed on a fingerprint of the path and the complete finding line so truncation
+cannot collapse two findings into one, with the title bounded below GitHub's
+256-character limit; over that limit the POST fails into a warning and the
+finding merges unrecorded. This matches what the weekly trunk review already
+files here.
+
+Gate revision `23518dbd89add6333ed0d147bd2acd8d898ef04e` (codex-review-gate#10).
+
+**Files:** `.github/workflows/codex-verdict-waker.yml`,
+`.github/workflows/codex-review-window.yml`,
+`thoughts/shared/plans/2026-08-29-review-policy-v2-sync.md`.
+
+**Branches:** `chore/gate-pin-23518db`.
+
+Pin bump only in both stubs, in lockstep: the gate's short window and the
+waker's re-entry are two halves of one protocol.
