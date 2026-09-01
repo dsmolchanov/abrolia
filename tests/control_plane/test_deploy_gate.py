@@ -179,3 +179,82 @@ def test_both_ends_of_the_deploy_read_this_one_filter() -> None:
         "a readiness predicate spelled inline in the workflow is the drift "
         f"this filter exists to prevent — put it in {filter_path}"
     )
+
+
+def test_a_broken_backup_writer_does_not_hold_the_deploy_either() -> None:
+    """Excused for the same reason as `backup_stale`, not a weaker one.
+
+    A deploy cannot fix a directory the service may not write to. Gating on it
+    would repeat the nine-day deadlock exactly: refusing the deploy for a
+    condition the deploy was never able to clear.
+    """
+    assert _deployable(
+        {"status": "not_ready", "blockers": ["backup_writer_failed"]}
+    )
+    assert _deployable(
+        {"status": "not_ready", "blockers": ["backup_stale", "backup_writer_failed"]}
+    )
+
+
+def test_a_broken_writer_still_does_not_excuse_a_real_blocker() -> None:
+    assert not _deployable(
+        {
+            "status": "not_ready",
+            "blockers": ["backup_writer_failed", "database_unavailable"],
+        }
+    )
+
+
+def test_the_excused_set_is_exactly_these_two() -> None:
+    """What the gate is allowed to ignore, pinned.
+
+    This gate ignoring a condition is how a real problem becomes invisible:
+    `backup_stale` stopped blocking deploys for a good reason, the boot archive
+    became non-fatal for a good reason, and the combination meant a writer that
+    failed at every boot looked like a healthy system for ten days.
+
+    Both current exemptions share one property — a deploy cannot clear them, so
+    refusing the deploy would deadlock rather than help — and both are NAMED in
+    the readiness payload, which is what makes them visible despite being
+    excused. A third exemption added without those two properties would recreate
+    the silence, so the set is asserted rather than trusted.
+    """
+    excused = ["backup_stale", "backup_writer_failed"]
+    assert _deployable({"status": "not_ready", "blockers": excused})
+
+    # Anything else, alone or travelling with an excused one, still refuses.
+    for blocker in (
+        "database_unavailable",
+        "volume_unavailable",
+        "workers_paused",
+        "stale_worker_leases",
+        "provider_outcomes_unknown",
+        "expired_bootstrap",
+        "provider_registry_unavailable",
+    ):
+        assert not _deployable(
+            {"status": "not_ready", "blockers": [blocker]}
+        ), f"{blocker} must hold the deploy"
+        assert not _deployable(
+            {"status": "not_ready", "blockers": [*excused, blocker]}
+        ), f"{blocker} must hold the deploy even beside an excused one"
+
+
+def test_every_excused_blocker_is_one_readiness_can_actually_emit() -> None:
+    """An exemption for a name nothing produces would be dead code hiding a typo."""
+    from control_plane.observability import HealthSnapshot
+
+    stale = HealthSnapshot(
+        database_ok=True,
+        volume_ok=True,
+        volume_free_bytes=1,
+        workers_paused=False,
+        pending_jobs=0,
+        stale_leases=0,
+        unknown_outcomes=0,
+        expired_bootstrap_tokens=0,
+        backup_age_seconds=10_000_000.0,
+        boot_archive_outcome="failed",
+    )
+    emitted = set(stale.readiness_blockers(maximum_backup_age_seconds=1.0))
+    assert {"backup_stale", "backup_writer_failed"} <= emitted

@@ -259,6 +259,11 @@ def create_app(
                 "volume": "ok" if snapshot.volume_ok else "unavailable",
                 "workers": "paused" if snapshot.workers_paused else "running",
                 "backup": backup_status,
+                # The WRITER, distinct from the archive's age. `backup: stale`
+                # with `backup_writer: ok` is a quiet week; `backup: stale`
+                # with `backup_writer: failed` is a system that cannot take a
+                # restore point at all, and the two were indistinguishable.
+                "backup_writer": snapshot.boot_archive_outcome or "not_observed",
                 "providers": provider_status,
             },
             "metrics": {
@@ -275,7 +280,8 @@ def create_app(
     def health_snapshot() -> HealthSnapshot:
         reporter = app.state.health_reporter
         return reporter.snapshot(
-            backup_completed_at=reporter.latest_backup_completed_at()
+            backup_completed_at=reporter.latest_backup_completed_at(),
+            boot_archive_outcome=reporter.latest_boot_archive_outcome(),
         )
 
     @app.get("/healthz")

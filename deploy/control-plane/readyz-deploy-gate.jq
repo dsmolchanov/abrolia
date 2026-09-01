@@ -33,9 +33,17 @@
 # know is not one it may treat as the benign case. The stricter post-deploy
 # check that used to catch it was replaced by this file, so the exception had
 # to grow the status test rather than inherit a permissive one.
+# `backup_writer_failed` is excused for the SAME reason and not for a weaker
+# one: a deploy cannot fix a directory the service may not write to, so gating
+# on it would repeat the nine-day deadlock exactly — refusing the deploy for a
+# condition the deploy was never able to clear. It is excused here and NAMED in
+# the blocker list, which is the half that was missing: a broken writer used to
+# be indistinguishable from a quiet week, because `backup_stale` said both.
 (.status == "ready")
 or (
   .status == "not_ready"
   and ((.blockers // []) | length) > 0
-  and (((.blockers // []) - ["backup_stale"]) | length) == 0
+  and (
+    ((.blockers // []) - ["backup_stale", "backup_writer_failed"]) | length
+  ) == 0
 )
