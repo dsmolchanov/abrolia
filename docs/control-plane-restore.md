@@ -36,7 +36,7 @@ archive and the migration, leaving a restore point that silently omits data.
 The container entrypoint runs the migration step before `serve`:
 
 ```bash
-python -m control_plane.db migrate --backup-first
+python -m control_plane.db migrate --backup-first --archive
 ```
 
 When at least one `control_plane/migrations/*.sql` is pending, it first writes
@@ -52,6 +52,39 @@ matters on restart: a partially upgraded database would be snapshotted by the
 next boot and recorded as the new pre-migrate archive, silently replacing the
 good restore point with one taken of the broken schema. When nothing is
 pending, no archive is written.
+
+## The boot archive (`--archive`)
+
+`--backup-first` is a rollback point for a migration. It is **not** the backup
+`/readyz` reports on, and confusing the two cost production ~237 hours without
+an archive while every deploy reported success: readiness reads the newest
+`/data/backups/*.cpb`, and the pre-migrate snapshot writes a `.bak` beside the
+database, only when a migration is pending. Nothing wrote the file readiness
+was looking for.
+
+`--archive` writes that file, after the migration, as
+`/data/backups/boot-<epoch>.cpb` — same authenticated format, same
+`ABROLIA_CONTROL_PLANE_BACKUP_KEY`, restored the same way:
+
+```bash
+abrolia-control-plane restore /data/backups/boot-<epoch>.cpb \
+  --target /data/control-plane.db
+```
+
+Three properties an operator should know:
+
+- **It is skipped, never fatal.** If the archive cannot be written the boot
+  reports `boot archive skipped: <reason>` on stderr and the container starts
+  anyway. A full volume must not become an outage. `--backup-first` still
+  fails closed, because it guards a migration.
+- **One per 6 hours, not one per boot.** A container in a restart loop writes
+  a single archive per window rather than one per attempt. If you need a fresh
+  archive right now, take one yourself with `abrolia-control-plane backup`
+  (stop the service first — it takes the writer lock).
+- **Retention keeps the 5 newest `boot-*.cpb` and touches nothing else.** Your
+  own archives in `/data/backups/` are never pruned, whatever their age. Name
+  them anything except a `boot-` prefix — the runbook's
+  `control-plane-<date>.cpb` is safe.
 
 Both the snapshot and the rollback restore stream through disk in bounded
 chunks, so neither is limited by the Machine's 512 MiB of RAM. The intermediate

@@ -63,11 +63,15 @@ batteries — then the staged flips the runbook already fixes.
 `tests/control_plane/test_deploy_gate.py`, `tests/test_deploy_workflow.py`,
 `docs/onboarding-runbook.md`,
 `deploy/control-plane/required-runtime-config.txt`,
-`tests/control_plane/test_required_config.py`.
+`tests/control_plane/test_required_config.py`,
+`control_plane/backup.py`, `control_plane/db.py`,
+`deploy/control-plane/Dockerfile`,
+`tests/control_plane/test_migrate_on_start.py`,
+`docs/control-plane-restore.md`.
 
 **Branches:** `fix/deploy-gate-backup-deadlock`,
 `fix/deploy-required-secrets-preflight`, `fix/deploy-verify-same-predicate`,
-`fix/readyz-gate-status-contract`.
+`fix/readyz-gate-status-contract`, `fix/boot-durability-archive`.
 
 **Round 2, 2026-08-31 — what the gate fix uncovered.** Removing the mask let a
 deploy through for the first time since 2026-08-22, and the new image would not
@@ -165,11 +169,53 @@ archive is written only by a deploy that happens to carry one. This step
 already said as much in Round 3 — "a backup that only a migration-carrying
 deploy can produce" — but the consequence is now observable rather than
 predicted: production's newest archive is ~237 hours old and ageing, and no
-deploy will refresh it on its own. The gate is right to stop blocking on it;
-the durability gap behind it is a separate decision (always snapshot at boot,
-against the 1 GB volume and the crash-loop protection that `_reusable_
-pre_migrate_backup` exists to provide) and belongs to Track R rather than to
-this step.
+deploy will refresh it on its own. The gate is right to stop blocking on it.
+Investigating why turned up something worse than the trigger — see Round 5.
+
+**Round 5, 2026-09-01 — the readiness signal had no writer at all.** "Only a
+migration-carrying deploy can produce it" was still too generous. The two
+halves were never connected in the first place:
+
+- `/readyz` reads the newest `<db>.parent/backups/*.cpb`
+  (`observability.py:150-157`). That is its entire definition of "the backup".
+- The only automated writer, `create_pre_migrate_backup`, writes
+  `<db>.pre-migrate-<rev>-<epoch>.bak` **beside the database** — a different
+  directory AND a different extension — and only when a migration is pending.
+
+So even a migration-carrying deploy would not have cleared `backup_stale`.
+`.cpb` appears exactly once in the whole of `control_plane/`, at the line that
+READS it; nothing writes one. The archive production was ageing from was an
+operator's manual `abrolia-control-plane backup`, and after it aged out
+nothing was ever going to replace it. The gate comment's premise — "the
+archive is written at CONTAINER START by `migrate --backup-first`" — was
+simply false, and it is the reason the deadlock looked like a clock problem
+rather than a missing feature.
+
+The two archives stay distinct, because they are distinct: a pre-migrate
+snapshot is a rollback point for one migration and FAILS CLOSED, while a
+durability archive is a floor and must never stop a container from starting.
+`create_boot_archive` writes the second one, into the directory `/readyz`
+actually reads, on every boot past a 6-hour interval:
+
+- **Interval, not content, for crash-loop protection.** The pre-migrate path
+  compares images because a failed migration leaves the database
+  byte-identical; here it legitimately differs every boot, so content would
+  never match and every restart would write a full archive onto a 1 GiB
+  volume. Six hours sits well under the 26-hour staleness threshold, so a
+  daily deploy keeps the signal green, and bounds a restart loop to four
+  archives a day.
+- **Non-fatal.** Every failure is reported and skipped. A full volume must not
+  become an outage, which is exactly the difference from `--backup-first`.
+- **Retention prunes only `boot-*.cpb`.** Operator archives live in the same
+  directory — the runbook puts them there — and pruning by extension would
+  delete the offsite copy taken before a risky migration, which is the one
+  archive that matters most. That property has its own regression.
+
+Nine tests land with it, including the defect stated directly
+(`test_backup_first_alone_writes_nothing_the_readiness_probe_can_see`) and a
+restore round-trip, because an archive that cannot be restored is not a
+restore point. The probe's own accessor is used to assert visibility rather
+than a second opinion about the path.
 
 - [ ] **O0a. Backups must not depend on deploys.** *Opened 2026-08-31 by the
   above, and deliberately NOT fixed with it — this needs a design, not a cron

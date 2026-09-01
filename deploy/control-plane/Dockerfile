@@ -45,4 +45,10 @@ EXPOSE 8080
 # Migrate-on-start with backup-before-migrate: a pending migration is applied
 # only after an authenticated snapshot of the volume database succeeds, and any
 # failure stops the container before `serve` can open the schema.
-CMD ["sh", "-c", "python -m control_plane.db migrate --backup-first && exec abrolia-control-plane serve --host 0.0.0.0 --port 8080"]
+#
+# `--archive` is the separate, non-fatal step that writes the durability
+# archive `/readyz` reads (`backups/*.cpb`). `--backup-first` never did: it
+# writes a migration rollback point beside the database, and only when a
+# migration is pending, so the readiness signal had no automated writer at all
+# and production ran ~237 hours with no archive while deploys reported success.
+CMD ["sh", "-c", "python -m control_plane.db migrate --backup-first --archive && exec abrolia-control-plane serve --host 0.0.0.0 --port 8080"]
