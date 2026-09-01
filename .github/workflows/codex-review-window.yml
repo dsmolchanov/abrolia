@@ -50,7 +50,7 @@ jobs:
     # waker (or vice versa) leaves clean PRs red until a human re-runs the
     # gate. Keep both pins in lockstep. To move the pin, read the host diff
     # first, then change this line: the bump is the review.
-    uses: dsmolchanov/codex-review-gate/.github/workflows/codex-review-window.yml@ae5d20884828bee1bdec72fcca998d1d6ed1c2c6
+    uses: dsmolchanov/codex-review-gate/.github/workflows/codex-review-window.yml@23518dbd89add6333ed0d147bd2acd8d898ef04e
     permissions:
       # actions:read is for the gate's waker probe — it reads the waker
       # workflow's state to size its verdict window; a called workflow's
