@@ -267,7 +267,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     import binascii
     import json
 
-    from control_plane.backup import BackupError, create_pre_migrate_backup
+    from control_plane.backup import (
+        BackupError,
+        create_boot_archive,
+        create_pre_migrate_backup,
+    )
     from control_plane.config import decode_key_material
 
     parser = argparse.ArgumentParser(prog="python -m control_plane.db")
@@ -277,6 +281,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--backup-first",
         action="store_true",
         help="take an authenticated snapshot before the first pending migration",
+    )
+    migrate.add_argument(
+        "--archive",
+        action="store_true",
+        help=(
+            "write the durability archive /readyz reads, if the newest one is"
+            " older than the boot-archive interval"
+        ),
     )
     args = parser.parse_args(argv)
 
@@ -326,8 +338,28 @@ def main(argv: Sequence[str] | None = None) -> int:
             if backup is not None:
                 print(f"restore from {backup}", file=sys.stderr)
             return 1
+        # AFTER the migration, and never fatal. This is the archive `/readyz`
+        # actually reads (`backups/*.cpb`); the pre-migrate snapshot above is a
+        # rollback point for the migration and lives elsewhere under a
+        # different name. Taking it after means it holds the schema the service
+        # is about to run, which is the state an operator would want back.
+        #
+        # A failure here is reported and the boot continues. The pre-migrate
+        # snapshot fails closed because it guards a migration; a durability
+        # archive that refused to start the container would turn a full volume
+        # into an outage.
+        archive: Path | None = None
+        if args.archive:
+            try:
+                archive = create_boot_archive(database, backup_key=backup_key)
+            except (BackupError, OSError) as error:
+                print(f"boot archive skipped: {error}", file=sys.stderr)
         print(json.dumps(
-            {"applied": applied, "backup": str(backup) if backup else None},
+            {
+                "applied": applied,
+                "backup": str(backup) if backup else None,
+                "archive": str(archive) if archive else None,
+            },
             sort_keys=True,
         ))
         return 0
