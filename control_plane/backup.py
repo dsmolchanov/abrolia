@@ -107,6 +107,173 @@ def create_pre_migrate_backup(
     return create_backup(database, target, backup_key=backup_key)
 
 
+# How long a boot archive stays authoritative before the next boot writes
+# another. Comfortably under `MAXIMUM_BACKUP_AGE_SECONDS` (26h), so an app that
+# is deployed even once a day never reports `backup_stale`; long enough that a
+# container restarting in a loop writes one archive rather than one per attempt.
+BOOT_ARCHIVE_MINIMUM_INTERVAL_SECONDS = 6 * 60 * 60
+
+# How many boot archives are kept. The volume is 1 GiB and the database is
+# small, but "small" is not a guarantee, so the count is bounded and the free
+# space is checked before writing.
+BOOT_ARCHIVE_RETAIN = 5
+
+# Boot archives are named distinctly from operator archives so pruning can tell
+# them apart. An operator's `abrolia-control-plane backup /data/backups/...cpb`
+# lands in the same directory and must never be deleted by this code.
+BOOT_ARCHIVE_PREFIX = "boot-"
+BOOT_ARCHIVE_SUFFIX = ".cpb"
+
+
+def boot_archive_directory(database: ControlPlaneDatabase) -> Path:
+    """Where `/readyz` looks for the newest archive.
+
+    `HealthProbe.latest_backup_completed_at` globs `<db>.parent/backups/*.cpb`,
+    and that is the only definition of "the backup" the health endpoint has.
+    """
+    return database.path.parent / "backups"
+
+
+def create_boot_archive(
+    database: ControlPlaneDatabase,
+    *,
+    backup_key: bytes,
+    now: float | None = None,
+    minimum_interval_seconds: float = BOOT_ARCHIVE_MINIMUM_INTERVAL_SECONDS,
+    retain: int = BOOT_ARCHIVE_RETAIN,
+) -> Path | None:
+    """Write the durability archive `/readyz` actually reads. None when skipped.
+
+    This exists because nothing wrote one. `/readyz` reports `backup_stale`
+    past 26 hours from the newest `backups/*.cpb`
+    (`observability.py:150-157`), and the only automated writer in the system
+    was `create_pre_migrate_backup`, which writes
+    `<db>.pre-migrate-<rev>-<epoch>.bak` NEXT TO the database — a different
+    directory and a different extension — and only when a migration is
+    pending. So the two never met: the deploy gate's premise that "a deploy
+    refreshes the backup" was false in both directions, and production ran
+    ~237 hours with no archive while every deploy reported success.
+
+    The two archives are deliberately different things and stay that way. A
+    pre-migrate snapshot is a rollback point for one migration and FAILS
+    CLOSED: never migrate a database you could not snapshot. A boot archive is
+    a durability floor, and it must never be the reason a container refuses to
+    start — a full volume would otherwise turn a recoverable disk-space
+    problem into an outage. Every failure here is reported and skipped.
+
+    Crash-loop protection is by interval rather than by content. The
+    pre-migrate path compares images because a failed migration leaves the
+    database byte-identical; here the database legitimately differs every
+    boot, so content would never match and every restart would write a full
+    archive. An interval bounds a restart loop to one archive per window.
+    """
+    directory = boot_archive_directory(database)
+    moment = time.time() if now is None else now
+
+    newest = _newest_boot_archive_mtime(directory)
+    if newest is not None and moment - newest < minimum_interval_seconds:
+        return None
+
+    # An archive of a damaged database is not a restore point, exactly as for
+    # the pre-migrate path. The difference is only in what happens next: there
+    # it stops a migration, here it stops the archive and lets the boot go on.
+    _require_sound_database(database)
+
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        raise BackupError(f"could not create {directory}: {error}") from error
+
+    _require_room_for_archive(database, directory)
+
+    stamp = int(moment)
+    target = directory / f"{BOOT_ARCHIVE_PREFIX}{stamp}{BOOT_ARCHIVE_SUFFIX}"
+    # Same bounded disambiguator as the pre-migrate path, for the same reason:
+    # `create_backup` refuses to overwrite, and two boots inside one second is
+    # what a fast-failing container does.
+    for suffix in range(1, 10):
+        if not target.exists():
+            break
+        target = directory / (
+            f"{BOOT_ARCHIVE_PREFIX}{stamp}-{suffix}{BOOT_ARCHIVE_SUFFIX}"
+        )
+    written = create_backup(database, target, backup_key=backup_key)
+    _prune_boot_archives(directory, retain=retain)
+    return written
+
+
+def _boot_archives(directory: Path) -> list[Path]:
+    """Only the archives THIS code wrote.
+
+    The operator's own archives live in the same directory — the runbook says
+    `abrolia-control-plane backup /data/backups/control-plane-<date>.cpb` — and
+    deleting one because it shares an extension would destroy the very thing
+    the retention policy exists to protect.
+    """
+    try:
+        return [
+            archive
+            for archive in directory.glob(
+                f"{BOOT_ARCHIVE_PREFIX}*{BOOT_ARCHIVE_SUFFIX}"
+            )
+            if archive.is_file()
+        ]
+    except OSError:
+        return []
+
+
+def _newest_boot_archive_mtime(directory: Path) -> float | None:
+    mtimes = []
+    for archive in _boot_archives(directory):
+        try:
+            mtimes.append(archive.stat().st_mtime)
+        except OSError:
+            continue
+    return max(mtimes, default=None)
+
+
+def _require_room_for_archive(database: ControlPlaneDatabase, directory: Path) -> None:
+    """Refuse before writing rather than fill the volume mid-archive.
+
+    A partial archive on a full 1 GiB volume costs the space AND is not a
+    restore point. The margin is the database's own size again, because the
+    archive is about that big and the database still needs room to write.
+    """
+    try:
+        database_bytes = database.path.stat().st_size
+        stats = os.statvfs(directory)
+    except OSError as error:
+        raise BackupError(f"could not size the volume: {error}") from error
+    free_bytes = stats.f_bavail * stats.f_frsize
+    if free_bytes < database_bytes * 2:
+        raise BackupError(
+            f"{free_bytes} bytes free is not room for a {database_bytes}-byte"
+            " archive plus working space; skipping the boot archive rather"
+            " than filling the volume"
+        )
+
+
+def _prune_boot_archives(directory: Path, *, retain: int) -> None:
+    """Keep the newest `retain` boot archives; never touch anything else.
+
+    Pruning failures are swallowed deliberately: a boot archive that was
+    written successfully is a success, and losing the cleanup is not worth
+    losing the archive or the boot.
+    """
+    archives = []
+    for archive in _boot_archives(directory):
+        try:
+            archives.append((archive.stat().st_mtime, archive))
+        except OSError:
+            continue
+    archives.sort(key=lambda entry: entry[0], reverse=True)
+    for _mtime, stale in archives[max(retain, 1):]:
+        try:
+            stale.unlink()
+        except OSError:
+            continue
+
+
 CHUNK_BYTES = 1 << 16
 
 

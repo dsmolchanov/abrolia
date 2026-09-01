@@ -26,6 +26,9 @@ from control_plane.email.models import (
     EmailNerveAttachmentPublicStatus,
     EmailOption,
     EmailPublicBinding,
+    email_secret_generation,
+    email_secret_generation_marker,
+    email_secret_sink_digest,
 )
 from control_plane.email.repository import EmailIdentityRepository
 from control_plane.feature_flags import (
@@ -1052,10 +1055,19 @@ class ProvisioningWorker:
                 binding_ref = SYNTHETIC_EMAIL_SECRET_BINDING
         if not isinstance(binding_ref, str) or not binding_ref:
             return False
+        # BOTH proofs below are scoped to this job's generation. Asking only
+        # whether the binding NAME is present answers a weaker question than
+        # the one that matters: generation N-1's secret surviving an incomplete
+        # teardown carries the same name, so a name-only probe would report
+        # "installed" for N and mark N verified while the runtime still holds
+        # N-1's credentials.
+        generation = email_secret_generation(job.id)
+        marker_name = email_secret_generation_marker(binding_ref, generation)
         try:
             row = self.jobs.db.query_one(
-                "SELECT 1 FROM email_secret_installs WHERE job_id = ?",
-                (job.id,),
+                "SELECT 1 FROM email_secret_installs"
+                " WHERE job_id = ? AND generation = ?",
+                (job.id, generation),
             )
             if row is not None:
                 return True
@@ -1065,7 +1077,11 @@ class ProvisioningWorker:
             pass
         try:
             contains = getattr(self.secret_sink, "contains", None)
-            proven = bool(callable(contains) and contains(namespace_ref, binding_ref))
+            # The MARKER, not the binding. This is the whole difference: the
+            # marker's name encodes the generation, so N-1's remains cannot
+            # answer for N, while a reconciliation of N's own job — same job,
+            # same generation — still converges without an operator.
+            proven = bool(callable(contains) and contains(namespace_ref, marker_name))
         except Exception:
             # The sink contract is that `contains` answers rather than raises;
             # a double that raises anyway means "no proof", never "installed".
@@ -1073,12 +1089,36 @@ class ProvisioningWorker:
         if not proven:
             return False
         # Create receipt for future reclaim without needing live inspection.
+        self._record_email_secret_receipt(
+            job, binding_ref, namespace_ref, generation, marker_name
+        )
+        return True
+
+    def _record_email_secret_receipt(
+        self,
+        job: JobRecord,
+        binding_ref: str,
+        namespace_ref: str,
+        generation: str,
+        marker_name: str,
+    ) -> None:
+        """Durable non-secret proof that THIS generation was installed.
+
+        No secret value reaches this row. `sink_digest` covers the namespace
+        and the marker — what the sink actually attested — because a sink that
+        cannot attest values cannot be asked to prove one.
+
+        A failed write is not fatal: the live marker still proves installation
+        and a later reclaim reconstructs the receipt from it.
+        """
         try:
             with self.jobs.db.write() as connection:
                 connection.execute(
                     "INSERT OR IGNORE INTO email_secret_installs"
-                    " (job_id, household_id, secret_name, namespace_ref, installed_at, created_at)"
-                    " VALUES (?, ?, ?, ?, ?, ?)",
+                    " (job_id, household_id, secret_name, namespace_ref,"
+                    " installed_at, created_at, generation, marker_name,"
+                    " sink_digest)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         job.id,
                         job.household_id,
@@ -1086,13 +1126,46 @@ class ProvisioningWorker:
                         namespace_ref,
                         self.clock(),
                         self.clock(),
+                        generation,
+                        marker_name,
+                        email_secret_sink_digest(namespace_ref, marker_name),
                     ),
                 )
         except sqlite3.Error:
-            # The live sink already proves installation; a later reclaim
-            # reconstructs the receipt via contains().
             pass
-        return True
+
+    def _delete_email_generation_markers(
+        self, namespace_ref: str, household_id: str, binding_ref: str
+    ) -> bool:
+        """Remove the generation markers installed beside a binding.
+
+        Erasure has to take the marker as well as the credential. Leaving it
+        is not a correctness hole — a marker names the generation that wrote
+        it, so a stale one can never certify a later job — but it is a durable
+        record in the runtime namespace that a household's data was here, and
+        it accumulates one entry per re-provisioning.
+
+        The receipts say which markers exist, so nothing has to be guessed
+        from a naming convention. Returns False if any deletion failed, which
+        the callers already treat as `secret_cleanup_unknown` rather than as
+        an erasure that succeeded.
+        """
+        try:
+            rows = self.jobs.db.query(
+                "SELECT marker_name FROM email_secret_installs"
+                " WHERE household_id = ? AND secret_name = ?"
+                " AND marker_name <> ''",
+                (household_id, binding_ref),
+            )
+        except sqlite3.Error:
+            return False
+        complete = True
+        for row in rows:
+            try:
+                self.secret_sink.delete(namespace_ref, row["marker_name"])
+            except Exception:
+                complete = False
+        return complete
 
     def _stage_email_secret(
         self,
@@ -1123,31 +1196,25 @@ class ProvisioningWorker:
             raise OutcomeUnknown(
                 "email secret material does not match its public binding"
             )
+        # The generation marker travels in the SAME installation as the
+        # credential it describes. `install` sends every name in one
+        # `fly secrets import`, so this is atomic where it matters: no crash
+        # window can leave a marker attesting a credential that is not there,
+        # or a credential that no later proof can recognise as this
+        # generation's. Added after the one-name validation above, so the
+        # provider still cannot smuggle a second secret past it.
+        generation = email_secret_generation(job.id)
+        marker_name = email_secret_generation_marker(binding_ref, generation)
+        result.secret_material.stage_companion(marker_name, generation.encode())
         try:
             self.secret_sink.install(namespace_ref, result.secret_material)
         except Exception:
             result.secret_material.clear()
             return False
         # Record durable non-secret receipt immediately after successful sink install.
-        try:
-            with self.jobs.db.write() as connection:
-                connection.execute(
-                    "INSERT OR IGNORE INTO email_secret_installs"
-                    " (job_id, household_id, secret_name, namespace_ref, installed_at, created_at)"
-                    " VALUES (?, ?, ?, ?, ?, ?)",
-                    (
-                        job.id,
-                        job.household_id,
-                        binding_ref,
-                        namespace_ref,
-                        self.clock(),
-                        self.clock(),
-                    ),
-                )
-        except sqlite3.Error:
-            # If the receipt write fails, the live sink still proves installation;
-            # a later reclaim will reconstruct the receipt via contains().
-            pass
+        self._record_email_secret_receipt(
+            job, binding_ref, namespace_ref, generation, marker_name
+        )
         return True
 
     def _validated_email_public_result(
@@ -1823,6 +1890,10 @@ class ProvisioningWorker:
                     try:
                         self.secret_sink.delete(namespace_ref, binding_ref)
                     except Exception:
+                        secret_cleanup_unknown = True
+                    if not self._delete_email_generation_markers(
+                        namespace_ref, job.household_id, binding_ref
+                    ):
                         secret_cleanup_unknown = True
                 if secret_cleanup_unknown and current is not None:
                     with self.jobs.db.write() as connection:
@@ -3358,7 +3429,9 @@ class ProvisioningWorker:
             self.secret_sink.delete(namespace_ref, binding_ref)
         except Exception:
             return False
-        return True
+        return self._delete_email_generation_markers(
+            namespace_ref, household_id, binding_ref
+        )
 
     def _delete_email_binding_secret(self, identity_id: str) -> bool:
         if self.email_identities is None:

@@ -289,6 +289,21 @@ class SecretMaterial:
     def items(self) -> list[tuple[str, memoryview]]:
         return [(name, memoryview(value)) for name, value in self._values.items()]
 
+    def stage_companion(self, name: str, value: bytes) -> None:
+        """Add a NON-secret entry that must be installed with this material.
+
+        The generation marker for an email secret handoff is the only user: it
+        has to reach the sink in the SAME installation as the credential it
+        describes, so that no crash window can leave a marker attesting a
+        credential that is not there, or a credential no later proof can
+        recognise.
+
+        Named for what it is. Everything else in here is secret bytes, and a
+        caller adding a real secret through this door would be defeating the
+        one-name validation the email path performs before installing.
+        """
+        self._values[str(name)] = bytearray(value)
+
     @property
     def is_empty(self) -> bool:
         return not self._values

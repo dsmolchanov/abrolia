@@ -111,9 +111,14 @@ Non-blocker debt: codex/phase-4-real-actions dirty file + untracked landing not 
 
 **Files:**
 - Upstream `nerve-cloud/internal/cloudapi/handler_keys.go` + `internal/store/*` + `go test ./...`
-- Local `control_plane/providers/email/*.py`, `control_plane/provisioning/worker.py`, `control_plane/provisioning/secrets.py`, `control_plane/migrations/0003_*` (if needed), `tests/control_plane/email/*`, `tests/control_plane/test_provisioning_jobs.py` (the B-02 convergence regressions live beside the SIGKILL/reclaim harness there, not under `email/` — see the acceptance note)
+- Local `control_plane/providers/email/*.py`, `control_plane/provisioning/worker.py`, `control_plane/provisioning/secrets.py`, `control_plane/migrations/0003_*` (if needed), `tests/control_plane/email/*`, `tests/control_plane/test_provisioning_jobs.py`
+- Generation-scoped convergence (2026-09-01): `control_plane/email/models.py`,
+  `control_plane/crypto.py`,
+  `control_plane/migrations/0015_email_secret_install_generation.sql`,
+  `tests/control_plane/test_db.py`, `tests/control_plane/chaos_child.py` (the B-02 convergence regressions live beside the SIGKILL/reclaim harness there, not under `email/` — see the acceptance note)
 
-**Branches:** `fix/b02-receipt-convergence-regression`
+**Branches:** `fix/b02-receipt-convergence-regression`,
+`feat/c1-generation-scoped-convergence`
 
 **Changes:**
 1. **Upstream B-01:** Resolve requested `org_id` against authenticated tenant; reject A→B service-token request with 403; add negative HTTP test `TestServiceToken_CrossOrgRejected` (A billing token requests B's org). Abrolia side adds adapter assertion that tenant never calls `/v1/service-tokens`.
@@ -157,8 +162,8 @@ Non-blocker debt: codex/phase-4-real-actions dirty file + untracked landing not 
   same pass to collect the file the proofs live in; as first written it
   stayed green with both regressions deleted. See the open box below.
 
-- [ ] **Generation-scoped convergence — "no generation → no `verified`"
-  (opened 2026-08-30 by Codex review on #108).** Changes item 2 specified
+- [x] **Generation-scoped convergence — "no generation → no `verified`"
+  (opened 2026-08-30 by Codex review on #108; closed 2026-09-01).** Changes item 2 specified
   `email_secret_installs {job_id, generation, secret_name, installed_at,
   sink_digest}`; the shipped schema (`0005`) carries neither `generation` nor
   `sink_digest`, and the reclaim proof consumes only the binding NAME:
@@ -179,6 +184,43 @@ Non-blocker debt: codex/phase-4-real-actions dirty file + untracked landing not 
   changes a provider contract, the sink protocol, and a schema, which is the
   C6a→C6b / C3f shape — review found scope inside a fix, and the scope gets a
   plan rather than a patch.
+
+  *Closed 2026-09-01 on `feat/c1-generation-scoped-convergence`.* The
+  generation is the provisioning job that installed the material: stable
+  across that job's own retries and reconciliations, so the legitimate
+  crash-after-sink case still converges without an operator, and necessarily
+  different for a later re-provisioning, so N−1's remains cannot answer for N.
+  It is assigned by the control plane rather than taken from provider output —
+  the party whose freshness is in question must not certify its own freshness,
+  which is the one place this deviates from the box's wording and is stated
+  here rather than quietly.
+
+  It reaches the sink as a MARKER NAME (`<binding>_GEN_<digest>`), because the
+  Fly sink can attest that a name exists and nothing whatever about the value
+  behind it — the "versioned marker where the sink cannot attest values" this
+  box asked for. Credential and marker travel in ONE `install`, which sends
+  every name in a single `fly secrets import`, so no crash window can leave a
+  marker attesting a credential that is not there.
+
+  Schema `0015` adds `generation`, `marker_name` and `sink_digest`.
+  `sink_digest` is deliberately not a digest of the secret value — no value
+  reaches that table — but of the namespace and marker actually attested.
+  Legacy `0005` rows default to an empty generation, which can never equal a
+  job id, so they are inert rather than permissive; that property has its own
+  regression because a "sensible" future default would silently reopen the
+  hole.
+
+  Both consumers are proven by
+  `test_convergence_is_scoped_to_the_generation_that_installed_the_secret`,
+  parameterized over (live-sink, durable-receipt) × (stale, fresh) — the
+  `fresh` column included because without it the test passes equally well if
+  nothing ever converges. Two mutations were run and each killed exactly its
+  own case: reverting the live probe to `contains(namespace_ref, binding_ref)`
+  fails `[stale-live-sink]`, and reverting the receipt lookup to `job_id`
+  alone fails `[stale-durable-receipt]` and the legacy-row regression.
+
+  Erasure takes the markers too, driven from the receipts rather than from a
+  naming convention. Full `-m "not live"` suite green.
 
 #### C2 — BYO Domain Live (B-05)
 
