@@ -49,7 +49,7 @@ batteries — then the staged flips the runbook already fixes.
 > **Sequenced runbook: `docs/canon-closure-runbook.md`** (added 2026-09-01).
 > Every remaining open canon box in one dependency-ordered list, with the
 > acceptance artifact or command each is measured by, each command run against
-> the checkout before being written down. Track O's boxes are O1–O7 there.
+> the checkout before being written down. Track O's boxes are O1–O11 there.
 
 - [ ] **O1. Legal pack signatures (B-07, P0).** DPA 28(3) + SCC module 2 + TIA
   for P1 Anthropic, P2 Fly.io, P4 Resend. **Partially executed as of
@@ -73,7 +73,8 @@ batteries — then the staged flips the runbook already fixes.
 `deploy/control-plane/Dockerfile`,
 `tests/control_plane/test_migrate_on_start.py`,
 `docs/control-plane-restore.md`,
-`docs/canon-closure-runbook.md`.
+`docs/canon-closure-runbook.md`,
+`tests/test_canon_closure_runbook.py`.
 
 **Branches:** `fix/deploy-gate-backup-deadlock`,
 `fix/deploy-required-secrets-preflight`, `fix/deploy-verify-same-predicate`,

@@ -19,43 +19,52 @@ engineering, with one exception: **O4** is waiting on a diagnosis
 
 ---
 
-## The rollout gate set
+## The rollout gate set, and which half applies when
 
-O7, O8 and O9 each turn a real provider path on. None of them is gated by the
-legal pack alone. `phase-DE-pilot.md:723` and canon Phase F state one set that
-**every** transition requires, and it is repeated here once rather than
-partially restated three times:
+`phase-DE-pilot.md:723` and canon Phase F state one set that every real-data
+transition requires. It splits in two, and conflating the halves makes the
+graph circular — item 5 is the live battery itself, so demanding it *before*
+the battery would make O7 and O8 prerequisites of themselves.
+
+**Prerequisites — required BEFORE running a live battery (O7, O8):**
 
 1. **Phase A legal merged** — O1 below.
 2. **Phase C1 receipt green** — the generation-scoped convergence (#119) and
    the upstream cross-org test (O2).
 3. `go test ./... -count=1` green in **nerve-cloud**.
 4. `pytest -p no:cacheprovider -m "not live" -q` green in **abrolia**.
-5. **One manual live gate** on `abrolia-synthetic` for that provider.
 
-Gmail carries one more, and it is a launch gate rather than a debt: **Google
-OAuth verification and the CASA assessment** must be complete before the
-dedicated-Gmail card is enabled for any real family
-(`2026-08-02-family-ops-assistant-mvp.md:105`).
+**Evidence the batteries produce — required before PROMOTION (O10):**
 
-Reading the dependency graph as "O1, then go" is the error this section exists
-to prevent.
+5. **One manual live gate** on `abrolia-synthetic` for that provider. This is
+   what O7 and O8 *are*. They supply item 5; they do not consume it.
+
+Gmail additionally needs **Google OAuth verification and the CASA
+assessment** — but at the real-family boundary, not before the test battery.
+The code is explicit about this: `GoogleOAuthProvisioner._allowed` permits an
+account in `google_oauth_test_users` while `gmail_real_enabled` is false, and
+`ControlPlaneConfig.validate` demands the verification/scope/CASA/Limited-Use
+evidence **only** when `gmail_real_enabled` is on
+(`control_plane/config.py:240`). So CASA gates O10 for Gmail, not O8.
+
+Reading the dependency graph as "O1, then go" is one error this section exists
+to prevent; reading it as "everything, then go" is the other.
 
 ---
 
 ## Dependency order
 
 ```
-O1 legal ────────────────┐
-O2 nerve cross-org ──────┼──► [rollout gate set] ──► O7 BYO ──┐
-                         │                          O8 Gmail ─┼──► O9 per-transition
-O3 release tag + drill ──┘                                    │
-O4 backup independence   (issue #121 — diagnosis first)       │
-O5 dry-run ──► O6 pilot onboarding ───────────────────────────┘
-O10 CI deny-patterns — independent, any time
+O1  legal ───────────────┐
+O2  nerve cross-org ─────┼──► [prerequisites 1-4] ──► O7  BYO battery ──┐
+O3  release tag + drill ─┘                            O8  Gmail battery ┼──► O10 promotion
+                                                          (+O9 rg check)│    (+CASA for Gmail)
+O4  backup independence  (issue #121 — diagnosis first)                 │
+O5  dry-run ──► O6 pilot onboarding ────────────────────────────────────┘
+O11 CI deny-patterns — independent, any time
 ```
 
-O5 and O10 need nothing and can be done today. O3 needs nothing either, and is
+O5 and O11 need nothing and can be done today. O3 needs nothing either, and is
 the cheapest way to reduce real risk.
 
 ---
@@ -237,7 +246,8 @@ Closes canon Phase E box 3.
 ## O7 — BYO domain live battery
 
 **Owner:** operator with live DNS control.
-**Requires: the full rollout gate set above** — not O1 alone.
+**Requires: prerequisites 1–4 above** — not O1 alone. This battery *supplies*
+gate 5 for BYO; it does not need it first.
 
 Bounded backoff (30/60/120/300/600) and manual CHECK are already implemented;
 this is execution, not development.
@@ -271,8 +281,13 @@ Closes canon C2 box, blocker **B-05**.
 ## O8 — Dedicated Gmail live path
 
 **Owner:** operator with a Google test account.
-**Requires: the full rollout gate set, plus OAuth verification and CASA.**
-The account must also be on the allowlist.
+**Requires: prerequisites 1–4 above**, and the account's recovery address in
+`google_oauth_test_users`. This battery *supplies* gate 5 for Gmail.
+
+**Not** OAuth verification or CASA. Those gate the real-family promotion
+(O10), and requiring them here would block the very battery that is meant to
+run before them: `_allowed` admits an allowlisted test user while
+`gmail_real_enabled` is false, which is the path this box exercises.
 
 Each step performed manually, once, and recorded:
 
@@ -329,9 +344,16 @@ families — needs its own manual battery per `docs/onboarding-runbook.md`
 §Rollout: receive, approved send, restart/cursor resume, reconnect, export,
 revoke, delete. Recorded PII-safe.
 
-The rollout gate set at the top applies to **every** transition, not only the
-first, and each provider's `ABROLIA_*_ENABLED` flips independently after
+Prerequisites 1–4 apply to **every** transition, not only the first, and gate
+5 must exist for the provider being promoted — that is the battery evidence
+from O7 or O8. Each provider's `ABROLIA_*_ENABLED` flips independently after
 operator-account soak.
+
+**Gmail's real-family promotion additionally requires** Google OAuth
+verification, scope review, CASA and Limited Use evidence. `gmail_real_enabled`
+cannot be turned on without them — `ControlPlaneConfig.validate` refuses with
+"real Gmail requires verified OAuth, scope, CASA and Limited Use evidence"
+(`control_plane/config.py:240`). This is the boundary those checks belong to.
 
 Closes go-live **O3**.
 
