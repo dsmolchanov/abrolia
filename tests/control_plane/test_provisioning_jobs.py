@@ -2994,3 +2994,68 @@ def test_a_programming_error_on_a_retry_path_is_loud_rather_than_retried(
         " AND error_code = 'secret_install_unknown'",
         (cp_stack.household.id,),
     )["total"] == 0
+
+
+# Erasure cannot be driven from receipts alone. `_record_email_secret_receipt`
+# tolerates a `sqlite3.Error` by design — the live marker still proves the
+# install — so a marker can exist with no row describing it. Cleanup that reads
+# only receipts then selects nothing, reports success, and leaves a durable
+# record of the household in the runtime namespace forever.
+@pytest.mark.parametrize("receipt", ("written", "lost"))
+@pytest.mark.parametrize("consumer", ("household-binding", "generation-markers"))
+def test_erasure_removes_the_generation_marker_even_without_its_receipt(
+    cp_stack, receipt: str, consumer: str
+) -> None:
+    job, _identity_id = _email_job_stuck_outcome_unknown(cp_stack)
+    binding = SYNTHETIC_EMAIL_SECRET_BINDING
+    marker = email_secret_generation_marker(binding, job["id"])
+
+    sink = InMemorySecretSink()
+    worker = cp_stack.make_worker(secret_sink=sink, now=BASE_TIME + 5)
+    namespace_ref = worker._secret_namespace_ref(
+        cp_stack.household.id, include_deleting=True
+    )
+    assert namespace_ref is not None, "the fixture has no secret namespace"
+
+    # Exactly what one `install` leaves behind: credential and marker together.
+    sink.install(
+        namespace_ref,
+        SecretMaterial.from_mapping({binding: b"credential", marker: job["id"]}),
+    )
+    assert sink.contains(namespace_ref, marker)
+
+    if receipt == "written":
+        with cp_stack.database.write() as connection:
+            connection.execute(
+                "INSERT INTO email_secret_installs"
+                " (job_id, household_id, secret_name, namespace_ref,"
+                " installed_at, created_at, generation, marker_name,"
+                " sink_digest)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    job["id"],
+                    cp_stack.household.id,
+                    binding,
+                    namespace_ref,
+                    BASE_TIME + 3,
+                    BASE_TIME + 3,
+                    job["id"],
+                    marker,
+                    email_secret_sink_digest(namespace_ref, marker),
+                ),
+            )
+
+    if consumer == "household-binding":
+        assert worker._delete_email_binding_secret_for_household(
+            cp_stack.household.id, binding
+        )
+        assert not sink.contains(namespace_ref, binding)
+    else:
+        assert worker._delete_email_generation_markers(
+            namespace_ref, cp_stack.household.id, binding
+        )
+
+    assert not sink.contains(namespace_ref, marker), (
+        "the generation marker outlived erasure"
+        + (" when its receipt was lost" if receipt == "lost" else "")
+    )
