@@ -19,6 +19,13 @@ name: codex-verdict-waker
 on:
   issue_comment:
     types: [created]
+  # A formal review leaves a stale failed gate run behind too: the gate's own
+  # re-entry starts a NEW check run while the earlier one that failed for want
+  # of a verdict stays on the commit, and GitHub's status rollup counts the red
+  # one — the pull request reports BLOCKED with a green run of the same context
+  # beside it. Cleared by hand four times on 2026-08-31 before this trigger.
+  pull_request_review:
+    types: [submitted]
 
 # NO workflow-level `concurrency:` — it would be claimed by EVERY comment on
 # the pull request before any `if:` is evaluated, so a human replying "thanks"
@@ -43,18 +50,23 @@ jobs:
     # run would enter the group first and cancel-in-progress would kill a live
     # wake. The callee keeps its own copy as defense in depth.
     if: >-
-      github.event.issue.pull_request != null &&
-      github.event.comment.user.login == 'chatgpt-codex-connector[bot]' &&
-      contains(github.event.comment.body, 'Codex Review')
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request != null &&
+       github.event.comment.user.login == 'chatgpt-codex-connector[bot]' &&
+       contains(github.event.comment.body, 'Codex Review')) ||
+      (github.event_name == 'pull_request_review' &&
+       github.event.review.user.login == 'chatgpt-codex-connector[bot]')
     # Keyed on the ISSUE number and on this workflow's OWN name: sharing the
     # gate's group would cancel the very run this workflow exists to re-run
     # (see the gate stub's header for the probe that found the caller/callee
     # trap). A burst of Codex comments on one PR should cost one wake, and the
     # newest comment is the one that matters, so cancel-in-progress is right.
     concurrency:
-      group: codex-verdict-waker-${{ github.event.issue.number }}
+      # `issue_comment` carries the PR as an issue, `pull_request_review` as a
+      # pull request. Exactly one is ever set.
+      group: codex-verdict-waker-${{ github.event.issue.number || github.event.pull_request.number }}
       cancel-in-progress: true
-    uses: dsmolchanov/codex-review-gate/.github/workflows/codex-verdict-waker.yml@656910056514570ab1fe0c94c122d2cbfcb1bbb4
+    uses: dsmolchanov/codex-review-gate/.github/workflows/codex-verdict-waker.yml@ae5d20884828bee1bdec72fcca998d1d6ed1c2c6
     permissions:
       # A called workflow's permissions cannot exceed its caller's, so the
       # re-run scope has to be granted here. Nothing else: the waker decides
