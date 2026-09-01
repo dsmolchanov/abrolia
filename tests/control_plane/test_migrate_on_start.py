@@ -4814,3 +4814,48 @@ def test_a_failing_writer_is_named_in_readiness(tmp_path, monkeypatch) -> None:
     # And it is NOT reported merely as an old archive, which is the conflation
     # that hid it: the archive here is minutes old, not stale at all.
     assert "backup_stale" not in blockers
+
+
+def test_the_writability_probe_never_removes_a_file_it_did_not_create(
+    tmp_path, monkeypatch
+) -> None:
+    """The probe cleans up after itself and nothing else.
+
+    A probe named from the pid collides with its own leftovers — a recycled
+    pid, or a boot killed between create and unlink — and the collision is
+    wrong twice over: `O_EXCL` fails, so a perfectly writable directory is
+    reported unwritable, and the cleanup then deletes an entry this call never
+    created. Sentinels stand in for every entry the old name could have hit.
+    """
+    assert _boot(tmp_path, monkeypatch) == 0
+    archives = tmp_path / "backups"
+
+    sentinels = {
+        # Exactly the name the pid-derived probe would have chosen.
+        archives / f".boot-archive-probe-{os.getpid()}": b"not ours to delete",
+        archives / ".boot-archive-probe-1": b"a leftover from another boot",
+        archives / "operator-notes.txt": b"an operator's own file",
+    }
+    for path, payload in sentinels.items():
+        path.write_bytes(payload)
+    link = archives / ".boot-archive-probe-symlink"
+    link.symlink_to(archives / "operator-notes.txt")
+
+    for existing in archives.glob("boot-*.cpb"):
+        existing.unlink()
+    assert _boot(tmp_path, monkeypatch) == 0, "a sentinel made the boot fail"
+
+    for path, payload in sentinels.items():
+        assert path.exists(), f"the probe deleted {path.name}, which it did not create"
+        assert path.read_bytes() == payload
+    assert link.is_symlink(), "the probe followed or removed a symlink"
+
+    # And the directory was correctly judged writable: an archive was taken.
+    assert list(archives.glob("boot-*.cpb")), "a writable directory was refused"
+    # The probe left nothing of its own behind.
+    leftovers = [
+        entry.name
+        for entry in archives.glob(".boot-archive-probe-*")
+        if entry.name not in {path.name for path in sentinels} | {link.name}
+    ]
+    assert leftovers == [], f"the probe leaked {leftovers}"

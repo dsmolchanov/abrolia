@@ -285,10 +285,18 @@ def _require_writable_directory(directory: Path) -> None:
     mount, and wrong whenever something other than mode stands in the way. The
     archive is about to create a file there, so the probe creates one.
     """
-    probe = directory / f".boot-archive-probe-{os.getpid()}"
+    # `mkstemp`, not a name derived from the pid. A pid-derived probe collides
+    # with its own leftovers — a recycled pid, or a boot killed between create
+    # and unlink — and the collision is doubly wrong: `O_EXCL` fails, so the
+    # directory is reported unwritable when it is fine, and the cleanup then
+    # deletes an entry this call never created. `mkstemp` picks an
+    # unpredictable name, creates it atomically with `O_CREAT | O_EXCL`, and
+    # hands back the path it actually made, so cleanup can only ever remove
+    # this call's own file.
     try:
-        with open(probe, "xb"):
-            pass
+        descriptor, created = tempfile.mkstemp(
+            prefix=".boot-archive-probe-", dir=directory
+        )
     except OSError as error:
         raise BootArchiveDirectoryNotWritable(
             f"{directory} is not writable by uid {os.getuid()} ({error});"
@@ -297,9 +305,9 @@ def _require_writable_directory(directory: Path) -> None:
             " console` creates it as root — the remedy is `chown` on the"
             " volume, not a deploy."
         ) from error
-    finally:
-        with contextlib.suppress(OSError):
-            probe.unlink()
+    os.close(descriptor)
+    with contextlib.suppress(OSError):
+        os.unlink(created)
 
 
 def _require_room_for_archive(database: ControlPlaneDatabase, directory: Path) -> None:
