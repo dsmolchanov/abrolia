@@ -4500,3 +4500,185 @@ def test_a_source_replaced_before_the_link_leaves_the_target_paused(
             "a database this restore never authenticated is at the target with"
             f" no worker pause beside it ({raised.value})"
         )
+
+
+# --- The boot archive: the durability signal that had no writer ------------
+#
+# `/readyz` reports `backup_stale` past 26 hours from the newest
+# `backups/*.cpb`. Nothing automated ever wrote one: `--backup-first` writes
+# `<db>.pre-migrate-<rev>-<epoch>.bak` BESIDE the database, and only when a
+# migration is pending. Production ran ~237 hours with no archive while every
+# deploy reported success, because the gate's premise — "a deploy refreshes the
+# backup" — was true of neither the location nor the trigger.
+
+
+def _boot(tmp_path, monkeypatch, *, archive: bool = True) -> int:
+    monkeypatch.setenv("ABROLIA_CONTROL_PLANE_DB", str(tmp_path / "control-plane.db"))
+    monkeypatch.setenv("ABROLIA_CONTROL_PLANE_BACKUP_KEY", BACKUP_KEY)
+    argv = ["migrate", "--backup-first"]
+    if archive:
+        argv.append("--archive")
+    return main(argv)
+
+
+def _archives(tmp_path) -> list[Path]:
+    return sorted((tmp_path / "backups").glob("*.cpb"))
+
+
+def test_backup_first_alone_writes_nothing_the_readiness_probe_can_see(
+    tmp_path, monkeypatch
+) -> None:
+    """The defect, stated as a test: the two halves never met.
+
+    This is the shape production was in. A boot with no pending migration took
+    the `--backup-first` path, reported success, and left the readiness probe
+    with nothing to find — for nine days, across fourteen deploys.
+    """
+    assert _boot(tmp_path, monkeypatch, archive=False) == 0
+
+    probe_directory = tmp_path / "backups"
+    assert not probe_directory.exists() or list(probe_directory.glob("*.cpb")) == [], (
+        "`--backup-first` must not be mistaken for the durability archive"
+    )
+
+
+def test_the_boot_archive_lands_where_the_readiness_probe_looks(
+    tmp_path, monkeypatch
+) -> None:
+    """And with no migration pending, which is the case that never wrote one."""
+    assert _boot(tmp_path, monkeypatch) == 0
+
+    written = _archives(tmp_path)
+    assert len(written) == 1, "a boot with no pending migration still archives"
+
+    # Not a second opinion about the path: the probe's own accessor.
+    from control_plane.observability import HealthReporter
+
+    database = ControlPlaneDatabase(tmp_path / "control-plane.db")
+    try:
+        newest = HealthReporter(database).latest_backup_completed_at()
+    finally:
+        database.close()
+    assert newest is not None, "the probe cannot see the archive that was written"
+    assert newest == pytest.approx(written[0].stat().st_mtime)
+
+
+def test_the_boot_archive_restores(tmp_path, monkeypatch) -> None:
+    """An archive that cannot be restored is not a restore point."""
+    assert _boot(tmp_path, monkeypatch) == 0
+    archive = _archives(tmp_path)[0]
+
+    restored = tmp_path / "restored.db"
+    restore_backup(archive, restored, backup_key=BACKUP_KEY_BYTES)
+
+    connection = sqlite3.connect(restored)
+    try:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+    finally:
+        connection.close()
+    assert "households" in tables, "the archive is not an image of the database"
+
+
+def test_a_restart_loop_writes_one_archive_not_one_per_attempt(
+    tmp_path, monkeypatch
+) -> None:
+    """Crash-loop protection, the reason this is interval-based.
+
+    The pre-migrate path compares CONTENT, which works there because a failed
+    migration leaves the database byte-identical. Here the database
+    legitimately differs every boot, so content would never match and every
+    restart would write a full archive onto a 1 GiB volume.
+    """
+    assert _boot(tmp_path, monkeypatch) == 0
+    for _restart in range(5):
+        assert _boot(tmp_path, monkeypatch) == 0
+
+    assert len(_archives(tmp_path)) == 1, "a restart loop filled the volume"
+
+
+def test_a_boot_past_the_interval_archives_again(tmp_path, monkeypatch) -> None:
+    from control_plane.backup import BOOT_ARCHIVE_MINIMUM_INTERVAL_SECONDS
+
+    assert _boot(tmp_path, monkeypatch) == 0
+    first = _archives(tmp_path)[0]
+
+    aged = first.stat().st_mtime - BOOT_ARCHIVE_MINIMUM_INTERVAL_SECONDS - 60
+    os.utime(first, (aged, aged))
+
+    assert _boot(tmp_path, monkeypatch) == 0
+    assert len(_archives(tmp_path)) == 2
+
+
+def test_retention_never_deletes_an_operator_archive(tmp_path, monkeypatch) -> None:
+    """The property that makes pruning safe at all.
+
+    The runbook tells operators to write
+    `abrolia-control-plane backup /data/backups/control-plane-<date>.cpb`, into
+    this very directory. Pruning by extension would delete the offsite copy
+    someone took before a risky migration — the one archive that matters most.
+    """
+    from control_plane.backup import BOOT_ARCHIVE_MINIMUM_INTERVAL_SECONDS, BOOT_ARCHIVE_RETAIN
+
+    directory = tmp_path / "backups"
+    directory.mkdir(parents=True, exist_ok=True)
+    operator = directory / "control-plane-20260804.cpb"
+    operator.write_bytes(b"an operator's archive, not ours to delete")
+    ancient = 1_000_000.0
+    os.utime(operator, (ancient, ancient))
+
+    for _boot_number in range(BOOT_ARCHIVE_RETAIN + 3):
+        assert _boot(tmp_path, monkeypatch) == 0
+        for archive in directory.glob("boot-*.cpb"):
+            aged = archive.stat().st_mtime - BOOT_ARCHIVE_MINIMUM_INTERVAL_SECONDS - 60
+            os.utime(archive, (aged, aged))
+
+    assert operator.exists(), "retention deleted an operator archive"
+    assert operator.read_bytes() == b"an operator's archive, not ours to delete"
+    assert len(list(directory.glob("boot-*.cpb"))) <= BOOT_ARCHIVE_RETAIN
+
+
+def test_a_failed_boot_archive_does_not_stop_the_container(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """The difference from `--backup-first`, and the whole reason it is separate.
+
+    A pre-migrate snapshot fails closed: never migrate a database you could not
+    snapshot. A durability archive that refused to start the container would
+    turn a full volume — a recoverable disk-space problem — into an outage.
+    """
+
+    # Boot once so the migrations are applied and `--backup-first` has nothing
+    # left to do. Otherwise this would prove the PRE-MIGRATE backup fails
+    # closed, which it should, and say nothing about the archive.
+    assert _boot(tmp_path, monkeypatch) == 0
+    for archive in (tmp_path / "backups").glob("boot-*.cpb"):
+        archive.unlink()
+
+    def refuse(*_args, **_kwargs):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(backup_module, "create_backup", refuse)
+    capsys.readouterr()
+
+    assert _boot(tmp_path, monkeypatch) == 0, "a failed archive stopped the boot"
+    assert _archives(tmp_path) == []
+    assert "boot archive skipped" in capsys.readouterr().err
+
+
+def test_the_boot_archive_is_reported_in_the_migrate_result(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """An operator reading the boot log can tell whether an archive was taken."""
+    assert _boot(tmp_path, monkeypatch) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["archive"] is not None
+    assert Path(result["archive"]).name.startswith("boot-")
+
+    # The second boot is inside the interval, and says so by reporting none.
+    assert _boot(tmp_path, monkeypatch) == 0
+    assert json.loads(capsys.readouterr().out)["archive"] is None
