@@ -6,10 +6,13 @@ name: codex-verdict-waker
 # What it does: `codex-review-window` no longer holds a runner for 15 minutes
 # waiting for a Codex verdict — that wait cost 424 billed minutes across the
 # fleet in one day, 263 of them in runs cancelled mid-sleep. The gate now waits
-# briefly and fails closed, and a verdict that arrives later re-enters on its
-# own: a formal review via the gate's own `pull_request_review` trigger, and a
-# clean-summary comment via THIS workflow, which re-runs the gate's PR-bound
-# run so the check reports against the PR head. (A comment event runs from the
+# briefly and fails closed, and a verdict that arrives later re-enters through
+# THIS workflow, which re-runs the gate's PR-bound run so the check reports
+# against the PR head: a clean-summary comment via `issue_comment`, and a
+# formal review via `pull_request_review` — the gate's own review trigger
+# starts a NEW run, so this workflow also drains the earlier run that failed
+# for want of a verdict, which would otherwise keep the status rollup red
+# beside a green run of the same context. (A comment event runs from the
 # default branch, so it could never satisfy the required check directly —
 # which is also why the gate itself must not listen to `issue_comment`.)
 #
@@ -66,7 +69,7 @@ jobs:
       # pull request. Exactly one is ever set.
       group: codex-verdict-waker-${{ github.event.issue.number || github.event.pull_request.number }}
       cancel-in-progress: true
-    uses: dsmolchanov/codex-review-gate/.github/workflows/codex-verdict-waker.yml@23518dbd89add6333ed0d147bd2acd8d898ef04e
+    uses: dsmolchanov/codex-review-gate/.github/workflows/codex-verdict-waker.yml@4d05f6909650381037fee2cfed40c6a5cab591af
     permissions:
       # A called workflow's permissions cannot exceed its caller's, so the
       # re-run scope has to be granted here. Nothing else: the waker decides
