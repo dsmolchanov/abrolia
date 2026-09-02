@@ -424,6 +424,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             results = active.runtime_health.reconcile_all(now=time.time())
             print(json.dumps([result.__dict__ for result in results], sort_keys=True))
             return 0
+    if args.command == "invite":
+        # Handled before the locking container below, for the same reason as
+        # `withdraw-consent`: `serve` holds the nonblocking writer flock for the
+        # life of the process, so an invite that takes it can only be issued
+        # with production STOPPED — every tester admitted cost a restart. The
+        # work is one token row and one line on the operator's stdout, which
+        # SQLite serialises on its own; the flock guards against a second
+        # long-running WORKER, which this is not.
+        with _container(lock=False, mailer=ConsoleMailer()) as active:
+            result = active.magic_links.issue(args.email)
+            print(json.dumps({"status": "issued", "expires_at": result.expires_at}))
+            return 0
     if args.command == "withdraw-consent":
         # Handled before the locking container below. `serve` holds the
         # nonblocking writer flock for the life of the process, so a command
@@ -451,8 +463,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             }, sort_keys=True))
             return 0
 
-    mailer = ConsoleMailer() if args.command == "invite" else None
-    with _container(mailer=mailer) as active:
+    with _container() as active:
         if args.command == "migrate":
             print(json.dumps({"status": "ok", "applied": active.database.migrate()}))
             return 0
@@ -522,10 +533,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(json.dumps(
                 [result.public_dict() for result in results], sort_keys=True
             ))
-            return 0
-        if args.command == "invite":
-            result = active.magic_links.issue(args.email)
-            print(json.dumps({"status": "issued", "expires_at": result.expires_at}))
             return 0
         if args.command == "resume-jobs":
             active.database.resume_workers()
