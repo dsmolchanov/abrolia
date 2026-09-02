@@ -86,7 +86,8 @@ batteries — then the staged flips the runbook already fixes.
 `fix/readyz-gate-status-contract`, `fix/boot-durability-archive`,
 `docs/canon-closure-operator-runbook`,
 `docs/runbook-completeness-and-rollout-gates`,
-`fix/boot-archive-failure-is-visible`.
+`fix/boot-archive-failure-is-visible`,
+`docs/manual-backup-does-not-trap-the-writer`.
 
 **Round 2, 2026-08-31 — what the gate fix uncovered.** Removing the mask let a
 deploy through for the first time since 2026-08-22, and the new image would not
