@@ -26,6 +26,21 @@ The archive uses authenticated AES-256-GCM. Secret values are read from the
 environment/Fly secret namespace; they are absent from argv, archive metadata,
 SQLite, and logs.
 
+> **If this is the first thing to write to `/data/backups`, fix its ownership
+> afterwards.** `flyctl ssh console` logs in as **root**, so the directory this
+> command creates is owned by root — while the service runs as uid 10001. The
+> Fly volume mounts over the image's `/data`, so the Dockerfile's build-time
+> `chown` does not apply to it either. The result is a directory the service
+> can never write its own boot archives into, and it cost production ten days
+> without a restore point before `/readyz` learned to say so.
+>
+> ```bash
+> chown -R 10001:10001 /data/backups
+> ```
+>
+> Confirm with `/readyz`: `checks.backup_writer` should read `written` after
+> the next boot, not `failed`.
+
 ## Backup before migrate (migrate-on-start)
 
 The container entrypoint runs the migration step before `serve`. It takes the
