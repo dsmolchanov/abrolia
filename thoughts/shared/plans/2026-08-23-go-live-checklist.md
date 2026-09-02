@@ -93,7 +93,8 @@ batteries — then the staged flips the runbook already fixes.
 `docs/v0.1.0-release-tag-and-restore-drill`,
 `fix/o2-stays-open-until-the-staging-drill`,
 `feat/backups-do-not-depend-on-deploys`,
-`docs/canon-status-2026-09-02`.
+`docs/canon-status-2026-09-02`,
+`docs/o2-nerve-cross-org-closed`.
 
 **Round 2, 2026-08-31 — what the gate fix uncovered.** Removing the mask let a
 deploy through for the first time since 2026-08-22, and the new image would not
