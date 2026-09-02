@@ -218,6 +218,41 @@ def create_boot_archive(
     return written
 
 
+def take_periodic_archive(
+    path: Path,
+    *,
+    backup_key: bytes,
+    now: float | None = None,
+) -> Path | None:
+    """The durability archive, taken by the RUNNING service rather than a boot.
+
+    Backups must not depend on deploys. Until this existed the only writer ran
+    at container start and the CLI refused to run beside a live service
+    ("Stop the service first."), so the system could only back up by
+    RESTARTING — which is why the 26-hour staleness alarm was really measuring
+    deploy cadence, and why it returned on any quiet day.
+
+    It opens its OWN connection rather than reusing the serving one.
+    `_materialise` calls `connection.backup()` outside the database mutex, so
+    driving it from the worker thread on the shared connection would race the
+    API threads already using it. A second connection to the same file is what
+    SQLite's online backup API is for, it needs no lock held across a
+    full-size copy, and it therefore cannot stall request handling.
+
+    `preserve_journal_mode` because this connection must not rewrite the
+    header of a database another connection is serving from.
+
+    Returns the archive written, or None when the interval has not elapsed.
+    Raising is the caller's problem to log: like the boot archive, a
+    durability failure must never take the service down.
+    """
+    database = ControlPlaneDatabase(path, preserve_journal_mode=True)
+    try:
+        return create_boot_archive(database, backup_key=backup_key, now=now)
+    finally:
+        database.close()
+
+
 def record_boot_archive_attempt(
     database: ControlPlaneDatabase,
     *,
