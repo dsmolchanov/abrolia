@@ -142,6 +142,43 @@ def _reconcile_runtime_health(active: ControlPlaneContainer, *, now: float) -> f
     return time.time() + 60
 
 
+def _take_periodic_archive(active, logger, *, now: float) -> None:
+    """Keep the durability archive fresh without a deploy.
+
+    Never raises into the worker loop, and never fails the service: the same
+    rule the boot path follows, for the same reason — a full volume must not
+    become an outage. Every outcome is recorded where `/readyz` reads it, so a
+    writer that has started failing says so rather than looking like a quiet
+    week.
+    """
+    from control_plane.backup import (
+        BackupError,
+        record_boot_archive_attempt,
+        take_periodic_archive,
+    )
+
+    if not active.config.backup_key:
+        return
+    try:
+        archive = take_periodic_archive(
+            active.database.path, backup_key=active.config.backup_key, now=now
+        )
+    except (BackupError, OSError) as error:
+        logger.emit(
+            "periodic_archive_failed",
+            status="failed",
+            error_code=error.__class__.__name__,
+        )
+        record_boot_archive_attempt(
+            active.database, outcome="failed", detail=str(error), now=now
+        )
+        return
+    if archive is not None:
+        record_boot_archive_attempt(
+            active.database, outcome="written", detail=str(archive), now=now
+        )
+
+
 def _serve(args: argparse.Namespace) -> int:
     active = _container()
     stop = threading.Event()
@@ -151,6 +188,10 @@ def _serve(args: argparse.Namespace) -> int:
         next_retention_at = 0.0
         next_deletion_resume_at = 0.0
         next_runtime_health_at = 0.0
+        # Not 0.0: the boot that started this process has just taken one, and
+        # `create_boot_archive`'s interval check would refuse anyway. Asking
+        # every five minutes costs a directory listing.
+        next_archive_at = time.time() + 300.0
         while not stop.wait(args.worker_interval):
             try:
                 if active.database.workers_paused:
@@ -170,6 +211,9 @@ def _serve(args: argparse.Namespace) -> int:
                     next_runtime_health_at = _reconcile_runtime_health(
                         active, now=now
                     )
+                if now >= next_archive_at:
+                    next_archive_at = now + 300.0
+                    _take_periodic_archive(active, logger, now=now)
             except Exception as error:
                 logger.emit(
                     "worker_loop_failed",

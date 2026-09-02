@@ -4859,3 +4859,170 @@ def test_the_writability_probe_never_removes_a_file_it_did_not_create(
         if entry.name not in {path.name for path in sentinels} | {link.name}
     ]
     assert leftovers == [], f"the probe leaked {leftovers}"
+
+
+# --- Backups must not depend on deploys (O0a) -------------------------------
+#
+# Until the periodic writer existed, the only archive path ran at container
+# start and the CLI refused to run beside a live service ("Stop the service
+# first."), so the system could only back up by RESTARTING. That is why the
+# 26-hour staleness alarm was really measuring deploy cadence, and why it came
+# back on any quiet day.
+
+
+def test_a_running_service_archives_without_restarting(tmp_path, monkeypatch) -> None:
+    """O0a stated as a test: no restart, no deploy, still an archive."""
+    from control_plane.backup import (
+        BOOT_ARCHIVE_MINIMUM_INTERVAL_SECONDS,
+        take_periodic_archive,
+    )
+
+    assert _boot(tmp_path, monkeypatch) == 0
+    archives = tmp_path / "backups"
+    first = sorted(archives.glob("boot-*.cpb"))
+    assert len(first) == 1
+
+    # A service that has been up long enough for the archive to go stale, with
+    # its connection open the whole time — exactly the quiet-day case.
+    database = ControlPlaneDatabase(tmp_path / "control-plane.db")
+    try:
+        assert database.query_one("SELECT 1") is not None
+        later = (
+            first[0].stat().st_mtime + BOOT_ARCHIVE_MINIMUM_INTERVAL_SECONDS + 60
+        )
+        written = take_periodic_archive(
+            tmp_path / "control-plane.db",
+            backup_key=BACKUP_KEY_BYTES,
+            now=later,
+        )
+        assert written is not None, "a running service could not take an archive"
+        assert written.parent == archives
+        # The serving connection is untouched and still usable afterwards.
+        assert database.query_one("SELECT 1") is not None
+    finally:
+        database.close()
+
+    assert len(sorted(archives.glob("boot-*.cpb"))) == 2
+
+
+def test_the_periodic_archive_does_not_stall_or_break_a_serving_connection(
+    tmp_path, monkeypatch
+) -> None:
+    """It must not drive `.backup()` on the connection the API is using.
+
+    `_materialise` calls `connection.backup()` OUTSIDE the database mutex, so
+    reusing the serving connection from the worker thread would race the API
+    threads already on it. The periodic path opens its own connection, which
+    is what SQLite's online backup API is for.
+    """
+    import threading
+
+    from control_plane.backup import (
+        BOOT_ARCHIVE_MINIMUM_INTERVAL_SECONDS,
+        take_periodic_archive,
+    )
+
+    assert _boot(tmp_path, monkeypatch) == 0
+    archives = tmp_path / "backups"
+    first = sorted(archives.glob("boot-*.cpb"))[0]
+    aged = first.stat().st_mtime + BOOT_ARCHIVE_MINIMUM_INTERVAL_SECONDS + 60
+
+    serving = ControlPlaneDatabase(tmp_path / "control-plane.db")
+    failures: list[BaseException] = []
+    stop = threading.Event()
+
+    def keep_serving() -> None:
+        while not stop.is_set():
+            try:
+                serving.query_one("SELECT COUNT(*) AS c FROM households")
+            except BaseException as error:  # noqa: BLE001 - recorded, not raised
+                failures.append(error)
+                return
+
+    reader = threading.Thread(target=keep_serving, daemon=True)
+    reader.start()
+    try:
+        written = take_periodic_archive(
+            tmp_path / "control-plane.db", backup_key=BACKUP_KEY_BYTES, now=aged
+        )
+        assert written is not None
+    finally:
+        stop.set()
+        reader.join(timeout=5)
+        serving.close()
+
+    assert not failures, f"the archive disturbed the serving connection: {failures}"
+
+    # And the archive it produced is a real restore point, not a torn copy.
+    restored = tmp_path / "concurrent-restore.db"
+    restore_backup(written, restored, backup_key=BACKUP_KEY_BYTES)
+    connection = sqlite3.connect(restored)
+    try:
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    finally:
+        connection.close()
+
+
+def test_the_periodic_archive_keeps_the_same_interval_as_the_boot(
+    tmp_path, monkeypatch
+) -> None:
+    """A five-minute tick must not mean a five-minute archive.
+
+    The loop asks often and cheaply; `create_boot_archive` decides. Otherwise
+    the periodic writer would fill the volume that the boot path's interval
+    exists to protect.
+    """
+    from control_plane.backup import take_periodic_archive
+
+    assert _boot(tmp_path, monkeypatch) == 0
+    before = len(list((tmp_path / "backups").glob("boot-*.cpb")))
+
+    for tick in range(10):
+        assert (
+            take_periodic_archive(
+                tmp_path / "control-plane.db",
+                backup_key=BACKUP_KEY_BYTES,
+                now=None,
+            )
+            is None
+        ), f"tick {tick} wrote an archive inside the interval"
+
+    assert len(list((tmp_path / "backups").glob("boot-*.cpb"))) == before
+
+
+def test_the_periodic_archive_never_rewrites_the_header_it_is_reading(
+    tmp_path, monkeypatch
+) -> None:
+    """Pinned directly, because behaviour cannot discriminate it here.
+
+    Opening a second connection normally sets `journal_mode=WAL`, which
+    REWRITES the database header. The database is already WAL in every case
+    this suite builds, so setting it again is a no-op and no behavioural
+    assertion can tell the two apart — a mutation dropping
+    `preserve_journal_mode` passed everything else. It still matters: the
+    header being rewritten belongs to a file another connection is actively
+    serving from, and `create_pre_migrate_backup` exists partly because a
+    header rewrite made a database differ from a snapshot taken moments
+    earlier.
+    """
+    from control_plane import backup as module
+
+    opened: list[dict] = []
+    real = module.ControlPlaneDatabase
+
+    class Recording(real):
+        def __init__(self, path, **kwargs):
+            opened.append(kwargs)
+            super().__init__(path, **kwargs)
+
+    assert _boot(tmp_path, monkeypatch) == 0
+    monkeypatch.setattr(module, "ControlPlaneDatabase", Recording)
+    module.take_periodic_archive(
+        tmp_path / "control-plane.db", backup_key=BACKUP_KEY_BYTES, now=None
+    )
+
+    assert opened, "the periodic archive opened no connection of its own"
+    assert opened[0].get("preserve_journal_mode") is True, (
+        "the periodic archive would rewrite the header of a database another "
+        "connection is serving from"
+    )

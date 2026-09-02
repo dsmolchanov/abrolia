@@ -76,7 +76,7 @@ batteries — then the staged flips the runbook already fixes.
 `docs/canon-closure-runbook.md`,
 `tests/test_canon_closure_runbook.py`,
 `thoughts/shared/implementations/2026-09-02-v0.1.0-restore-drill.md`, `control_plane/observability.py`,
-`control_plane/api/app.py`, `control_plane/models.py`,
+`control_plane/api/app.py`, `control_plane/models.py`, `control_plane/cli.py`,
 `control_plane/migrations/0016_boot_archive_outcome.sql`,
 `tests/control_plane/test_db.py`, `tests/control_plane/test_observability.py`,
 `tests/control_plane/test_schema_contract.py`,
@@ -90,7 +90,8 @@ batteries — then the staged flips the runbook already fixes.
 `fix/boot-archive-failure-is-visible`,
 `docs/manual-backup-does-not-trap-the-writer`,
 `docs/v0.1.0-release-tag-and-restore-drill`,
-`fix/o2-stays-open-until-the-staging-drill`.
+`fix/o2-stays-open-until-the-staging-drill`,
+`feat/backups-do-not-depend-on-deploys`.
 
 **Round 2, 2026-08-31 — what the gate fix uncovered.** Removing the mask let a
 deploy through for the first time since 2026-08-22, and the new image would not
@@ -236,15 +237,41 @@ restore round-trip, because an archive that cannot be restored is not a
 restore point. The probe's own accessor is used to assert visibility rather
 than a second opinion about the path.
 
-- [ ] **O0a. Backups must not depend on deploys.** *Opened 2026-08-31 by the
-  above, and deliberately NOT fixed with it — this needs a design, not a cron
-  entry.* The only backup path runs at container start, and the CLI refuses to
+- [x] **O0a. Backups must not depend on deploys.** *Closed 2026-09-02 by an
+  in-process periodic archive — the first of the two options this box named.
+  Opened 2026-08-31, and deliberately NOT fixed then, because it needed a
+  design rather than a cron entry.* The only backup path runs at container start, and the CLI refuses to
   run beside a live service, so today the system can only back up by
   RESTARTING. That is why the 26-hour alarm was really measuring deploy
   cadence, and why it will fire again on any quiet day. The honest options are
   an in-process periodic backup (the serving process already holds the lock) or
   a scheduled restart; both are real work and neither is a workflow file.
   Until one lands, `/readyz` reports `not_ready` on any day without a deploy.
+
+  **The in-process option landed.** `take_periodic_archive` runs from the
+  `serve` worker loop on the same five-minute tick the retention and
+  runtime-health tasks already use, and `create_boot_archive` still owns the
+  decision — the loop asks often and cheaply, the interval decides, so a
+  frequent tick does not mean a frequent archive.
+
+  Two design points, both load-bearing:
+
+  - **It opens its OWN connection.** `_materialise` calls
+    `connection.backup()` OUTSIDE the database mutex, so driving it from the
+    worker thread on the serving connection would race the API threads
+    already on it. A second connection to the same file is what SQLite's
+    online backup API is for, needs no lock held across a full-size copy, and
+    so cannot stall request handling.
+  - **`preserve_journal_mode=True`**, because opening a connection normally
+    sets `journal_mode=WAL` and REWRITES the header — of a file another
+    connection is serving from. That property is pinned directly rather than
+    behaviourally: the database is already WAL in every case the suite builds,
+    so setting it again is a no-op and a mutation dropping the flag passed
+    every behavioural assertion.
+
+  Failure stays non-fatal and is recorded where `/readyz` reads it, so a
+  periodic writer that starts failing says `backup_writer: failed` rather than
+  looking like a quiet week.
 
 - [ ] **O2. Release tag + restore drill.** *Tag DONE; drill PARTIAL — the
   staging half is unperformed, so this box stays open — 2026-09-02, evidence in

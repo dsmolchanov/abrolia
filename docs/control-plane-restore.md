@@ -101,6 +101,22 @@ Three properties an operator should know:
   them anything except a `boot-` prefix — the runbook's
   `control-plane-<date>.cpb` is safe.
 
+### It no longer waits for a deploy
+
+The boot archive is taken at container start, and for a while that was the only
+writer — so the system could only back up by RESTARTING, and the 26-hour
+staleness alarm was really measuring deploy cadence. The serving process now
+also takes one: `take_periodic_archive` runs from the `serve` worker loop,
+asking every five minutes and writing only when the interval has actually
+elapsed, so a quiet week no longer produces a stale archive.
+
+It opens its own connection rather than the serving one — SQLite's online
+backup API is designed for exactly that — so it neither stalls request
+handling nor rewrites the header of the database being served.
+
+`abrolia-control-plane backup` is still the way to take one on demand, and
+still requires stopping the service.
+
 ### When it is skipped, how you find out
 
 Because the archive is skipped rather than fatal, a writer that fails at every
