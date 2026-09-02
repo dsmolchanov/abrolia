@@ -434,9 +434,14 @@ placeholder.
 2. Rollout order: synthetic → operator accounts → invited pilot families per provider; each transition requires `Phase A` legal + `Phase C1` receipt + `go test` + `pytest -m "not live"` + one manual live gate.
 
 **Acceptance:**
-- [ ] Flag matrix doctested; `git diff --check` + `ruff` +
+- [x] Flag matrix doctested; `git diff --check` + `ruff` +
   `gitleaks detect --log-opts="--all"` + `check_fixtures --all --require-deny`
-  green. **CI is the only surface that can close this box (noted 2026-08-30):**
+  green. *Closed 2026-09-02 by CI evidence: `ci.yml` runs
+  `check_fixtures --all --require-deny` with `HERMES_EXTRA_DENY_FILE`
+  materialised from the `HERMES_DENY_PATTERNS` secret (fail-closed when
+  empty), green on `main` at `97706ea`; `git diff --check`, `ruff` and
+  `check_fixtures --all` re-run clean locally the same day. Runbook O11.*
+  **CI is the only surface that can close this box (noted 2026-08-30):**
   `check_fixtures --all --require-deny` exits **2** locally — a refusal, not a
   warning — because the private deny-patterns file (`HERMES_EXTRA_DENY_FILE`)
   exists only in CI. Everything else is green locally at 2026-08-30: suite 1686,
