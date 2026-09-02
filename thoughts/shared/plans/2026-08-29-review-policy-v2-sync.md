@@ -102,3 +102,34 @@ Gate revision `23518dbd89add6333ed0d147bd2acd8d898ef04e` (codex-review-gate#10).
 
 Pin bump only in both stubs, in lockstep: the gate's short window and the
 waker's re-entry are two halves of one protocol.
+
+## Step 5 — gate v3.5: review-debt identity lives in a tested script (2026-09-02)
+
+One change over Step 4's revision.
+
+What identifies a deferred finding is decided in one tested file. On a round
+past the review budget the gate merges over still-open P1s and files one issue
+per finding; the key that makes two findings the same finding was a sed
+pipeline inside the workflow's heredoc, and four of the five review rounds on
+the per-finding change were spent re-deriving it. The rule now lives in
+`scripts/review_debt.py` in the gate repository — fingerprint of the path and
+the complete finding line, display title bounded under GitHub's 256-character
+limit, in-batch and cross-round dedup — with the policy stated once (no line
+number, no comment id, no PR number) and pinned by unit tests. The workflow
+fetches that file at its own commit, the one this stub pins, so identity and
+workflow cannot drift apart. Titles are byte-identical to the previous rule, so
+issues already filed here still dedupe. The fetch is fail-soft: a failure warns
+and merges the finding unrecorded rather than guessing a key.
+
+Gate revision `4d05f6909650381037fee2cfed40c6a5cab591af` (codex-review-gate#15).
+
+**Files:** `.github/workflows/codex-verdict-waker.yml`,
+`.github/workflows/codex-review-window.yml`,
+`thoughts/shared/plans/2026-08-29-review-policy-v2-sync.md`.
+
+**Branches:** `chore/gate-pin-4d05f69`.
+
+Both stubs re-synced byte for byte from the dev-agent fleet template at the
+new pin, in lockstep: the gate's short window and the waker's re-entry are two
+halves of one protocol. Outside comments the only change is the pin; the
+comments now describe the revision the stub pins.
