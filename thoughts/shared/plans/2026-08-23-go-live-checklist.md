@@ -74,7 +74,8 @@ batteries — then the staged flips the runbook already fixes.
 `tests/control_plane/test_migrate_on_start.py`,
 `docs/control-plane-restore.md`,
 `docs/canon-closure-runbook.md`,
-`tests/test_canon_closure_runbook.py`, `control_plane/observability.py`,
+`tests/test_canon_closure_runbook.py`,
+`thoughts/shared/implementations/2026-09-02-v0.1.0-restore-drill.md`, `control_plane/observability.py`,
 `control_plane/api/app.py`, `control_plane/models.py`,
 `control_plane/migrations/0016_boot_archive_outcome.sql`,
 `tests/control_plane/test_db.py`, `tests/control_plane/test_observability.py`,
@@ -87,7 +88,8 @@ batteries — then the staged flips the runbook already fixes.
 `docs/canon-closure-operator-runbook`,
 `docs/runbook-completeness-and-rollout-gates`,
 `fix/boot-archive-failure-is-visible`,
-`docs/manual-backup-does-not-trap-the-writer`.
+`docs/manual-backup-does-not-trap-the-writer`,
+`docs/v0.1.0-release-tag-and-restore-drill`.
 
 **Round 2, 2026-08-31 — what the gate fix uncovered.** Removing the mask let a
 deploy through for the first time since 2026-08-22, and the new image would not
@@ -243,7 +245,26 @@ than a second opinion about the path.
   a scheduled restart; both are real work and neither is a workflow file.
   Until one lands, `/readyz` reports `not_ready` on any day without a deploy.
 
-- [ ] **O2. Release tag + restore drill.** Zero git tags exist today. Tag the
+- [x] **O2. Release tag + restore drill.** *Tag done, drill done for everything
+  that is not a Fly resource — 2026-09-02, evidence in
+  `thoughts/shared/implementations/2026-09-02-v0.1.0-restore-drill.md`.*
+  `v0.1.0` is the first tag this repository has ever carried, annotated at
+  `cc86bfb`. The rehearsal ran against the CURRENT Phase E schema (27 tables,
+  16 migrations, newest `0016`): 56 checks, 0 failures — integrity and
+  foreign-key checks clean, 0600 pause marker, row counts identical table by
+  table, the Phase E surfaces verified by content, all four refusals (existing
+  target, wrong key, tampered archive, corrupt file), a smoke without leasing
+  whose export carried no credential hash, `resume-jobs` resuming only on
+  request, and a NEW onboarding driven to `config_revisions.revision = 1` on
+  the restored database.
+  **Still open, and the reason this box is not simply closed:** the staging
+  half needs Fly — an isolated volume on a Machine with no public route, the
+  actual production archive rather than an equivalent database, and the
+  teardown. Step 6's job reconciliation is also unexercised, because the
+  seeded jobs were `pending` and nothing was `running`/`outcome_unknown`.
+  Ticking on what the box gates — the release is named and the schema is
+  proven restorable — and recording the environment half as it is.
+  Original text: Zero git tags exist today. Tag the
   release, then repeat the Phase B isolated backup/restore procedure on the
   Phase E schema (now incl. `channel_preferences`/`channel_bindings`/usage
   tables): `integrity_check`, `foreign_key_check`, pause marker 0600, smoke
