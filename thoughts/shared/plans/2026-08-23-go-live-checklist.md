@@ -1224,6 +1224,19 @@ Prerequisite: O1 ticked. Order is not negotiable per runbook and canon.
   **B-06** (verification/CASA + dedicated-Gmail live gates — deferred, still
   open). Shared-WA relay last, after C5.
 
+#### Inventory — R1 the flag flip
+
+One line: `ABROLIA_REAL_EMAIL_ENABLED = "1"` on the synthetic control plane.
+`ABROLIA_SYNTHETIC_ONLY` stays `1` — `ControlPlaneConfig.validate` gates
+managed email on Nerve configuration and a non-empty household allowlist,
+both already installed as secrets, not on the synthetic-only switch. The PR
+stays a draft until O1 (Phase A registry), the nerve-cloud cross-org test,
+both suites, the 0012 rehearsal and the allowlist check are recorded on it.
+
+**Files:** `deploy/control-plane/fly.toml`.
+
+**Branches:** `rollout/r1-real-email-operator-accounts`.
+
 ## Execution log
 
 - 2026-08-28: **The recovery I added could make things worse; narrowed it, and
