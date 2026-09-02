@@ -147,3 +147,77 @@ def test_the_live_batteries_do_not_require_the_gate_they_supply() -> None:
         assert "full rollout gate set" not in section, (
             f"{box} requires the gate it produces — a circular gate"
         )
+
+
+# --- A ticked box must not also say it is not done -------------------------
+
+CHECKLIST = (
+    Path(__file__).resolve().parents[1]
+    / "thoughts" / "shared" / "plans" / "2026-08-23-go-live-checklist.md"
+)
+
+#: Phrases that mean "required work has not happened". A box carrying one of
+#: these is describing partial evidence, whatever its checkbox says.
+NOT_DONE = (
+    "still open",
+    "is unperformed",
+    "are unperformed",
+    "remains unperformed",
+    "remain unperformed",
+    "unexercised",
+    "not ticked",
+)
+
+
+def _operator_boxes() -> list[tuple[bool, str]]:
+    """Every Track O checkbox, as (ticked, text-until-the-next-box)."""
+    text = CHECKLIST.read_text(encoding="utf-8")
+    boxes: list[tuple[bool, str]] = []
+    current: list[str] | None = None
+    ticked = False
+    for line in text.splitlines():
+        started = re.match(r"^- \[( |x)\] \*\*O", line)
+        if started:
+            if current is not None:
+                boxes.append((ticked, "\n".join(current)))
+            ticked = started.group(1) == "x"
+            current = [line]
+        elif current is not None:
+            if line.startswith("- [") or line.startswith("## "):
+                boxes.append((ticked, "\n".join(current)))
+                current = None
+            else:
+                current.append(line)
+    if current is not None:
+        boxes.append((ticked, "\n".join(current)))
+    return boxes
+
+
+def test_no_ticked_operator_box_also_records_work_it_did_not_do() -> None:
+    """The mistake this exists to refuse, made once and caught in review.
+
+    O2 was ticked on 2026-09-02 with "the staging half is unperformed" written
+    in the same entry. The caveat was honest and the tick was still wrong: O2
+    gates the live batteries and the promotion, so downstream a tick reads as
+    "recovery is proven", and half a recovery exercise must not be able to
+    satisfy a real-data gate.
+
+    Partial evidence is worth recording. It is not worth a checkbox.
+    """
+    boxes = _operator_boxes()
+    assert boxes, "no operator boxes were parsed, so this check proves nothing"
+
+    offenders = []
+    for ticked, body in boxes:
+        if not ticked:
+            continue
+        lowered = body.casefold()
+        hits = [phrase for phrase in NOT_DONE if phrase in lowered]
+        if hits:
+            offenders.append((body.splitlines()[0][:72], hits))
+
+    assert not offenders, (
+        "these boxes are ticked while their own text says required work has "
+        f"not happened: {offenders}. Record it as partial evidence and leave "
+        "the box open."
+    )

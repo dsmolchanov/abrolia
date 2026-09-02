@@ -138,7 +138,21 @@ Closes canon C1 box 1, blocker **B-01**.
 
 ## O3 — Release tag and restore drill
 
-**Owner:** operator. **Needs nothing first.** **Zero git tags exist today.**
+**Owner:** operator. **Needs nothing first.**
+**Status 2026-09-02: tag done, drill PARTIAL — this box is still open.**
+
+`v0.1.0` exists (the first tag this repository has carried), and the schema
+half of the drill passed 56 checks against the current Phase E schema —
+evidence in
+`thoughts/shared/implementations/2026-09-02-v0.1.0-restore-drill.md`.
+
+**What is left is the staging half, and it is the half that closes the box:**
+an isolated volume on a Machine with no public route, the *actual production
+archive* rather than an equivalent database at the same schema, the teardown,
+and step 6's job reconciliation (unexercised — the seeded jobs were
+`pending`). Because this box gates the live batteries and the promotion, a
+tick here reads downstream as "recovery is proven", so partial evidence stays
+partial.
 
 This is the cheapest open box with real downside if skipped: nothing has yet
 demonstrated that the *current* Phase E schema can actually be restored.
