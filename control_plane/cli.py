@@ -145,17 +145,19 @@ def _reconcile_runtime_health(active: ControlPlaneContainer, *, now: float) -> f
 def _take_periodic_archive(active, logger, *, now: float) -> None:
     """Keep the durability archive fresh without a deploy.
 
-    Never raises into the worker loop, and never fails the service: the same
-    rule the boot path follows, for the same reason — a full volume must not
-    become an outage. Every outcome is recorded where `/readyz` reads it, so a
-    writer that has started failing says so rather than looking like a quiet
-    week.
+    Never raises, and never fails the service: the same rule the boot path
+    follows, for the same reason — a full volume must not become an outage.
+
+    `Exception`, not `(BackupError, OSError)`. The narrow tuple was wrong and
+    quietly so: `take_periodic_archive` reaches `PRAGMA integrity_check`, a
+    second `sqlite3.connect`, and `connection.backup()`, every one of which
+    raises `sqlite3.Error` — which is neither. Those escaped to the worker
+    loop's generic handler WITHOUT recording an attempt, so `/readyz` went on
+    reporting the previous `written` while nothing was being written. That is
+    exactly the invisibility the `backup_writer` signal exists to end, so the
+    one thing this must never do is fail without saying so.
     """
-    from control_plane.backup import (
-        BackupError,
-        record_boot_archive_attempt,
-        take_periodic_archive,
-    )
+    from control_plane.backup import record_boot_archive_attempt, take_periodic_archive
 
     if not active.config.backup_key:
         return
@@ -163,7 +165,7 @@ def _take_periodic_archive(active, logger, *, now: float) -> None:
         archive = take_periodic_archive(
             active.database.path, backup_key=active.config.backup_key, now=now
         )
-    except (BackupError, OSError) as error:
+    except Exception as error:  # noqa: BLE001 - recorded, never propagated
         logger.emit(
             "periodic_archive_failed",
             status="failed",
@@ -179,41 +181,80 @@ def _take_periodic_archive(active, logger, *, now: float) -> None:
         )
 
 
+def _run_maintenance(active, logger, schedule: dict[str, float], *, now: float) -> None:
+    """One pass of the periodic tasks, each in its own failure boundary.
+
+    Previously these shared a single `try`, and the archive was last. A task
+    that failed persistently — `retention.run()` raising, say, leaving its own
+    "next at" unadvanced so it retried on every tick — jumped to the outer
+    handler before the archive branch was ever reached. The service stayed up,
+    nothing looked wrong, and 26 hours later the backup was stale again: the
+    exact defect O0a describes, returning through a different door.
+
+    So each task advances its own schedule BEFORE running, and a failure in
+    one cannot starve another. The archive is also first, because it is the
+    one whose starvation is silent.
+    """
+    tasks: list[tuple[str, float, callable]] = [
+        ("archive", 300.0, lambda: _take_periodic_archive(active, logger, now=now)),
+        ("retention", 24 * 60 * 60.0, lambda: active.retention.run(now=now)),
+        (
+            "deletion_resume",
+            30.0,
+            lambda: _resume_deletions_if_running(active, limit=10, now=now),
+        ),
+    ]
+    if active.config.runtime_provider == "fly-runtime":
+        tasks.append(
+            (
+                "runtime_health",
+                60.0,
+                lambda: active.runtime_health.reconcile_all(now=now),
+            )
+        )
+
+    for name, interval, run in tasks:
+        if now < schedule.get(name, 0.0):
+            continue
+        # Advanced BEFORE the call: a task that raises must not retry on every
+        # 0.5s tick, which is what let one failure crowd out everything else.
+        schedule[name] = now + interval
+        try:
+            run()
+        except Exception as error:  # noqa: BLE001 - isolated, never propagated
+            logger.emit(
+                "maintenance_task_failed",
+                status="failed",
+                error_code=f"{name}:{error.__class__.__name__}",
+            )
+
+
 def _serve(args: argparse.Namespace) -> int:
     active = _container()
     stop = threading.Event()
     logger = StructuredLogger(sys.stderr)
 
     def worker_loop() -> None:
-        next_retention_at = 0.0
-        next_deletion_resume_at = 0.0
-        next_runtime_health_at = 0.0
-        # Not 0.0: the boot that started this process has just taken one, and
-        # `create_boot_archive`'s interval check would refuse anyway. Asking
-        # every five minutes costs a directory listing.
-        next_archive_at = time.time() + 300.0
+        # The archive is not due immediately: the boot that started this
+        # process has just taken one, and the interval check would refuse
+        # anyway. Asking every five minutes costs a directory listing.
+        schedule: dict[str, float] = {"archive": time.time() + 300.0}
         while not stop.wait(args.worker_interval):
             try:
                 if active.database.workers_paused:
                     continue
                 active.worker.run_once()
-                now = time.time()
-                if now >= next_retention_at:
-                    active.retention.run(now=now)
-                    next_retention_at = now + 24 * 60 * 60
-                if now >= next_deletion_resume_at:
-                    _resume_deletions_if_running(active, limit=10, now=now)
-                    next_deletion_resume_at = now + 30
-                if (
-                    active.config.runtime_provider == "fly-runtime"
-                    and now >= next_runtime_health_at
-                ):
-                    next_runtime_health_at = _reconcile_runtime_health(
-                        active, now=now
-                    )
-                if now >= next_archive_at:
-                    next_archive_at = now + 300.0
-                    _take_periodic_archive(active, logger, now=now)
+            except Exception as error:
+                logger.emit(
+                    "worker_loop_failed",
+                    status="failed",
+                    error_code=error.__class__.__name__,
+                )
+            # Outside the block above, so a failing job drain cannot starve
+            # the maintenance tasks either.
+            try:
+                if not active.database.workers_paused:
+                    _run_maintenance(active, logger, schedule, now=time.time())
             except Exception as error:
                 logger.emit(
                     "worker_loop_failed",

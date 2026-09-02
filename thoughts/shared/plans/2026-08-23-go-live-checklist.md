@@ -77,6 +77,7 @@ batteries — then the staged flips the runbook already fixes.
 `tests/test_canon_closure_runbook.py`,
 `thoughts/shared/implementations/2026-09-02-v0.1.0-restore-drill.md`, `control_plane/observability.py`,
 `control_plane/api/app.py`, `control_plane/models.py`, `control_plane/cli.py`,
+`tests/control_plane/test_serve_maintenance.py`,
 `control_plane/migrations/0016_boot_archive_outcome.sql`,
 `tests/control_plane/test_db.py`, `tests/control_plane/test_observability.py`,
 `tests/control_plane/test_schema_contract.py`,
@@ -272,6 +273,24 @@ than a second opinion about the path.
   Failure stays non-fatal and is recorded where `/readyz` reads it, so a
   periodic writer that starts failing says `backup_writer: failed` rather than
   looking like a quiet week.
+
+  **Round 2, 2026-09-02 — Codex found the defect returning through two other
+  doors, and was right about both.** The first cut put the archive last inside
+  the loop's single shared `try`, so a task that failed persistently —
+  `retention.run()` raising, leaving its own "next at" unadvanced so it
+  retried on every 0.5s tick — jumped to the outer handler before the archive
+  branch was ever reached. Service up, nothing visibly wrong, stale backup 26
+  hours later: O0a exactly, by a different route. Each task now advances its
+  own schedule BEFORE running and has its own failure boundary, and the
+  archive runs first because its starvation is the silent one.
+
+  The second: `_take_periodic_archive` caught only `(BackupError, OSError)`,
+  while `take_periodic_archive` reaches `PRAGMA integrity_check`, a second
+  `sqlite3.connect` and `connection.backup()` — all of which raise
+  `sqlite3.Error`, which is neither. Those escaped without recording an
+  attempt, so `/readyz` kept reporting the previous `written` while nothing
+  was being written. That is the invisibility `backup_writer` exists to end,
+  reintroduced by the writer it was built for.
 
 - [ ] **O2. Release tag + restore drill.** *Tag DONE; drill PARTIAL — the
   staging half is unperformed, so this box stays open — 2026-09-02, evidence in
