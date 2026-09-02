@@ -127,7 +127,7 @@ Non-blocker debt: codex/phase-4-real-actions dirty file + untracked landing not 
 3. Tests: SIGKILL after sink before commit → reclaimed lease still requires receipt; no secret in DB/log/telemetry; revoked/replayed sink behavior.
 
 **Acceptance:**
-- [ ] Nerve PR with cross-org test green + `go test ./... -count=1`.
+- [x] Nerve PR with cross-org test green + `go test ./... -count=1`. *Closed 2026-09-02: nerve-cloud #178 — cross-org `org_id` answers 403 at every `resolveOrgIDForPrincipal` caller, `TestServiceToken_CrossOrgRejected` red on the previous main and green with the fix, full suite green against Postgres (`NM_TEST_DB_DSN`; the cloudapi tests skip without one).*
 - [x] Abrolia `pytest tests/control_plane/email tests/control_plane/test_provisioning_jobs.py` proves crash-after-sink converges without operator, and hard-reclaim without sink stays `secret_handoff_unknown`.
   *Audited 2026-08-30 — half evidenced, and the box stays open for the other
   half.* The suite is green, and the SECOND clause is proven by name:

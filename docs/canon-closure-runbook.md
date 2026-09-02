@@ -61,7 +61,7 @@ to prevent; reading it as "everything, then go" is the other.
 
 ```
 O1  legal ───────────────┐
-O2  nerve cross-org ─────┼──► [prerequisites 1-4] ──► O7  BYO battery ──┐
+O2  nerve cross-org ✅ ──┼──► [prerequisites 1-4] ──► O7  BYO battery ──┐
 O3  release tag + drill ─┘                            O8  Gmail battery ┼──► O10 promotion
                                                           (+O9 rg check)│    (+CASA for Gmail)
 O4  backup independence  ✅ closed 2026-09-02 (#121, #131)              │
@@ -118,6 +118,11 @@ Closes canon Phase A box 1, go-live **O1**, blocker **B-07**.
 
 **Owner:** whoever holds commit rights on `nerve-cloud`. **Repository:** not
 this one.
+**Status 2026-09-02: CLOSED** — nerve-cloud #178 merged: cross-org requests
+answer 403 at every caller of `resolveOrgIDForPrincipal`,
+`TestServiceToken_CrossOrgRejected` present and green, `go test ./... -count=1`
+green against Postgres. The cloudapi tests **skip** without `NM_TEST_DB_DSN`,
+so a green run without a database is not evidence for this box.
 
 1. Resolve the requested `org_id` against the authenticated tenant in
    `internal/cloudapi/handler_keys.go` (and `internal/store/*` as needed).
