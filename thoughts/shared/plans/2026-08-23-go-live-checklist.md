@@ -1224,6 +1224,19 @@ Prerequisite: O1 ticked. Order is not negotiable per runbook and canon.
   **B-06** (verification/CASA + dedicated-Gmail live gates — deferred, still
   open). Shared-WA relay last, after C5.
 
+#### Inventory — R0 admitting a tester without a restart
+
+Every human tester on the synthetic contour enters through one operator
+invite, and `invite` took the single-writer flock that `serve` holds for the
+life of the process — so each tester admitted cost a production restart. The
+command is one token row and one line of operator stdout; it now runs beside
+the serving process the way `withdraw-consent` does.
+
+**Files:** `control_plane/cli.py`, `docs/onboarding-runbook.md`,
+`tests/control_plane/test_invite_cli.py`.
+
+**Branches:** `feat/invite-without-downtime`.
+
 ## Execution log
 
 - 2026-08-28: **The recovery I added could make things worse; narrowed it, and
