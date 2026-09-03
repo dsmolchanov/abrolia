@@ -19,6 +19,7 @@ from pydantic import (
 from control_plane.crypto import reject_secret_fields
 from control_plane.email.domain_policy import canonicalize_domain, domain_guidance
 from control_plane.email.local_part import normalize_local_part
+from control_plane.profile_choices import COUNTRY_CODES, LANGUAGE_CODES, TIMEZONE_NAMES
 
 _SYNTHETIC_ACTOR_OR_CHAT = re.compile(
     r"^synthetic-[a-z0-9](?:[a-z0-9._-]{0,126})$"
@@ -156,17 +157,57 @@ class DurableContract(BaseModel):
 
 
 class ProfileInput(DurableContract):
+    """The household basics, drawn from closed vocabularies.
+
+    Language, country and timezone are codes the form offers as choices
+    (`control_plane.profile_choices`), not free text checked by shape: a
+    country typed as "Czechia" or a language described in a sentence used to
+    be a 422 the page never showed. Case and whitespace are forgiven — a
+    lower-case country code is the same country — but an unknown value is
+    refused with a message that names the field.
+    """
+
     first_name: str = Field(min_length=1, max_length=100)
     last_name: str = Field(min_length=1, max_length=100)
     family_language: str = Field(min_length=2, max_length=35)
     timezone: str = Field(min_length=1, max_length=64)
-    country_code: str = Field(pattern=r"^[A-Z]{2}$")
+    country_code: str = Field(min_length=2, max_length=2)
     residency_mode: ResidencyMode = ResidencyMode.EU_APP
 
-    @field_validator("first_name", "last_name", "family_language")
+    @field_validator("first_name", "last_name")
     @classmethod
     def _strip_text(cls, value: str) -> str:
         return value.strip()
+
+    @field_validator("family_language", mode="before")
+    @classmethod
+    def _known_language(cls, value: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+        code = value.strip().casefold()
+        if code not in LANGUAGE_CODES:
+            raise ValueError("family_language must be one of the offered language codes")
+        return code
+
+    @field_validator("country_code", mode="before")
+    @classmethod
+    def _known_country(cls, value: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+        code = value.strip().upper()
+        if code not in COUNTRY_CODES:
+            raise ValueError("country_code must be an ISO 3166-1 alpha-2 code")
+        return code
+
+    @field_validator("timezone", mode="before")
+    @classmethod
+    def _known_timezone(cls, value: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+        zone = value.strip()
+        if zone not in TIMEZONE_NAMES:
+            raise ValueError("timezone must be an IANA zone name such as Europe/Prague")
+        return zone
 
 
 class SpecialCategoryConsent(DurableContract):

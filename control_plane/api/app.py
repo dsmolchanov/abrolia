@@ -31,6 +31,7 @@ from control_plane.email.models import EMAIL_SELECTION_KINDS
 from control_plane.observability import HealthReporter, HealthSnapshot
 from control_plane.onboarding.contracts import WorkflowConflict
 from control_plane.privacy.consent import consent_version_and_sha, consent_version_and_text
+from control_plane.profile_choices import COUNTRIES, LANGUAGES, TIMEZONES
 from control_plane.repositories.households import HouseholdNotFound
 
 WEB_ROOT = Path(__file__).resolve().parents[1] / "web"
@@ -189,6 +190,11 @@ def create_app(
                 "csrf_token": request.cookies.get(active_container.config.csrf_cookie_name, ""),
                 "idempotency_key": new_id(),
                 "error": request.query_params.get("error"),
+                "profile_choices": {
+                    "languages": LANGUAGES,
+                    "countries": COUNTRIES,
+                    "timezones": TIMEZONES,
+                },
                 "google_confirm": request.query_params.get("google") == "confirm",
                 "special_category_restriction_version": restriction_version,
                 "special_category_restriction_text": restriction_text,
