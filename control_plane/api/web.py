@@ -12,10 +12,11 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, ValidationError
 
-from control_plane.api.auth import issue_requested_link
+from control_plane.api.auth import MAX_AUTH_BODY_BYTES, issue_requested_link
 from control_plane.api.dependencies import (
     Principal,
     container,
+    read_bounded_form,
     read_bounded_json,
     require_private_mutation,
 )
@@ -52,8 +53,10 @@ async def request_link_form(request: Request) -> RedirectResponse:
     active = container(request)
     if request.headers.get("origin") != active.config.public_origin:
         raise HTTPException(http_status.HTTP_403_FORBIDDEN, "same-origin request required")
-    form = await request.form()
-    email = str(form.get("email", ""))
+    # Bounded before it is read whole — `request.form()` is not, and this
+    # route runs before either rate limiter, same as the JSON sibling.
+    form = await read_bounded_form(request, limit=MAX_AUTH_BODY_BYTES)
+    email = form.get("email", "")
     network = request.client.host if request.client else "unknown"
     try:
         active.rate_limiter.check(

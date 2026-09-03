@@ -11,6 +11,7 @@ from control_plane.api.dependencies import (
     authenticate,
     container,
     network_bucket,
+    read_bounded_json,
     require_origin,
     require_private_mutation,
 )
@@ -30,6 +31,22 @@ class LinkRequest(BaseModel):
 class ConsumeRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     token: str = Field(min_length=32, max_length=512)
+
+
+#: The two unauthenticated auth bodies carry one address or one token. Bounded
+#: BEFORE parsing, at a fraction of the general limit: a Pydantic parameter
+#: would let FastAPI hold the whole document first, so the field limits above
+#: bound what is accepted and never what is read — and these routes run
+#: before any rate limiter.
+MAX_AUTH_BODY_BYTES = 4 * 1024
+
+
+async def _link_body(request: Request) -> LinkRequest:
+    return await read_bounded_json(request, LinkRequest, limit=MAX_AUTH_BODY_BYTES)
+
+
+async def _consume_body(request: Request) -> ConsumeRequest:
+    return await read_bounded_json(request, ConsumeRequest, limit=MAX_AUTH_BODY_BYTES)
 
 
 def issue_requested_link(request: Request, email: str) -> None:
@@ -56,7 +73,9 @@ def issue_requested_link(request: Request, email: str) -> None:
 
 
 @router.post("/api/v1/auth/request-link", status_code=status.HTTP_202_ACCEPTED)
-def request_link(payload: LinkRequest, request: Request) -> dict[str, str]:
+def request_link(
+    payload: Annotated[LinkRequest, Depends(_link_body)], request: Request
+) -> dict[str, str]:
     require_origin(request)
     active = container(request)
     generic = {"status": "accepted"}
@@ -76,7 +95,11 @@ def request_link(payload: LinkRequest, request: Request) -> dict[str, str]:
 
 
 @router.post("/api/v1/auth/consume")
-def consume(payload: ConsumeRequest, request: Request, response: Response) -> dict:
+def consume(
+    payload: Annotated[ConsumeRequest, Depends(_consume_body)],
+    request: Request,
+    response: Response,
+) -> dict:
     require_origin(request)
     active = container(request)
     try:
