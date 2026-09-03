@@ -1393,7 +1393,36 @@ now says what the values are and where a tester reads their id.
 
 **Branches:** `fix/allowlist-secret-cannot-take-prod-down`.
 
+#### Inventory — R1 every household, no allowlist
+
+Owner decision, 2026-09-03, after the allowlist incident: "no allowlist,
+open for all emails". Testers register themselves, and each one waited for
+an operator to put a household id on a secret — the loop that produced the
+outage above. `ABROLIA_REAL_EMAIL_ALL_HOUSEHOLDS=1` makes selection and
+dispatch authorize every household; the allowlist is ignored, not consulted
+and not reported. The live brake (`ABROLIA_REAL_EMAIL_ENABLED`) still stops
+dispatch at call time, the flag is dormant while the brake is on, and the
+Art. 9(4) country check is untouched: real content still needs a recorded
+determination for the profile's country (DE, NL, ES today). Roll back to
+the list by setting the flag to `0`. `/s/ Product owner (CEO), 2026-09-03`.
+
+**Files:** `control_plane/config.py`, `control_plane/container.py`,
+`control_plane/onboarding/service.py`,
+`control_plane/provisioning/worker.py`, `deploy/control-plane/fly.toml`,
+`docs/onboarding-runbook.md`,
+`tests/control_plane/test_real_email_for_every_household.py`.
+
+**Branches:** `feat/real-email-for-every-household`.
+
 ## Execution log
+
+- 2026-09-03: **Real email for every household — owner decision.** After the
+  allowlist secret took production down (see the inventory above), the owner
+  dropped the per-household list: every self-registered household gets real
+  managed email. What still holds: the live brake, the Art. 9(2)(a) consent,
+  the Art. 9(4) country determination (DE, NL, ES). The scope of the earlier
+  decision — testers, before the Phase A pack — is now "anyone who registers",
+  and O1 still gates R2 as written.
 
 - 2026-09-03: **R1 flipped on testers before the Phase A pack — owner
   decision.** The product owner chose to run real managed email for

@@ -158,6 +158,17 @@ email addresses, comma-separated, no brackets. `flyctl secrets set` without
 `--stage` restarts the Machine at once, so the whole list is replaced — name
 every household that should stay on it.
 
+**Every household, no list.** `ABROLIA_REAL_EMAIL_ALL_HOUSEHOLDS=1` (owner
+decision, 2026-09-03: testers register themselves and get real managed email
+without an operator step) makes selection and dispatch authorize every
+household. The allowlist is then ignored — not consulted and not reported on
+`/readyz` — and the secret can stay whatever it is. Dormant while
+`ABROLIA_REAL_EMAIL_ENABLED=0`; the live brake still stops dispatch at call
+time. The Art. 9(4) country check is unchanged: real content still requires a
+recorded determination for the profile's country (`docs/privacy/lawful-bases.md`
+section 3), whatever this flag says. Roll back to the list by setting it to
+`0` and deploying.
+
 Each email connection uses a lifecycle-scoped Nerve org reconciliation key:
 `arbolia:household:<household_id>:email:<email_identity_id>`. Cleanup tombstones
 that org permanently. Retrying the deleted identity must continue to conflict;

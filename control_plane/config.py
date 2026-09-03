@@ -134,6 +134,10 @@ class ControlPlaneConfig:
     #: Entries of the allowlist that were not canonical UUIDs — a count, never
     #: the values, which an operator may have typed as addresses.
     real_email_household_allowlist_invalid: int = 0
+    #: Owner decision 2026-09-03: real managed email for EVERY household, no
+    #: allowlist. The list is then ignored — not consulted, not reported.
+    #: Dormant unless `real_email_enabled`; the live brake still applies.
+    real_email_all_households: bool = False
     real_whatsapp_enabled: bool = False
     real_channel_enabled: bool = False
     # The Phase F per-provider kill switches are NOT here. They were: six
@@ -184,7 +188,7 @@ class ControlPlaneConfig:
         broken backup writer, because a deploy cannot fix a secret and refusing
         one would deadlock. Nothing here is a reason to stop serving.
         """
-        if not self.real_email_enabled:
+        if not self.real_email_enabled or self.real_email_all_households:
             return ()
         blockers: list[str] = []
         if self.real_email_household_allowlist_invalid:
@@ -423,6 +427,9 @@ class ControlPlaneConfig:
             real_email_enabled=source.get("ABROLIA_REAL_EMAIL_ENABLED", "0") == "1",
             real_email_household_allowlist=allowlist,
             real_email_household_allowlist_invalid=allowlist_invalid,
+            real_email_all_households=(
+                source.get("ABROLIA_REAL_EMAIL_ALL_HOUSEHOLDS", "0") == "1"
+            ),
             real_whatsapp_enabled=source.get("ABROLIA_REAL_WHATSAPP_ENABLED", "0") == "1",
             real_channel_enabled=source.get("ABROLIA_REAL_CHANNEL_ENABLED", "0") == "1",
             nerve_base_url=source.get("ABROLIA_NERVE_BASE_URL") or None,

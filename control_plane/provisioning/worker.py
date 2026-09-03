@@ -197,6 +197,7 @@ class ProvisioningWorker:
         email_identities: EmailIdentityRepository | None = None,
         worker_id: str = "worker",
         real_email_authorized_households: frozenset[str] = frozenset(),
+        real_email_all_households: bool = False,
         runtime_provider: str = "dry-run-runtime",
         model_api_key: str | None = None,
         gateway_relay_root_key: bytes = b"",
@@ -229,6 +230,9 @@ class ProvisioningWorker:
         #: The live environment is ANDed with membership and can only subtract:
         #: `0 -> 1` must never authorize a household this frozen set omits.
         self.real_email_authorized_households = real_email_authorized_households
+        #: Owner decision 2026-09-03: every household, no list. The set above
+        #: is then irrelevant; the live brake is not — `0` still stops dispatch.
+        self.real_email_all_households = real_email_all_households
         self.runtime_provider = runtime_provider
         self.model_api_key = model_api_key
         self.gateway_relay_root_key = gateway_relay_root_key
@@ -1733,7 +1737,10 @@ class ProvisioningWorker:
         # resolve them, which means absence no longer stops forward work and
         # this is the only thing that does.
         authorized = (
-            job.household_id in self.real_email_authorized_households
+            (
+                self.real_email_all_households
+                or job.household_id in self.real_email_authorized_households
+            )
             and is_real_email_enabled()
         )
         if real_email and not authorized:
