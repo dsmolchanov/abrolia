@@ -47,11 +47,24 @@
       {{ command_fields() }}
       <label>First name<input name="first_name" autocomplete="given-name" required></label>
       <label>Last name<input name="last_name" autocomplete="family-name" required></label>
-      <label>Family language<input name="family_language" value="en" required></label>
-      <label>Timezone<input name="timezone" value="Europe/Prague" required></label>
-      <label>Country<input name="country_code" value="CZ" pattern="[A-Z]{2}" required></label>
+      <label>Family language<select name="family_language" required>
+        {%- for code, name in profile_choices.languages %}
+        <option value="{{ code }}"{% if code == "en" %} selected{% endif %}>{{ name }}</option>
+        {%- endfor %}
+      </select></label>
+      <label>Timezone<select name="timezone" required>
+        {%- for zone in profile_choices.timezones %}
+        <option value="{{ zone }}"{% if zone == "Europe/Prague" %} selected{% endif %}>{{ zone }}</option>
+        {%- endfor %}
+      </select></label>
+      <label>Country<select name="country_code" required>
+        {%- for code, name in profile_choices.countries %}
+        <option value="{{ code }}"{% if code == "CZ" %} selected{% endif %}>{{ name }}</option>
+        {%- endfor %}
+      </select></label>
       <input name="residency_mode" type="hidden" value="eu-app">
       <button type="submit">Continue to Email</button>
+      <p id="command-error" class="form-error" role="alert" hidden></p>
     </form>
   </section>
 

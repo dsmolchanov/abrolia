@@ -176,11 +176,32 @@ if (page === "onboarding") {
     }
   }
 
+  // A refused command used to vanish: the page re-rendered the unchanged state
+  // and said nothing, so a 422 on the profile looked like a dead button. The
+  // server's validation answer carries only field paths and messages (never
+  // the submitted values), which is exactly what the person needs to see.
+  const commandError = document.querySelector("#command-error");
+  async function showCommandError(response) {
+    let text = `That command could not be accepted (${response.status}).`;
+    try {
+      const payload = await response.json();
+      if (Array.isArray(payload.detail)) {
+        text = payload.detail
+          .map((item) => `${(item.loc || []).filter((part) => part !== "body").join(".")}: ${item.msg}`)
+          .join(" ");
+      } else if (typeof payload.detail === "string") {
+        text = payload.detail;
+      }
+    } catch (_error) { /* no JSON body: keep the status line */ }
+    if (commandError) { commandError.textContent = text; commandError.hidden = false; }
+  }
+
   async function command(path, body) {
     if (commandInFlight) return;
     if (state === null && !(await refresh())) return;
     commandInFlight = true;
     setInteractive(false);
+    if (commandError) commandError.hidden = true;
     try {
       const response = await fetch(path, {
         method: path.endsWith("/profile") ? "PUT" : "POST",
@@ -189,7 +210,7 @@ if (page === "onboarding") {
       });
       if (response.status === 401) { window.location.replace("/start"); return; }
       if (response.ok) render(await response.json());
-      else if (!(await refresh())) state = null;
+      else { await showCommandError(response); if (!(await refresh())) state = null; }
     } catch (_error) {
       if (!(await refresh())) state = null;
     } finally {

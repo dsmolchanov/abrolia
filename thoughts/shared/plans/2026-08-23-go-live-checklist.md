@@ -1309,6 +1309,26 @@ such, and keeping it off means no link can be delivered to anyone.
 **Branches:** `feat/self-signup-for-testers`,
 `fix/request-link-body-bounds`.
 
+#### Inventory — R0 the profile is chosen, not typed
+
+First tester through the front door (2026-09-03) got a 422 on the profile
+and saw nothing: language, country and timezone were free text validated by
+shape afterwards — `^[A-Z]{2}$` for the country, 2–35 characters for the
+language, nothing for the timezone — and the enhanced page re-rendered the
+unchanged state on any refusal. Owner ask: dropdowns. Three changes: the
+vocabularies live in `control_plane/profile_choices.py` (ISO 639-1, ISO
+3166-1 alpha-2, IANA zones from `tzdata`) and the form offers exactly them;
+`ProfileInput` accepts exactly them, forgiving case and whitespace and naming
+the field it refuses; the enhanced page prints the server's refusal (field
+paths and messages only — the answer never carries the submitted value).
+
+**Files:** `control_plane/profile_choices.py`, `control_plane/models.py`,
+`control_plane/api/app.py`, `control_plane/web/templates/onboarding.html`,
+`control_plane/web/static/onboarding.js`, `pyproject.toml`,
+`tests/control_plane/test_profile_choices.py`.
+
+**Branches:** `fix/onboarding-profile-choices`.
+
 ## Execution log
 
 - 2026-09-03: **R1 flipped on testers before the Phase A pack — owner
