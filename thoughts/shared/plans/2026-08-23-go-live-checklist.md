@@ -1214,7 +1214,9 @@ Prerequisite: O1 ticked. Order is not negotiable per runbook and canon.
 - [ ] **R0. Operator soak prep (synthetic, can start anytime).** Dedicated
   staging org confirmed; `ABROLIA_REAL_EMAIL_HOUSEHOLD_ALLOWLIST` populated
   with the operator household only.
-- [ ] **R1. Operator accounts, managed email first.** *Before this promotion,
+- [ ] **R1. Operator accounts, managed email first.** *Flipped 2026-09-03 by
+  owner decision ahead of O1 — see the R1 inventory below; the battery and
+  soak are still owed before this box ticks.* *Before this promotion,
   run `python3 scripts/rehearse_0012_routing.py` against a copy of the
   database it creates: `0012` decides which existing bindings the gateway will
   still route, and a household it misses goes silent rather than failing a
@@ -1239,7 +1241,44 @@ the serving process the way `withdraw-consent` does.
 
 **Branches:** `feat/invite-without-downtime`.
 
+#### Inventory — R1 the flag flip
+
+One line: `ABROLIA_REAL_EMAIL_ENABLED = "1"` on the synthetic control plane.
+`ABROLIA_SYNTHETIC_ONLY` stays `1` — `ControlPlaneConfig.validate` gates
+managed email on Nerve configuration and a non-empty household allowlist,
+both already installed as secrets, not on the synthetic-only switch.
+
+**Owner decision, 2026-09-03.** R1 proceeds on testers before the Phase A
+pack (P2 Fly.io DPA/SCC, the TIAs, the Art. 27 representative are all still
+⏳ in `docs/privacy/processors.md`). The scope of that decision is TESTERS —
+operator accounts and invited testers whose household IDs the operator has
+put on `ABROLIA_REAL_EMAIL_HOUSEHOLD_ALLOWLIST`. **O1 still gates R2**, the
+first invited pilot family. Recorded here and in the execution log rather
+than by flipping any registry row: the registry says what is signed, and
+nothing new is. `/s/ Product owner (CEO), 2026-09-03`.
+
+What was true at the flip: O2 closed (nerve-cloud #178), `go test ./...`
+green there against Postgres, `pytest -m "not live"` green here, the
+allowlist secret installed. The 0012 routing rehearsal was not run — the
+production database is already at `0016`, so 0012 has long been applied
+there and a rehearsal on a copy would only replay a migration the live
+schema already carries. The O3 battery is owed on the day of the flip.
+
+**Files:** `deploy/control-plane/fly.toml`.
+
+**Branches:** `rollout/r1-real-email-operator-accounts`.
+
 ## Execution log
+
+- 2026-09-03: **R1 flipped on testers before the Phase A pack — owner
+  decision.** The product owner chose to run real managed email for
+  allowlisted tester households without waiting for the Fly.io DPA, the TIAs
+  or the Art. 27 appointment. Recorded as a decision, not as evidence: no
+  registry row in `processors.md` moves, and O1 keeps gating R2. What did
+  hold at the flip: O2 (nerve-cloud #178), both suites green, `invite` no
+  longer needs a restart (#133), the allowlist secret installed. Owed: the
+  O3 battery on the day of the flip, the soak, and the pack itself before the
+  first invited family.
 
 - 2026-08-28: **The recovery I added could make things worse; narrowed it, and
   stopped.** Review round 3 found two things, both inside my own fix. The job
