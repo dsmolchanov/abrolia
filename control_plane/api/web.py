@@ -19,6 +19,7 @@ from control_plane.api.dependencies import (
     read_bounded_json,
     require_private_mutation,
 )
+from control_plane.auth.mailer import MailDeliveryError
 from control_plane.auth.rate_limit import RateLimitExceeded
 from control_plane.db import new_id
 from control_plane.models import ProfileInput, StepKind
@@ -62,7 +63,9 @@ async def request_link_form(request: Request) -> RedirectResponse:
             "request-link-address", email, limit=5, window_seconds=3600
         )
         issue_requested_link(request, email)
-    except (RateLimitExceeded, ValueError):
+    except (MailDeliveryError, RateLimitExceeded, ValueError):
+        # The same non-answer the JSON route gives: eligibility, existence and
+        # the delivery outcome stay invisible to the requester.
         pass
     return RedirectResponse("/start?sent=1", status_code=http_status.HTTP_303_SEE_OTHER)
 

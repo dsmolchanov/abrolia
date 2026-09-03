@@ -151,7 +151,13 @@ class ControlPlaneContainer:
                 else MemoryMailer()
             )
         magic_links = MagicLinkService(auth, mailer, config.public_origin)
-        account_service = AccountService(auth, accounts, households, sessions)
+        account_service = AccountService(
+            auth,
+            accounts,
+            households,
+            sessions,
+            self_signup_enabled=config.self_signup_enabled,
+        )
         household_service = HouseholdService(households)
         rate_limiter = RateLimiter(database, lookup)
         providers = synthetic_provider_registry()

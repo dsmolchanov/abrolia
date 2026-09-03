@@ -1,10 +1,13 @@
 # Onboarding control plane runbook
 
-Phase 1 is an invite-only, synthetic-only staging contour. It is not permission
-to process real family content, connect a personal mailbox, or enable a real
-email, WhatsApp, or channel adapter. The real Nerve email exception described
-below is restricted to explicitly allowlisted operator-owned synthetic staging
-households; it does not enable real family data.
+Phase 1 is a synthetic-only staging contour. It is not permission to process
+real family content, connect a personal mailbox, or enable a real email,
+WhatsApp, or channel adapter. The real Nerve email exception described below is
+restricted to explicitly allowlisted operator-owned synthetic staging
+households; it does not enable real family data. Since 2026-09-03 the contour
+is no longer invite-only: with `ABROLIA_SELF_SIGNUP_ENABLED=1` a tester
+creates their own account from `/start` (see "Self-service registration"
+below); the operator `invite` remains for `.test` addresses.
 
 ## Topology and locked flags
 
@@ -81,6 +84,30 @@ generic public `accepted` response and never include the address, link, API key,
 or provider response body in an application error. Roll back by setting the
 gate to `0`; this immediately restores `.test`-only delivery without weakening
 the real-family provider gates.
+
+### Self-service registration for testers
+
+`ABROLIA_SELF_SIGNUP_ENABLED=1` changes one decision: a public `request-link`
+(`POST /api/v1/auth/request-link`, or the no-JS form on `/start`) for an
+address with **no account** issues an `invite` link instead of nothing.
+Consuming it creates the account, its household and a session, exactly as an
+operator invite does. Everything else is unchanged:
+
+- an existing active account still gets `login`/`reauth`, never a second invite;
+- an account that is not active gets nothing — a sign-up form does not reopen a
+  disabled account;
+- the public response is `accepted` in every case, so the form reveals neither
+  existence nor eligibility nor delivery outcome;
+- the rate limits stay (10 per network and 5 per address per hour);
+- the household starts on the synthetic providers. Real managed email reaches
+  it only once its UUID is on `ABROLIA_REAL_EMAIL_HOUSEHOLD_ALLOWLIST`.
+
+The flag **requires** `ABROLIA_MAGIC_LINK_DELIVERY_ENABLED=1`; `validate`
+refuses the combination without it, because the synthetic mailers keep the link
+in memory or on an operator's stdout, and a sign-up form whose links never
+arrive cannot say so. That is why `ABROLIA_RESEND_API_KEY` and
+`ABROLIA_MAGIC_LINK_FROM` are on the deploy preflight list. Roll back with
+`ABROLIA_SELF_SIGNUP_ENABLED=0`; the delivery gate can stay on for logins.
 
 The dedicated runtime has a separate, locked `HERMES_*` contract. Its Machine
 environment contains `HERMES_HOUSEHOLD=/data/household.toml`,

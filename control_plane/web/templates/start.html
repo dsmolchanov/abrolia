@@ -3,15 +3,22 @@
 {% block page %}start{% endblock %}
 {% block content %}
 <section class="panel narrow">
+  {% if self_signup %}
+  <p class="eyebrow">Tester access</p>
+  <h1>Set up your family assistant</h1>
+  <p>Enter your email. We send a secure link that creates your account and starts setup. It works once and expires in 15 minutes.</p>
+  {% else %}
   <p class="eyebrow">Private synthetic pilot</p>
   <h1>Set up your family assistant</h1>
   <p>Use a reserved <code>.test</code> address. Real family data and real provider accounts are blocked.</p>
-  <form id="request-link" class="stack" method="post" action="/start/request-link">
-    <label for="email">Recovery email</label>
+  {% endif %}
+  {% set sent_message = "If this address can be used, its secure link is on its way." if self_signup else "If this synthetic address is eligible, its secure link has been sent." %}
+  <form id="request-link" class="stack" method="post" action="/start/request-link" data-sent-message="{{ sent_message }}">
+    <label for="email">{% if self_signup %}Email{% else %}Recovery email{% endif %}</label>
     <input id="email" name="email" type="email" autocomplete="email" required
-           placeholder="owner@example.test">
+           placeholder="{% if self_signup %}you@example.com{% else %}owner@example.test{% endif %}">
     <button type="submit">Send secure link</button>
-    <p class="form-status" role="status" aria-live="polite">{% if sent %}If this synthetic address is eligible, its secure link has been sent.{% endif %}</p>
+    <p class="form-status" role="status" aria-live="polite">{% if sent %}{{ sent_message }}{% endif %}</p>
   </form>
 </section>
 {% endblock %}
