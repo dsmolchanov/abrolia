@@ -60,7 +60,9 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px s
 .cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; }
 .cards.two { grid-template-columns: repeat(2, 1fr); }
 .cards form { display: flex; flex-direction: column; gap: .55rem; }
-.card { min-height: 170px; padding: 1.25rem; color: var(--ink); text-align: left; background: white; border: 1px solid var(--line); display: flex; flex-direction: column; gap: .7rem; }
+.card { min-height: 170px; padding: 1.25rem; color: var(--ink); text-align: left; background: white; border: 1px solid var(--line); display: flex; flex-direction: column; gap: .7rem; cursor: pointer; }
+.card .card-cta { margin-top: auto; color: var(--leaf); font-weight: 700; font-size: .9rem; }
+.card:disabled { cursor: not-allowed; opacity: .6; transform: none; }
 .card:hover { border-color: var(--leaf); transform: translateY(-2px); }
 .card.recommended { border: 2px solid var(--leaf); background: #fbfef9; }
 .card strong { font: 700 1.15rem/1.2 ui-serif, Georgia, serif; }

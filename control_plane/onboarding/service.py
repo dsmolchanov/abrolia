@@ -393,7 +393,15 @@ class OnboardingService:
             and selection.get("kind") != "gmail_agent"
             and household_id not in self.real_email_household_allowlist
         ):
-            raise InvalidTransition("real email is not enabled for this household")
+            # Tester-facing since self-signup: this is the first wall a
+            # self-registered household hits once R1 is on, and the message is
+            # what the page prints. It names the id the operator allowlists by
+            # and the one thing the tester can do about it.
+            raise InvalidTransition(
+                "real email is not enabled for this household yet "
+                f"(household {household_id}). Ask the operator to enable it, "
+                "then choose this option again."
+            )
         if (
             selection.get("special_category_restriction_acknowledged") is not True
             or not selection.get("special_category_restriction_receipt_id")

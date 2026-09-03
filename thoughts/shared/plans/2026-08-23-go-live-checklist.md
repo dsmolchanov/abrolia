@@ -1344,6 +1344,27 @@ Atlantic islands, Cyprus and the Caucasus).
 **Branches:** `fix/onboarding-profile-choices`,
 `fix/profile-form-sends-only-the-profile`.
 
+#### Inventory — R0 a refusal is visible on every step, and names what to do
+
+The first tester past the profile hit 409 on the email step and saw
+nothing again: the error slot #138 added lived inside the profile form,
+which is hidden from the second step on. The 409 itself is R1 working as
+designed — managed email now routes to Nerve, and this household is not on
+`ABROLIA_REAL_EMAIL_HOUSEHOLD_ALLOWLIST` — but "real email is not enabled
+for this household" gave the tester nothing to act on and the operator no
+id to act with. The slot moved to page level; the message names the
+household id and the one thing the tester can do; the page shows the id
+in its header so it can be sent to the operator; and every option card
+carries an explicit "Continue with … →" line, because a tester read the
+cards as a list and looked for a Next button that does not exist.
+
+**Files:** `control_plane/api/app.py`, `control_plane/onboarding/service.py`,
+`control_plane/web/templates/onboarding.html`,
+`control_plane/web/static/onboarding.css`,
+`tests/control_plane/test_onboarding_refusal_visible.py`.
+
+**Branches:** `fix/onboarding-refusal-visible-on-every-step`.
+
 ## Execution log
 
 - 2026-09-03: **R1 flipped on testers before the Phase A pack — owner
