@@ -205,7 +205,7 @@ def test_a_broken_writer_still_does_not_excuse_a_real_blocker() -> None:
     )
 
 
-def test_the_excused_set_is_exactly_these_two() -> None:
+def test_the_excused_set_is_exactly_these_four() -> None:
     """What the gate is allowed to ignore, pinned.
 
     This gate ignoring a condition is how a real problem becomes invisible:
@@ -213,14 +213,25 @@ def test_the_excused_set_is_exactly_these_two() -> None:
     became non-fatal for a good reason, and the combination meant a writer that
     failed at every boot looked like a healthy system for ten days.
 
-    Both current exemptions share one property — a deploy cannot clear them, so
-    refusing the deploy would deadlock rather than help — and both are NAMED in
-    the readiness payload, which is what makes them visible despite being
-    excused. A third exemption added without those two properties would recreate
-    the silence, so the set is asserted rather than trusted.
+    Every exemption shares one property — a deploy cannot clear it, so refusing
+    the deploy would deadlock rather than help — and every one is NAMED in the
+    readiness payload, which is what makes it visible despite being excused. An
+    exemption added without those two properties would recreate the silence, so
+    the set is asserted rather than trusted.
+
+    The two allowlist blockers joined on 2026-09-03: an allowlist secret set to
+    email addresses refused the boot and took production down. The boot no
+    longer refuses, the condition is named, and a deploy cannot fix a secret.
     """
-    excused = ["backup_stale", "backup_writer_failed"]
+    excused = [
+        "backup_stale",
+        "backup_writer_failed",
+        "real_email_allowlist_invalid",
+        "real_email_allowlist_empty",
+    ]
     assert _deployable({"status": "not_ready", "blockers": excused})
+    for blocker in excused:
+        assert _deployable({"status": "not_ready", "blockers": [blocker]}), blocker
 
     # Anything else, alone or travelling with an excused one, still refuses.
     for blocker in (

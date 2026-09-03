@@ -1365,6 +1365,34 @@ cards as a list and looked for a Next button that does not exist.
 
 **Branches:** `fix/onboarding-refusal-visible-on-every-step`.
 
+#### Inventory — R1 the allowlist secret cannot take production down
+
+2026-09-03, ~19:35 UTC: the operator set
+`ABROLIA_REAL_EMAIL_HOUSEHOLD_ALLOWLIST` to two email addresses. `flyctl
+secrets set` restarted the Machine, `ControlPlaneConfig.validate` refused
+the configuration ("must be a canonical UUID"), the boot failed, and
+production was down — `/readyz` unreachable, Machine `stopped` — for several
+minutes until the secret was replaced by hand with a placeholder UUID. The
+deploy of #140 failed in the same window and was re-run. The previous
+allowlist contents were overwritten and are not recoverable; it must be
+re-entered from the household ids.
+
+The list already fails closed per household (selection refuses anyone not on
+it), so a bad entry was never a reason to stop serving. Now: entries that are
+not canonical UUIDs are dropped and COUNTED (never kept — they may be
+addresses), an empty list enables nobody, and both conditions are named on
+`/readyz` as `real_email_allowlist_invalid` / `real_email_allowlist_empty`.
+The deploy gate excuses those two on the same two properties as the backup
+writer: a deploy cannot fix a secret, and the condition is named. The runbook
+now says what the values are and where a tester reads their id.
+
+**Files:** `control_plane/config.py`, `control_plane/api/app.py`,
+`deploy/control-plane/readyz-deploy-gate.jq`, `docs/onboarding-runbook.md`,
+`tests/control_plane/test_config.py`, `tests/control_plane/test_deploy_gate.py`,
+`tests/control_plane/test_allowlist_readiness.py`.
+
+**Branches:** `fix/allowlist-secret-cannot-take-prod-down`.
+
 ## Execution log
 
 - 2026-09-03: **R1 flipped on testers before the Phase A pack — owner

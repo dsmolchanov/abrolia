@@ -327,6 +327,9 @@ def create_app(
         ))
         if any(value == "unavailable" for value in providers.values()):
             blockers.append("provider_registry_unavailable")
+        # A rollout list that cannot do its job is named here rather than
+        # refused at boot — see `_uuid_set_lenient` for the outage that taught it.
+        blockers.extend(active_container.config.real_email_allowlist_blockers)
         blocker_tuple = tuple(blockers)
         return JSONResponse(
             probe_payload(
