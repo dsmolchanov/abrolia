@@ -186,6 +186,10 @@ def create_app(
             "onboarding.html",
             {
                 "snapshot": snapshot,
+                # The tester's own household id, so a refusal that names it
+                # ("not enabled for this household") can be acted on: the
+                # operator allowlists by this id and needs it from the tester.
+                "household_id": household.id,
                 "recovery_email": account.masked_email if account else "unavailable",
                 "csrf_token": request.cookies.get(active_container.config.csrf_cookie_name, ""),
                 "idempotency_key": new_id(),

@@ -29,7 +29,8 @@
       <h1>Choose how Abrolia works with your family</h1>
     </div>
     <p class="recovery">Recovery contact: <strong>{{ recovery_email }}</strong><br>
-      <small>This is fallback contact only — never the agent inbox.</small>
+      <small>This is fallback contact only — never the agent inbox.</small><br>
+      <small>Household ID: <code>{{ household_id }}</code></small>
     </p>
   </header>
 
@@ -40,6 +41,9 @@
   </ol>
 
   {% if error %}<p class="form-error" role="alert">That command could not be accepted. The durable state below is unchanged.</p>{% endif %}
+  {# One slot for every step: it used to live inside the profile form, which is
+     hidden from the second step on, so a refusal on the email step vanished. #}
+  <p id="command-error" class="form-error" role="alert" hidden></p>
 
   <section class="profile-preflight" data-step="profile"{% if snapshot.state.value != 'profile_required' or snapshot.current_step.value != 'profile' %} hidden{% endif %}>
     <h2>First, your household basics</h2>
@@ -64,7 +68,6 @@
       </select></label>
       <input name="residency_mode" type="hidden" value="eu-app">
       <button type="submit">Continue to Email</button>
-      <p id="command-error" class="form-error" role="alert" hidden></p>
     </form>
   </section>
 
@@ -93,6 +96,7 @@
         <button class="card recommended" data-select="email_identity" data-kind="abrolia_managed">
           <span class="badge">Recommended</span> <strong>@abrolia.com</strong>
           <span>Managed assistant inbox with a synthetic pilot identity.</span>
+          <span class="card-cta">Continue with @abrolia.com →</span>
         </button>
       </form>
       {%- if email_option_offered["gmail_agent"] %}
@@ -106,6 +110,7 @@
         <button class="card" data-select="email_identity" data-kind="gmail_agent">
           <strong>Separate agent Gmail</strong>
           <span>A dedicated agent account with OAuth — never your personal Gmail or an app password.</span>
+          <span class="card-cta">Continue with Gmail →</span>
         </button>
       </form>
       {%- endif %}
@@ -124,6 +129,7 @@
         {{ household_consent_fields("family_domain") }}
         <button class="card" data-select="email_identity" data-kind="family_domain">
           <strong>Your family domain</strong><span>Use a dedicated assistant address on a domain you control.</span>
+          <span class="card-cta">Continue with my domain →</span>
         </button>
       </form>
       {%- endif %}
@@ -139,6 +145,7 @@
         <button class="card recommended" data-select="whatsapp_identity" data-kind="shared_abrolia">
           <span class="badge">Recommended · Beta</span><strong>Shared Abrolia WhatsApp</strong>
           <span>Accept the channel privacy notice before the synthetic member test.</span>
+          <span class="card-cta">Continue with shared number →</span>
         </button>
       </form>
       <form method="post" action="/onboarding/select/whatsapp_identity">
@@ -148,6 +155,7 @@
         <button class="card" data-select="whatsapp_identity" data-kind="dedicated_number">
           <span class="badge">Beta</span><strong>Dedicated number</strong>
           <span>QR linking requires explicit linked-device and number-blocking risk consent.</span>
+          <span class="card-cta">Continue with dedicated number →</span>
         </button>
       </form>
     </div>
@@ -162,6 +170,7 @@
         <button class="card{% if recommended %} recommended{% endif %}" data-select="primary_channel" data-kind="{{ channel }}">
           {% if recommended %}<span class="badge">Recommended</span>{% endif %}<strong>{{ label }}</strong>
           <span>{% if channel == 'telegram' %}Bind a verified synthetic chat.{% elif channel == 'whatsapp' %}Use the verified WhatsApp identity above.{% else %}Minimal first-party web channel binding.{% endif %}</span>
+          <span class="card-cta">Continue with {{ label }} →</span>
         </button>
       </form>
       {% endfor %}
