@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from typing import Any, NamedTuple
+from urllib.parse import parse_qs
 
 from fastapi import Header, HTTPException, Request, status
 from pydantic import ValidationError
@@ -242,9 +243,12 @@ def browser_session(request: Request) -> BrowserSession:
 MAX_JSON_BODY_BYTES = 64 * 1024
 
 
-async def read_bounded_json(
-    request: Request, model: type[Any], *, limit: int = MAX_JSON_BODY_BYTES
-) -> Any:
+async def read_bounded_body(request: Request, *, limit: int) -> bytes:
+    """The raw body, refused past `limit` BEFORE it is held whole.
+
+    Shared by every public parser here so that the bound is the same object
+    for JSON and for a browser form — the unauthenticated routes accept both.
+    """
     declared = request.headers.get("content-length")
     if declared is not None:
         try:
@@ -262,9 +266,30 @@ async def read_bounded_json(
         # Catches a request that declares nothing, or lies about it.
         if len(body) > limit:
             raise HTTPException(status.HTTP_413_CONTENT_TOO_LARGE, "body too large")
+    return bytes(body)
+
+
+async def read_bounded_json(
+    request: Request, model: type[Any], *, limit: int = MAX_JSON_BODY_BYTES
+) -> Any:
+    body = await read_bounded_body(request, limit=limit)
     try:
-        return model.model_validate_json(bytes(body))
+        return model.model_validate_json(body)
     except ValidationError as error:
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_CONTENT, "invalid request body"
         ) from error
+
+
+async def read_bounded_form(
+    request: Request, *, limit: int = MAX_JSON_BODY_BYTES
+) -> dict[str, str]:
+    """A URL-encoded form, bounded the same way — `request.form()` is not.
+
+    Starlette's `form()` materialises the whole body first, so a no-JS form
+    route that calls it has no bound at all. First value per field, which is
+    what the forms here send; a repeated field is not a second answer.
+    """
+    body = await read_bounded_body(request, limit=limit)
+    fields = parse_qs(body.decode("utf-8", errors="replace"), keep_blank_values=True)
+    return {name: values[0] for name, values in fields.items() if values}

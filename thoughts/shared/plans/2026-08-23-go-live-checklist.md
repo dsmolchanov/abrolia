@@ -1285,13 +1285,29 @@ deploy preflight. The landing page's primary action now points at
 
 **Files:** `control_plane/config.py`, `control_plane/services/accounts.py`,
 `control_plane/container.py`, `control_plane/api/app.py`,
-`control_plane/api/web.py`, `control_plane/web/templates/start.html`,
+`control_plane/api/web.py`, `control_plane/api/auth.py`,
+`control_plane/api/dependencies.py`,
+`control_plane/web/templates/start.html`,
 `control_plane/web/static/onboarding.js`, `deploy/control-plane/fly.toml`,
 `deploy/control-plane/required-runtime-config.txt`, `landing/index.html`,
 `docs/onboarding-runbook.md`, `tests/control_plane/test_self_signup.py`,
-`tests/control_plane/test_required_config.py`.
+`tests/control_plane/test_required_config.py`,
+`tests/control_plane/test_auth_body_bounds.py`.
 
-**Branches:** `feat/self-signup-for-testers`.
+**Review follow-up (Codex on #136, P1).** The three unauthenticated auth
+bodies — `request-link` JSON, the no-JS form, `consume` — were parsed before
+any bound: a Pydantic parameter lets FastAPI hold the whole document, and
+`request.form()` has no bound at all. With the front door public, that is an
+unbounded body on a public endpoint. All three now read through the same
+pre-parse bound (`MAX_AUTH_BODY_BYTES`, declared length and streamed bytes);
+the regression covers declared and chunked framing on each. The second
+finding — that delivering a login link to Resend sends the address to a third
+party — was disputed in the thread: Resend is the contracted processor for
+exactly that payload (P4, DPA + SCC ✅), the runbook documents the gate as
+such, and keeping it off means no link can be delivered to anyone.
+
+**Branches:** `feat/self-signup-for-testers`,
+`fix/request-link-body-bounds`.
 
 ## Execution log
 
