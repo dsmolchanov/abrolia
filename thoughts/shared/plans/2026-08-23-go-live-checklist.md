@@ -1322,12 +1322,27 @@ vocabularies live in `control_plane/profile_choices.py` (ISO 639-1, ISO
 the field it refuses; the enhanced page prints the server's refusal (field
 paths and messages only — the answer never carries the submitted value).
 
+**Round 2, same day — the refusal, once visible, named the real cause.** It
+was never the tester's values. `{{ command_fields() }}` puts the no-JS
+command fields (`csrf_token`, `idempotency_key`, `version`) inside the
+profile form, and the enhanced path posted `Object.fromEntries(new
+FormData(form))` — all of them — to a contract with `extra="forbid"`. Every
+tester hit that 422 on the first screen; the dropdowns alone would not have
+fixed it. The JS now strips the three command fields (they travel as headers
+on that path). Two owner asks in the same round: the `<select>`s were unstyled
+(the CSS addressed `input` only), and the country list is **Europe only** —
+49 states, Council of Europe plus the European states outside it — with the
+timezone list narrowed to the zones those countries use (`Europe/*` plus the
+Atlantic islands, Cyprus and the Caucasus).
+
 **Files:** `control_plane/profile_choices.py`, `control_plane/models.py`,
 `control_plane/api/app.py`, `control_plane/web/templates/onboarding.html`,
-`control_plane/web/static/onboarding.js`, `pyproject.toml`,
+`control_plane/web/static/onboarding.js`,
+`control_plane/web/static/onboarding.css`, `pyproject.toml`,
 `tests/control_plane/test_profile_choices.py`.
 
-**Branches:** `fix/onboarding-profile-choices`.
+**Branches:** `fix/onboarding-profile-choices`,
+`fix/profile-form-sends-only-the-profile`.
 
 ## Execution log
 

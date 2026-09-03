@@ -66,103 +66,54 @@ LANGUAGES: tuple[tuple[str, str], ...] = (
     ("zh", "Chinese"),
 )
 
-#: ISO 3166-1 alpha-2 → short English name.
+#: ISO 3166-1 alpha-2 → short English name. Europe only, by owner decision
+#: (2026-09-03): the product is for families living in Europe, and a list of
+#: 249 states hid the fifty that apply. Council of Europe members plus the
+#: European states outside it, and the transcontinental ones a family in
+#: Europe may actually live in.
 COUNTRIES: tuple[tuple[str, str], ...] = (
-    ("AD", "Andorra"), ("AE", "United Arab Emirates"), ("AF", "Afghanistan"),
-    ("AG", "Antigua and Barbuda"), ("AI", "Anguilla"), ("AL", "Albania"),
-    ("AM", "Armenia"), ("AO", "Angola"), ("AR", "Argentina"),
-    ("AS", "American Samoa"), ("AT", "Austria"), ("AU", "Australia"),
-    ("AW", "Aruba"), ("AX", "Åland Islands"), ("AZ", "Azerbaijan"),
-    ("BA", "Bosnia and Herzegovina"), ("BB", "Barbados"), ("BD", "Bangladesh"),
-    ("BE", "Belgium"), ("BF", "Burkina Faso"), ("BG", "Bulgaria"),
-    ("BH", "Bahrain"), ("BI", "Burundi"), ("BJ", "Benin"),
-    ("BL", "Saint Barthélemy"), ("BM", "Bermuda"), ("BN", "Brunei"),
-    ("BO", "Bolivia"), ("BQ", "Caribbean Netherlands"), ("BR", "Brazil"),
-    ("BS", "Bahamas"), ("BT", "Bhutan"), ("BW", "Botswana"),
-    ("BY", "Belarus"), ("BZ", "Belize"), ("CA", "Canada"),
-    ("CC", "Cocos (Keeling) Islands"), ("CD", "Congo (Kinshasa)"),
-    ("CF", "Central African Republic"), ("CG", "Congo (Brazzaville)"),
-    ("CH", "Switzerland"), ("CI", "Côte d'Ivoire"), ("CK", "Cook Islands"),
-    ("CL", "Chile"), ("CM", "Cameroon"), ("CN", "China"), ("CO", "Colombia"),
-    ("CR", "Costa Rica"), ("CU", "Cuba"), ("CV", "Cabo Verde"),
-    ("CW", "Curaçao"), ("CX", "Christmas Island"), ("CY", "Cyprus"),
-    ("CZ", "Czechia"), ("DE", "Germany"), ("DJ", "Djibouti"), ("DK", "Denmark"),
-    ("DM", "Dominica"), ("DO", "Dominican Republic"), ("DZ", "Algeria"),
-    ("EC", "Ecuador"), ("EE", "Estonia"), ("EG", "Egypt"),
-    ("EH", "Western Sahara"), ("ER", "Eritrea"), ("ES", "Spain"),
-    ("ET", "Ethiopia"), ("FI", "Finland"), ("FJ", "Fiji"),
-    ("FK", "Falkland Islands"), ("FM", "Micronesia"), ("FO", "Faroe Islands"),
-    ("FR", "France"), ("GA", "Gabon"), ("GB", "United Kingdom"),
-    ("GD", "Grenada"), ("GE", "Georgia"), ("GF", "French Guiana"),
-    ("GG", "Guernsey"), ("GH", "Ghana"), ("GI", "Gibraltar"),
-    ("GL", "Greenland"), ("GM", "Gambia"), ("GN", "Guinea"),
-    ("GP", "Guadeloupe"), ("GQ", "Equatorial Guinea"), ("GR", "Greece"),
-    ("GS", "South Georgia and the South Sandwich Islands"), ("GT", "Guatemala"),
-    ("GU", "Guam"), ("GW", "Guinea-Bissau"), ("GY", "Guyana"),
-    ("HK", "Hong Kong"), ("HN", "Honduras"), ("HR", "Croatia"), ("HT", "Haiti"),
-    ("HU", "Hungary"), ("ID", "Indonesia"), ("IE", "Ireland"), ("IL", "Israel"),
-    ("IM", "Isle of Man"), ("IN", "India"), ("IO", "British Indian Ocean Territory"),
-    ("IQ", "Iraq"), ("IR", "Iran"), ("IS", "Iceland"), ("IT", "Italy"),
-    ("JE", "Jersey"), ("JM", "Jamaica"), ("JO", "Jordan"), ("JP", "Japan"),
-    ("KE", "Kenya"), ("KG", "Kyrgyzstan"), ("KH", "Cambodia"), ("KI", "Kiribati"),
-    ("KM", "Comoros"), ("KN", "Saint Kitts and Nevis"), ("KP", "North Korea"),
-    ("KR", "South Korea"), ("KW", "Kuwait"), ("KY", "Cayman Islands"),
-    ("KZ", "Kazakhstan"), ("LA", "Laos"), ("LB", "Lebanon"), ("LC", "Saint Lucia"),
-    ("LI", "Liechtenstein"), ("LK", "Sri Lanka"), ("LR", "Liberia"),
-    ("LS", "Lesotho"), ("LT", "Lithuania"), ("LU", "Luxembourg"), ("LV", "Latvia"),
-    ("LY", "Libya"), ("MA", "Morocco"), ("MC", "Monaco"), ("MD", "Moldova"),
-    ("ME", "Montenegro"), ("MF", "Saint Martin"), ("MG", "Madagascar"),
-    ("MH", "Marshall Islands"), ("MK", "North Macedonia"), ("ML", "Mali"),
-    ("MM", "Myanmar"), ("MN", "Mongolia"), ("MO", "Macao"),
-    ("MP", "Northern Mariana Islands"), ("MQ", "Martinique"), ("MR", "Mauritania"),
-    ("MS", "Montserrat"), ("MT", "Malta"), ("MU", "Mauritius"), ("MV", "Maldives"),
-    ("MW", "Malawi"), ("MX", "Mexico"), ("MY", "Malaysia"), ("MZ", "Mozambique"),
-    ("NA", "Namibia"), ("NC", "New Caledonia"), ("NE", "Niger"),
-    ("NF", "Norfolk Island"), ("NG", "Nigeria"), ("NI", "Nicaragua"),
-    ("NL", "Netherlands"), ("NO", "Norway"), ("NP", "Nepal"), ("NR", "Nauru"),
-    ("NU", "Niue"), ("NZ", "New Zealand"), ("OM", "Oman"), ("PA", "Panama"),
-    ("PE", "Peru"), ("PF", "French Polynesia"), ("PG", "Papua New Guinea"),
-    ("PH", "Philippines"), ("PK", "Pakistan"), ("PL", "Poland"),
-    ("PM", "Saint Pierre and Miquelon"), ("PN", "Pitcairn"), ("PR", "Puerto Rico"),
-    ("PS", "Palestine"), ("PT", "Portugal"), ("PW", "Palau"), ("PY", "Paraguay"),
-    ("QA", "Qatar"), ("RE", "Réunion"), ("RO", "Romania"), ("RS", "Serbia"),
-    ("RU", "Russia"), ("RW", "Rwanda"), ("SA", "Saudi Arabia"),
-    ("SB", "Solomon Islands"), ("SC", "Seychelles"), ("SD", "Sudan"),
-    ("SE", "Sweden"), ("SG", "Singapore"), ("SH", "Saint Helena"),
-    ("SI", "Slovenia"), ("SJ", "Svalbard and Jan Mayen"), ("SK", "Slovakia"),
-    ("SL", "Sierra Leone"), ("SM", "San Marino"), ("SN", "Senegal"),
-    ("SO", "Somalia"), ("SR", "Suriname"), ("SS", "South Sudan"),
-    ("ST", "São Tomé and Príncipe"), ("SV", "El Salvador"), ("SX", "Sint Maarten"),
-    ("SY", "Syria"), ("SZ", "Eswatini"), ("TC", "Turks and Caicos Islands"),
-    ("TD", "Chad"), ("TF", "French Southern Territories"), ("TG", "Togo"),
-    ("TH", "Thailand"), ("TJ", "Tajikistan"), ("TK", "Tokelau"),
-    ("TL", "Timor-Leste"), ("TM", "Turkmenistan"), ("TN", "Tunisia"),
-    ("TO", "Tonga"), ("TR", "Türkiye"), ("TT", "Trinidad and Tobago"),
-    ("TV", "Tuvalu"), ("TW", "Taiwan"), ("TZ", "Tanzania"), ("UA", "Ukraine"),
-    ("UG", "Uganda"), ("UM", "U.S. Outlying Islands"), ("US", "United States"),
-    ("UY", "Uruguay"), ("UZ", "Uzbekistan"), ("VA", "Vatican City"),
-    ("VC", "Saint Vincent and the Grenadines"), ("VE", "Venezuela"),
-    ("VG", "British Virgin Islands"), ("VI", "U.S. Virgin Islands"),
-    ("VN", "Vietnam"), ("VU", "Vanuatu"), ("WF", "Wallis and Futuna"),
-    ("WS", "Samoa"), ("YE", "Yemen"), ("YT", "Mayotte"), ("ZA", "South Africa"),
-    ("ZM", "Zambia"), ("ZW", "Zimbabwe"),
+    ("AD", "Andorra"), ("AL", "Albania"), ("AM", "Armenia"), ("AT", "Austria"),
+    ("AZ", "Azerbaijan"), ("BA", "Bosnia and Herzegovina"), ("BE", "Belgium"),
+    ("BG", "Bulgaria"), ("BY", "Belarus"), ("CH", "Switzerland"), ("CY", "Cyprus"),
+    ("CZ", "Czechia"), ("DE", "Germany"), ("DK", "Denmark"), ("EE", "Estonia"),
+    ("ES", "Spain"), ("FI", "Finland"), ("FR", "France"), ("GB", "United Kingdom"),
+    ("GE", "Georgia"), ("GR", "Greece"), ("HR", "Croatia"), ("HU", "Hungary"),
+    ("IE", "Ireland"), ("IS", "Iceland"), ("IT", "Italy"), ("LI", "Liechtenstein"),
+    ("LT", "Lithuania"), ("LU", "Luxembourg"), ("LV", "Latvia"), ("MC", "Monaco"),
+    ("MD", "Moldova"), ("ME", "Montenegro"), ("MK", "North Macedonia"),
+    ("MT", "Malta"), ("NL", "Netherlands"), ("NO", "Norway"), ("PL", "Poland"),
+    ("PT", "Portugal"), ("RO", "Romania"), ("RS", "Serbia"), ("RU", "Russia"),
+    ("SE", "Sweden"), ("SI", "Slovenia"), ("SK", "Slovakia"), ("SM", "San Marino"),
+    ("TR", "Türkiye"), ("UA", "Ukraine"), ("VA", "Vatican City"),
 )
 
 LANGUAGE_CODES: frozenset[str] = frozenset(code for code, _ in LANGUAGES)
 COUNTRY_CODES: frozenset[str] = frozenset(code for code, _ in COUNTRIES)
 
 
-def _timezones() -> tuple[str, ...]:
-    """IANA zone names, `Region/City` form only.
+#: Zones outside `Europe/*` that a family in one of the countries above lives
+#: in: the Atlantic islands of Portugal, Spain, Denmark and Iceland, and the
+#: Caucasus and Cyprus, whose IANA zones sit under `Asia/` and `Atlantic/`.
+_EUROPEAN_ZONES_ELSEWHERE = frozenset({
+    "Atlantic/Azores", "Atlantic/Canary", "Atlantic/Faroe", "Atlantic/Madeira",
+    "Atlantic/Reykjavik", "Asia/Baku", "Asia/Nicosia", "Asia/Tbilisi",
+    "Asia/Yerevan",
+})
 
-    `Etc/*`, bare offsets and legacy aliases are real zones but not answers to
-    "where does the family live". The tz database comes from the `tzdata`
-    package so the production image does not depend on the OS having one.
+
+def _timezones() -> tuple[str, ...]:
+    """IANA zone names for the countries offered, `Region/City` form only.
+
+    The same owner decision that limits the countries to Europe limits the
+    zones: a family in one of those countries lives in `Europe/*` or one of
+    the few zones listed above, and four hundred others hid them. The tz
+    database comes from the `tzdata` package so the production image does not
+    depend on the OS having one.
     """
     zones = zoneinfo.available_timezones()
     return tuple(sorted(
         zone for zone in zones
-        if "/" in zone and not zone.startswith(("Etc/", "SystemV/", "US/", "Canada/"))
+        if zone.startswith("Europe/") or zone in _EUROPEAN_ZONES_ELSEWHERE
     ))
 
 
