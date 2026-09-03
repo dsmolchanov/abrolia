@@ -110,16 +110,19 @@ def test_real_email_requires_complete_https_nerve_config_and_allowlist() -> None
                 ABROLIA_NERVE_PLATFORM_DOMAIN_ID="30000000-0000-4000-8000-000000000001",
             )
         )
-    with pytest.raises(ConfigurationError, match="allowlist"):
-        ControlPlaneConfig.from_env(
-            _production_env(
-                ABROLIA_REAL_EMAIL_ENABLED="1",
-                ABROLIA_NERVE_BASE_URL="https://nerve.example.test",
-                ABROLIA_NERVE_ADMIN_KEY="synthetic-admin-key",
-                ABROLIA_NERVE_PLATFORM_ORG_ID="20000000-0000-4000-8000-000000000001",
-                ABROLIA_NERVE_PLATFORM_DOMAIN_ID="30000000-0000-4000-8000-000000000001",
-            )
+    # An EMPTY allowlist is not a boot refusal any more: it enables nobody and
+    # is named on /readyz. See test_real_email_allowlist_problems_are_visible_not_fatal.
+    config = ControlPlaneConfig.from_env(
+        _production_env(
+            ABROLIA_REAL_EMAIL_ENABLED="1",
+            ABROLIA_NERVE_BASE_URL="https://nerve.example.test",
+            ABROLIA_NERVE_ADMIN_KEY="synthetic-admin-key",
+            ABROLIA_NERVE_PLATFORM_ORG_ID="20000000-0000-4000-8000-000000000001",
+            ABROLIA_NERVE_PLATFORM_DOMAIN_ID="30000000-0000-4000-8000-000000000001",
         )
+    )
+    assert config.real_email_household_allowlist == frozenset()
+    assert config.real_email_allowlist_blockers == ("real_email_allowlist_empty",)
 
 
 def test_real_email_config_is_independent_from_real_family_data_gate() -> None:
@@ -142,13 +145,57 @@ def test_real_email_config_is_independent_from_real_family_data_gate() -> None:
     assert "synthetic-admin-key" not in repr(config)
 
 
-def test_real_email_allowlist_rejects_non_uuid_entries() -> None:
-    with pytest.raises(ConfigurationError, match="comma-separated UUIDs"):
-        ControlPlaneConfig.from_env(
-            _production_env(
-                ABROLIA_REAL_EMAIL_HOUSEHOLD_ALLOWLIST="not-a-household-id"
-            )
-        )
+def test_real_email_allowlist_problems_are_visible_not_fatal() -> None:
+    """A bad entry in a rollout list must not stop the service.
+
+    On 2026-09-03 an operator set the allowlist secret to two email addresses;
+    `flyctl secrets set` restarted the Machine, the boot refused the
+    configuration, and production was down until the secret was replaced by
+    hand. The list already fails closed per household, so the honest shape is:
+    drop what is not a UUID, keep what is, count what was dropped (never the
+    values — they may be addresses), and NAME the condition on /readyz.
+    """
+    nerve = dict(
+        ABROLIA_REAL_EMAIL_ENABLED="1",
+        ABROLIA_NERVE_BASE_URL="https://nerve.example.test",
+        ABROLIA_NERVE_ADMIN_KEY="synthetic-admin-key",
+        ABROLIA_NERVE_PLATFORM_ORG_ID="20000000-0000-4000-8000-000000000001",
+        ABROLIA_NERVE_PLATFORM_DOMAIN_ID="30000000-0000-4000-8000-000000000001",
+    )
+    household_id = "10000000-0000-4000-8000-000000000001"
+
+    # The outage shape: addresses instead of ids. Boots; enables nobody.
+    addresses = ControlPlaneConfig.from_env(_production_env(
+        **nerve, ABROLIA_REAL_EMAIL_HOUSEHOLD_ALLOWLIST="one@example.test,two@example.test",
+    ))
+    assert addresses.real_email_household_allowlist == frozenset()
+    assert addresses.real_email_household_allowlist_invalid == 2
+    assert addresses.real_email_allowlist_blockers == (
+        "real_email_allowlist_invalid", "real_email_allowlist_empty",
+    )
+    assert "one@example.test" not in repr(addresses), "the dropped values are never kept"
+
+    # One typo beside a good id: the good id still works, the typo is counted.
+    mixed = ControlPlaneConfig.from_env(_production_env(
+        **nerve, ABROLIA_REAL_EMAIL_HOUSEHOLD_ALLOWLIST=f"{household_id}, not-a-household-id",
+    ))
+    assert mixed.real_email_household_allowlist == frozenset({household_id})
+    assert mixed.real_email_household_allowlist_invalid == 1
+    assert mixed.real_email_allowlist_blockers == ("real_email_allowlist_invalid",)
+
+    # Non-canonical spelling of a real id is a typo too, not a second id.
+    # (An id with hex letters, so that upper-casing actually changes it.)
+    upper = ControlPlaneConfig.from_env(_production_env(
+        **nerve, ABROLIA_REAL_EMAIL_HOUSEHOLD_ALLOWLIST="1a000000-0000-4000-8000-00000000000b".upper(),
+    ))
+    assert upper.real_email_household_allowlist == frozenset()
+    assert upper.real_email_household_allowlist_invalid == 1
+
+    # With real email OFF the list is dormant and raises no blocker at all.
+    off = ControlPlaneConfig.from_env(_production_env(
+        ABROLIA_REAL_EMAIL_HOUSEHOLD_ALLOWLIST="not-a-household-id",
+    ))
+    assert off.real_email_allowlist_blockers == ()
 
 
 def test_fly_runtime_requires_all_private_pinned_inputs() -> None:

@@ -138,11 +138,25 @@ ABROLIA_NERVE_PLATFORM_ORG_ID=<platform-org-uuid>
 ABROLIA_NERVE_PLATFORM_DOMAIN_ID=<platform-domain-uuid>
 ```
 
-Install `ABROLIA_NERVE_ADMIN_KEY` through the secret store. Missing values, an
-empty/invalid UUID allowlist, or a non-HTTPS Nerve origin abort startup. The
-container then registers `nerve-managed` and `nerve-byo-domain`; a household
-outside the allowlist is rejected before a provisioning job is created. Gmail,
-WhatsApp and primary-channel real adapters remain disabled.
+Install `ABROLIA_NERVE_ADMIN_KEY` through the secret store. Missing Nerve
+values or a non-HTTPS Nerve origin abort startup. The allowlist does **not**:
+entries that are not canonical UUIDs are dropped and counted, an empty list
+enables nobody, and either condition is named on `/readyz` as
+`real_email_allowlist_invalid` / `real_email_allowlist_empty` — visible, not
+fatal. (On 2026-09-03 an allowlist set to two email addresses refused the boot
+and took production down until the secret was replaced by hand; the list
+already fails closed per household, so a bad entry is no reason to stop
+serving.) The deploy gate excuses those two blockers the way it excuses a
+broken backup writer, because a deploy cannot fix a secret. The container
+registers `nerve-managed` and `nerve-byo-domain`; a household outside the
+allowlist is rejected before a provisioning job is created. Gmail, WhatsApp
+and primary-channel real adapters remain disabled.
+
+Setting the allowlist: values are household UUIDs (`/api/v1/me` →
+`households[].id`, or the "Household ID" line on the onboarding page), never
+email addresses, comma-separated, no brackets. `flyctl secrets set` without
+`--stage` restarts the Machine at once, so the whole list is replaced — name
+every household that should stay on it.
 
 Each email connection uses a lifecycle-scoped Nerve org reconciliation key:
 `arbolia:household:<household_id>:email:<email_identity_id>`. Cleanup tombstones

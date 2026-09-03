@@ -60,17 +60,34 @@ def backup_key_from_env(env: dict[str, str] | None = None) -> bytes:
     return _decode_key(encoded, name="ABROLIA_CONTROL_PLANE_BACKUP_KEY")
 
 
-def _uuid_set(value: str, *, name: str) -> frozenset[str]:
+def _uuid_set_lenient(value: str) -> tuple[frozenset[str], int]:
+    """The canonical UUIDs in a comma-separated list, and how many entries were not.
+
+    For the real-email household allowlist. This used to refuse the whole
+    configuration on one bad entry, and on 2026-09-03 an operator set the
+    allowlist to two email addresses: `flyctl secrets set` restarted the
+    Machine, the boot refused, and production was down until the secret was
+    replaced by hand. A bad entry in a rollout list is not a reason to stop
+    serving every household — the list already fails closed per household.
+    The count (never the values, which may be addresses) becomes a readiness
+    blocker so the mistake is visible instead of fatal.
+    """
     parsed: set[str] = set()
+    invalid = 0
     for item in value.split(","):
         candidate = item.strip()
         if not candidate:
             continue
         try:
-            parsed.add(str(uuid.UUID(candidate)))
-        except ValueError as error:
-            raise ConfigurationError(f"{name} must contain comma-separated UUIDs") from error
-    return frozenset(parsed)
+            canonical = str(uuid.UUID(candidate))
+        except ValueError:
+            invalid += 1
+            continue
+        if canonical != candidate:
+            invalid += 1
+            continue
+        parsed.add(canonical)
+    return frozenset(parsed), invalid
 
 
 def _canonical_uuid(value: str | None, *, name: str) -> str:
@@ -114,6 +131,9 @@ class ControlPlaneConfig:
     real_family_data_enabled: bool = False
     real_email_enabled: bool = False
     real_email_household_allowlist: frozenset[str] = field(default_factory=frozenset)
+    #: Entries of the allowlist that were not canonical UUIDs — a count, never
+    #: the values, which an operator may have typed as addresses.
+    real_email_household_allowlist_invalid: int = 0
     real_whatsapp_enabled: bool = False
     real_channel_enabled: bool = False
     # The Phase F per-provider kill switches are NOT here. They were: six
@@ -155,6 +175,23 @@ class ControlPlaneConfig:
     google_gmail_scope_approved: bool = False
     google_casa_current: bool = False
     google_limited_use_disclosed: bool = False
+
+    @property
+    def real_email_allowlist_blockers(self) -> tuple[str, ...]:
+        """Readiness blockers for a rollout list that cannot do its job.
+
+        Named, not fatal: the deploy gate excuses them the way it excuses a
+        broken backup writer, because a deploy cannot fix a secret and refusing
+        one would deadlock. Nothing here is a reason to stop serving.
+        """
+        if not self.real_email_enabled:
+            return ()
+        blockers: list[str] = []
+        if self.real_email_household_allowlist_invalid:
+            blockers.append("real_email_allowlist_invalid")
+        if not self.real_email_household_allowlist:
+            blockers.append("real_email_allowlist_empty")
+        return tuple(blockers)
 
     @property
     def nerve_configured(self) -> bool:
@@ -226,22 +263,15 @@ class ControlPlaneConfig:
                 self.nerve_platform_domain_id,
                 name="ABROLIA_NERVE_PLATFORM_DOMAIN_ID",
             )
-        if self.real_email_enabled:
-            # Completeness stays here: dormant settings may be absent, but
-            # turning real email ON without them is a misconfiguration.
-            if not self.nerve_configured:
-                raise ConfigurationError(
-                    "real email requires complete Nerve admin and platform configuration"
-                )
-            if not self.real_email_household_allowlist:
-                raise ConfigurationError(
-                    "real email requires an explicit household allowlist"
-                )
-            for household_id in self.real_email_household_allowlist:
-                _canonical_uuid(
-                    household_id,
-                    name="ABROLIA_REAL_EMAIL_HOUSEHOLD_ALLOWLIST entry",
-                )
+        # Completeness stays here: dormant settings may be absent, but turning
+        # real email ON without them is a misconfiguration. The allowlist is
+        # deliberately NOT validated here: an empty or partly invalid list
+        # keeps the boot alive and surfaces as `real_email_allowlist_blockers`
+        # on /readyz. Selection already refuses every household not on it.
+        if self.real_email_enabled and not self.nerve_configured:
+            raise ConfigurationError(
+                "real email requires complete Nerve admin and platform configuration"
+            )
         google_configured = bool(
             self.google_oauth_client_id and self.google_oauth_client_secret
         )
@@ -344,6 +374,9 @@ class ControlPlaneConfig:
         encoded_backup = source.get("ABROLIA_CONTROL_PLANE_BACKUP_KEY", "")
         encoded_gateway_sender = source.get("ABROLIA_GATEWAY_SENDER_HMAC_KEY", "")
         encoded_relay_root = source.get("ABROLIA_GATEWAY_RELAY_ROOT_KEY", "")
+        allowlist, allowlist_invalid = _uuid_set_lenient(
+            source.get("ABROLIA_REAL_EMAIL_HOUSEHOLD_ALLOWLIST", "")
+        )
         config = cls(
             database_path=Path(source.get("ABROLIA_CONTROL_PLANE_DB", "data/control-plane.db")),
             public_origin=source.get("ABROLIA_PUBLIC_ORIGIN", "https://app.abrolia.com"),
@@ -388,10 +421,8 @@ class ControlPlaneConfig:
             synthetic_only=source.get("ABROLIA_SYNTHETIC_ONLY", "1") == "1",
             real_family_data_enabled=source.get("REAL_FAMILY_DATA_ENABLED", "0") == "1",
             real_email_enabled=source.get("ABROLIA_REAL_EMAIL_ENABLED", "0") == "1",
-            real_email_household_allowlist=_uuid_set(
-                source.get("ABROLIA_REAL_EMAIL_HOUSEHOLD_ALLOWLIST", ""),
-                name="ABROLIA_REAL_EMAIL_HOUSEHOLD_ALLOWLIST",
-            ),
+            real_email_household_allowlist=allowlist,
+            real_email_household_allowlist_invalid=allowlist_invalid,
             real_whatsapp_enabled=source.get("ABROLIA_REAL_WHATSAPP_ENABLED", "0") == "1",
             real_channel_enabled=source.get("ABROLIA_REAL_CHANNEL_ENABLED", "0") == "1",
             nerve_base_url=source.get("ABROLIA_NERVE_BASE_URL") or None,

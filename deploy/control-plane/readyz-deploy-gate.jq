@@ -39,11 +39,22 @@
 # condition the deploy was never able to clear. It is excused here and NAMED in
 # the blocker list, which is the half that was missing: a broken writer used to
 # be indistinguishable from a quiet week, because `backup_stale` said both.
+#
+# `real_email_allowlist_invalid` and `real_email_allowlist_empty` are excused
+# on the same two properties. On 2026-09-03 an operator set the allowlist
+# secret to two email addresses; the boot refused the configuration and
+# production was down until the secret was replaced by hand. The boot no
+# longer refuses — the list fails closed per household anyway — and the
+# condition is NAMED here instead. A deploy cannot fix a secret, so refusing
+# one for it would be the backup deadlock again.
 (.status == "ready")
 or (
   .status == "not_ready"
   and ((.blockers // []) | length) > 0
   and (
-    ((.blockers // []) - ["backup_stale", "backup_writer_failed"]) | length
+    ((.blockers // []) - [
+      "backup_stale", "backup_writer_failed",
+      "real_email_allowlist_invalid", "real_email_allowlist_empty"
+    ]) | length
   ) == 0
 )
