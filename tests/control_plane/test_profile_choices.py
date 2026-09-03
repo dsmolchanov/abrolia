@@ -25,11 +25,15 @@ BASE = {
 
 
 def test_the_vocabularies_are_well_formed() -> None:
-    assert len(COUNTRIES) >= 240 and all(len(code) == 2 and code.isupper() for code, _ in COUNTRIES)
+    # Europe only, by owner decision: a list of 249 states hid the fifty that apply.
+    assert 45 <= len(COUNTRIES) <= 55 and all(len(code) == 2 and code.isupper() for code, _ in COUNTRIES)
+    assert {"CZ", "DE", "GB", "RU", "UA", "TR", "GE"} <= {code for code, _ in COUNTRIES}
+    assert not {"US", "CN", "BR"} & {code for code, _ in COUNTRIES}
     assert len(LANGUAGES) >= 40 and all(len(code) == 2 and code.islower() for code, _ in LANGUAGES)
     assert "Europe/Prague" in TIMEZONES and "Europe/Moscow" in TIMEZONES
-    assert not any(zone.startswith("Etc/") for zone in TIMEZONES), "offsets are not places"
-    assert len(TIMEZONES) > 300, "the tz database must be present, not an empty fallback"
+    assert "Atlantic/Canary" in TIMEZONES and "Asia/Nicosia" in TIMEZONES
+    assert not any(zone.startswith(("Etc/", "America/", "Africa/")) for zone in TIMEZONES)
+    assert len(TIMEZONES) > 50, "the tz database must be present, not an empty fallback"
 
 
 @pytest.mark.parametrize(
@@ -90,6 +94,45 @@ def test_the_enhanced_page_prints_a_refusal(api_harness) -> None:
     # The refusal is rendered from loc + msg only; the submitted value is
     # never in the server's answer, so it cannot be echoed here either.
     assert "item.msg" in script and "input" not in script.split("showCommandError")[1].split("async function command")[0]
+
+
+def test_the_enhanced_form_sends_only_the_profile(api_harness) -> None:
+    """The real first-screen 422: the form carries the no-JS command fields.
+
+    `command_fields()` puts csrf_token, idempotency_key and version inside the
+    profile form for the server-form path. The enhanced path posted every
+    FormData entry to a contract with extra="forbid", so every tester was
+    refused with "Extra inputs are not permitted" — a message the page did not
+    show until #138. On that path the three travel as headers.
+    """
+    script = api_harness.client.get("/static/onboarding.js").text
+    handler = script.split('document.querySelector("#profile-form")')[1].split("command(")[0]
+    assert "COMMAND_FIELDS" in handler
+    for name in ("csrf_token", "idempotency_key", "version"):
+        assert f'"{name}"' in script.split("const COMMAND_FIELDS")[1].split(";")[0], name
+    # And the contract really does refuse them — the JS strip is not cosmetic.
+    world = api_harness.create_principal("command-fields@pilot.test")
+    api_harness.authenticate(world)
+    current = api_harness.client.get("/api/v1/onboarding/current").json()
+    response = api_harness.client.put(
+        "/api/v1/onboarding/profile",
+        json={**BASE, "residency_mode": "eu-app", "csrf_token": "x", "idempotency_key": "y", "version": "0"},
+        headers={
+            **api_harness.mutation_headers,
+            "Idempotency-Key": "22222222-2222-4222-8222-222222222222",
+            "If-Match": str(current["version"]),
+        },
+    )
+    assert response.status_code == 422
+    assert {tuple(item["loc"]) for item in response.json()["detail"]} == {
+        ("body", "csrf_token"), ("body", "idempotency_key"), ("body", "version"),
+    }
+
+
+def test_the_page_styles_a_select_like_an_input(api_harness) -> None:
+    css = api_harness.client.get("/static/onboarding.css").text
+    assert "input, select {" in css
+    assert "select:focus-visible" in css
 
 
 def test_the_api_refuses_the_old_free_text_with_a_named_field(api_harness) -> None:

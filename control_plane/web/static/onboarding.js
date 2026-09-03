@@ -219,9 +219,16 @@ if (page === "onboarding") {
     }
   }
 
+  // The form also carries the no-JS command fields (csrf_token,
+  // idempotency_key, version). On this path those travel as headers, and the
+  // profile contract forbids extra keys — sending them was the 422 every
+  // tester hit on the first screen.
+  const COMMAND_FIELDS = new Set(["csrf_token", "idempotency_key", "version"]);
   document.querySelector("#profile-form")?.addEventListener("submit", (event) => {
     event.preventDefault();
-    const values = Object.fromEntries(new FormData(event.currentTarget));
+    const values = Object.fromEntries(
+      [...new FormData(event.currentTarget)].filter(([name]) => !COMMAND_FIELDS.has(name)),
+    );
     command("/api/v1/onboarding/profile", values);
   });
   document.querySelectorAll("[data-select]").forEach((button) => button.addEventListener("click", (event) => {
