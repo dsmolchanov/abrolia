@@ -11,6 +11,9 @@ primary_region = "ams"
   # ABROLIA_MAGIC_LINK_FROM is a Fly secret, not a value here: the fixtures
   # gate refuses a real address in a committed file, and the sender is one.
   ABROLIA_SELF_SIGNUP_ENABLED = "1"
+  # Owner decision 2026-09-03: real managed email for every household that
+  # registers; the allowlist secret is ignored while this is on.
+  ABROLIA_REAL_EMAIL_ALL_HOUSEHOLDS = "1"
   ABROLIA_RUNTIME_PROVIDER = "fly-runtime"
   ABROLIA_SYNTHETIC_ONLY = "1"
   REAL_FAMILY_DATA_ENABLED = "0"

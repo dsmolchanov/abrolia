@@ -55,6 +55,7 @@ class OnboardingService:
         allow_real_email_domains: bool = False,
         real_email_enabled: bool = False,
         real_email_household_allowlist: frozenset[str] = frozenset(),
+        real_email_all_households: bool = False,
         email_identities: EmailIdentityService | None = None,
     ) -> None:
         self.households = households
@@ -67,6 +68,7 @@ class OnboardingService:
         self.allow_real_email_domains = allow_real_email_domains
         self.real_email_enabled = real_email_enabled
         self.real_email_household_allowlist = real_email_household_allowlist
+        self.real_email_all_households = real_email_all_households
         self.email_identities = email_identities
 
     @staticmethod
@@ -390,6 +392,7 @@ class OnboardingService:
         # family data can arrive.
         if (
             self.real_email_enabled
+            and not self.real_email_all_households
             and selection.get("kind") != "gmail_agent"
             and household_id not in self.real_email_household_allowlist
         ):

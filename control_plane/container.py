@@ -237,6 +237,7 @@ class ControlPlaneContainer:
             allow_real_email_domains=config.real_email_enabled,
             real_email_enabled=config.real_email_enabled,
             real_email_household_allowlist=config.real_email_household_allowlist,
+            real_email_all_households=config.real_email_all_households,
             email_identities=email_identity_service,
         )
         planner = DesiredSpecPlanner(
@@ -267,6 +268,11 @@ class ControlPlaneContainer:
                 config.real_email_household_allowlist
                 if config.real_email_enabled
                 else frozenset()
+            ),
+            # Owner decision 2026-09-03: every household, no list. Still ANDed
+            # with the live brake at dispatch, and dormant while the flag is off.
+            real_email_all_households=(
+                config.real_email_all_households and config.real_email_enabled
             ),
             logger=StructuredLogger(sys.stderr),
         )
