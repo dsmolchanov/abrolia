@@ -149,7 +149,12 @@ def create_app(
     @app.get("/start", include_in_schema=False)
     def start(request: Request):
         return templates.TemplateResponse(
-            request, "start.html", {"sent": request.query_params.get("sent") == "1"}
+            request,
+            "start.html",
+            {
+                "sent": request.query_params.get("sent") == "1",
+                "self_signup": active_container.config.self_signup_enabled,
+            },
         )
 
     @app.get("/auth/verify", include_in_schema=False)

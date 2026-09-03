@@ -24,6 +24,12 @@ ABROLIA_CONTROL_PLANE_BACKUP_KEY
 FLY_API_TOKEN
 ABROLIA_RUNTIME_IMAGE
 ABROLIA_RUNTIME_MODEL_API_KEY
+# Required because fly.toml turns ABROLIA_MAGIC_LINK_DELIVERY_ENABLED on: the
+# boot refuses production delivery without the sending key and the sender.
+# The sender is not secret, but it is a real address, and the fixtures gate
+# refuses one in a committed file — so it lives in the secret store too.
+ABROLIA_RESEND_API_KEY
+ABROLIA_MAGIC_LINK_FROM
 
 # Non-secret settings — carried in fly.toml [env].
 ABROLIA_FLY_ORG

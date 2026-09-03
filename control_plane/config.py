@@ -144,6 +144,9 @@ class ControlPlaneConfig:
     magic_link_delivery_enabled: bool = False
     resend_api_key: str | None = field(default=None, repr=False)
     magic_link_from: str | None = None
+    #: A public `request-link` for an address with no account issues an INVITE
+    #: instead of nothing. Off, new accounts stay operator-only (`invite`).
+    self_signup_enabled: bool = False
     google_oauth_client_id: str | None = None
     google_oauth_client_secret: str | None = field(default=None, repr=False)
     google_oauth_test_users: tuple[str, ...] = ()
@@ -197,6 +200,13 @@ class ControlPlaneConfig:
             character in self.magic_link_from for character in "\r\n"
         ):
             raise ConfigurationError("magic-link sender contains invalid characters")
+        if self.self_signup_enabled and not self.magic_link_delivery_enabled:
+            # The synthetic mailers keep the link in memory or on an operator's
+            # stdout. A public sign-up form on top of one is a form whose links
+            # never arrive, and the public response cannot say so.
+            raise ConfigurationError(
+                "self-signup requires production magic-link delivery"
+            )
         # Structural checks bind to CONSTRUCTIBILITY, not to enablement.
         # `container.build` now builds the Nerve adapters whenever the settings
         # are complete, so teardown can still reach a provider with the brake
@@ -401,6 +411,7 @@ class ControlPlaneConfig:
             ),
             resend_api_key=source.get("ABROLIA_RESEND_API_KEY") or None,
             magic_link_from=source.get("ABROLIA_MAGIC_LINK_FROM") or None,
+            self_signup_enabled=source.get("ABROLIA_SELF_SIGNUP_ENABLED", "0") == "1",
             google_oauth_client_id=source.get("ABROLIA_GOOGLE_OAUTH_CLIENT_ID") or None,
             google_oauth_client_secret=(
                 source.get("ABROLIA_GOOGLE_OAUTH_CLIENT_SECRET") or None

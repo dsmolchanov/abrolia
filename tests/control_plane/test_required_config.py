@@ -60,6 +60,12 @@ def _production_env() -> dict[str, str]:
         "ABROLIA_RUNTIME_IMAGE": "registry.fly.io/runtime@sha256:" + "a" * 64,
         "ABROLIA_RUNTIME_MODEL_API_KEY": "sk-ant-synthetic",
         "ABROLIA_INTERNAL_BOOTSTRAP_HOST": "abrolia-control-plane-synthetic.flycast",
+        # Self-signup for testers: fly.toml turns production delivery on, which
+        # makes the sending key and the sender required at boot.
+        "ABROLIA_MAGIC_LINK_DELIVERY_ENABLED": "1",
+        "ABROLIA_MAGIC_LINK_FROM": "Abrolia <login@example.test>",
+        "ABROLIA_RESEND_API_KEY": "re_synthetic",
+        "ABROLIA_SELF_SIGNUP_ENABLED": "1",
     }
 
 
@@ -80,6 +86,8 @@ BOOT_CONFIG = {
     "ABROLIA_RUNTIME_IMAGE",
     "ABROLIA_RUNTIME_MODEL_API_KEY",
     "ABROLIA_INTERNAL_BOOTSTRAP_HOST",
+    "ABROLIA_RESEND_API_KEY",
+    "ABROLIA_MAGIC_LINK_FROM",
 }
 
 #: Proven by a different call, and CONDITIONALLY fatal, which is worse than
@@ -157,5 +165,9 @@ def test_secrets_are_never_carried_in_fly_toml() -> None:
         "ABROLIA_CONTROL_PLANE_BACKUP_KEY",
         "FLY_API_TOKEN",
         "ABROLIA_RUNTIME_MODEL_API_KEY",
+        "ABROLIA_RESEND_API_KEY",
+        # Not a secret, but a real address: the fixtures gate refuses it in a
+        # committed file, so it is carried in the secret store.
+        "ABROLIA_MAGIC_LINK_FROM",
     ):
         assert f"{name} =" not in toml, f"{name} must be a secret, not a fly.toml value"

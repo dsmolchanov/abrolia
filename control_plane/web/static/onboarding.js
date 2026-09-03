@@ -25,7 +25,7 @@ if (page === "start") {
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify({email: new FormData(event.currentTarget).get("email")}),
     });
-    status.textContent = "If this synthetic address is eligible, its secure link has been sent.";
+    status.textContent = event.currentTarget.dataset.sentMessage;
   });
 }
 

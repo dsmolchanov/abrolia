@@ -1268,6 +1268,31 @@ schema already carries. The O3 battery is owed on the day of the flip.
 
 **Branches:** `rollout/r1-real-email-operator-accounts`.
 
+#### Inventory — R0 self-service registration for testers
+
+Owner ask, 2026-09-03: testers register themselves from the front instead of
+each one waiting for an operator `invite`. One decision changes:
+`ABROLIA_SELF_SIGNUP_ENABLED=1` makes a public `request-link` for an address
+with no account issue an `invite` link instead of nothing; consuming it
+creates the account, household and session exactly as an operator invite
+does. Existing accounts still get `login`/`reauth`, a disabled account is not
+reopened, the public answer stays `accepted` either way, the rate limits
+stay, and the new household starts on the synthetic providers until its UUID
+is allowlisted. The flag refuses to turn on without production magic-link
+delivery, so `ABROLIA_RESEND_API_KEY` and `ABROLIA_MAGIC_LINK_FROM` join the
+deploy preflight. The landing page's primary action now points at
+`app.abrolia.com/start`.
+
+**Files:** `control_plane/config.py`, `control_plane/services/accounts.py`,
+`control_plane/container.py`, `control_plane/api/app.py`,
+`control_plane/api/web.py`, `control_plane/web/templates/start.html`,
+`control_plane/web/static/onboarding.js`, `deploy/control-plane/fly.toml`,
+`deploy/control-plane/required-runtime-config.txt`, `landing/index.html`,
+`docs/onboarding-runbook.md`, `tests/control_plane/test_self_signup.py`,
+`tests/control_plane/test_required_config.py`.
+
+**Branches:** `feat/self-signup-for-testers`.
+
 ## Execution log
 
 - 2026-09-03: **R1 flipped on testers before the Phase A pack — owner

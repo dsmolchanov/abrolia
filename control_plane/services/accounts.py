@@ -18,7 +18,8 @@ class LoginResult:
 
 @dataclass(frozen=True)
 class RequestedLinkTarget:
-    account_id: str
+    #: `None` for an invite: the account does not exist until the link is consumed.
+    account_id: str | None
     email: str
     purpose: str
 
@@ -32,11 +33,14 @@ class AccountService:
         accounts: AccountsRepository,
         households: HouseholdsRepository,
         sessions: SessionService,
+        *,
+        self_signup_enabled: bool = False,
     ) -> None:
         self.auth = auth
         self.accounts = accounts
         self.households = households
         self.sessions = sessions
+        self.self_signup_enabled = self_signup_enabled
 
     def requested_link_target(
         self,
@@ -44,10 +48,21 @@ class AccountService:
         *,
         authenticated_account_id: str | None = None,
     ) -> RequestedLinkTarget | None:
-        """Classify a public request without turning an unknown address into an invite."""
+        """Classify a public request.
+
+        An unknown address becomes an invite only with self-signup on; otherwise
+        it is nothing, and the public response reads the same either way. An
+        account that exists but is not active is never re-invited from here:
+        `consume_magic_link` would refuse the invite, and a disabled account is
+        not a door a sign-up form reopens.
+        """
 
         account = self.accounts.by_email(email)
-        if account is None or account.status != "active":
+        if account is None:
+            if not self.self_signup_enabled:
+                return None
+            return RequestedLinkTarget(None, email, "invite")
+        if account.status != "active":
             return None
         purpose = (
             "reauth" if authenticated_account_id == account.id else "login"
