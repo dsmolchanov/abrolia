@@ -73,10 +73,13 @@ before the key it answers 503 (`chat_unavailable`), after it answers normally.
 ### Public magic-link delivery gate
 
 The default remains the `.test`-only in-memory mailer. To stage production
-delivery, configure `ABROLIA_MAGIC_LINK_FROM=Abrolia <login@abrolia.com>` as a
-non-secret environment value and install a separate `ABROLIA_RESEND_API_KEY`
-through the Fly secret store. The sender domain must already be verified in
-Resend. Only then set `ABROLIA_MAGIC_LINK_DELIVERY_ENABLED=1` and deploy.
+delivery, install `ABROLIA_MAGIC_LINK_FROM` (the display name and sending
+address, `Name <login@…>`) and a separate `ABROLIA_RESEND_API_KEY` through the
+Fly secret store — the sender is not secret, but it is a real address, and the
+fixtures gate refuses one in a committed file, so it cannot ride in
+`fly.toml [env]`. The sender domain must already be verified in Resend. Only
+then set `ABROLIA_MAGIC_LINK_DELIVERY_ENABLED=1` and deploy; the deploy
+preflight refuses until both names exist.
 
 Enabling the gate sends the recovery email address and the one-time login URL
 to Resend. The link expires after 15 minutes. Provider failures retain the
