@@ -761,9 +761,12 @@ pytest tests/control_plane/test_config.py -q
 
 - [x] Rollout order documented in `docs/onboarding-runbook.md` with per-transition prerequisites (Phase A + C1 + `go test` + `pytest -m "not live"` + one manual live gate).
 
-- [ ] Flag matrix doctested; `git diff --check` + `ruff` +
+- [x] Flag matrix doctested; `git diff --check` + `ruff` +
   `gitleaks detect --log-opts="--all"` + `check_fixtures --all --require-deny`
-  green on the F branch. **This box can only be closed by CI (noted
+  green on the F branch. *Closed 2026-09-02 by CI evidence — see canon
+  Phase F box and `docs/canon-closure-runbook.md` O11: the `fixtures & lint &
+  tests` job runs `--require-deny` against the secret-backed deny file and is
+  green on `main` at `97706ea`.* **This box can only be closed by CI (noted
   2026-08-30).** Every other gate passes locally, but
   `check_fixtures --all --require-deny` exits **2** on a developer machine — it
   REFUSES to run without the private deny-patterns file

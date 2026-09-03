@@ -157,9 +157,10 @@ inspects the stable names before every create. HTTP `409` causes inspection;
 
 ## Synthetic invite and onboarding
 
-Only reserved `.test` recipients are accepted. With the API stopped (so the
-single-writer lock can be acquired), an operator can generate one link in an SSH
-console:
+Only reserved `.test` recipients are accepted. An operator generates one link
+in an SSH console **while the service is serving** — `invite` does not take
+the writer lock (it is one token row, like `withdraw-consent`), so admitting a
+tester no longer costs a restart:
 
 ```bash
 abrolia-control-plane invite owner@example.test
@@ -167,7 +168,7 @@ abrolia-control-plane invite owner@example.test
 
 The link token is displayed once to that operator, stored only as a hash, and
 expires after 15 minutes. Do not paste it into tickets, chat, screenshots, or
-logs. Start the service again, open the link, and verify that a replay fails.
+logs. Open the link, and verify that a replay fails.
 
 ### Pre-onboarding rehearsal (`--dry-run`)
 

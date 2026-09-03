@@ -12,10 +12,15 @@ Where a box's acceptance criterion is easy to misread, the misreading is called
 out — see **O9**, where the obvious `rg` check reports a failure in the correct
 state.
 
-**Status at 2026-09-01.** The last box that was *code* — canon C1's
-generation-scoped convergence — closed in #119. Nothing below is blocked on
-engineering, with one exception: **O4** is waiting on a diagnosis
-(issue #121), not on a decision.
+**Status at 2026-09-02.** The last box that was *code* — canon C1's
+generation-scoped convergence — closed in #119. Since then: **O4** is closed
+(issue #121 — a root-owned `/data/backups`, fixed with a `chown` on the
+volume, not a deploy), go-live **O0a** is closed (#131, the serving process
+keeps its own archive fresh), **O11** is closed by CI evidence (see below),
+and **O3** is half done — `v0.1.0` exists and the schema drill passed, the
+staging drill has not run. Nothing below is blocked on engineering. What
+remains is counsel (O1), another repository (O2), and an operator with live
+credentials (O3 staging half, O5–O8, O10).
 
 ---
 
@@ -56,10 +61,10 @@ to prevent; reading it as "everything, then go" is the other.
 
 ```
 O1  legal ───────────────┐
-O2  nerve cross-org ─────┼──► [prerequisites 1-4] ──► O7  BYO battery ──┐
+O2  nerve cross-org ✅ ──┼──► [prerequisites 1-4] ──► O7  BYO battery ──┐
 O3  release tag + drill ─┘                            O8  Gmail battery ┼──► O10 promotion
                                                           (+O9 rg check)│    (+CASA for Gmail)
-O4  backup independence  (issue #121 — diagnosis first)                 │
+O4  backup independence  ✅ closed 2026-09-02 (#121, #131)              │
 O5  dry-run ──► O6 pilot onboarding ────────────────────────────────────┘
 O11 CI deny-patterns — independent, any time
 ```
@@ -113,6 +118,11 @@ Closes canon Phase A box 1, go-live **O1**, blocker **B-07**.
 
 **Owner:** whoever holds commit rights on `nerve-cloud`. **Repository:** not
 this one.
+**Status 2026-09-02: CLOSED** — nerve-cloud #178 merged: cross-org requests
+answer 403 at every caller of `resolveOrgIDForPrincipal`,
+`TestServiceToken_CrossOrgRejected` present and green, `go test ./... -count=1`
+green against Postgres. The cloudapi tests **skip** without `NM_TEST_DB_DSN`,
+so a green run without a database is not evidence for this box.
 
 1. Resolve the requested `org_id` against the authenticated tenant in
    `internal/cloudapi/handler_keys.go` (and `internal/store/*` as needed).
@@ -181,8 +191,8 @@ Closes go-live **O2**, `phase-DE-pilot.md:646`, canon Phase E change 9.
 
 ## O4 — Backups must not depend on deploys
 
-**Owner:** operator, then possibly engineering. **Status: diagnosis first —
-see issue #121.**
+**Owner:** operator, then possibly engineering. **Status 2026-09-02: CLOSED —
+issue #121 resolved, O0a closed in #131. Kept for the record.**
 
 #118 gave the readiness signal the writer it never had: the boot path now
 writes `/data/backups/boot-<epoch>.cpb`, the archive `/readyz` actually reads.
@@ -220,11 +230,14 @@ distinct `BootArchiveDirectoryNotWritable`, whose message states the remedy,
 and the readiness payload reports `backup_writer: failed` with a
 `backup_writer_failed` blocker. Issue #121 has the remaining candidate list.
 
-Beyond that diagnosis, go-live **O0a** remains open on its own terms: the only
-backup path still runs at container start, so the system can only back up by
-restarting. Closing O0a properly means an in-process periodic backup (the
-serving process already holds the lock) or a scheduled restart. Both are real
-work; neither is a workflow file.
+**Resolution (2026-09-02).** The hypothesis held: `/data/backups` was
+root-owned, `EACCES` for uid 10001. The `chown -R 10001:10001 /data/backups`
+landed on the volume and the next boot wrote the archive — `/readyz` went from
+`backup_stale` after 258 hours without a restore point to `blockers: []`,
+`backup_writer: skipped_interval`. Go-live **O0a** closed the same day in
+#131: `take_periodic_archive` runs from the `serve` worker loop, so an archive
+no longer needs a restart. Steady state observed at 2026-09-02 05:00 UTC:
+`status: ready`, archive age 5 h, no blockers.
 
 ---
 
@@ -397,6 +410,12 @@ Closes go-live **O3**.
 ## O11 — `check_fixtures --require-deny` in CI
 
 **Owner:** whoever holds the CI secret. **Independent of everything else.**
+**Status 2026-09-02: CLOSED.** `ci.yml` materialises `HERMES_DENY_PATTERNS`
+from the repository secret into `$RUNNER_TEMP/deny-patterns.txt` (empty secret
+⇒ the next step exits 2, fail-closed) and runs
+`check_fixtures --all --require-deny` against it in the `fixtures & lint &
+tests` job; that job is green on `main` at `97706ea`. The plan boxes were
+ticked in the same PR as this note.
 
 Only CI can close this, and that is the design — the private deny-patterns file
 exists only there. Locally the command **exits 2, a refusal, not a warning**:

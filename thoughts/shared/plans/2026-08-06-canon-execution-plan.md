@@ -127,7 +127,7 @@ Non-blocker debt: codex/phase-4-real-actions dirty file + untracked landing not 
 3. Tests: SIGKILL after sink before commit → reclaimed lease still requires receipt; no secret in DB/log/telemetry; revoked/replayed sink behavior.
 
 **Acceptance:**
-- [ ] Nerve PR with cross-org test green + `go test ./... -count=1`.
+- [x] Nerve PR with cross-org test green + `go test ./... -count=1`. *Closed 2026-09-02: nerve-cloud #178 — cross-org `org_id` answers 403 at every `resolveOrgIDForPrincipal` caller, `TestServiceToken_CrossOrgRejected` red on the previous main and green with the fix, full suite green against Postgres (`NM_TEST_DB_DSN`; the cloudapi tests skip without one).*
 - [x] Abrolia `pytest tests/control_plane/email tests/control_plane/test_provisioning_jobs.py` proves crash-after-sink converges without operator, and hard-reclaim without sink stays `secret_handoff_unknown`.
   *Audited 2026-08-30 — half evidenced, and the box stays open for the other
   half.* The suite is green, and the SECOND clause is proven by name:
@@ -434,9 +434,14 @@ placeholder.
 2. Rollout order: synthetic → operator accounts → invited pilot families per provider; each transition requires `Phase A` legal + `Phase C1` receipt + `go test` + `pytest -m "not live"` + one manual live gate.
 
 **Acceptance:**
-- [ ] Flag matrix doctested; `git diff --check` + `ruff` +
+- [x] Flag matrix doctested; `git diff --check` + `ruff` +
   `gitleaks detect --log-opts="--all"` + `check_fixtures --all --require-deny`
-  green. **CI is the only surface that can close this box (noted 2026-08-30):**
+  green. *Closed 2026-09-02 by CI evidence: `ci.yml` runs
+  `check_fixtures --all --require-deny` with `HERMES_EXTRA_DENY_FILE`
+  materialised from the `HERMES_DENY_PATTERNS` secret (fail-closed when
+  empty), green on `main` at `97706ea`; `git diff --check`, `ruff` and
+  `check_fixtures --all` re-run clean locally the same day. Runbook O11.*
+  **CI is the only surface that can close this box (noted 2026-08-30):**
   `check_fixtures --all --require-deny` exits **2** locally — a refusal, not a
   warning — because the private deny-patterns file (`HERMES_EXTRA_DENY_FILE`)
   exists only in CI. Everything else is green locally at 2026-08-30: suite 1686,
