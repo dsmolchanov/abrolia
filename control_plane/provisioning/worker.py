@@ -1548,7 +1548,15 @@ class ProvisioningWorker:
             waiting_external_ref = None
             if job.kind == "email_identity":
                 try:
-                    waiting_external_ref = self.jobs.external_ref(job.id)
+                    # The provider's answer first: an inspection may have
+                    # moved the reference (managed Nerve rotates the key
+                    # before probing). The job's own stored reference is
+                    # the fallback, and for a fresh inspect job it is empty —
+                    # which is why reading only it turned every "check again"
+                    # on a pending flag into outcome_unknown.
+                    waiting_external_ref = (
+                        inspected.external_ref or self.jobs.external_ref(job.id)
+                    )
                     public_result, waiting_external_ref = (
                         self._validated_email_waiting_result(
                         job,

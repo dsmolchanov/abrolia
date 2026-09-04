@@ -1414,6 +1414,49 @@ the list by setting the flag to `0`. `/s/ Product owner (CEO), 2026-09-03`.
 
 **Branches:** `feat/real-email-for-every-household`.
 
+#### Inventory — R1 a pending flag is not an unknown outcome
+
+First tester to reach the email step, 2026-09-04 09:34 UTC. The managed
+adapter created the Nerve org, inbox, key and webhook, found the
+`attachments` flag off for that org and settled `waiting_user` with
+`nerve_attachment_flag_pending` — correct, and the page said so. Ten seconds
+later the tester pressed "check again" and the job settled
+`outcome_unknown`, which no tester and no page can clear: the step froze.
+
+The reference moves. `inspect` routes to `_recover_and_probe`, which deletes
+and reissues the API key and rotates the webhook secret BEFORE probing the
+flag, and then answered PENDING carrying no reference at all. The worker read
+the reference from the inspect job's own row — empty, because `check` had
+created that job seconds earlier — and `_validated_email_waiting_result`
+refuses a managed Nerve wait without one; the `ValueError` became
+`OutcomeUnknown`. Worse than a stuck step: the rotated key was never
+recorded, so a live Nerve credential existed that teardown could not name.
+
+`InspectResult` now carries `external_ref`, the managed adapter returns the
+rotated reference, and the worker prefers the provider's answer over the
+job's own. The validator is unchanged — a wait with no reference anywhere is
+still `outcome_unknown`. Separately, `reconcile` no longer takes the writer
+flock (`invite` and `withdraw-consent` precedent): settling one quarantined
+job should not require stopping production, and the embedded worker never
+leases a job in `outcome_unknown`.
+
+Not fixed here, and deliberately: the `attachments` flag itself is per-org
+in Nerve and default-off, so every new household waits for
+`nerve-flags set attachments --org <org> --enabled=true`. Whether that
+should default on for Abrolia-created orgs is a Nerve decision, not a
+control-plane one.
+
+**Files:** `control_plane/provisioning/contracts.py`,
+`control_plane/provisioning/worker.py`,
+`control_plane/providers/email/nerve_managed.py`, `control_plane/cli.py`,
+`tests/control_plane/test_managed_email_check.py`, `.check-fixtures-allow`
+(the managed address is part of the option's contract — the validator
+compares the waiting reference against `<local_part>@abrolia.com`, so a
+documentation domain would not exercise it; same entry as the existing
+regression).
+
+**Branches:** `fix/managed-email-check-keeps-the-reference`.
+
 ## Execution log
 
 - 2026-09-03: **Real email for every household — owner decision.** After the

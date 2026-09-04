@@ -84,4 +84,5 @@ thoughts/shared/handoffs/general/*.md | email | help@abrolia.com
 # `<local_part>@abrolia.com` — so a placeholder documentation domain would
 # fail the validation the test exists to exercise. Local part is fictional.
 tests/control_plane/test_real_email_wiring.py | email | family-agent@abrolia.com
+tests/control_plane/test_managed_email_check.py | email | family-agent@abrolia.com
 .check-fixtures-allow | email | family-agent@abrolia.com
