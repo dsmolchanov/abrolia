@@ -1449,7 +1449,11 @@ control-plane one.
 **Files:** `control_plane/provisioning/contracts.py`,
 `control_plane/provisioning/worker.py`,
 `control_plane/providers/email/nerve_managed.py`, `control_plane/cli.py`,
-`tests/control_plane/test_managed_email_check.py`.
+`tests/control_plane/test_managed_email_check.py`, `.check-fixtures-allow`
+(the managed address is part of the option's contract — the validator
+compares the waiting reference against `<local_part>@abrolia.com`, so a
+documentation domain would not exercise it; same entry as the existing
+regression).
 
 **Branches:** `fix/managed-email-check-keeps-the-reference`.
 
