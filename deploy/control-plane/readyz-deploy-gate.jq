@@ -47,6 +47,24 @@
 # longer refuses — the list fails closed per household anyway — and the
 # condition is NAMED here instead. A deploy cannot fix a secret, so refusing
 # one for it would be the backup deadlock again.
+#
+# `provider_outcomes_unknown` joined on 2026-09-04, and it is the sharpest
+# case yet. ONE tester's email job settled `outcome_unknown` — a provider call
+# whose effect nobody had settled — and that single row blocked every deploy
+# for the whole project. The fix that would have let an operator settle it
+# without stopping production was in the pull request this gate then refused
+# to ship, so the remedy required deploying past the gate by hand.
+#
+# It qualifies on both properties. A deploy cannot clear an unknown outcome:
+# only `abrolia-control-plane reconcile <job-id>` settles one, and nothing a
+# deploy does touches that row. And it is NAMED, both in the blocker list and
+# as `metrics.unknown_outcomes`, so excusing it hides nothing.
+#
+# It is NOT excused because it is unimportant. An unsettled provider effect is
+# exactly what the reconcile command exists for, and `/readyz` still answers
+# `not_ready` — which is what an operator and any external monitor read. What
+# changes is only that one household's stuck job no longer stops the pipeline
+# that fixes it.
 (.status == "ready")
 or (
   .status == "not_ready"
@@ -54,7 +72,8 @@ or (
   and (
     ((.blockers // []) - [
       "backup_stale", "backup_writer_failed",
-      "real_email_allowlist_invalid", "real_email_allowlist_empty"
+      "real_email_allowlist_invalid", "real_email_allowlist_empty",
+      "provider_outcomes_unknown"
     ]) | length
   ) == 0
 )

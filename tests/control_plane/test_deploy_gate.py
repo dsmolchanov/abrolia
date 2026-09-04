@@ -205,7 +205,39 @@ def test_a_broken_writer_still_does_not_excuse_a_real_blocker() -> None:
     )
 
 
-def test_the_excused_set_is_exactly_these_four() -> None:
+def test_an_unsettled_provider_outcome_does_not_hold_the_deploy_either() -> None:
+    """The 2026-09-04 deadlock, as one case.
+
+    One tester's email job settled `outcome_unknown`, and that single row
+    blocked every deploy for the whole project — including the pull request
+    whose own change let an operator settle such a job without stopping
+    production. The remedy had to be a hand-run deploy past this gate.
+
+    Only `reconcile` clears an unknown outcome; nothing a deploy does touches
+    that row. `/readyz` still answers `not_ready`, and the blocker is still
+    named — an operator reading readiness sees it exactly as before.
+    """
+    assert _deployable(
+        {"status": "not_ready", "blockers": ["provider_outcomes_unknown"]}
+    )
+    # The shape production actually served, verbatim, while the deploy failed.
+    assert _deployable({
+        "status": "not_ready",
+        "mode": "synthetic-only",
+        "checks": {"database": "ok", "volume": "ok", "workers": "running"},
+        "metrics": {"unknown_outcomes": 1, "pending_jobs": 0},
+        "blockers": ["provider_outcomes_unknown"],
+    })
+
+
+def test_an_unknown_outcome_still_does_not_excuse_a_real_blocker() -> None:
+    assert not _deployable({
+        "status": "not_ready",
+        "blockers": ["provider_outcomes_unknown", "database_unavailable"],
+    })
+
+
+def test_the_excused_set_is_exactly_these_five() -> None:
     """What the gate is allowed to ignore, pinned.
 
     This gate ignoring a condition is how a real problem becomes invisible:
@@ -222,12 +254,15 @@ def test_the_excused_set_is_exactly_these_four() -> None:
     The two allowlist blockers joined on 2026-09-03: an allowlist secret set to
     email addresses refused the boot and took production down. The boot no
     longer refuses, the condition is named, and a deploy cannot fix a secret.
+    `provider_outcomes_unknown` joined on 2026-09-04: one tester's stuck job
+    blocked every deploy, and only `reconcile` — never a deploy — clears one.
     """
     excused = [
         "backup_stale",
         "backup_writer_failed",
         "real_email_allowlist_invalid",
         "real_email_allowlist_empty",
+        "provider_outcomes_unknown",
     ]
     assert _deployable({"status": "not_ready", "blockers": excused})
     for blocker in excused:
@@ -239,7 +274,6 @@ def test_the_excused_set_is_exactly_these_four() -> None:
         "volume_unavailable",
         "workers_paused",
         "stale_worker_leases",
-        "provider_outcomes_unknown",
         "expired_bootstrap",
         "provider_registry_unavailable",
     ):

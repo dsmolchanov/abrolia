@@ -199,7 +199,13 @@ provider.
    pending job alone does not remove the API from service.
    Fly routing checks use `/healthz`; `/readyz` remains an operator/release
    signal so an `outcome_unknown` does not make the only reconciliation surface
-   unreachable.
+   unreachable. For the same reason the deploy gate EXCUSES
+   `provider_outcomes_unknown` (since 2026-09-04): only
+   `abrolia-control-plane reconcile <job-id>` settles an unknown outcome, so
+   refusing deploys for one meant a single household's stuck job blocked the
+   pipeline that ships the fix — it did, and the remedy was a hand-run deploy
+   past the gate. `/readyz` still answers `not_ready` and still names the
+   blocker; nothing about monitoring changes.
 6. Point the app subdomain at the control plane only after the auth/security
    suite is green. The static landing remains on its own deployable and retains
    `connect-src 'none'`.

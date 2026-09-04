@@ -1457,6 +1457,26 @@ regression).
 
 **Branches:** `fix/managed-email-check-keeps-the-reference`.
 
+#### Inventory — R1 one stuck job stops one household, not every deploy
+
+2026-09-04, straight after the check fix: the tester's `outcome_unknown`
+email job put `provider_outcomes_unknown` on `/readyz`, the deploy gate
+refused, and the deploy that carried the very fix for that job failed. One
+household's row blocked the whole pipeline, and the remedy was a hand-run
+`flyctl deploy` past the gate.
+
+The blocker joins the excused set on the same two properties as the others:
+a deploy cannot clear an unknown outcome — only
+`abrolia-control-plane reconcile <job-id>` settles one — and it stays NAMED,
+in the blocker list and as `metrics.unknown_outcomes`. `/readyz` still
+answers `not_ready`, so operators and monitors read exactly what they read
+before; only the pipeline stops being held hostage.
+
+**Files:** `deploy/control-plane/readyz-deploy-gate.jq`,
+`tests/control_plane/test_deploy_gate.py`, `docs/onboarding-runbook.md`.
+
+**Branches:** `fix/deploy-gate-excuses-unknown-outcomes`.
+
 ## Execution log
 
 - 2026-09-03: **Real email for every household — owner decision.** After the
