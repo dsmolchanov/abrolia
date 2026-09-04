@@ -300,10 +300,14 @@ class NerveManagedEmailProvisioner:
             api_key=str(recovered_key["key"]), expected_org_id=refs.org_id
         ):
             pending = self._pending(recovered_refs)
+            # The reference carries the ROTATED key id: the probe above
+            # consumed the old one. Dropping it here left the worker with no
+            # reference to validate, and a pending flag became outcome_unknown.
             return InspectResult(
                 InspectState.PENDING,
                 error_code=pending.code,
                 public_result=pending.public_result,
+                external_ref=pending.external_ref,
             )
         bundle = json.dumps(
             {

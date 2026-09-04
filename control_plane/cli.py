@@ -410,6 +410,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             sort_keys=True,
         ))
         return 0
+    if args.command == "reconcile":
+        # Beside the serving process, like `withdraw-consent` and `invite`:
+        # `serve` holds the writer flock for the life of the process, and an
+        # `outcome_unknown` that can only be settled with production STOPPED
+        # is a job every tester's onboarding waits on until an operator finds
+        # a quiet hour. The flock guards against a second long-running WORKER;
+        # this is one job, and the embedded worker never leases a job in
+        # `outcome_unknown`, so nothing races it for the row.
+        with _container(lock=False) as active:
+            result = active.worker.reconcile(args.job_id)
+            print(json.dumps(result.__dict__, sort_keys=True))
+            return 0
     if args.command == "runtime-health":
         # This read/compare/projection command is safe to run beside the
         # embedded worker and must remain available while ``serve`` owns the
@@ -483,10 +495,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         if args.command == "jobs":
             return _jobs(active)
-        if args.command == "reconcile":
-            result = active.worker.reconcile(args.job_id)
-            print(json.dumps(result.__dict__, sort_keys=True))
-            return 0
         if args.command == "reconcile-bindings":
             # Dry run by default: this schedules real deployments for
             # households nobody asked about, and the operator should read what

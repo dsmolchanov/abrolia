@@ -99,8 +99,17 @@ class InspectResult:
     result: ProvisionResult | None = None
     error_code: str | None = None
     public_result: dict[str, Any] = field(default_factory=dict)
+    #: The durable reference a PENDING inspection leaves behind — the same
+    #: thing `ProviderWaiting.external_ref` carries on the ensure path. An
+    #: inspection may MOVE the reference: managed Nerve rotates the API key and
+    #: webhook secret before it probes, so the key id the caller held is gone.
+    #: Without this field the worker had only the inspect job's own (empty)
+    #: reference, refused it, and settled a routine "flag still pending" as
+    #: `outcome_unknown` — on every tester's first "check again".
+    external_ref: str | None = None
 
     def __post_init__(self) -> None:
+        reject_secret_fields({"external_ref": self.external_ref})
         reject_secret_fields(self.public_result)
         if self.error_code is not None and self.error_code not in _LOCAL_PROVIDER_ERROR_CODES:
             object.__setattr__(self, "error_code", "provider_rejected")
