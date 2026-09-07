@@ -87,7 +87,13 @@
     <div class="cards">
       <form method="post" action="/onboarding/select/email_identity">
         {{ command_fields() }}<input type="hidden" name="kind" value="abrolia_managed">
-        <input type="hidden" name="local_part" value="family.assistant">
+        {# Every household used to be offered the same hardcoded
+           `family.assistant`, which the first one reserved and every later one
+           collided with — as a 500. The address is the family's to choose, and
+           the default is one the server has checked is free. #}
+        <label>Assistant address<input name="local_part" value="{{ managed_local_part }}"
+               autocomplete="off" spellcheck="false" required></label>
+        <p class="hint">Your assistant's mailbox: <code>{{ managed_local_part }}@abrolia.com</code>. Letters, digits, dot, dash and underscore.</p>
         <input type="hidden" name="special_category_restriction_text_version" value="{{ special_category_restriction_version }}">
         <input type="hidden" name="special_category_restriction_text_sha256" value="{{ special_category_restriction_sha256 }}">
         <label class="consent"><input type="checkbox" name="special_category_restriction_acknowledged" value="yes" aria-describedby="special-category-content-restriction" required>

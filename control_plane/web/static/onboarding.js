@@ -238,7 +238,8 @@ if (page === "onboarding") {
     const kind = button.dataset.select;
     const option = button.dataset.kind;
     let selection = {kind: option};
-    if (option === "abrolia_managed") selection.local_part = "family.assistant";
+    // The address the family typed, not a constant every household shared.
+    if (option === "abrolia_managed") selection.local_part = form.elements.local_part.value.trim();
     if (option === "gmail_agent") selection.separate_agent_account_acknowledged = true;
     if (option === "family_domain") selection = {
       kind: option,

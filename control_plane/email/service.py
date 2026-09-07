@@ -3,7 +3,11 @@ from __future__ import annotations
 import sqlite3
 import time
 
-from control_plane.email.local_part import normalize_local_part, suggest_local_part
+from control_plane.email.local_part import (
+    collision_candidate,
+    normalize_local_part,
+    suggest_local_part,
+)
 from control_plane.email.models import EmailIdentityRecord, EmailOption
 from control_plane.email.repository import EmailIdentityRepository
 from control_plane.owners import owner_contact_query
@@ -44,13 +48,26 @@ class EmailIdentityService:
             )
         if address is not None:
             self._reject_owner_contact(connection, household_id, address)
-        identity = self.repository.create_selected(
-            connection,
-            household_id=household_id,
-            option=option,
-            address=address,
-            now=now,
-        )
+        try:
+            identity = self.repository.create_selected(
+                connection,
+                household_id=household_id,
+                option=option,
+                address=address,
+                now=now,
+            )
+        except sqlite3.IntegrityError as error:
+            # A taken address is the family's to fix, not a server fault. The
+            # reservation is UNIQUE on (domain, local part), and the onboarding
+            # page offered every household the same `family.assistant`, so the
+            # SECOND household to choose the managed option raised this — as a
+            # 500, because nothing above translates a database error. Same
+            # class as the other refusals here: correctable, and it names no
+            # address, because whose mailbox that is is not this family's
+            # business.
+            raise MailboxRefused(
+                "that assistant address is already taken; choose another"
+            ) from error
         self.repository.mark_provisioning(connection, identity.id, now=now)
         current = connection.execute(
             "SELECT * FROM email_identities WHERE id = ?", (identity.id,)
@@ -89,7 +106,29 @@ class EmailIdentityService:
                 " (self-ingestion loop)"
             )
 
-    def suggest(self, household_id: str) -> str:
+    #: How many `name`, `name2`, `name3` … candidates `suggest` tries before it
+    #: gives up and offers the plain suggestion. Small on purpose: a family
+    #: hitting the end of it is a family that should type its own address, and
+    #: the form now lets them.
+    SUGGESTION_ATTEMPTS = 20
+
+    def suggest(self, household_id: str, *, now: float | None = None) -> str:
+        """A local part this household can actually take.
+
+        It used to answer from the family's name alone, and the onboarding page
+        did not use it at all — every household was offered the same hardcoded
+        `family.assistant`, which the first one reserved and every later one
+        collided with. An offer that is not available is not an offer, so
+        availability is part of the answer.
+        """
+        base = self._suggest_from_profile(household_id)
+        for sequence in range(1, self.SUGGESTION_ATTEMPTS + 1):
+            candidate = collision_candidate(base, sequence)
+            if self.available(candidate, now=now):
+                return candidate
+        return base
+
+    def _suggest_from_profile(self, household_id: str) -> str:
         profile = self.repository.db.query_one(
             "SELECT * FROM household_profiles WHERE household_id = ?", (household_id,)
         )
