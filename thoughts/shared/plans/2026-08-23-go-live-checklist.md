@@ -1503,6 +1503,30 @@ because whose mailbox that is is not the asking family's business.
 
 **Branches:** `fix/assistant-address-is-per-household`.
 
+#### Inventory — R1 a household can be moved onto a fixed runtime image
+
+2026-09-07, found by asking why both pilot households sat in
+`needs_attention`: their runtimes were still serving
+`runtime-phase-b-20260809-r3`, an image from 9 August. Its consent
+catalogue has `special-category-content-restriction-v1` where the control
+plane now issues v2, and knows nothing of `special_category_household_content`
+at all — the Art. 9(2)(a) purpose every real-email household owes. Both
+runtimes therefore answered `/readyz` 503 `content_restriction_not_current`,
+`runtime-health` parked their email identities, and the web chat and mail
+paths were dead for both families.
+
+`ABROLIA_RUNTIME_IMAGE` pins what NEW runtimes are built from; existing ones
+move only when a revision is rolled out, and every path that plans one hangs
+off a family action. So there was no operator way to move a settled household
+onto a fixed image at all. `roll-runtime <household-id>` is that path: issues
+a revision, queues the runtime job, runs beside the serving process, refuses
+an unsettled household and one whose rollout is already in flight.
+
+**Files:** `control_plane/cli.py`, `docs/onboarding-runbook.md`,
+`tests/control_plane/test_roll_runtime_command.py`.
+
+**Branches:** `feat/roll-runtime-command`.
+
 ## Execution log
 
 - 2026-09-03: **Real email for every household — owner decision.** After the
