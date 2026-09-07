@@ -126,6 +126,37 @@ is a stable HMAC bound to the exact managed runtime ref; its value is not stored
 in control-plane SQLite. Do not substitute similarly named `ABROLIA_*`
 variables: the runtime rejects an incomplete or mismatched `HERMES_*` binding.
 
+### Moving households onto a new runtime image
+
+`ABROLIA_RUNTIME_IMAGE` pins the image every NEW runtime is created from.
+Existing households keep the image they were provisioned with until a new
+config revision is rolled out to them, and every path that plans a revision
+hangs off a family action — verifying a binding, finishing onboarding. So a
+runtime pinned before a fix stays pinned until somebody in that household
+happens to do something.
+
+That is not academic. On 2026-09-07 both pilot households were still serving
+`runtime-phase-b-20260809-r3`, whose consent catalogue predates
+`special-category-content-restriction-v2` and knows nothing of the Art.
+9(2)(a) purpose. Both answered `/readyz` with 503
+`content_restriction_not_current`, so `runtime-health` parked their email
+identities in `needs_attention`, and no command existed to move them.
+
+The sequence, after building and pushing a new image:
+
+```text
+flyctl secrets set ABROLIA_RUNTIME_IMAGE=<registry>@sha256:<digest> -a <control-plane-app>
+abrolia-control-plane roll-runtime <household-id>
+```
+
+`roll-runtime` issues a revision and queues the runtime job the embedded
+worker then runs; it does not take the writer lock, so production keeps
+serving. It refuses a household that is not settled (`active`/`provisioning`,
+workflow `complete`, no open runtime job) and one whose rollout is already in
+flight — a second rollout strands both. Confirm with
+`abrolia-control-plane runtime-health`, which should report `active` for the
+runtime ref once the new machine answers `/readyz` with `status: ready`.
+
 ### Operator-only Nerve email gate
 
 Keep `ABROLIA_REAL_EMAIL_ENABLED=0` for the normal synthetic contour. A Phase

@@ -28,7 +28,11 @@ from control_plane.db import ControlPlaneDatabase, ProcessAlreadyRunning
 from control_plane.observability import StructuredLogger
 from control_plane.privacy.consent import CONSENT_TEXTS
 from control_plane.privacy.withdraw import ConsentNotHeld
-from control_plane.provisioning.rollout import reconcile_stale_bindings
+from control_plane.provisioning.rollout import (
+    RolloutNotReady,
+    reconcile_stale_bindings,
+    schedule_runtime_rollout,
+)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -102,6 +106,20 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     commands.add_parser("resume-jobs", help="remove the exact post-restore worker pause")
+    # Rolling a household onto the CURRENT runtime image had no operator entry
+    # point at all. Every path that plans a revision hangs off a family action
+    # — verifying a binding, finishing onboarding — so a runtime pinned before
+    # a fix stayed pinned until somebody in that household happened to do
+    # something. On 2026-09-07 both pilot households were serving an image
+    # built on 2026-08-09, whose consent catalogue predates
+    # `special-category-content-restriction-v2` and knows nothing of the Art.
+    # 9(2)(a) purpose, so every one of them answered `/readyz` 503
+    # `content_restriction_not_current` and sat in `needs_attention`.
+    roll = commands.add_parser(
+        "roll-runtime",
+        help="issue a new revision so a household picks up the pinned runtime image",
+    )
+    roll.add_argument("household_id")
     # The operator boundary for Art. 7(3). The consent copy advertises a
     # mailbox, not a button, so withdrawal arrives as mail to a human — this
     # is the command that human runs. A self-service route needs an
@@ -421,6 +439,41 @@ def main(argv: Sequence[str] | None = None) -> int:
         with _container(lock=False) as active:
             result = active.worker.reconcile(args.job_id)
             print(json.dumps(result.__dict__, sort_keys=True))
+            return 0
+    if args.command == "roll-runtime":
+        # Beside the serving process, like `reconcile` and `withdraw-consent`:
+        # one short transaction that plans a revision and queues the rollout
+        # the embedded worker then runs. Taking the writer flock would mean
+        # stopping production to move a household onto a fixed image.
+        with _container(lock=False) as active:
+            try:
+                with active.database.write() as connection:
+                    planned = active.planner.issue(
+                        connection, household_id=args.household_id
+                    )
+                    job_id = schedule_runtime_rollout(
+                        connection,
+                        jobs=active.jobs,
+                        onboarding=active.onboarding_repository,
+                        household_id=args.household_id,
+                        planned=planned,
+                        runtime_provider=active.config.runtime_provider,
+                    )
+            except RolloutNotReady as error:
+                # A rollout is already in flight. Not a fault: the one running
+                # will carry the pinned image, and a second would strand both.
+                raise SystemExit(f"rollout already in flight: {error}") from error
+            except (KeyError, ValueError) as error:
+                raise SystemExit(f"household cannot be rolled: {error}") from error
+            print(json.dumps(
+                {
+                    "household_id": args.household_id,
+                    "revision": planned.revision.revision,
+                    "job_id": job_id,
+                    "runtime_image": active.config.runtime_image_digest,
+                },
+                sort_keys=True,
+            ))
             return 0
     if args.command == "runtime-health":
         # This read/compare/projection command is safe to run beside the
