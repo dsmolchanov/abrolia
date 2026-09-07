@@ -1477,6 +1477,32 @@ before; only the pipeline stops being held hostage.
 
 **Branches:** `fix/deploy-gate-excuses-unknown-outcomes`.
 
+#### Inventory — R1 the assistant address belongs to one household
+
+Found while answering "what address is this registered to", 2026-09-07: the
+onboarding page hardcoded `local_part=family.assistant` for every household,
+and `email_address_reservations` is UNIQUE on (domain, local part). The first
+household consumed the managed address `family.assistant`; the second family to
+choose the managed option would hit `sqlite3.IntegrityError`, which nothing
+above translates — a 500 on the first screen that matters, on every tester
+after the first. Open registration makes that certain rather than unlikely.
+
+Three parts. The address is the family's to type, defaulted from the
+household's own profile through `suggest`, which the page never used. That
+suggester now returns an address it has CHECKED is free, walking
+`collision_candidate` — an offer that is not available is not an offer. And
+a taken address raises `MailboxRefused`, the existing correctable class (409
+on the JSON route, redirect on the form), whose message names no address,
+because whose mailbox that is is not the asking family's business.
+
+**Files:** `control_plane/email/service.py`, `control_plane/api/app.py`,
+`control_plane/web/templates/onboarding.html`,
+`control_plane/web/static/onboarding.js`,
+`control_plane/web/static/onboarding.css`,
+`tests/control_plane/test_assistant_address_per_household.py`.
+
+**Branches:** `fix/assistant-address-is-per-household`.
+
 ## Execution log
 
 - 2026-09-03: **Real email for every household — owner decision.** After the

@@ -69,6 +69,7 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px s
 .card span:last-child { color: var(--muted); font-size: .9rem; }
 .badge { width: fit-content; border-radius: 999px; padding: .2rem .5rem; color: var(--leaf); background: var(--leaf-soft); font-size: .7rem; font-weight: 800; text-transform: uppercase; }
 .consent { color: var(--muted); font-size: .8rem; }
+.hint { color: var(--muted); font-size: .8rem; margin: 0; }
 .consent input { width: auto; margin-right: .35rem; }
 .form-error { border-left: 4px solid var(--danger); padding: .8rem 1rem; background: #faecea; }
 .reset-actions { display: flex; flex-wrap: wrap; gap: .7rem; }

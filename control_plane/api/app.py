@@ -54,6 +54,25 @@ SECURITY_HEADERS = {
 }
 
 
+#: Offered when the household has no profile yet, or the suggester cannot
+#: answer. Never a shared constant that a household could actually reserve:
+#: the family types over it, and a taken address is now a named refusal
+#: rather than a 500.
+FALLBACK_LOCAL_PART = "family_agent"
+
+
+def _managed_local_part_suggestion(
+    active_container: ControlPlaneContainer, household_id: str
+) -> str:
+    service = getattr(active_container, "email_identity_service", None)
+    if service is None:
+        return FALLBACK_LOCAL_PART
+    try:
+        return service.suggest(household_id)
+    except (ValueError, KeyError):
+        return FALLBACK_LOCAL_PART
+
+
 def create_app(
     config: ControlPlaneConfig | None = None,
     *,
@@ -190,6 +209,14 @@ def create_app(
                 # ("not enabled for this household") can be acted on: the
                 # operator allowlists by this id and needs it from the tester.
                 "household_id": household.id,
+                # A free assistant address for THIS household, so the managed
+                # card offers something takeable. The page used to hardcode
+                # `family.assistant` for everyone; the first household reserved
+                # it and the second got a 500. Falls back when the profile is
+                # not saved yet — that step is still ahead of this card.
+                "managed_local_part": _managed_local_part_suggestion(
+                    active_container, household.id
+                ),
                 "recovery_email": account.masked_email if account else "unavailable",
                 "csrf_token": request.cookies.get(active_container.config.csrf_cookie_name, ""),
                 "idempotency_key": new_id(),
