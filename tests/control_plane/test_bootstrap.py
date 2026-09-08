@@ -660,10 +660,12 @@ def test_crash_after_activate_response_cannot_delete_secret_before_local_receipt
 
 
 @pytest.mark.parametrize("lose_activation_response", [False, True])
+@pytest.mark.parametrize("attention", ["none", "monitor", "unowned", "changed_version", "wrong_runtime", "superseded", "failed_checks"])
 def test_active_runtime_executes_rollout_through_bootstrap_api(
-    api_harness, tmp_path: Path, monkeypatch, lose_activation_response: bool,
+    api_harness, tmp_path: Path, monkeypatch, lose_activation_response: bool, attention: str,
 ) -> None:
     from control_plane.provisioning.rollout import schedule_runtime_rollout
+    from control_plane.provisioning.runtime_health import RuntimeReadinessMonitor
 
     runtime = _provision_runtime(api_harness)
     active = api_harness.container
@@ -699,6 +701,24 @@ def test_active_runtime_executes_rollout_through_bootstrap_api(
     cleanup = active.worker.run_once()
     assert cleanup is not None and cleanup.status == "succeeded"
 
+    if attention != "none":
+        monitor = RuntimeReadinessMonitor(active.database)
+        # The provisioner uses synthetic runtime refs. Supply the failed probe
+        # observation while exercising the monitor's real durable projection.
+        monkeypatch.setattr(monitor, "_observe", lambda *args, **kwargs: "needs_attention")
+        assert monitor.reconcile_all(now=time.time())[0].status == "needs_attention"
+        monitor.client.close()
+        mutations = {
+            "unowned": "UPDATE email_activation_receipts SET runtime_health_owns_attention = 0",
+            "changed_version": "UPDATE email_identities SET version = version + 1",
+            "wrong_runtime": "UPDATE email_activation_receipts SET runtime_ref = 'another-runtime'",
+            "superseded": "UPDATE config_revisions SET status = 'superseded' WHERE status = 'active'",
+            "failed_checks": "UPDATE email_activation_receipts SET inbound_check = 'failed'",
+        }
+        if attention in mutations:
+            with active.database.write() as connection:
+                connection.execute(mutations[attention])
+
     with active.database.write() as connection:
         planned = active.planner.issue(connection, household_id=runtime.world.household.id)
         job_id = schedule_runtime_rollout(
@@ -721,6 +741,14 @@ def test_active_runtime_executes_rollout_through_bootstrap_api(
     calls.clear()
     service = RuntimeService(**paths, env=env)
     assert service.readyz().status_code == 503
+    if attention not in {"none", "monitor"}:
+        with pytest.raises(BootstrapError, match="HTTP 409"):
+            runtime_service_module.bootstrap_from_environment(service, env=env)
+        assert service.readyz().status_code == 503
+        assert active.jobs.get(job_id).status == "pending"
+        assert active.database.query_one("SELECT status FROM email_identities")["status"] == "needs_attention"
+        service.close()
+        return
     lose_response = lose_activation_response
     if lose_activation_response:
         with pytest.raises(BootstrapOutcomeUnknown):

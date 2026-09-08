@@ -934,6 +934,25 @@ that the planner chose among owners with an unordered `LIMIT 1`.
 
 **Branches:** `codex/c4a-preferences-writer`.
 
+#### Inventory — activation after monitor-owned runtime failure
+
+**Files:** `control_plane/provisioning/bootstrap.py`, `tests/control_plane/test_bootstrap.py`.
+
+**Branches:** `codex/runtime-activation-health-recovery`.
+
+Production recovery exposed the control-plane half of the activation deadlock:
+an existing runtime installs its newer revision and reports healthy email checks,
+but activation rejects the identity previously marked `needs_attention` by the
+runtime monitor. Readiness cannot clear that mark until activation succeeds.
+Allow the current desired revision's healthy activation to recover only attention
+owned by the same runtime's previous active revision receipt, with unchanged
+identity version, matching provider, and healthy prior email checks. Keep all
+other attention causes blocking. Exercise the monitor's durable projection and
+the real bootstrap API, including lost activation responses and negative cases
+for unowned attention, changed identity version, foreign runtime, superseded
+revision, and failed prior checks. No manual identity-state rewrite is part of
+the recovery.
+
 #### Inventory — existing runtime revision activation
 
 **Files:** `hermes_cloud/runtime/bootstrap.py`, `tests/test_runtime_service.py`,
