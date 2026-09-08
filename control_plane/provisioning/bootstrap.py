@@ -365,16 +365,41 @@ class BootstrapService:
             ):
                 raise BootstrapConflict("activation requires all verified onboarding results")
             identity = connection.execute(
-                "SELECT id, status FROM email_identities WHERE household_id = ?"
+                "SELECT id, status, version FROM email_identities WHERE household_id = ?"
                 " AND status NOT IN ('disconnecting','deleted')"
                 " ORDER BY created_at DESC LIMIT 1",
                 (household_id,),
             ).fetchone()
-            if identity is None or identity["status"] not in {
+            recovering_monitor_attention = False
+            if (
+                identity is not None
+                and identity["status"] == "needs_attention"
+                and household["current_config_revision"] == config_revision
+            ):
+                # A new healthy activation can replace the failed runtime's
+                # receipt. Requiring readiness first would deadlock: readiness
+                # itself requires this activation. The previous active revision
+                # must prove the monitor still owns this exact identity version;
+                # unrelated or subsequently changed attention remains blocking.
+                recovering_monitor_attention = connection.execute(
+                    "SELECT 1 FROM email_activation_receipts ear"
+                    " JOIN config_revisions cr ON cr.household_id = ?"
+                    " AND cr.revision = ear.desired_revision AND cr.status = 'active'"
+                    " WHERE ear.email_identity_id = ? AND ear.runtime_ref = ?"
+                    " AND ear.desired_revision < ? AND ear.provider = ?"
+                    " AND ear.status = 'needs_attention'"
+                    " AND ear.runtime_health_status = 'needs_attention'"
+                    " AND ear.runtime_health_owns_attention = 1"
+                    " AND ear.runtime_health_identity_version = ?"
+                    " AND ear.inbound_check = 'healthy' AND ear.outbound_check = 'healthy'",
+                    (household_id, identity["id"], runtime_ref, config_revision,
+                     provider_kind, identity["version"]),
+                ).fetchone() is not None
+            if identity is None or (identity["status"] not in {
                 "verified",
                 "activating",
                 "active",
-            }:
+            } and not recovering_monitor_attention):
                 raise BootstrapConflict("activation email identity is unavailable")
             connection.execute(
                 "UPDATE email_identities SET status = 'activating', version = version + 1,"
