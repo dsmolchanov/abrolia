@@ -934,6 +934,28 @@ that the planner chose among owners with an unordered `LIMIT 1`.
 
 **Branches:** `codex/c4a-preferences-writer`.
 
+#### Inventory — existing runtime revision activation
+
+**Files:** `hermes_cloud/runtime/bootstrap.py`, `tests/test_runtime_service.py`,
+`tests/control_plane/test_bootstrap.py`.
+
+**Branches:** `codex/runtime-revision-activation`.
+
+The runtime must execute the rollout already scheduled by C3b and `roll-runtime`.
+When the desired revision is newer than its durable active or activating receipt,
+claim and validate that revision before loading the old manifest against the new
+environment. Preserve the normal install/activate/acknowledge protocol and resume
+after a crash between manifest installation and receipt persistence. Never
+acknowledge an older receipt with the new token. Reject a lower desired revision,
+another runtime or household, and unsupported receipt states. Same-revision
+restart and activation-response recovery retain their existing behavior.
+
+Validation covers adjacent and skipped revisions, interrupted protocol boundaries,
+identity and downgrade rejection, and an existing runtime rolling through the
+real bootstrap API to readiness and a succeeded provisioning job, including a
+lost activation response. Production recovery uses a pinned runtime image and a
+fresh `roll-runtime` revision; no volume-state deletion is required.
+
 #### Inventory — C3b revision rollout
 
 **Files:** `control_plane/provisioning/worker.py`,
