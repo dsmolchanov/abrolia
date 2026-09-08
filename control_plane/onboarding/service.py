@@ -20,6 +20,7 @@ from control_plane.models import (
     StepStatus,
     WhatsAppSelection,
     synthetic_channel_identity,
+    web_channel_identity,
 )
 from control_plane.onboarding.contracts import (
     CommandContext,
@@ -48,6 +49,7 @@ class OnboardingService:
         onboarding: OnboardingRepository,
         jobs: JobsRepository,
         *,
+        synthetic_only: bool = True,
         runtime_provider: str = "dry-run-runtime",
         email_provider: str = "fake-email",
         gmail_provider: str | None = None,
@@ -58,6 +60,7 @@ class OnboardingService:
         real_email_all_households: bool = False,
         email_identities: EmailIdentityService | None = None,
     ) -> None:
+        self.synthetic_only = synthetic_only
         self.households = households
         self.onboarding = onboarding
         self.jobs = jobs
@@ -105,6 +108,7 @@ class OnboardingService:
         if row["request_sha"] != request_sha:
             raise IdempotencyConflict("idempotency key was already used with another body")
         body = json.loads(row["response_body_json"])
+        body["synthetic_only"] = self.synthetic_only
         return CommandResult(OnboardingSnapshot.model_validate(body), replayed=True)
 
     def _remember(
@@ -253,6 +257,11 @@ class OnboardingService:
         }
         if kind not in adapters:
             raise InvalidTransition(f"{kind.value} is not a selectable user step")
+        if not self.synthetic_only:
+            if kind is StepKind.WHATSAPP and selection.get("kind") != "disabled":
+                raise WorkflowConflict("WhatsApp is not available; continue without connecting it")
+            if kind is StepKind.PRIMARY_CHANNEL and selection.get("kind") != "web":
+                raise WorkflowConflict("Only web chat is available")
         if kind is StepKind.PRIMARY_CHANNEL:
             # The channel identity is DERIVED here and whatever the caller sent
             # is discarded. Both select routes reach this method, so this is the
@@ -264,14 +273,22 @@ class OnboardingService:
             # no legitimate client-supplied value to preserve — the field was
             # never the caller's to choose — so a refusal would only convert a
             # stale client into an error where a correct value is available.
-            actor_id, chat_id = synthetic_channel_identity(household_id)
+            identity = synthetic_channel_identity if self.synthetic_only else web_channel_identity
+            actor_id, chat_id = identity(household_id)
             selection = {**selection, "actor_id": actor_id, "chat_id": chat_id}
         return adapters[kind].validate_python(
             selection,
-            context={"allow_real_email_domains": self.allow_real_email_domains},
+            context={
+                "allow_real_email_domains": self.allow_real_email_domains,
+                "production_web": not self.synthetic_only,
+            },
         ).model_dump(mode="json", exclude_none=True)
 
     def _provider_for(self, kind: StepKind, selection_kind: str) -> str:
+        if kind is StepKind.WHATSAPP and selection_kind == "disabled":
+            return "local-configuration"
+        if not self.synthetic_only and kind is StepKind.PRIMARY_CHANNEL and selection_kind == "web":
+            return "local-configuration"
         if kind is StepKind.EMAIL and selection_kind == "family_domain":
             return self.byo_domain_provider
         if kind is StepKind.EMAIL and selection_kind == "gmail_agent":
@@ -289,6 +306,8 @@ class OnboardingService:
         asked without the exception, so the onboarding page and this gate cannot
         answer it differently — the failure that predicate below was written for.
         """
+        if not self.synthetic_only and not self.real_email_enabled and option != "gmail_agent":
+            raise InvalidTransition("Email setup is temporarily unavailable")
         gated = GATED_EMAIL_OPTIONS.get(option)
         if gated is None:
             return
@@ -597,7 +616,7 @@ class OnboardingService:
                         " does not match"
                     ),
                 )
-            if kind is StepKind.WHATSAPP:
+            if kind is StepKind.WHATSAPP and parsed["kind"] != "disabled":
                 household_row = connection.execute(
                     "SELECT family_language FROM households WHERE id = ?", (household_id,)
                 ).fetchone()

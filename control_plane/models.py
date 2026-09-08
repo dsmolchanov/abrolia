@@ -278,6 +278,15 @@ EmailSelection = Annotated[
 ]
 
 
+def web_channel_identity(household_id: str) -> tuple[str, str]:
+    """Server-owned web identity; the planner binds it to the authenticated owner."""
+    return f"web-owner.{household_id}", f"web-chat.{household_id}"
+
+
+class DisabledWhatsAppSelection(DurableContract):
+    kind: Literal["disabled"] = "disabled"
+
+
 class SharedWhatsAppSelection(DurableContract):
     kind: Literal["shared_abrolia"] = "shared_abrolia"
     member_phone_test_ref: str = Field(pattern=r"^synthetic-phone:[a-z0-9-]+$")
@@ -292,7 +301,7 @@ class DedicatedWhatsAppSelection(DurableContract):
 
 
 WhatsAppSelection = Annotated[
-    SharedWhatsAppSelection | DedicatedWhatsAppSelection,
+    SharedWhatsAppSelection | DedicatedWhatsAppSelection | DisabledWhatsAppSelection,
     Field(discriminator="kind"),
 ]
 
@@ -304,7 +313,11 @@ class PrimaryChannelSelection(DurableContract):
 
     @field_validator("actor_id", "chat_id")
     @classmethod
-    def _synthetic_id_only(cls, value: str) -> str:
+    def _synthetic_id_only(cls, value: str, info: ValidationInfo) -> str:
+        if isinstance(info.context, dict) and info.context.get("production_web"):
+            if not re.fullmatch(r"web-(?:owner|chat)\." + _UUID_TEXT_PATTERN[1:], value):
+                raise ValueError("web identity must be derived from the household")
+            return value
         return _require_synthetic_actor_or_chat(value)
 
 
@@ -334,7 +347,7 @@ class OnboardingSnapshot(DurableContract):
     version: int
     state: WorkflowState
     current_step: StepKind
-    synthetic_only: Literal[True] = True
+    synthetic_only: bool = True
     steps: tuple[StepSnapshot, ...]
 
 

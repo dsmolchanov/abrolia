@@ -103,6 +103,7 @@ def create_app(
     app.state.health_reporter = HealthReporter(active_container.database)
     app.state.owns_container = owns_container
     templates = Jinja2Templates(directory=str(WEB_ROOT / "templates"))
+    templates.env.globals["synthetic_only"] = active_container.config.synthetic_only
     app.mount("/static", StaticFiles(directory=WEB_ROOT / "static"), name="static")
     # PWA shell from top-level web/ (Phase E E6) — serve manifest, sw, icons
     if PWA_ROOT.is_dir():
@@ -295,7 +296,7 @@ def create_app(
             backup_status = "fresh"
         return {
             "status": status_value,
-            "mode": "synthetic-only",
+            "mode": "synthetic-only" if active_container.config.synthetic_only else "production",
             "checks": {
                 "database": "ok" if snapshot.database_ok else "unavailable",
                 "volume": "ok" if snapshot.volume_ok else "unavailable",

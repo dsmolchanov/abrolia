@@ -101,16 +101,16 @@ if (page === "onboarding") {
       available: ["Ready", "Choose an option to continue."],
       selected: ["Selection saved", "The durable worker will begin this setup."],
       provisioning: ["Setting up", "The durable worker is applying your selection."],
-      waiting_user: ["Waiting for you", "Complete the synthetic verification, then check again."],
+      waiting_user: ["Waiting for you", "Complete the connection steps, then check again."],
       verifying: ["Checking verification", "The durable worker is inspecting the existing provider result."],
       failed: ["Needs attention", "The provider returned a safe error. You can retry this selection."],
       verified: ["Verified", "This choice is locked. Use explicit reset to change it."],
       cancelled: ["Setup cancelled", "No new onboarding work will be started."],
     };
     const workflows = {
-      runtime_provisioning: ["Preparing your private runtime", "The durable worker is creating the synthetic runtime and immutable configuration."],
+      runtime_provisioning: ["Preparing your private runtime", "We are preparing your private assistant."],
       activating: ["Activating your runtime", "Waiting for the runtime to install and acknowledge the exact configuration revision."],
-      complete: ["Setup complete", "Your synthetic household runtime is active."],
+      complete: ["Setup complete", "Your assistant is ready."],
       cancelled: ["Setup cancelled", "No new onboarding work will be started."],
     };
     const message = workflows[snapshot.state] || labels[current?.status]

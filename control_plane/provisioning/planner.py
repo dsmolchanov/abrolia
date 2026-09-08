@@ -98,8 +98,10 @@ class DesiredSpecPlanner:
         provider_kind = str(
             email_public.get("provider", email_public.get("mode", "synthetic"))
         )
+        whatsapp_enabled = not whatsapp_selection or whatsapp_selection.get("kind") != "disabled"
         required_purposes = required_consent_purposes(
             provider_kind=provider_kind,
+            whatsapp_enabled=whatsapp_enabled,
             whatsapp_dedicated_number=bool(
                 whatsapp_selection
                 and whatsapp_selection.get("kind") == "dedicated_number"
@@ -306,7 +308,7 @@ class DesiredSpecPlanner:
             ),
             provider_refs={
                 "email": email_result["external_ref"],
-                "whatsapp": whatsapp_result["external_ref"],
+                **({"whatsapp": whatsapp_result["external_ref"]} if whatsapp_enabled else {}),
                 "primary_channel": channel_result["external_ref"],
                 "consent_authority": "control_plane",
             },

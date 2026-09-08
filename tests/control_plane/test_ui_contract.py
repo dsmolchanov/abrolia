@@ -153,7 +153,7 @@ def test_waiting_user_has_check_action_and_verifying_has_checking_copy(api_harne
             ),
         )
     waiting = api_harness.client.get("/onboarding")
-    assert "Complete the synthetic verification, then check again." in waiting.text
+    assert "Complete the connection steps, then check again." in waiting.text
     assert 'action="/onboarding/check/email_identity"' in waiting.text
     assert '<button id="check-step" type="submit">Check again</button>' in waiting.text
     assert "DNS records to add" in waiting.text

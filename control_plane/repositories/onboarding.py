@@ -5,7 +5,8 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from control_plane.db import new_id
+from control_plane.crypto import FieldCipher, LookupHasher
+from control_plane.db import ControlPlaneDatabase, new_id
 from control_plane.models import (
     OnboardingSnapshot,
     StepKind,
@@ -26,6 +27,13 @@ class WorkflowRecord:
 
 
 class OnboardingRepository(Repository):
+    def __init__(
+        self, database: ControlPlaneDatabase, cipher: FieldCipher, lookup: LookupHasher,
+        *, synthetic_only: bool = True,
+    ) -> None:
+        super().__init__(database, cipher, lookup)
+        self.synthetic_only = synthetic_only
+
     def workflow_for_household(self, household_id: str) -> WorkflowRecord:
         row = self.db.query_one(
             "SELECT * FROM onboarding_workflows WHERE household_id = ?",
@@ -92,6 +100,7 @@ class OnboardingRepository(Repository):
             for row in rows
         )
         return OnboardingSnapshot(
+            synthetic_only=self.synthetic_only,
             household_id=household_id,
             workflow_id=workflow.id,
             version=workflow.version,

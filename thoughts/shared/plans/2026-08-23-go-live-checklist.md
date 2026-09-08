@@ -2100,3 +2100,37 @@ an unsettled household and one whose rollout is already in flight.
   `emit_alert` (unknown names raise) and `budget_exceeded` is actually emitted
   now. Proven by three new cases in `tests/test_cost_caps.py`; full non-live
   suite 1475 green, ruff clean, sanitizer clean.
+
+
+### Production web onboarding (owner decision 2026-09-08)
+
+**Branches:** `codex/production-web-onboarding`.
+
+**Files:** `control_plane/models.py`, `control_plane/container.py`,
+`control_plane/onboarding/service.py`, `control_plane/repositories/onboarding.py`,
+`control_plane/provisioning/local_configuration.py`, `control_plane/provisioning/worker.py`,
+`control_plane/privacy/consent.py`, `control_plane/provisioning/planner.py`,
+`control_plane/api/app.py`, `control_plane/api/web.py`,
+`control_plane/web/templates/base.html`, `control_plane/web/templates/start.html`,
+`control_plane/web/templates/onboarding.html`, `control_plane/web/static/onboarding.js`,
+`deploy/control-plane/fly.toml`, `deploy/control-plane/Dockerfile`,
+`tests/control_plane/test_production_onboarding.py`,
+`tests/control_plane/test_real_email_wiring.py`, `tests/control_plane/test_ui_contract.py`,
+`docs/onboarding-runbook.md`.
+
+The owner authorized leaving synthetic mode and testing the live application.
+Production enables family data and uses the existing real Nerve mailbox and Fly
+runtime. Web chat is the supported interactive channel. WhatsApp is explicitly
+unconfigured; Telegram and WhatsApp connection choices are refused at the shared
+selection/retry boundary. The web identity is derived on the server and the
+planner binds its seat to the authenticated household owner. Local configuration
+uses durable workflow results, with restart reconciliation and cancellation;
+it does not fabricate a provider connection or a messenger verification receipt.
+Synthetic provider names remain resolvable only for historical cleanup. Their
+forward operations cannot produce new results in production. Existing household
+data, real resources and infrastructure identifiers are preserved.
+
+Validation: production page/API mode, JS and form selection paths, unsupported
+channel refusal, tenant identity isolation, local completion/reconciliation and
+cancellation, retired provider refusal and cleanup, plus the full non-live suite.
+Deploy after CI; verify the effective environment, public pages and readiness.
