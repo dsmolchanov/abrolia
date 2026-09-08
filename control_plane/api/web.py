@@ -198,6 +198,8 @@ def _selection(
             **household_binding,
         }
     if kind is StepKind.WHATSAPP:
+        if option == "disabled":
+            return {"kind": "disabled"}
         if form.get("privacy_notice_accepted") != "yes":
             raise ValueError("privacy notice acceptance required")
         if option == "shared_abrolia":

@@ -1,3 +1,17 @@
+> **Current production mode — 2026-09-08.** The owner authorized real household
+> use at `https://app.abrolia.com`. Deploy with `ABROLIA_SYNTHETIC_ONLY=0`,
+> `REAL_FAMILY_DATA_ENABLED=1`, `ABROLIA_REAL_EMAIL_ENABLED=1`,
+> `ABROLIA_REAL_EMAIL_ALL_HOUSEHOLDS=1` and `ABROLIA_RUNTIME_PROVIDER=fly-runtime`.
+> Sign-up and magic-link delivery remain enabled. Supported onboarding is a real
+> Nerve assistant inbox, an explicit choice to leave WhatsApp disconnected, and
+> authenticated web chat. Telegram/WhatsApp setup is unavailable; do not enable
+> their real-provider flags. The existing Fly app/org names containing
+> `synthetic` are infrastructure identifiers, not the application's mode.
+> Older synthetic procedures below describe the rehearsal environment only.
+> Production health reports `mode: production`; its UI has no synthetic banner.
+> Tests may still use synthetic fixtures. In production, old synthetic provider
+> names permit cleanup only and cannot provision or reconcile forward work.
+
 # Onboarding control plane runbook
 
 Phase 1 is a synthetic-only staging contour. It is not permission to process

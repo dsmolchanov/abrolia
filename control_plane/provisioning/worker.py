@@ -65,6 +65,7 @@ from control_plane.provisioning.contracts import (
     ProvisionResult,
     SecretSink,
 )
+from control_plane.provisioning.local_configuration import local_configuration_ref
 from control_plane.provisioning.planner import DesiredSpecPlanner
 from control_plane.provisioning.secrets import SecretInstallError
 from control_plane.repositories.configs import ConfigRepository
@@ -1677,6 +1678,8 @@ class ProvisioningWorker:
         `SYNTHETIC_PUBLIC_EMAIL`); an adapter that declares no derivable
         contract still refuses, whichever registry name it sits under.
         """
+        if job.provider == "local-configuration":
+            return local_configuration_ref(job.intent_key)
         if job.kind != "email_identity":
             return None
         identity_id = request.get("email_identity_id")
@@ -2275,6 +2278,18 @@ class ProvisioningWorker:
                     job, request, "outcome_unknown", "reconcile_inconclusive"
                 )
             return WorkResult(job.id, "outcome_unknown", "reconcile_inconclusive")
+        if job.provider == "local-configuration" and job.kind in {"whatsapp_identity", "channel_binding"}:
+            if self._is_shutdown_action(job):
+                return self._shutdown_probe(job, request)
+            try:
+                result = provider.reconcile(request, job.intent_key)
+                if self._superseded(self.jobs.get(job.id)):
+                    return self._cleanup_cancelled_result(job, result, provider)
+                return self._finish_step(job, request, result)
+            except _ProjectionCancelled:
+                return self._cleanup_cancelled_result(job, result, provider)
+            except ProviderRejected as error:
+                return self._mark_step_problem(job, request, "failed", error.code)
         if job.kind == "email_identity":
             reconcile_email = getattr(provider, "reconcile", None)
             if not callable(reconcile_email):
@@ -3425,6 +3440,8 @@ class ProvisioningWorker:
                     " WHERE id = ?",
                     (self.clock(), request["resource_id"]),
                 )
+            if job.provider == "local-configuration":
+                self._settle_cancelled_parent(connection, request.get("parent_job_id"))
             if (
                 request.get("resource_type") == "email_identity"
                 and self.email_identities is not None

@@ -101,7 +101,7 @@
         {{ household_consent_fields("abrolia_managed") }}
         <button class="card recommended" data-select="email_identity" data-kind="abrolia_managed">
           <span class="badge">Recommended</span> <strong>@abrolia.com</strong>
-          <span>Managed assistant inbox with a synthetic pilot identity.</span>
+          <span>{{ "Managed assistant inbox with a synthetic pilot identity." if synthetic_only else "Your assistant’s email address for receiving and sending family correspondence." }}</span>
           <span class="card-cta">Continue with @abrolia.com →</span>
         </button>
       </form>
@@ -143,7 +143,14 @@
   </section>
 
   <section class="choice-step" data-step="whatsapp_identity"{% if snapshot.state.value != 'in_progress' or snapshot.current_step.value != 'whatsapp_identity' %} hidden{% endif %}>
-    <h2>2. WhatsApp identity</h2>
+    <h2>2. Messaging</h2>
+    {% if not synthetic_only %}
+    <p>You can talk to your assistant here in Abrolia. WhatsApp is not available yet.</p>
+    <form method="post" action="/onboarding/select/whatsapp_identity">
+      {{ command_fields() }}<input type="hidden" name="kind" value="disabled">
+      <button data-select="whatsapp_identity" data-kind="disabled">Continue without WhatsApp →</button>
+    </form>
+    {% else %}
     <div class="cards two">
       <form method="post" action="/onboarding/select/whatsapp_identity">
         {{ command_fields() }}<input type="hidden" name="kind" value="shared_abrolia">
@@ -165,17 +172,18 @@
         </button>
       </form>
     </div>
+    {% endif %}
   </section>
 
   <section class="choice-step" data-step="primary_channel"{% if snapshot.state.value != 'in_progress' or snapshot.current_step.value != 'primary_channel' %} hidden{% endif %}>
     <h2>3. Communication</h2>
     <div class="cards">
-      {% for channel, label, recommended in [('telegram', 'Telegram', true), ('whatsapp', 'WhatsApp', false), ('web', 'Web', false)] %}
+      {% for channel, label, recommended in ([('telegram', 'Telegram', true), ('whatsapp', 'WhatsApp', false), ('web', 'Web', false)] if synthetic_only else [('web', 'Web chat', true)]) %}
       <form method="post" action="/onboarding/select/primary_channel">
         {{ command_fields() }}<input type="hidden" name="kind" value="{{ channel }}">
         <button class="card{% if recommended %} recommended{% endif %}" data-select="primary_channel" data-kind="{{ channel }}">
           {% if recommended %}<span class="badge">Recommended</span>{% endif %}<strong>{{ label }}</strong>
-          <span>{% if channel == 'telegram' %}Bind a verified synthetic chat.{% elif channel == 'whatsapp' %}Use the verified WhatsApp identity above.{% else %}Minimal first-party web channel binding.{% endif %}</span>
+          <span>{% if channel == 'telegram' %}Bind a verified synthetic chat.{% elif channel == 'whatsapp' %}Use the verified WhatsApp identity above.{% else %}Talk to your assistant securely in this browser.{% endif %}</span>
           <span class="card-cta">Continue with {{ label }} →</span>
         </button>
       </form>
@@ -193,19 +201,19 @@
   <section class="status-panel" aria-live="polite">
     {% if snapshot.state.value == 'runtime_provisioning' %}
       <h2 id="status-title">Preparing your private runtime</h2>
-      <p id="status-copy">The durable worker is creating the synthetic runtime and immutable configuration.</p>
+      <p id="status-copy">We are preparing your private assistant.</p>
     {% elif snapshot.state.value == 'activating' %}
       <h2 id="status-title">Activating your runtime</h2>
       <p id="status-copy">Waiting for the runtime to acknowledge the exact configuration revision.</p>
     {% elif snapshot.state.value == 'complete' %}
       <h2 id="status-title">Setup complete</h2>
-      <p id="status-copy">Your synthetic household runtime is active.</p>
+      <p id="status-copy">Your assistant is ready.</p>
     {% elif snapshot.state.value == 'cancelled' %}
       <h2 id="status-title">Setup cancelled</h2>
       <p id="status-copy">No new onboarding work will be started.</p>
     {% elif current.status == 'waiting_user' %}
       <h2 id="status-title">Waiting for you</h2>
-      <p id="status-copy">Complete the synthetic verification, then check again. For a family domain, add the displayed DNS records; the same records remain available after reload.</p>
+      <p id="status-copy">Complete the connection steps, then check again. For a family domain, add the displayed DNS records; the same records remain available after reload.</p>
     {% elif current.status == 'verifying' %}
       <h2 id="status-title">Checking verification</h2>
       <p id="status-copy">The durable worker is inspecting the existing provider result.</p>

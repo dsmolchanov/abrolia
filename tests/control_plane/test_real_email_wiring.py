@@ -64,6 +64,7 @@ def test_production_container_registers_real_nerve_providers_fail_closed(
             "fake-email": "configured",
             "fake-whatsapp": "configured",
             "google-oauth": "configured",
+            "local-configuration": "configured",
             "nerve-byo-domain": "configured",
             "nerve-managed": "configured",
         }

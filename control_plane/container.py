@@ -38,6 +38,10 @@ from control_plane.providers.email.google_oauth import (
 )
 from control_plane.provisioning.bootstrap import BootstrapService
 from control_plane.provisioning.fakes import synthetic_provider_registry
+from control_plane.provisioning.local_configuration import (
+    LocalConfigurationProvisioner,
+    production_provider_registry,
+)
 from control_plane.provisioning.planner import DesiredSpecPlanner
 from control_plane.provisioning.runtime_health import RuntimeReadinessMonitor
 from control_plane.provisioning.secrets import FlySecretSink, InMemorySecretSink
@@ -121,7 +125,9 @@ class ControlPlaneContainer:
         accounts = AccountsRepository(database, cipher, lookup)
         auth = AuthRepository(database, cipher, lookup, token_hasher)
         households = HouseholdsRepository(database, cipher, lookup)
-        onboarding_repository = OnboardingRepository(database, cipher, lookup)
+        onboarding_repository = OnboardingRepository(
+            database, cipher, lookup, synthetic_only=config.synthetic_only
+        )
         jobs = JobsRepository(database, cipher, lookup)
         configs = ConfigRepository(database, cipher, lookup, token_hasher)
         bindings = ChannelBindingsRepository(
@@ -160,7 +166,10 @@ class ControlPlaneContainer:
         )
         household_service = HouseholdService(households)
         rate_limiter = RateLimiter(database, lookup)
-        providers = synthetic_provider_registry()
+        providers = (
+            synthetic_provider_registry() if config.synthetic_only else production_provider_registry()
+        )
+        providers.register("local-configuration", LocalConfigurationProvisioner())
         fly_provider = None
         if config.runtime_provider == "fly-runtime":
             from control_plane.provisioning.fly import FlyRuntimeProvisioner
@@ -230,6 +239,7 @@ class ControlPlaneContainer:
             households,
             onboarding_repository,
             jobs,
+            synthetic_only=config.synthetic_only,
             runtime_provider=config.runtime_provider,
             gmail_provider="google-oauth",
             email_provider=email_provider,

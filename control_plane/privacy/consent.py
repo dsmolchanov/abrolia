@@ -163,15 +163,17 @@ def processes_real_household_content(provider_kind: str | None) -> bool:
 
 
 def required_consent_purposes(
-    *, provider_kind: str | None, whatsapp_dedicated_number: bool
+    *, provider_kind: str | None, whatsapp_dedicated_number: bool, whatsapp_enabled: bool = True
 ) -> list[str]:
     """The authoritative purpose set a household must hold, in manifest order.
 
     The single place that answers "which consents does this household owe?", so
     the planner's manifest and the boundaries that re-check it cannot disagree.
     """
-    purposes = [CONTENT_RESTRICTION_PURPOSE, "whatsapp_channel_privacy"]
-    if whatsapp_dedicated_number:
+    purposes = [CONTENT_RESTRICTION_PURPOSE]
+    if whatsapp_enabled:
+        purposes.append("whatsapp_channel_privacy")
+    if whatsapp_enabled and whatsapp_dedicated_number:
         purposes.append("whatsapp_linked_device_risk")
     if processes_real_household_content(provider_kind):
         purposes.append(HOUSEHOLD_CONTENT_PURPOSE)
