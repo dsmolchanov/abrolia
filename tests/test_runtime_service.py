@@ -16,6 +16,7 @@ import pytest
 from control_plane.privacy.consent import consent_version_and_sha
 from hermes_cloud.core.db import open_database
 from hermes_cloud.core.runtime_manifest import compute_config_sha256, parse_runtime_manifest
+from hermes_cloud.runtime import bootstrap as runtime_bootstrap_module
 from hermes_cloud.runtime import service as runtime_service_module
 from hermes_cloud.runtime.bootstrap import (
     ActivationState,
@@ -42,6 +43,7 @@ _HOUSEHOLD_VERSION, _HOUSEHOLD_SHA = consent_version_and_sha(
 
 def manifest_toml(
     *,
+    revision: int = 4,
     with_email_binding: bool = False,
     email_provider: str = "nerve-managed",
     with_content_restriction: bool = True,
@@ -117,6 +119,7 @@ purpose = "special_category_household_content"
 text_version = "{_HOUSEHOLD_VERSION}"
 text_sha256 = "{_HOUSEHOLD_SHA}"
 """
+    body = body.replace("config_revision = 4", f"config_revision = {revision}")
     digest = compute_config_sha256(body)
     return body.replace("schema_version = 1\n", f'schema_version = 1\nconfig_sha256 = "{digest}"\n')
 
@@ -218,6 +221,125 @@ def test_bootstrap_atomically_activates_matching_manifest(tmp_path: Path) -> Non
     assert client.claims == 1
     assert len(client.activations) == 1
     assert len(client.acknowledgements) == 2
+
+
+@pytest.fixture
+def active_rollout(tmp_path: Path):
+    paths = {
+        "manifest_path": tmp_path / "household.toml",
+        "activation_path": tmp_path / "activation.json",
+    }
+    old = FakeBootstrapClient(manifest_toml(revision=1))
+    RuntimeBootstrapper(old, runtime_ref=RUNTIME_REF, **_binding(old), **paths, env={}).run(TOKEN)
+
+    def target(revision=2):
+        client = FakeBootstrapClient(manifest_toml(revision=revision))
+        env = {
+            "HERMES_HOUSEHOLD_ID": client.manifest.household_id,
+            "HERMES_CONFIG_REVISION": str(revision),
+            "HERMES_CONFIG_SHA256": client.manifest.config_sha256,
+        }
+        bootstrapper = RuntimeBootstrapper(client, runtime_ref=RUNTIME_REF, **paths, env=env)
+        service = RuntimeService(runtime_ref=RUNTIME_REF, **paths, env=env)
+        return client, bootstrapper, service
+
+    return target
+
+
+@pytest.mark.parametrize("revision", [2, 3])
+@pytest.mark.parametrize("old_status", ["active", "activating"])
+def test_runtime_rolls_forward_to_desired_revision(active_rollout, revision, old_status) -> None:
+    client, bootstrapper, service = active_rollout(revision)
+    state = load_activation_state(bootstrapper.activation_path)
+    write_activation_state(
+        bootstrapper.activation_path,
+        ActivationState(**{**state.__dict__, "status": old_status}),
+    )
+    assert service.readyz().status_code == 503
+    assert not service.can_start_workers
+    manifest = bootstrapper.run(TOKEN)
+    assert manifest.config_sha256 == client.manifest.config_sha256
+    assert service.readyz().status_code == 200
+    assert service.require_ready().config_revision == revision
+    assert client.claims == 1
+    assert [r.config_revision for r in client.activations] == [revision]
+    assert [r.config_revision for r in client.acknowledgements] == [revision]
+    assert load_activation_state(bootstrapper.activation_path).config_revision == revision
+    assert bootstrapper.run("") == manifest
+    assert bootstrapper.run(TOKEN) == manifest
+    assert client.claims == 1
+    service.close()
+
+
+@pytest.mark.parametrize("failure", ["token", "claim", "manifest", "activating", "activate", "active", "acknowledge"])
+def test_rollout_resumes_each_interrupted_boundary(active_rollout, monkeypatch, failure) -> None:
+    client, bootstrapper, service = active_rollout()
+    before = (bootstrapper.manifest_path.read_bytes(), bootstrapper.activation_path.read_bytes())
+
+    def interrupted(*args, **kwargs):
+        raise OSError("synthetic interruption")
+
+    with monkeypatch.context() as patch:
+        if failure in {"claim", "activate", "acknowledge"}:
+            patch.setattr(client, failure, interrupted)
+        elif failure == "manifest":
+            patch.setattr(runtime_bootstrap_module, "atomic_write", interrupted)
+        elif failure in {"activating", "active"}:
+            write = runtime_bootstrap_module.write_activation_state
+
+            def interrupt_state(path, state):
+                if state.status == failure:
+                    interrupted()
+                write(path, state)
+
+            patch.setattr(runtime_bootstrap_module, "write_activation_state", interrupt_state)
+        with pytest.raises((BootstrapError, OSError)):
+            bootstrapper.run("" if failure == "token" else TOKEN)
+
+    if failure in {"token", "claim", "manifest"}:
+        assert (bootstrapper.manifest_path.read_bytes(), bootstrapper.activation_path.read_bytes()) == before
+    if failure != "acknowledge":
+        assert service.readyz().status_code == 503
+        assert not service.can_start_workers
+    # A new process must recover from the durable files, including the window
+    # where the manifest is new and the activation receipt still names N.
+    restarted = RuntimeBootstrapper(
+        client,
+        runtime_ref=RUNTIME_REF,
+        manifest_path=bootstrapper.manifest_path,
+        activation_path=bootstrapper.activation_path,
+        env=bootstrapper.env,
+    )
+    assert restarted.run(TOKEN).config_sha256 == client.manifest.config_sha256
+    assert service.readyz().status_code == 200
+    assert [r.config_revision for r in client.activations] == ([2, 2] if failure == "active" else [2])
+    assert [r.config_revision for r in client.acknowledgements] == [2]
+    service.close()
+
+
+@pytest.mark.parametrize("change", ["household_id", "runtime_ref", "status", "downgrade", "same_revision_hash"])
+def test_rollout_rejects_invalid_durable_binding(active_rollout, change) -> None:
+    client, bootstrapper, service = active_rollout()
+    state = load_activation_state(bootstrapper.activation_path)
+    changes = {
+        "household_id": {"household_id": "another-household"},
+        "runtime_ref": {"runtime_ref": "fly:another-runtime"},
+        "status": {"status": "unsupported"},
+        "downgrade": {"config_revision": 3},
+        "same_revision_hash": {"config_revision": 2, "config_sha256": "0" * 64},
+    }
+    write_activation_state(
+        bootstrapper.activation_path,
+        ActivationState(**{**state.__dict__, **changes[change]}),
+    )
+    before = (bootstrapper.manifest_path.read_bytes(), bootstrapper.activation_path.read_bytes())
+    with pytest.raises(BootstrapError):
+        bootstrapper.run(TOKEN)
+    assert client.claims == 0
+    assert client.activations == client.acknowledgements == []
+    assert (bootstrapper.manifest_path.read_bytes(), bootstrapper.activation_path.read_bytes()) == before
+    assert service.readyz().status_code == 503
+    service.close()
 
 
 def test_activating_state_resumes_activate_without_second_claim(tmp_path: Path) -> None:

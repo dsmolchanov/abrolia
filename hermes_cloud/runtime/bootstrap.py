@@ -442,8 +442,23 @@ class RuntimeBootstrapper:
         state = load_activation_state(self.activation_path)
         if state is not None and state.runtime_ref != self.runtime_ref:
             raise BootstrapError("activation state belongs to another runtime")
+        if state is not None:
+            if self.household_id and state.household_id != self.household_id:
+                raise BootstrapError("activation state belongs to another household")
+            if state.status not in {"active", "activating"}:
+                raise BootstrapError("activation state has an unsupported status")
+            if self.config_revision and self.config_revision < state.config_revision:
+                raise BootstrapError("desired revision is older than activation state")
 
-        if state is not None and self.manifest_path.is_file():
+        # A receipt for N cannot be acknowledged with N+1's token. Claim the
+        # desired revision before loading the installed manifest: the latter is
+        # intentionally incompatible with the new environment's revision/hash.
+        # This also recovers a crash after replacing the manifest but before
+        # persisting its activating receipt. Claim is repeatable until activate;
+        # once activate may have run, the durable receipt already names N+1 and
+        # the same-revision branch below resumes it without another claim.
+        advancing = state is not None and self.config_revision > state.config_revision
+        if state is not None and not advancing and self.manifest_path.is_file():
             manifest = self._load_installed()
             if not state_matches_manifest(state, manifest):
                 raise BootstrapError("activation state does not match installed manifest")

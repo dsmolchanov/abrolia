@@ -21,6 +21,7 @@ from control_plane.provisioning.bootstrap import (
     BootstrapGone,
 )
 from hermes_cloud.runtime import bootstrap as runtime_bootstrap_module
+from hermes_cloud.runtime import service as runtime_service_module
 from hermes_cloud.runtime.bootstrap import (
     BootstrapError,
     BootstrapOutcomeUnknown,
@@ -656,6 +657,84 @@ def test_crash_after_activate_response_cannot_delete_secret_before_local_receipt
         "SELECT * FROM provisioning_jobs WHERE kind = 'bootstrap_cleanup'"
     )
     assert cleanup is not None and cleanup["status"] == "pending"
+
+
+@pytest.mark.parametrize("lose_activation_response", [False, True])
+def test_active_runtime_executes_rollout_through_bootstrap_api(
+    api_harness, tmp_path: Path, monkeypatch, lose_activation_response: bool,
+) -> None:
+    from control_plane.provisioning.rollout import schedule_runtime_rollout
+
+    runtime = _provision_runtime(api_harness)
+    active = api_harness.container
+    calls = []
+    lose_response = False
+
+    def transport(url, *, data, headers, timeout):
+        nonlocal lose_response
+        path = urlparse(url).path
+        calls.append((path, json.loads(data)["config_revision"]))
+        response = api_harness.client.post(path, content=data, headers=dict(headers))
+        if lose_response and path.endswith("/activate"):
+            lose_response = False
+            assert response.status_code == 200
+            raise urllib.error.URLError("synthetic response loss")
+        return response.status_code, response.content
+
+    client = ControlPlaneBootstrapClient(api_harness.config.public_origin, transport=transport)
+    monkeypatch.setattr(runtime_service_module, "ControlPlaneBootstrapClient", lambda _url: client)
+    paths = {"manifest_path": tmp_path / "household.toml", "activation_path": tmp_path / "activation.json"}
+    env = {
+        "HERMES_HOUSEHOLD_ID": runtime.world.household.id,
+        "HERMES_RUNTIME_REF": runtime.runtime_ref,
+        "HERMES_CONTROL_PLANE_URL": api_harness.config.public_origin,
+        "HERMES_BOOTSTRAP_TOKEN": runtime.raw_token,
+        "HERMES_CONFIG_REVISION": str(runtime.revision),
+        "HERMES_CONFIG_SHA256": runtime.manifest_sha256,
+    }
+    service = RuntimeService(**paths, env=env)
+    runtime_service_module.bootstrap_from_environment(service, env=env)
+    assert service.readyz().status_code == 200
+    service.close()
+    cleanup = active.worker.run_once()
+    assert cleanup is not None and cleanup.status == "succeeded"
+
+    with active.database.write() as connection:
+        planned = active.planner.issue(connection, household_id=runtime.world.household.id)
+        job_id = schedule_runtime_rollout(
+            connection,
+            jobs=active.jobs,
+            onboarding=active.onboarding_repository,
+            household_id=runtime.world.household.id,
+            planned=planned,
+            runtime_provider=active.config.runtime_provider,
+        )
+    rollout = active.worker.run_once()
+    assert rollout is not None and rollout.error_code == "awaiting_activation"
+    raw = active.secret_sink.get(runtime.runtime_ref, "HERMES_BOOTSTRAP_TOKEN")
+    assert raw is not None
+    env.update(
+        HERMES_BOOTSTRAP_TOKEN=raw.decode("ascii"),
+        HERMES_CONFIG_REVISION=str(planned.revision.revision),
+        HERMES_CONFIG_SHA256=planned.spec.config_sha256,
+    )
+    calls.clear()
+    service = RuntimeService(**paths, env=env)
+    assert service.readyz().status_code == 503
+    lose_response = lose_activation_response
+    if lose_activation_response:
+        with pytest.raises(BootstrapOutcomeUnknown):
+            runtime_service_module.bootstrap_from_environment(service, env=env)
+        assert service.readyz().status_code == 503
+    installed = runtime_service_module.bootstrap_from_environment(service, env=env)
+    assert installed.config_revision == planned.revision.revision
+    assert service.readyz().status_code == 200
+    assert active.jobs.get(job_id).status == "succeeded"
+    assert active.households.get(runtime.world.household.id).status == "active"
+    assert {revision for _path, revision in calls} == {planned.revision.revision}
+    assert sum(path.endswith("/claim") for path, _revision in calls) == 1
+    assert load_activation_state(paths["activation_path"]).config_revision == planned.revision.revision
+    service.close()
 
 
 def test_a_member_rollout_activates_the_revision_without_rewriting_onboarding(
