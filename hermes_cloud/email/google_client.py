@@ -256,8 +256,14 @@ class GmailHttpClient:
     def message(self, message_id: str) -> dict[str, Any]:
         return self._request("GET", f"/messages/{message_id}", params={"format": "raw"})
 
-    def list_inbox(self, page_token: str | None = None, *, max_results: int) -> dict[str, Any]:
-        params: dict[str, Any] = {"labelIds": "INBOX", "maxResults": max_results}
+    def list_inbox(
+        self, page_token: str | None = None, *, max_results: int, query: str
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {
+            "labelIds": "INBOX",
+            "maxResults": max_results,
+            "q": query,
+        }
         if page_token:
             params["pageToken"] = page_token
         return self._request("GET", "/messages", params=params)
