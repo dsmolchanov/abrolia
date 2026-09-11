@@ -31,14 +31,20 @@ list still reaches green only through a counted clean signal.
 
 ## Files
 
-- `.github/workflows/codex-review-window.yml` — gate stub: re-synced byte for
-  byte from the dev-agent fleet template at the new pin. The only change outside
-  comments is the pin; the comments now describe the revision the stub pins.
-- `.github/workflows/codex-verdict-waker.yml` — waker stub: re-synced the same
-  way, in lockstep. The gate's short window and the waker's re-entry are two
-  halves of one protocol and must name the same revision.
-- `thoughts/shared/plans/2026-09-11-gate-v36-clean-verdict-retraction.md.md` — this plan (an applicable plan must list
-  itself).
+**Files:** `.github/workflows/codex-verdict-waker.yml`, `.github/workflows/codex-review-window.yml`, `thoughts/shared/plans/2026-09-11-gate-v36-clean-verdict-retraction.md`.
+
+**Branches:** `chore/gate-pin-v36-clean-verdict-retraction`.
+
+| File | Change |
+| --- | --- |
+| `.github/workflows/codex-verdict-waker.yml` | waker stub, re-synced byte for byte from the dev-agent fleet template at the new pin |
+| `.github/workflows/codex-review-window.yml` | gate stub, re-synced the same way |
+| `thoughts/shared/plans/2026-09-11-gate-v36-clean-verdict-retraction.md` | this plan (an applicable plan must list itself) |
+
+Both stubs move in lockstep: the gate's short window and the waker's re-entry
+are two halves of one protocol and must name the same revision. Outside comments
+the only change is the pin; the gate stub's comment now describes the revision
+it pins, at the same 79 lines (the template's ceiling is `< 80`).
 
 ## Verification
 
