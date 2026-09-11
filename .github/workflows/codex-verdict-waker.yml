@@ -69,7 +69,7 @@ jobs:
       # pull request. Exactly one is ever set.
       group: codex-verdict-waker-${{ github.event.issue.number || github.event.pull_request.number }}
       cancel-in-progress: true
-    uses: dsmolchanov/codex-review-gate/.github/workflows/codex-verdict-waker.yml@4d05f6909650381037fee2cfed40c6a5cab591af
+    uses: dsmolchanov/codex-review-gate/.github/workflows/codex-verdict-waker.yml@dbd0d8429c58ec2a444597ae1a08419fa962c163
     permissions:
       # A called workflow's permissions cannot exceed its caller's, so the
       # re-run scope has to be granted here. Nothing else: the waker decides

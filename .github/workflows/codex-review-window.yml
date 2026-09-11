@@ -40,25 +40,25 @@ jobs:
     # whatever that ref resolves to. A tag is mutable: retagging `v1` — by
     # compromise or by accident — would silently change the code holding those
     # secrets in every consumer at once, with no diff anywhere to review.
-    # The SHA below pins gate revision 4d05f69 (codex-review-gate#15, atop the
-    # per-finding review debt of #10): on a degraded round the gate files one
-    # issue per deferred finding, and the finding's identity comes from
-    # scripts/review_debt.py in the gate repository, fetched at this pinned
-    # revision (job.workflow_sha), fail-soft — never a moving ref. The gate waits
-    # 120s for a verdict only where an ACTIVE waker with an `issue_comment`
-    # trigger exists on the default branch — the probe reads the trigger, not
-    # the workflow's name, because a `workflow_call` host is `active` too and
-    # can wake nothing — and keeps 900s otherwise. A verdict arriving later
-    # re-enters the gate instead of being caught by an in-run poll: a formal
-    # review through the gate's own `pull_request_review` trigger (the waker
-    # then drains the stale failed run that re-entry leaves behind), a
+    # The SHA below pins gate revision dbd0d84 (codex-review-gate#16, atop the
+    # review-debt identity of #15): a head-bound clean verdict — the verbatim
+    # "Didn't find any major issues." summary naming this head — RETRACTS the
+    # findings of every head-bound verdict on that head STRICTLY OLDER than it,
+    # so a finding Codex has taken back no longer holds the merge with no
+    # escape but a new commit. Same sentence that already releases a review-less
+    # head; no marker, no label, no human action. An unreadable timestamp or a
+    # tie retracts nothing; a review published AFTER the clean signal still
+    # decides. The gate waits 120s for a verdict only where an ACTIVE waker with
+    # an `issue_comment` trigger exists on the default branch, 900s otherwise,
+    # and a verdict arriving later re-enters it rather than being caught by an
+    # in-run poll: a formal review through the gate's own `pull_request_review`
+    # trigger (the waker then drains the stale failed run re-entry leaves), a
     # clean-summary comment through the codex-verdict-waker stub INSTALLED
     # ALONGSIDE THIS FILE. The two stubs are two halves of one protocol:
-    # bumping this pin without the waker (or vice versa) leaves clean PRs red
-    # until a human re-runs the gate. Keep both pins in lockstep. To move the
-    # pin, read the host diff first, then change this line: the bump is the
-    # review.
-    uses: dsmolchanov/codex-review-gate/.github/workflows/codex-review-window.yml@4d05f6909650381037fee2cfed40c6a5cab591af
+    # bumping this pin without the waker leaves clean PRs red until a human
+    # re-runs the gate. Keep both pins in lockstep. To move the pin, read the
+    # host diff first, then change this line: the bump is the review.
+    uses: dsmolchanov/codex-review-gate/.github/workflows/codex-review-window.yml@dbd0d8429c58ec2a444597ae1a08419fa962c163
     permissions:
       # actions:read is for the gate's waker probe — it reads the waker
       # workflow's state to size its verdict window; a called workflow's
