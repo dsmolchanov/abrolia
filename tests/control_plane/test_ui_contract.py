@@ -735,3 +735,100 @@ def test_the_art9_statement_appears_iff_a_rendered_form_asks_for_it(
         # visible copy — a hidden field naming a statement the page did not
         # show is the same defect wearing a different hat.
         assert f'value="{sha256}"' not in html
+
+
+def test_a_gmail_step_that_can_no_longer_connect_offers_a_way_out(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The class: never present an onboarding action provider policy will reject.
+
+    Gmail selected while the account was a test user persists as
+    `oauth_required`. Once the operator drops the account from the list and the
+    deployment restarts, the start endpoint refuses it — so the page must not
+    offer "Continue with Google", and the family must still be able to change
+    the pending email step and finish with another option.
+    """
+    from dataclasses import replace
+
+    from fastapi.testclient import TestClient
+
+    from control_plane.api.app import create_app
+    from control_plane.auth.mailer import MemoryMailer
+    from control_plane.config import ControlPlaneConfig
+    from control_plane.container import ControlPlaneContainer
+    from tests.control_plane.conftest import APIHarness
+
+    monkeypatch.setenv("ABROLIA_GMAIL_ENABLED", "1")
+    email = "stranded-owner@family.test"
+
+    def deployment(test_users: tuple[str, ...]):
+        config = replace(
+            ControlPlaneConfig.for_test(tmp_path),
+            google_oauth_client_id="synthetic-client.apps.example.test",
+            google_oauth_client_secret="synthetic-client-secret",
+            google_oauth_test_users=test_users,
+        )
+        return config, ControlPlaneContainer.build(config, mailer=MemoryMailer())
+
+    def version(active, household_id: str) -> str:
+        return str(active.onboarding_repository.snapshot(household_id).version)
+
+    config, active = deployment((email,))
+    with active, TestClient(create_app(active_container=active), base_url=config.public_origin) as client:
+        harness = APIHarness(config, active, MemoryMailer(), client)
+        world = harness.create_principal(email)
+        harness.authenticate(world)
+        origin = harness.mutation_headers
+        assert client.post("/onboarding/profile", headers=origin, follow_redirects=False, data={
+            "csrf_token": world.session.csrf_token, "idempotency_key": "stranded-profile",
+            "version": "0", "first_name": "Test", "last_name": "Family",
+            "family_language": "en", "timezone": "Europe/Prague", "country_code": "DE",
+            "residency_mode": "eu-app",
+        }).headers["location"] == "/onboarding"
+        assert active.worker.run_once().status == "succeeded"
+        assert client.post("/onboarding/select/email_identity", headers=origin, follow_redirects=False, data={
+            "csrf_token": world.session.csrf_token, "idempotency_key": "stranded-gmail",
+            "version": version(active, world.household.id), "kind": "gmail_agent",
+            "special_category_restriction_acknowledged": "yes",
+            **_restriction_form_binding(), **_household_form_binding(),
+        }).headers["location"] == "/onboarding"
+        assert active.worker.run_once().status == "waiting_user"
+        eligible = client.get("/onboarding").text
+        assert '<button id="google-connect" type="button">' in eligible
+
+    config, active = deployment(("someone-else@family.test",))
+    with active, TestClient(create_app(active_container=active), base_url=config.public_origin) as client:
+        harness = APIHarness(config, active, MemoryMailer(), client)
+        harness.authenticate(world)
+        origin = harness.mutation_headers
+        page = client.get("/onboarding").text
+        assert '<button id="google-connect" type="button" hidden>' in page
+        assert '<p id="google-unavailable">' in page
+        assert 'id="reset-pending-email" type="submit" class="secondary" data-reset="email_identity">' in page
+        # The polling render must keep the same answer, not re-show the button.
+        script = client.get("/static/onboarding.js").text
+        assert 'googlePanel.dataset.gmailConnectAllowed === "true"' in script
+        assert '|| callbackConfirmed || !connectAllowed;' in script
+        assert 'current?.kind !== "email_identity" || current?.status !== "waiting_user"' in script
+
+        reset = client.post("/onboarding/reset/email_identity", headers=origin, follow_redirects=False, data={
+            "csrf_token": world.session.csrf_token, "idempotency_key": "stranded-reset",
+            "version": version(active, world.household.id),
+        })
+        assert reset.headers["location"] == "/onboarding"
+        after = client.get("/onboarding").text
+        assert 'data-kind="gmail_agent"' not in after
+        # The reset queues cleanup of the pending Gmail identity; the serving
+        # worker settles it before a new email identity may be selected.
+        cleanup = [getattr(active.worker.run_once(), "status", None) for _ in range(5)]
+        assert "succeeded" in cleanup, cleanup
+        assert client.post("/onboarding/select/email_identity", headers=origin, follow_redirects=False, data={
+            "csrf_token": world.session.csrf_token, "idempotency_key": "stranded-managed",
+            "version": version(active, world.household.id), "kind": "abrolia_managed",
+            "local_part": "stranded-agent", "special_category_restriction_acknowledged": "yes",
+            **_restriction_form_binding(),
+        }).headers["location"] == "/onboarding"
+        assert active.worker.run_once().status == "succeeded"
+        snapshot = active.onboarding_repository.snapshot(world.household.id)
+        email_step = next(step for step in snapshot.steps if step.kind.value == "email_identity")
+        assert email_step.status.value == "verified"
