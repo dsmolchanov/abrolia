@@ -138,6 +138,44 @@ def test_an_enabled_email_option_is_admitted(cp_stack, monkeypatch, option) -> N
     assert queued, "an enabled option queued nothing"
 
 
+@pytest.mark.parametrize(
+    "option, provider",
+    [("family_domain", "nerve-byo-domain"), ("gmail_agent", "google-oauth")],
+)
+def test_production_offers_an_enabled_option_on_its_real_provider(
+    cp_stack, monkeypatch, option, provider
+) -> None:
+    """Production mode narrows WhatsApp and the channel, not the email step.
+
+    `fly.toml` turns both options on in production, so the production guard in
+    `OnboardingService` must admit them and route each to the real provider —
+    not to a retired synthetic one that refuses forward work.
+    """
+    monkeypatch.setenv(GATED[option][0], "1")
+    cp_stack.complete_profile()
+    cp_stack.service.synthetic_only = False
+    cp_stack.service.real_email_enabled = True
+    cp_stack.service.real_email_all_households = True
+    cp_stack.service.byo_domain_provider = "nerve-byo-domain"
+    cp_stack.service.gmail_provider = "google-oauth"
+    assert cp_stack.service.email_option_offered(option)
+    _hold_the_content_restriction(cp_stack, now=1_760_000_000.0)
+
+    cp_stack.service.select(
+        cp_stack.household.id,
+        StepKind.EMAIL,
+        _selection(option),
+        context=cp_stack.context(),
+    )
+
+    queued = cp_stack.database.query(
+        "SELECT provider FROM provisioning_jobs WHERE household_id = ?"
+        " AND kind = 'email_identity'",
+        (cp_stack.household.id,),
+    )
+    assert [row["provider"] for row in queued] == [provider]
+
+
 def test_the_managed_option_is_not_gated(cp_stack, monkeypatch) -> None:
     """Deliberate, and worth pinning so the omission is not read as a miss.
 

@@ -3,8 +3,20 @@
 > `REAL_FAMILY_DATA_ENABLED=1`, `ABROLIA_REAL_EMAIL_ENABLED=1`,
 > `ABROLIA_REAL_EMAIL_ALL_HOUSEHOLDS=1` and `ABROLIA_RUNTIME_PROVIDER=fly-runtime`.
 > Sign-up and magic-link delivery remain enabled. Supported onboarding is a real
-> Nerve assistant inbox, an explicit choice to leave WhatsApp disconnected, and
-> authenticated web chat. Telegram/WhatsApp setup is unavailable; do not enable
+> assistant inbox, an explicit choice to leave WhatsApp disconnected, and
+> authenticated web chat.
+>
+> **Email options — 2026-09-13.** The owner also opened
+> `ABROLIA_BYO_EMAIL_ENABLED=1` (family domain via Nerve DNS verify) and
+> `ABROLIA_GMAIL_ENABLED=1` (separate agent Gmail). Gmail connects only for
+> accounts in the `ABROLIA_GOOGLE_OAUTH_TEST_USERS` secret, which must match the
+> test users on the Google OAuth consent screen; everyone else is refused at
+> connect. `ABROLIA_GMAIL_REAL_ENABLED` stays `0` until verification, scope
+> approval, CASA and the Limited Use disclosure exist (see §Gmail operator
+> rollout). The O7 (BYO) and O8 (Gmail) live batteries in
+> `docs/canon-closure-runbook.md` were not run before this opening.
+>
+> Telegram/WhatsApp setup is unavailable; do not enable
 > their real-provider flags. The existing Fly app/org names containing
 > `synthetic` are infrastructure identifiers, not the application's mode.
 > Older synthetic procedures below describe the rehearsal environment only.
