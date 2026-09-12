@@ -18,6 +18,13 @@ primary_region = "ams"
   ABROLIA_SYNTHETIC_ONLY = "0"
   REAL_FAMILY_DATA_ENABLED = "1"
   ABROLIA_REAL_EMAIL_ENABLED = "1"
+  # Owner decision 2026-09-13: offer the family domain and the separate agent
+  # Gmail next to @abrolia.com. Gmail connects only for accounts listed in the
+  # ABROLIA_GOOGLE_OAUTH_TEST_USERS secret: ABROLIA_GMAIL_REAL_ENABLED stays 0
+  # until Google OAuth verification, restricted-scope approval and CASA exist,
+  # and the config refuses to boot with it on before that evidence.
+  ABROLIA_BYO_EMAIL_ENABLED = "1"
+  ABROLIA_GMAIL_ENABLED = "1"
   ABROLIA_REAL_WHATSAPP_ENABLED = "0"
   ABROLIA_REAL_CHANNEL_ENABLED = "0"
   ABROLIA_FLY_ORG = "abrolia-synthetic"

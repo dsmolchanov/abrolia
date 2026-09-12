@@ -247,7 +247,9 @@ def create_app(
                 # and the gate is the enforcement, so the page reads the answer
                 # rather than the flag.
                 "email_option_offered": {
-                    option: active_container.onboarding.email_option_offered(option)
+                    option: active_container.onboarding.email_option_offered(
+                        option, account_id=account.id if account else ""
+                    )
                     for option in EMAIL_SELECTION_KINDS
                 },
                 # The Art. 9(2)(a) statement is shown if and only if some
@@ -263,7 +265,9 @@ def create_app(
                 # on offer, and a consent question is the last place to blur
                 # that.
                 "household_consent_copy_shown": any(
-                    active_container.onboarding.email_option_offered(option)
+                    active_container.onboarding.email_option_offered(
+                        option, account_id=account.id if account else ""
+                    )
                     and active_container.onboarding
                     .email_option_processes_real_content(option)
                     for option in EMAIL_SELECTION_KINDS

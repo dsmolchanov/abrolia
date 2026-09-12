@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -284,8 +284,12 @@ def test_the_calendar_tool_reads_but_never_writes(world) -> None:
     from hermes_cloud.runner.tools import REGISTRY, Services
 
     pipeline, transport, backend = world
+    # Инструмент читает окно от настоящего «сейчас», поэтому событие ставится
+    # относительно него: фиксированный START однажды ушёл в прошлое и уронил тест.
     pipeline.calendar.upsert(
-        build_calendar_event(approval_id="a-1", title="Экскурсия 3b", start=START)
+        build_calendar_event(
+            approval_id="a-1", title="Экскурсия 3b", start=datetime.now(UTC) + timedelta(days=1)
+        )
     )
     services = Services.on(pipeline.approvals.db, calendar=pipeline.calendar)
 

@@ -2134,3 +2134,29 @@ Validation: production page/API mode, JS and form selection paths, unsupported
 channel refusal, tenant identity isolation, local completion/reconciliation and
 cancellation, retired provider refusal and cleanup, plus the full non-live suite.
 Deploy after CI; verify the effective environment, public pages and readiness.
+
+### Production email options: family domain and agent Gmail (owner decision 2026-09-13)
+
+**Branches:** `feat/prod-byo-gmail-flags`.
+
+**Files:** `deploy/control-plane/fly.toml`,
+`deploy/control-plane/required-runtime-config.txt`, `docs/onboarding-runbook.md`,
+`control_plane/config.py`, `control_plane/onboarding/service.py`,
+`control_plane/container.py`, `control_plane/api/app.py`,
+`control_plane/providers/email/google_oauth.py`, `tests/test_gcal.py`,
+`tests/control_plane/conftest.py`,
+`tests/control_plane/test_art9_household_consent.py`,
+`tests/control_plane/test_email_option_flags.py`,
+`tests/control_plane/test_production_onboarding.py`,
+`tests/control_plane/test_required_config.py`.
+
+Production offers the BYO family domain (`ABROLIA_BYO_EMAIL_ENABLED=1`) and the
+separate agent Gmail (`ABROLIA_GMAIL_ENABLED=1`) next to `@abrolia.com`. Real
+Gmail stays off (`ABROLIA_GMAIL_REAL_ENABLED=0`) until OAuth verification, scope
+approval and CASA exist, so Gmail connects only for the test-user list. An
+offered option must be completable: the boot refuses the Gmail switch without
+the OAuth client and, while real Gmail is off, a non-empty test-user list (both
+now in the deploy preflight), and the card and its selection are refused per
+account with the same policy the connect step applies. Also fixes the
+`test_gcal` calendar-tool test, whose fixed event time expired on 2026-09-12.
+The O7 (BYO) and O8 (Gmail) live batteries were not run before this opening.

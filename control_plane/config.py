@@ -60,6 +60,29 @@ def backup_key_from_env(env: dict[str, str] | None = None) -> bytes:
     return _decode_key(encoded, name="ABROLIA_CONTROL_PLANE_BACKUP_KEY")
 
 
+def _require_offered_gmail_completable(
+    config: ControlPlaneConfig, source: dict[str, str]
+) -> None:
+    """An offered Gmail card must be one a family can actually finish.
+
+    `ABROLIA_GMAIL_ENABLED` decides whether the card is rendered and a
+    `google-oauth` job queued, but connecting needs an OAuth client and — while
+    `gmail_real_enabled` is off — an account on the test-user list. Without
+    them `GoogleOAuthService` refuses every start, so the deployment advertised
+    a path nobody could complete. The switch itself stays in `feature_flags`,
+    read at call time; this reads it once, at boot, only to refuse a
+    configuration that could never honour it.
+    """
+    if source.get("ABROLIA_GMAIL_ENABLED", "0").strip() != "1":
+        return
+    if not (config.google_oauth_client_id and config.google_oauth_client_secret):
+        raise ConfigurationError("the Gmail option requires the Google OAuth client")
+    if not config.gmail_real_enabled and not config.google_oauth_test_users:
+        raise ConfigurationError(
+            "the Gmail option requires ABROLIA_GOOGLE_OAUTH_TEST_USERS while real Gmail is off"
+        )
+
+
 def _uuid_set_lenient(value: str) -> tuple[frozenset[str], int]:
     """The canonical UUIDs in a comma-separated list, and how many entries were not.
 
@@ -473,7 +496,9 @@ class ControlPlaneConfig:
                 source.get("ABROLIA_GOOGLE_LIMITED_USE_DISCLOSED", "0") == "1"
             ),
         )
-        return config.validate()
+        config = config.validate()
+        _require_offered_gmail_completable(config, source)
+        return config
 
     @classmethod
     def for_test(cls, root: Path, *, key_byte: int = 7) -> ControlPlaneConfig:

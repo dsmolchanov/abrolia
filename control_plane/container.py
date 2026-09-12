@@ -249,6 +249,7 @@ class ControlPlaneContainer:
             real_email_household_allowlist=config.real_email_household_allowlist,
             real_email_all_households=config.real_email_all_households,
             email_identities=email_identity_service,
+            gmail_account_allowed=google_oauth.account_allowed,
         )
         planner = DesiredSpecPlanner(
             accounts,

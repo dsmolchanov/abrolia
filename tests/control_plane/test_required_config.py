@@ -66,6 +66,13 @@ def _production_env() -> dict[str, str]:
         "ABROLIA_MAGIC_LINK_FROM": "Abrolia <login@example.test>",
         "ABROLIA_RESEND_API_KEY": "re_synthetic",
         "ABROLIA_SELF_SIGNUP_ENABLED": "1",
+        # fly.toml offers the agent Gmail, and an offered card has to be one a
+        # family can finish: the OAuth client and, while real Gmail is off, the
+        # test-user list become required at boot.
+        "ABROLIA_GMAIL_ENABLED": "1",
+        "ABROLIA_GOOGLE_OAUTH_CLIENT_ID": "synthetic-client.apps.example.test",
+        "ABROLIA_GOOGLE_OAUTH_CLIENT_SECRET": "synthetic-client-secret",
+        "ABROLIA_GOOGLE_OAUTH_TEST_USERS": "tester@example.test",
     }
 
 
@@ -88,6 +95,9 @@ BOOT_CONFIG = {
     "ABROLIA_INTERNAL_BOOTSTRAP_HOST",
     "ABROLIA_RESEND_API_KEY",
     "ABROLIA_MAGIC_LINK_FROM",
+    "ABROLIA_GOOGLE_OAUTH_CLIENT_ID",
+    "ABROLIA_GOOGLE_OAUTH_CLIENT_SECRET",
+    "ABROLIA_GOOGLE_OAUTH_TEST_USERS",
 }
 
 #: Proven by a different call, and CONDITIONALLY fatal, which is worse than
@@ -171,3 +181,17 @@ def test_secrets_are_never_carried_in_fly_toml() -> None:
         "ABROLIA_MAGIC_LINK_FROM",
     ):
         assert f"{name} =" not in toml, f"{name} must be a secret, not a fly.toml value"
+
+
+def test_an_unoffered_gmail_option_requires_no_google_configuration() -> None:
+    """The requirement follows the switch, so a deployment that does not offer
+    Gmail is not made to hold OAuth secrets it never uses."""
+    env = _production_env()
+    env["ABROLIA_GMAIL_ENABLED"] = "0"
+    for name in (
+        "ABROLIA_GOOGLE_OAUTH_CLIENT_ID",
+        "ABROLIA_GOOGLE_OAUTH_CLIENT_SECRET",
+        "ABROLIA_GOOGLE_OAUTH_TEST_USERS",
+    ):
+        del env[name]
+    ControlPlaneConfig.from_env(env)

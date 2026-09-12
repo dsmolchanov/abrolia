@@ -201,3 +201,34 @@ def test_idempotent_response_reports_current_mode(cp_stack):
                                            context=context, now=BASE_TIME + 2)
     assert replay.replayed
     assert not replay.snapshot.synthetic_only
+
+
+@pytest.mark.parametrize("listed", [False, True])
+def test_the_gmail_card_is_rendered_only_for_an_account_that_can_connect(
+    tmp_path, monkeypatch, listed,
+):
+    """The container wires the connect policy into the page, not just the service.
+
+    With the Gmail switch on and real Gmail off, an account outside the
+    test-user list must not see the card it would be refused at connect.
+    """
+    monkeypatch.setenv("ABROLIA_GMAIL_ENABLED", "1")
+    email = "api-owner@family.test"
+    config = replace(
+        ControlPlaneConfig.for_test(tmp_path),
+        synthetic_only=False,
+        real_family_data_enabled=True,
+        google_oauth_client_id="synthetic-client.apps.example.test",
+        google_oauth_client_secret="synthetic-client-secret",
+        google_oauth_test_users=(email,) if listed else ("someone-else@family.test",),
+    )
+    with (
+        ControlPlaneContainer.build(config, mailer=MemoryMailer()) as active,
+        TestClient(create_app(active_container=active), base_url=config.public_origin) as client,
+    ):
+        harness = APIHarness(config, active, MemoryMailer(), client)
+        world = harness.create_principal(email)
+        harness.authenticate(world)
+        page = client.get("/onboarding")
+        assert page.status_code == 200
+        assert ('data-kind="gmail_agent"' in page.text) is listed

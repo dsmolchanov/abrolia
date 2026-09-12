@@ -214,6 +214,12 @@ class GoogleOAuthService:
     def redirect_uri(self) -> str:
         return f"{self.config.public_origin}/api/v1/email/google/callback"
 
+    def account_allowed(self, account_id: str) -> bool:
+        """Whether this account may connect Gmail — the question onboarding
+        asks before it offers or accepts the card, so the card and the connect
+        refusal cannot disagree."""
+        return self._allowed(account_id)
+
     def _allowed(self, account_id: str) -> bool:
         account = self.accounts.get(account_id)
         return bool(

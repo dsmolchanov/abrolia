@@ -247,6 +247,11 @@ def api_harness(tmp_path: Path) -> APIHarness:
     config = ControlPlaneConfig.for_test(tmp_path)
     mailer = MemoryMailer()
     active = ControlPlaneContainer.build(config, mailer=mailer)
+    # Page and flag suites exercise which options a DEPLOYMENT offers, with no
+    # OAuth client configured. Their principals stand for accounts that may
+    # connect Gmail; the per-account policy and its container wiring have their
+    # own test in `test_production_onboarding.py`.
+    active.onboarding.gmail_account_allowed = lambda _account_id: True
     app = create_app(active_container=active)
     try:
         with TestClient(app, base_url=config.public_origin) as client:
