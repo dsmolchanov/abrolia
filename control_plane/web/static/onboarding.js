@@ -97,6 +97,8 @@ if (page === "onboarding") {
     const googleConfirm = document.querySelector("#google-confirm");
     const googleConfirmLabel = document.querySelector("#google-confirm-label");
     const googleConnected = document.querySelector("#google-connected");
+    const googleUnavailable = document.querySelector("#google-unavailable");
+    const resetPendingEmail = document.querySelector("#reset-pending-email");
     const labels = {
       available: ["Ready", "Choose an option to continue."],
       selected: ["Selection saved", "The durable worker will begin this setup."],
@@ -140,7 +142,11 @@ if (page === "onboarding") {
     const callbackConfirmed = new URLSearchParams(window.location.search).get("google") === "confirm";
     googlePanel.hidden = !["oauth_required", "dedicated_account_confirmation"].includes(googleState)
       && !callbackConfirmed;
-    googleConnect.hidden = googleState !== "oauth_required" || callbackConfirmed;
+    // Eligibility is rendered by the server from the policy the start endpoint
+    // enforces; a persisted `oauth_required` alone is not a button to offer.
+    const connectAllowed = googlePanel.dataset.gmailConnectAllowed === "true";
+    googleConnect.hidden = googleState !== "oauth_required" || callbackConfirmed || !connectAllowed;
+    googleUnavailable.hidden = googleState !== "oauth_required" || callbackConfirmed || connectAllowed;
     googleConfirm.hidden = googleState !== "dedicated_account_confirmation" && !callbackConfirmed;
     googleConfirmLabel.hidden = googleConfirm.hidden;
     const maskedAddress = current?.public_status?.connected_address_masked;
@@ -150,6 +156,8 @@ if (page === "onboarding") {
     retry.dataset.kind = current?.kind || "";
     check.hidden = workflowOwnsView || current?.status !== "waiting_user";
     check.dataset.kind = current?.kind || "";
+    resetPendingEmail.hidden = workflowOwnsView
+      || current?.kind !== "email_identity" || current?.status !== "waiting_user";
     setInteractive(false);
     if (!commandInFlight && !workflowOwnsView) {
       enableControls("[data-reset]");

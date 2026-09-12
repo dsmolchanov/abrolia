@@ -2160,3 +2160,20 @@ now in the deploy preflight), and the card and its selection are refused per
 account with the same policy the connect step applies. Also fixes the
 `test_gcal` calendar-tool test, whose fixed event time expired on 2026-09-12.
 The O7 (BYO) and O8 (Gmail) live batteries were not run before this opening.
+
+### A pending Gmail step the account can no longer connect (post-merge Codex finding on #162)
+
+**Branches:** `fix/gmail-connect-eligibility`.
+
+**Files:** `control_plane/api/app.py`, `control_plane/web/templates/onboarding.html`,
+`control_plane/web/static/onboarding.js`, `tests/control_plane/test_ui_contract.py`.
+
+Root invariant: never present an onboarding action provider policy will reject.
+#162 applied the per-account Gmail policy to the option card and consent copy,
+but the persisted `oauth_required` panel still offered "Continue with Google"
+after the account left the test-user list, and a pending email step had no
+reset control on the page although `reset_from` accepts it — stranding the
+household (the same dead end applied to a BYO domain waiting on DNS). The page
+now renders connect eligibility from `GoogleOAuthService.account_allowed`, says
+Gmail is unavailable instead, and offers "Change email option" for a pending
+email step; the polling render keeps both answers.

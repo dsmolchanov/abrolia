@@ -240,13 +240,14 @@
         {% endfor %}
       </ul>
     </div>
-    <div id="google-oauth-panel"{% if current.public_status.get('state') not in ['oauth_required', 'dedicated_account_confirmation'] and not google_confirm %} hidden{% endif %}>
+    <div id="google-oauth-panel" data-gmail-connect-allowed="{{ 'true' if gmail_connect_allowed else 'false' }}"{% if current.public_status.get('state') not in ['oauth_required', 'dedicated_account_confirmation'] and not google_confirm %} hidden{% endif %}>
       <h3>Connect a dedicated Google account</h3>
       <p id="google-disclosure">Abrolia reads and sends mail only for this dedicated agent mailbox; Google data is not used to train a general model.</p>
       <p id="google-connected"{% if not current.public_status.get('connected_address_masked') %} hidden{% endif %}>
         Connected mailbox: <strong>{{ current.public_status.get('connected_address_masked', '') }}</strong>
       </p>
-      <button id="google-connect" type="button"{% if current.public_status.get('state') != 'oauth_required' %} hidden{% endif %}>Continue with Google</button>
+      <button id="google-connect" type="button"{% if current.public_status.get('state') != 'oauth_required' or not gmail_connect_allowed %} hidden{% endif %}>Continue with Google</button>
+      <p id="google-unavailable"{% if current.public_status.get('state') != 'oauth_required' or gmail_connect_allowed %} hidden{% endif %}>Gmail is not available for this account. Change the email option to continue.</p>
       <label id="google-confirm-label" class="consent"{% if current.public_status.get('state') != 'dedicated_account_confirmation' and not google_confirm %} hidden{% endif %}>
         <input id="google-dedicated" type="checkbox" required>
         I confirm this is a separate mailbox created for the agent, not my recovery or personal account.
@@ -259,6 +260,12 @@
     </form>
     <form method="post" action="/onboarding/check/{{ snapshot.current_step.value }}">
       {{ command_fields() }}<button id="check-step" type="submit"{% if current.status != 'waiting_user' %} hidden{% endif %}>Check again</button>
+    </form>
+    {# The service resets a pending email step (`reset_from`), so the page offers it:
+       a family waiting on DNS, or on a Gmail connection it can no longer start,
+       must not be left without a way to choose another option. #}
+    <form method="post" action="/onboarding/reset/email_identity">
+      {{ command_fields() }}<button id="reset-pending-email" type="submit" class="secondary" data-reset="email_identity"{% if snapshot.current_step.value != 'email_identity' or current.status != 'waiting_user' %} hidden{% endif %}>Change email option</button>
     </form>
   </section>
 
