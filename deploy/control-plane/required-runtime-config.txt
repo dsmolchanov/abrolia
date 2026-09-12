@@ -30,6 +30,12 @@ ABROLIA_RUNTIME_MODEL_API_KEY
 # refuses one in a committed file — so it lives in the secret store too.
 ABROLIA_RESEND_API_KEY
 ABROLIA_MAGIC_LINK_FROM
+# Required because fly.toml turns ABROLIA_GMAIL_ENABLED on: the boot refuses to
+# offer a Gmail card nobody could connect. The test-user list is required while
+# ABROLIA_GMAIL_REAL_ENABLED is off, and it holds real addresses.
+ABROLIA_GOOGLE_OAUTH_CLIENT_ID
+ABROLIA_GOOGLE_OAUTH_CLIENT_SECRET
+ABROLIA_GOOGLE_OAUTH_TEST_USERS
 
 # Non-secret settings — carried in fly.toml [env].
 ABROLIA_FLY_ORG

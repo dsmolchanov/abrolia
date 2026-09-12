@@ -176,6 +176,53 @@ def test_production_offers_an_enabled_option_on_its_real_provider(
     assert [row["provider"] for row in queued] == [provider]
 
 
+@pytest.mark.parametrize("allowed", [False, True])
+def test_gmail_is_offered_only_to_an_account_that_can_connect_it(
+    cp_stack, monkeypatch, allowed
+) -> None:
+    """While real Gmail is off only test users can connect. The card and the
+    selection ask the same per-account question the connect step asks, so a
+    family is never offered a step it would select and then be refused."""
+    monkeypatch.setenv("ABROLIA_GMAIL_ENABLED", "1")
+    cp_stack.complete_profile()
+    asked: list[str] = []
+
+    def account_allowed(account_id: str) -> bool:
+        asked.append(account_id)
+        return allowed
+
+    cp_stack.service.gmail_account_allowed = account_allowed
+    _hold_the_content_restriction(cp_stack, now=1_760_000_000.0)
+
+    assert (
+        cp_stack.service.email_option_offered(
+            "gmail_agent", account_id=cp_stack.account.id
+        )
+        is allowed
+    )
+
+    def select():
+        cp_stack.service.select(
+            cp_stack.household.id,
+            StepKind.EMAIL,
+            _selection("gmail_agent"),
+            context=cp_stack.context(),
+        )
+
+    if allowed:
+        select()
+    else:
+        with pytest.raises(InvalidTransition, match="not available for this account"):
+            select()
+    queued = cp_stack.database.query(
+        "SELECT id FROM provisioning_jobs WHERE household_id = ?"
+        " AND kind = 'email_identity'",
+        (cp_stack.household.id,),
+    )
+    assert bool(queued) is allowed
+    assert set(asked) == {cp_stack.account.id}
+
+
 def test_the_managed_option_is_not_gated(cp_stack, monkeypatch) -> None:
     """Deliberate, and worth pinning so the omission is not read as a miss.
 

@@ -368,6 +368,8 @@ def real_email_harness(tmp_path: Path):
     )
     mailer = MemoryMailer()
     active = ControlPlaneContainer.build(config, mailer=mailer)
+    # As in `api_harness`: the principal may connect Gmail.
+    active.onboarding.gmail_account_allowed = lambda _account_id: True
     app = create_app(active_container=active)
     try:
         with TestClient(app, base_url=config.public_origin) as client:

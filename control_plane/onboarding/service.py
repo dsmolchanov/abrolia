@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+from collections.abc import Callable
 from typing import Any
 
 from pydantic import TypeAdapter
@@ -59,8 +60,10 @@ class OnboardingService:
         real_email_household_allowlist: frozenset[str] = frozenset(),
         real_email_all_households: bool = False,
         email_identities: EmailIdentityService | None = None,
+        gmail_account_allowed: Callable[[str], bool] | None = None,
     ) -> None:
         self.synthetic_only = synthetic_only
+        self.gmail_account_allowed = gmail_account_allowed
         self.households = households
         self.onboarding = onboarding
         self.jobs = jobs
@@ -299,12 +302,18 @@ class OnboardingService:
             StepKind.PRIMARY_CHANNEL: "fake-channel",
         }[kind]
 
-    def _require_email_option_offered(self, option: str) -> None:
+    def _require_email_option_offered(
+        self, option: str, *, account_id: str | None = None
+    ) -> None:
         """Refuse an option the deployment does not currently offer.
 
         The one place that decides. `email_option_offered` is this question
         asked without the exception, so the onboarding page and this gate cannot
         answer it differently — the failure that predicate below was written for.
+
+        Gmail is also asked PER ACCOUNT: while real Gmail is off only test users
+        can connect, and a card offered to anyone else is a step the family
+        selects and then cannot finish.
         """
         if not self.synthetic_only and not self.real_email_enabled and option != "gmail_agent":
             raise InvalidTransition("Email setup is temporarily unavailable")
@@ -315,8 +324,17 @@ class OnboardingService:
             check_provider_enabled(gated)
         except RuntimeError as error:
             raise InvalidTransition(str(error)) from error
+        if (
+            option == "gmail_agent"
+            and account_id is not None
+            and self.gmail_account_allowed is not None
+            and not self.gmail_account_allowed(account_id)
+        ):
+            raise InvalidTransition(
+                "Gmail is not available for this account yet; choose another option"
+            )
 
-    def email_option_offered(self, option: str) -> bool:
+    def email_option_offered(self, option: str, *, account_id: str | None = None) -> bool:
         """Whether the onboarding page should render this option at all.
 
         Hiding a cut option is a courtesy, not the enforcement: the server
@@ -326,7 +344,7 @@ class OnboardingService:
         the flag a second time.
         """
         try:
-            self._require_email_option_offered(option)
+            self._require_email_option_offered(option, account_id=account_id)
         except InvalidTransition:
             return False
         return True
@@ -379,7 +397,13 @@ class OnboardingService:
             if key not in self.CONSENT_FIELDS
         }
 
-    def _assert_email_rollout(self, household_id: str, selection: dict[str, Any]) -> None:
+    def _assert_email_rollout(
+        self,
+        household_id: str,
+        selection: dict[str, Any],
+        *,
+        account_id: str | None = None,
+    ) -> None:
         # The per-provider kill switch, BEFORE anything else this method asks.
         # `feature_flags` was written for exactly this — "default off,
         # fail-closed, read at call time" — and had no production caller at all,
@@ -389,7 +413,9 @@ class OnboardingService:
         # real content can arrive, so it runs ahead of the synthetic
         # early-return below: a disabled option stays disabled even where it
         # would route to a fake provider.
-        self._require_email_option_offered(str(selection.get("kind") or ""))
+        self._require_email_option_offered(
+            str(selection.get("kind") or ""), account_id=account_id
+        )
         # Gate on the PROVIDER this selection routes to, not on the managed
         # rollout flag. `gmail_agent` goes to `google-oauth` unconditionally —
         # it is a real provider even when `ABROLIA_REAL_EMAIL_ENABLED=0` — so
@@ -579,7 +605,9 @@ class OnboardingService:
                 return replay
             row = self._scoped_workflow(connection, context.account_id, household_id)
             if kind is StepKind.EMAIL:
-                self._assert_email_rollout(household_id, parsed)
+                self._assert_email_rollout(
+                    household_id, parsed, account_id=context.account_id
+                )
             self._check_version(row, context.expected_version)
             if row["current_step"] != kind.value:
                 raise InvalidTransition("onboarding steps cannot be skipped or reordered")
@@ -892,7 +920,9 @@ class OnboardingService:
                 # Art. 9(4) country refusal or a household allowlist that has
                 # since changed. The worker rechecks receipts and knows nothing
                 # about either, so this is the only place the question is asked.
-                self._assert_email_rollout(household_id, parsed)
+                self._assert_email_rollout(
+                    household_id, parsed, account_id=context.account_id
+                )
             self._check_version(row, context.expected_version)
             step = connection.execute(
                 "SELECT * FROM onboarding_steps WHERE workflow_id = ? AND kind = ?",
