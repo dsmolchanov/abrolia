@@ -1,0 +1,438 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="How Abrolia processes family data, including data received from Google APIs." />
+    <meta name="theme-color" content="#f7fafc" />
+    <meta name="color-scheme" content="light" />
+    <link rel="canonical" href="https://abrolia.com/privacy.html" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/styles.css" />
+    <title>Privacy Policy — Abrolia</title>
+  </head>
+  <body class="legal-page">
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="legal-header">
+      <div class="shell legal-nav">
+        <a class="brand" href="/" aria-label="Abrolia home">
+          <svg class="brand-mark brand-symbol" viewBox="0 0 120 68" aria-hidden="true" data-abrolia-logo="handwritten-a">
+            <path class="brand-stroke" d="M18 21 C31 8 50 8 58 18 C67 29 59 43 45 50 C31 57 14 54 10 45 C6 36 16 27 29 25 C43 23 54 29 59 41 C65 54 77 55 91 43" />
+            <circle class="brand-dot" cx="105" cy="43" r="5" />
+          </svg>
+          <span>Abrolia</span>
+        </a>
+        <nav class="legal-links" aria-label="Legal">
+          <a href="/privacy.html" aria-current="page">Privacy Policy</a>
+          <a href="/terms.html">Terms of Service</a>
+        </nav>
+      </div>
+    </header>
+    <main id="main" class="shell legal-content">
+      <h1>Privacy Policy</h1>
+      <p><em>Version: 2026-09-13, production pilot. Controller details, the contact address
+      for data-subject requests, and the legal condition for special-category data are
+      filled in. A Union representative under Art. 27 GDPR has not yet been
+      designated.</em>
+      <em>A Russian version is kept in sync and is available on request.</em></p>
+      <h2>In short</h2>
+      <ul>
+      <li>We read <strong>only what you send to the assistant's separate inbox or channel</strong>:
+        a forwarded email, photo, voice note, or message.</li>
+      <li>The account/onboarding control plane stores only profile, setup state, and
+        provisioning metadata; family emails and messages never enter it.</li>
+      <li>We <strong>never send or create anything</strong> without your explicit confirmation — every
+        action appears as a card and waits for your ✅.</li>
+      <li>Your data is <strong>not used to train models</strong>.</li>
+      <li>The application and database run <strong>in the EU</strong>; some services (the model,
+        email delivery) are outside the EU and are listed by name below.</li>
+      <li>You can obtain a <strong>complete user-data export</strong> and request account+runtime
+        <strong>deletion</strong>; security secrets/hashes are not exported and minimal
+        consent/DSAR/tombstone records remain for the stated period.</li>
+      </ul>
+      <blockquote>
+      <p><strong>Service status.</strong> Since 8 September 2026 Abrolia runs in production and
+      processes real family correspondence. Available today: an <code>@abrolia.com</code>
+      assistant inbox, an inbox on your family's own domain, a separate agent Gmail
+      account, and Abrolia Web chat. While Google completes verification of the
+      Gmail integration, Gmail can be connected only by accounts Abrolia has added
+      as test users. WhatsApp, Telegram and Web push are not available yet.
+      Open compliance items are stated below where they apply.</p>
+      </blockquote>
+      <h2>Who processes your data</h2>
+      <p>Controller — <strong>Axiom Atlas, LLC</strong>, a limited liability company formed under the
+      laws of the State of Delaware, USA, by Certificate of Formation dated 19 March
+      2025. Registered office: 131 Continental Dr, Suite 305, Newark, DE 19713, New
+      Castle County, USA. Registered agent: Legalinc Corporate Services Inc. The
+      Abrolia service operator is that same legal entity.</p>
+      <p>Questions, data-subject requests and withdrawal of consent: <a href="mailto:help@abrolia.com">help@abrolia.com</a>.</p>
+      <p><strong>No Union representative under Art. 27 GDPR has been designated yet.</strong> The
+      controller is established outside the EU and has no establishment in the Union.
+      The obligation applies to us: the Art. 27(2)(a) derogation is unavailable
+      because the processing is not occasional and involves special categories of
+      data, and Art. 27(2)(b) concerns public authorities. Until a representative is
+      designated in writing, you can reach the controller directly at
+      <a href="mailto:help@abrolia.com">help@abrolia.com</a>; the representative's name and address will be recorded in
+      this notice once designated.</p>
+      <p><strong>No Data Protection Officer is required</strong> — determined on 2026-08-12 under
+      Art. 37(1): the controller is not a public authority, and neither regular and
+      systematic monitoring of data subjects on a large scale nor large-scale
+      processing of special categories is a core activity (the pilot is limited to
+      5–20 households, third-party special categories are outside the scope of the
+      service, and no profiling of data subjects takes place). The determination is
+      revisited when the pilot ends.</p>
+      <p>You may lodge a complaint with the supervisory authority of your habitual
+      residence, place of work, or place of the alleged infringement (Art. 77 GDPR).</p>
+      <h2>What we process and why</h2>
+      <div class="legal-table"><table>
+      <thead>
+      <tr>
+      <th>Data</th>
+      <th>Source</th>
+      <th>Purpose</th>
+      </tr>
+      </thead>
+      <tbody>
+      <tr>
+      <td>Abrolia account, verified recovery email, names, language, timezone, country</td>
+      <td>invite and profile</td>
+      <td>sign in, recover access, and configure the household</td>
+      </tr>
+      <tr>
+      <td>Session/security metadata and workflow/step/transition records</td>
+      <td>browser/control plane</td>
+      <td>protect the account, resume the exact step, and audit commands</td>
+      </tr>
+      <tr>
+      <td>Provisioning jobs/resource refs/config revisions/bootstrap lifecycle</td>
+      <td>control-plane worker</td>
+      <td>create one dedicated runtime and activate the right revision; browser secrets are excluded</td>
+      </tr>
+      <tr>
+      <td>Content of emails, messages, photos, voice notes</td>
+      <td>you send it to the agent inbox/channel</td>
+      <td>understand the obligation: what, when, how much, to whom</td>
+      </tr>
+      <tr>
+      <td>Verified channel ID, runtime actor/role, primary/fallback</td>
+      <td>owner-authorised binding</td>
+      <td>route cards, enforce rights, and select the proactive channel</td>
+      </tr>
+      <tr>
+      <td>Tasks, reminders, calendar events</td>
+      <td>your confirmations</td>
+      <td>deliver the service</td>
+      </tr>
+      <tr>
+      <td>Memory (facts about your household)</td>
+      <td>only via your per-entry confirmation</td>
+      <td>avoid asking the same thing twice</td>
+      </tr>
+      <tr>
+      <td>Action journal</td>
+      <td>system</td>
+      <td>accountability: who confirmed what</td>
+      </tr>
+      <tr>
+      <td>Technical logs</td>
+      <td>system</td>
+      <td>reliability; <strong>message content is never written to logs</strong></td>
+      </tr>
+      </tbody>
+      </table></div>
+      <p>Legal bases: performance of our contract (account, onboarding, provisioning,
+      agent inbox, and channels); separate consent (memory, dedicated-WhatsApp risk,
+      and push where required); our legitimate interests (security, replay prevention,
+      and processing sender data in content you provide).</p>
+      <h2>Special-category data (health, religion)</h2>
+      <p>School emails often contain health data (a medical certificate, an allergy, a PE
+      exemption) and, indirectly, religion (an exemption for a religious holiday). For
+      the content you send to the agent inbox or channel, the legal condition is
+      <strong>explicit consent, Art. 9(2)(a) GDPR</strong>: your own, and — for your minor children
+      — given by you as a holder of parental responsibility. Consent is collected as a
+      separate item, never bundled with the terms, recorded in a versioned receipt, and
+      withdrawn in one step.</p>
+      <p>Special-category data <strong>about other people</strong> — other children, teachers, other
+      parents — is <strong>outside the scope of the service</strong>: no Art. 9(2) condition is
+      available for it, so such material should not be sent to the assistant. You
+      confirm this as a separate item before choosing an email identity. If such
+      material reaches us by mistake, stop using it and request deletion at
+      <a href="mailto:help@abrolia.com">help@abrolia.com</a>.</p>
+      <p>We do not extract or index health and religion attributes and build no profiles
+      from them. There is no server-side "medical filter" either: telling such an email
+      apart would require reading it, which is itself processing.</p>
+      <h2>Other people's data</h2>
+      <p>A school email contains names of teachers, other parents, children. We process
+      them only as part of your email: no enrichment from external sources, no
+      profiles, no sharing beyond the providers listed below, and deletion on
+      schedule. Any of those people may contact us and request erasure of their data
+      from your instance of the service.</p>
+      <h2>Children</h2>
+      <p>Children are not users of the service. Their data reaches us only inside your
+      emails; we build no child profiles and make no automated decisions about
+      children. Our policy on minors is available on request.</p>
+      <h2>Who we share with</h2>
+      <div class="legal-table"><table>
+      <thead>
+      <tr>
+      <th>Provider</th>
+      <th>Role</th>
+      <th>Where</th>
+      </tr>
+      </thead>
+      <tbody>
+      <tr>
+      <td>Anthropic</td>
+      <td>the model that reads the email text</td>
+      <td>US / global</td>
+      </tr>
+      <tr>
+      <td>Fly.io</td>
+      <td>metadata-only control plane, dedicated runtime, databases/secrets</td>
+      <td>Netherlands (EU); provider control plane in the US</td>
+      </tr>
+      <tr>
+      <td>Resend</td>
+      <td>account magic-link delivery; delivery for Nerve-managed inboxes</td>
+      <td>US</td>
+      </tr>
+      <tr>
+      <td>Nerve</td>
+      <td><code>@abrolia.com</code> or family-domain agent inbox</td>
+      <td>US</td>
+      </tr>
+      <tr>
+      <td>Google</td>
+      <td>calendar; a separate agent Gmail through OAuth, if you choose that option</td>
+      <td>global</td>
+      </tr>
+      <tr>
+      <td>Telegram / WhatsApp</td>
+      <td>communication channels — not available yet, no data is shared</td>
+      <td>outside the EU</td>
+      </tr>
+      <tr>
+      <td>Web Push provider</td>
+      <td>optional Abrolia Web push — not selected, not used</td>
+      <td>TBD</td>
+      </tr>
+      </tbody>
+      </table></div>
+      <p>Some of these providers are outside the EU. Data processing agreements with
+      Standard Contractual Clauses are <strong>in effect with Anthropic and Resend</strong>. The
+      data processing agreement with Fly.io and the transfer impact assessments are
+      <strong>still being put in place</strong>. You can request a copy of the safeguards in force
+      at the contact address. We do <strong>not</strong> claim "EU-only processing" — with today's
+      providers that would be untrue.</p>
+      <h2>Retention</h2>
+      <div class="legal-table"><table>
+      <thead>
+      <tr>
+      <th>Data</th>
+      <th>Retention</th>
+      </tr>
+      </thead>
+      <tbody>
+      <tr>
+      <td>Source emails, photos, voice notes, attachments</td>
+      <td>30 days</td>
+      </tr>
+      <tr>
+      <td>Conversation with the assistant</td>
+      <td>180 days</td>
+      </tr>
+      <tr>
+      <td>Tasks and reminders</td>
+      <td>90 days after completion</td>
+      </tr>
+      <tr>
+      <td>Action journal</td>
+      <td>365 days</td>
+      </tr>
+      <tr>
+      <td>Email delivery receipts</td>
+      <td>365 days with us; at the mail provider (Resend) per their own retention policy</td>
+      </tr>
+      <tr>
+      <td>Calendar events (our internal mapping to your calendar)</td>
+      <td>365 days; the event itself stays in your Google account</td>
+      </tr>
+      <tr>
+      <td>Memory</td>
+      <td>until you delete it; we prompt a review every 90 days</td>
+      </tr>
+      <tr>
+      <td>Incoming messages on any channel (webhook, WhatsApp) before processing</td>
+      <td>30 days — same as other source content</td>
+      </tr>
+      <tr>
+      <td>Messages that failed processing: content / technical failure reason</td>
+      <td>30 days / 90 days</td>
+      </tr>
+      <tr>
+      <td>Outgoing emails and messages: text and recipient in the journal</td>
+      <td>365 days; the copy at the recipient and at the mail provider is outside our control</td>
+      </tr>
+      <tr>
+      <td>Requests to the language model</td>
+      <td>not stored separately: the prompt is built at processing time and not retained; at Anthropic, per their terms, with no training on your data</td>
+      </tr>
+      <tr>
+      <td>Account/profile/membership, onboarding workflow/transitions, resource refs/config revisions</td>
+      <td>account/household lifetime + 30 days; the active config lives while the household is active</td>
+      </tr>
+      <tr>
+      <td>Magic/invite/reauth token record</td>
+      <td>link works for 15 minutes; hash-only record is removed 24 hours after use/expiry</td>
+      </tr>
+      <tr>
+      <td>Web session record</td>
+      <td>24-hour idle and 30-day absolute life; hash/security metadata removed 30 days after revoke/expiry</td>
+      </tr>
+      <tr>
+      <td>Idempotency record</td>
+      <td>24 hours</td>
+      </tr>
+      <tr>
+      <td>Provisioning/bootstrap encrypted payload / technical metadata</td>
+      <td>30 / 90 days after settled/revoked/expired; no plaintext bootstrap token in the database</td>
+      </tr>
+      <tr>
+      <td>Access keys/OAuth/provider secrets</td>
+      <td>while the integration is active; never exported; revoked/deleted on disconnect/delete; bootstrap secret after activation</td>
+      </tr>
+      <tr>
+      <td>Technical logs (identifiers and statuses, no content)</td>
+      <td>30 days</td>
+      </tr>
+      <tr>
+      <td>Backups</td>
+      <td>rolling 30-day window</td>
+      </tr>
+      <tr>
+      <td>Consent receipts and deletion tombstone</td>
+      <td>while consent is in force plus 3 years after withdrawal; tombstone for 3 years</td>
+      </tr>
+      <tr>
+      <td>Records of your rights requests (what was asked, what was done, when)</td>
+      <td>3 years from closing the request</td>
+      </tr>
+      <tr>
+      <td>Incident records</td>
+      <td>3 years from closing the incident</td>
+      </tr>
+      <tr>
+      <td>Family member identifiers and settings</td>
+      <td>while the account is active + 30 days</td>
+      </tr>
+      </tbody>
+      </table></div>
+      <p>The control-plane periods are a provisional, configurable pilot policy and are
+      reviewed as the pilot grows. The three-year periods are our choice, not a statutory figure: the law requires
+      us to be able to demonstrate consent and to keep incident records, but names no
+      period. Three years follows the limitation period and will be confirmed by
+      counsel before launch.</p>
+      <p>This table lists every class of data we retain. A technical version with
+      storage locations and jurisdictions is available on request.</p>
+      <h2 id="google">If you chose a separate agent Gmail</h2>
+      <ul>
+      <li>You first create a separate Google account for the assistant. We do not
+        connect personal Gmail and never request a password or app password.</li>
+      <li>The OAuth account chooser is always shown; after callback you confirm the
+        selected address again. Scopes are only <code>gmail.readonly</code> and <code>gmail.send</code>.</li>
+      <li><strong>What Abrolia accesses:</strong> new messages that arrive in the inbox of that
+        agent mailbox after you connect it (no earlier backlog is read), and the
+        sending of an email — only an email you have confirmed on a card. Message
+        content is kept for 30 days like other source content; sent emails are
+        journaled for 365 days.</li>
+      <li>The refresh token goes directly to the household's Fly secret namespace and
+        is kept encrypted by the household's dedicated runtime; it is absent from the
+        browser, control-plane database, job records, runtime manifest, model, and
+        logs. Disconnect revokes the grant and removes token material.</li>
+      <li>Immediately before OAuth, we explain what Gmail data Abrolia will access and
+        why. Abrolia's use and transfer to any other app of information received from
+        Google APIs will adhere to the
+        <a href="https://developers.google.com/terms/api-services-user-data-policy">Google API Services User Data Policy</a>,
+        including the Limited Use requirements. The use of information received from
+        Google Workspace scopes will adhere to the Google User Data Policy, including
+        the Limited Use requirements. Concretely: Gmail data is used only to provide
+        or improve the user-facing assistant features you use, never for advertising,
+        sale, credit decisions, or training generalized models, and is not
+        transferred to others except as needed to provide those features (the model
+        provider listed above), for security, or to comply with law. Humans do not
+        read it except with your consent, for security or abuse investigation, or to
+        comply with law.</li>
+      <li>Until Google completes verification of the Gmail integration, connecting
+        Gmail is available only to accounts Abrolia has added as test users.</li>
+      </ul>
+      <h2>If you connected WhatsApp</h2>
+      <ul>
+      <li><strong>Shared Abrolia number (Beta)</strong> is a quick start only for family dialogue
+        from pre-verified adult numbers. School/external/group chats are not routed.
+        It requires a separate channel privacy-notice receipt.</li>
+      <li><strong>Dedicated number (Beta)</strong> uses a separate family SIM/eSIM through an
+        unofficial linked-device session. The session can technically see messages
+        on that number and there is a real blocking risk. It requires a separate
+        informed-risk receipt before QR; disconnect logs the session out.</li>
+      </ul>
+      <p>One receipt cannot replace the other. Every outgoing WhatsApp action waits for
+      explicit approval. The official Business Platform needs separate eligibility
+      and legal review and is not promised as a universal GA path.</p>
+      <h2>Where you talk to Abrolia</h2>
+      <p>Today you talk to Abrolia in authenticated Abrolia Web chat; Telegram and
+      WhatsApp are not available yet. The owner's recovery email is only a fallback
+      notification (a link without sensitive content) and is never the agent inbox.</p>
+      <h2>Special categories of data</h2>
+      <p>School emails sometimes contain health information (a sick note, an allergy, an
+      exemption) and occasionally religious information. We do not extract it or use
+      it in any product logic. Do not send this material, or any other special-category
+      personal data about any person, to the agent inbox or channel. Before choosing
+      an email identity, the household owner separately acknowledges this obligation;
+      the accepted text version is stored as an accountability receipt. If material is
+      sent by mistake, stop using it and request deletion at <a href="mailto:help@abrolia.com">help@abrolia.com</a>.</p>
+      <p>This restriction defines the permitted pilot scope, but it does not remove
+      Abrolia's data-protection obligations or make accidentally received material
+      "unprocessed". The condition we rely on for special-category data in content you
+      send is your explicit consent, described above.</p>
+      <h2>Is providing data mandatory</h2>
+      <p>Data required for the service (account/recovery contact, household profile,
+      verified channel binding, and content you send to the assistant) is provided
+      under our contract. Agent email identity and primary channel are your choices.
+      Memory, dedicated-WhatsApp risk consent, and optional push can be withdrawn
+      without affecting the other available parts of the service.</p>
+      <h2>Where data about other people comes from</h2>
+      <p>Data about teachers, other parents and children reaches us not from them but
+      from content you send to the agent inbox/channel, and from messages arriving on connected
+      channels. Categories: names, contact details, roles, participation in events,
+      payment details. We do not collect it from external sources and do not enrich it.</p>
+      <h2>Automated decision-making</h2>
+      <p>There is no automated decision-making producing legal or similarly significant
+      effects (Art. 22). The assistant only proposes; only what a human confirms is
+      carried out.</p>
+      <h2>Your rights</h2>
+      <p>Access, rectification, erasure, restriction, objection, portability, withdrawal
+      of consent (withdrawal does not affect the lawfulness of processing before it),
+      and complaint to a supervisory authority. In practice:</p>
+      <ul>
+      <li>account-level <code>/export</code> combines control-plane metadata and the dedicated
+        runtime; secrets and token/session/bootstrap hashes are excluded;</li>
+      <li>account-level <code>/delete</code> requires fresh owner re-auth, revokes sessions/tokens,
+        cleans runtime/providers and control-plane data, and never reports a partial
+        or unknown cleanup as complete; a minimal three-year tombstone remains;</li>
+      <li>what has already left our system (message copies in your Telegram, events in
+        your Google Calendar, emails at their recipients) we cannot delete, and we say
+        so plainly — data in backups disappears within the 30-day window.</li>
+      </ul>
+      <p>We respond within one month.</p>
+      <h2>Changes</h2>
+      <p>Material changes to this notice are announced in the assistant chat before they
+      take effect.</p>
+    </main>
+    <footer class="legal-footer">
+      <div class="shell legal-footer-row">
+        <span>© 2026 Axiom Atlas, LLC · Abrolia</span>
+        <span><a href="/privacy.html">Privacy Policy</a> · <a href="/terms.html">Terms of Service</a> · <a href="mailto:help@abrolia.com">help@abrolia.com</a></span>
+      </div>
+    </footer>
+  </body>
+</html>
