@@ -246,6 +246,14 @@ def create_app(
                 # family should not be shown — but the hiding is the courtesy
                 # and the gate is the enforcement, so the page reads the answer
                 # rather than the flag.
+                # Whether THIS account may start Google OAuth now, from the same
+                # policy `/api/v1/email/google/start` enforces. A Gmail step that
+                # was selected while the account was eligible persists as
+                # `oauth_required`; if the test-user list changed since, the
+                # page must not offer a connect button the server will refuse.
+                "gmail_connect_allowed": active_container.google_oauth.account_allowed(
+                    account.id if account else ""
+                ),
                 "email_option_offered": {
                     option: active_container.onboarding.email_option_offered(
                         option, account_id=account.id if account else ""
