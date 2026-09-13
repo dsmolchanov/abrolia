@@ -246,7 +246,9 @@
       <ul id="google-data-use">
         <li><strong>Reads</strong> new messages that arrive in this mailbox’s inbox after you connect it, to prepare proposals for your family. Earlier mail is not read.</li>
         <li><strong>Sends</strong> an email from this mailbox only after you confirm it on a card.</li>
-        <li>Never used for advertising or sold. Abrolia’s use and transfer of information received from Google APIs adheres to the <a href="https://developers.google.com/terms/api-services-user-data-policy" rel="noopener" target="_blank">Google API Services User Data Policy</a>, including the Limited Use requirements. See our <a href="https://abrolia.com/privacy.html#google" rel="noopener" target="_blank">Privacy Policy</a>. You can disconnect at any time.</li>
+        <li>Message content is processed by our AI provider, Anthropic, only to prepare those proposals, and is deleted after 30 days.</li>
+        <li>Never used for advertising, never sold, never used to train AI models. Abrolia’s use and transfer of information received from Google APIs adheres to the <a href="https://developers.google.com/terms/api-services-user-data-policy" rel="noopener" target="_blank">Google API Services User Data Policy</a>, including the Limited Use requirements. See our <a href="https://abrolia.com/privacy.html#google" rel="noopener" target="_blank">Privacy Policy</a>.</li>
+        <li>You can remove Abrolia’s access at any time in your Google Account at <a href="https://myaccount.google.com/permissions" rel="noopener" target="_blank">myaccount.google.com/permissions</a>.</li>
       </ul>
       <p id="google-connected"{% if not current.public_status.get('connected_address_masked') %} hidden{% endif %}>
         Connected mailbox: <strong>{{ current.public_status.get('connected_address_masked', '') }}</strong>

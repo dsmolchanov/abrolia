@@ -30,7 +30,7 @@ Re-read them before submitting; they change.
 | Publishing status switched from **Testing** to **In production** | owner | ⏳ |
 | Verification submitted with scope justifications and demo video | owner | ⏳ |
 | CASA assessment with an authorized lab; Letter of Assessment | owner + lab | ⏳ |
-| Dependency vulnerability scan in CI and `cryptography` ≥ 50 | engineering | ⏳ follow-up PR |
+| Dependency vulnerability scan and `cryptography` ≥ 50 in the control plane | engineering | done (#166); household runtimes need the next image + `roll-runtime` |
 | Evidence flags + `ABROLIA_GMAIL_REAL_ENABLED=1` deployed | engineering | ⏳ after approval |
 
 **While the app is in Testing**, Google expires refresh tokens after 7 days for
@@ -82,7 +82,8 @@ scopes are broader than needed; Abrolia never creates drafts or modifies mail.
 household's dedicated EU-hosted runtime, kept 30 days, never used for
 advertising or to train generalized models, and transferred only to the model
 provider named in the Privacy Policy to produce the proposal. Refresh tokens are
-stored encrypted; disconnect revokes the grant.
+stored encrypted. Access is removed in the user's Google Account, on request,
+or by deleting the Abrolia account, which revokes the grant with Google.
 
 ## 3. Demo video script (English, ~3 minutes, unlisted YouTube link)
 
@@ -102,8 +103,8 @@ consent page, and how each requested scope is used.
    agent mailbox; show the proposal card Abrolia creates from it.
 7. **gmail.send**: confirm a reply on a card; show the sent message arriving in
    the other account's inbox.
-8. Disconnect Gmail in Abrolia and show the grant disappear from
-   `myaccount.google.com/permissions`.
+8. Open `myaccount.google.com/permissions` for the agent account, show Abrolia
+   listed with its Gmail access, and remove it.
 
 Use synthetic letters and accounts only; no real family data on screen.
 
@@ -118,8 +119,8 @@ Use synthetic letters and accounts only; no real family data on screen.
   AES-256-GCM encrypted in the runtime database, bound to identity and revision
   (`hermes_cloud/email/google_grant.py`). It never reaches the browser, the
   control-plane database, job records, the model, or logs.
-- **Revocation and deletion**: disconnect calls Google's revoke endpoint and
-  wipes token material; account deletion revokes and removes the secret
+- **Revocation and deletion**: resetting the email step or an operator
+  disconnect calls Google's revoke endpoint and wipes token material; account deletion revokes and removes the secret
   (`docs/privacy/delete-runbook.md`).
 - **Transport and headers**: HTTPS only; HSTS on `app.abrolia.com`
   (`max-age=31536000; includeSubDomains`) and on `abrolia.com`; strict CSP,
@@ -129,9 +130,12 @@ Use synthetic letters and accounts only; no real family data on screen.
   (`docs/SECURITY.md`).
 - **Secrets scanning**: gitleaks over full history and the fixture sanitizer on
   every PR (`.github/workflows/ci.yml`).
-- **Known gap before the lab scan**: no dependency vulnerability scanning in CI,
-  and `cryptography` 45.0.7 has published advisories fixed in ≥ 50.0.0. Close
-  both first.
+- **Dependencies**: `pip-audit` runs on every PR and weekly
+  (`.github/workflows/dependency-audit.yml`). Before the lab scan, roll
+  household runtimes onto an image built with `cryptography` ≥ 50.
+- **Known gap**: there is no in-app "Disconnect Gmail" control once setup is
+  complete; users revoke in their Google Account, on request, or by deleting
+  the account. An in-app control is worth adding before submission.
 - Level (AL1/AL2) is assigned by Google; revalidation is annual.
 
 ## 5. Opening Gmail to everyone

@@ -2186,7 +2186,8 @@ email step; the polling render keeps both answers.
 `landing/styles.css`, `landing/sitemap.xml`, `.check-fixtures-allow`,
 `control_plane/web/templates/onboarding.html`,
 `tests/control_plane/test_ui_contract.py`, `docs/google-verification.md`,
-`docs/privacy/privacy-notice-en.md`, `docs/privacy/privacy-notice-ru.md`.
+`docs/privacy/privacy-notice-en.md`, `docs/privacy/privacy-notice-ru.md`,
+`bench/README.md`.
 
 The owner chose full Google verification (gmail.readonly kept, CASA accepted) so
 the agent Gmail option can open beyond test users. This change supplies what the

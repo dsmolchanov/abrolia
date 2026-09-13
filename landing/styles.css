@@ -1260,6 +1260,12 @@ mark {
   color: rgb(255 255 255 / 59%);
 }
 
+.privacy-point a {
+  color: var(--white);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
 .pilot-section {
   background: var(--lilac);
 }
@@ -1933,6 +1939,12 @@ mark {
   font-family: var(--display);
   font-size: 1.35rem;
   line-height: 1.25;
+}
+
+.legal-content h3 {
+  margin: 1.8em 0 0.5em;
+  font-family: var(--display);
+  font-size: 1.08rem;
 }
 
 .legal-content p,

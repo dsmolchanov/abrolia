@@ -30,6 +30,102 @@ reference text; both are kept in sync.*
 > as test users. WhatsApp, Telegram and Web push are not available yet.
 > Open compliance items are stated below where they apply.
 
+## Google user data (separate agent Gmail)
+
+This section applies if you connect a separate Google account as your
+assistant's mailbox. It describes **all** Google user data Abrolia accesses
+through Google APIs; Abrolia accesses no other Google data. The same
+information is shown in the app before you connect.
+
+### What we access and why
+
+Abrolia requests only these Google OAuth scopes:
+
+| Scope | What it allows | Why Abrolia needs it |
+|---|---|---|
+| `gmail.readonly` | Read messages in the agent mailbox | When a new message arrives in the inbox of the agent mailbox, Abrolia reads its sender, recipients, date, subject, body and the names and types of attachments, to work out what your family needs to do and show you a proposal. Abrolia does not import the mailbox history: it follows new inbox messages only (if Gmail can no longer provide that change feed, Abrolia re-checks at most the 100 most recent inbox messages). Drafts, sent mail and other labels are not processed. |
+| `gmail.send` | Send email from the agent mailbox | To send an email that an adult in your household has reviewed and confirmed on a proposal card. Abrolia never sends email automatically. |
+| `openid`, `email` | Identify the connected Google account | To show you which address was connected and check that it is the separate agent account you intended, not a personal one. |
+
+### How we use it
+
+Google user data is used only to provide and improve the user-facing features
+you use in Abrolia: turning incoming letters into proposals (events, tasks,
+reminders, replies), answering your questions about those letters, and sending
+emails you confirm. We do **not**:
+
+- use Google user data for advertising, including personalized, retargeted or
+  interest-based advertising;
+- sell it, or transfer it to data brokers or information resellers;
+- use it to determine creditworthiness or for lending purposes;
+- use it to develop, improve or train generalized or non-personalized AI or
+  machine-learning models. Problems we find are reproduced with synthetic
+  examples; real messages are not copied into test or training data.
+
+### AI processing
+
+To understand a letter, its content is sent to our AI model provider,
+**Anthropic** (Claude API), which processes it on our behalf under a data
+processing agreement and commercial terms that do not permit using it to train
+models. The result is shown to you as a proposal and is not used to train any
+model.
+
+### Who we share it with
+
+We transfer Google user data only:
+
+- to **Anthropic**, for the AI processing described above;
+- to **Fly.io**, which hosts the dedicated environment where it is stored
+  (Netherlands, EU);
+- to the recipients of an email **you** confirm;
+- when required by applicable law, or to protect against fraud, abuse or
+  security threats;
+- as part of a merger, acquisition or sale of assets, only after telling you
+  and obtaining your consent.
+
+### Storage, security and retention
+
+- Stored in your household's dedicated environment in the Netherlands (EU),
+  on encrypted disks; always transmitted over TLS.
+- OAuth tokens are encrypted with AES-256-GCM and are never exposed to your
+  browser, our account system, the AI model, or logs.
+- Message content is deleted after **30 days**. Details of items you confirm
+  follow the retention table below; emails sent on your confirmation are
+  journaled for 365 days. Logs contain identifiers and statuses only, never
+  message content. Backups roll off within 30 days.
+
+### Human access
+
+No one at Abrolia reads your Google user data, except: with your explicit
+permission for specific messages (for example, when you ask for support);
+when necessary for security purposes, such as investigating a bug or abuse; to
+comply with applicable law; or where the data has been aggregated and
+anonymized for internal operations.
+
+### Revoking access and deleting data
+
+- Remove Abrolia's access at any time in your Google Account at
+  [myaccount.google.com/permissions](https://myaccount.google.com/permissions);
+  Abrolia can no longer read or send from the mailbox after that.
+- Ask us at `help@abrolia.com` to disconnect the mailbox: we revoke the grant
+  with Google and delete the stored tokens.
+- Deleting your Abrolia account revokes the grant, deletes the tokens and
+  deletes the household's data, including Google user data; copies in backups
+  disappear within 30 days.
+
+### Limited Use
+
+Abrolia's use and transfer to any other app of information received from Google
+APIs will adhere to the
+[Google API Services User Data Policy](https://developers.google.com/terms/api-services-user-data-policy),
+including the Limited Use requirements. The use of information received from
+Google Workspace APIs will adhere to the
+[Google Workspace API User Data and Developer Policy](https://developers.google.com/workspace/workspace-api-user-data-developer-policy),
+including the Limited Use requirements.
+
+Until Google completes verification of the Gmail integration, connecting Gmail
+is available only to accounts Abrolia has added as test users.
+
 ## Who processes your data
 
 Controller — **Axiom Atlas, LLC**, a limited liability company formed under the
@@ -122,7 +218,7 @@ children. See our minors policy for detail.
 | Fly.io | metadata-only control plane, dedicated runtime, databases/secrets | Netherlands (EU); provider control plane in the US |
 | Resend | account magic-link delivery; delivery for Nerve-managed inboxes | US |
 | Nerve | `@abrolia.com` or family-domain agent inbox (email a/c) | US |
-| Google | calendar; a separate agent Gmail through OAuth, if you choose that option | global |
+| Google | Gmail API for a separate agent Gmail account, if you choose that option — see "Google user data" | global |
 | Telegram / WhatsApp | communication channels — not available yet, no data is shared | outside the EU |
 | Web Push provider | optional Abrolia Web push — not selected, not used | TBD |
 
@@ -142,7 +238,7 @@ providers that would be untrue.
 | Tasks and reminders | 90 days after completion |
 | Action journal | 365 days |
 | Email delivery receipts | 365 days with us; at the mail provider (Resend) per their own retention policy |
-| Calendar events (our internal mapping to your calendar) | 365 days; the event itself stays in your Google account |
+| Calendar events, where a family calendar is connected (our internal mapping) | 365 days; the event itself stays in that calendar |
 | Memory | until you delete it; we prompt a review every 90 days |
 | Incoming messages on any channel (webhook, WhatsApp) before processing | 30 days — same as other source content |
 | Messages that failed processing: content / technical failure reason | 30 days / 90 days |
@@ -169,37 +265,6 @@ counsel before launch.
 
 This table lists every class of data we retain. The technical version with
 storage locations and jurisdictions is in `docs/privacy/data-map.md`.
-
-## If you chose a separate agent Gmail
-
-- You first create a separate Google account for the assistant. We do not
-  connect personal Gmail and never request a password or app password.
-- The OAuth account chooser is always shown; after callback you confirm the
-  selected address again. Scopes are only `gmail.readonly` and `gmail.send`.
-- **What Abrolia accesses:** new messages that arrive in the inbox of that
-  agent mailbox after you connect it (no earlier backlog is read), and the
-  sending of an email — only an email you have confirmed on a card. Message
-  content is kept for 30 days like other source content; sent emails are
-  journaled for 365 days.
-- The refresh token goes directly to the household's Fly secret namespace and
-  is kept encrypted by the household's dedicated runtime; it is absent from the
-  browser, control-plane database, job records, runtime manifest, model, and
-  logs. Disconnect revokes the grant and removes token material.
-- Immediately before OAuth, we explain what Gmail data Abrolia will access and
-  why. Abrolia's use and transfer to any other app of information received from
-  Google APIs will adhere to the
-  [Google API Services User Data Policy](https://developers.google.com/terms/api-services-user-data-policy),
-  including the Limited Use requirements. The use of information received from
-  Google Workspace scopes will adhere to the Google User Data Policy, including
-  the Limited Use requirements. Concretely: Gmail data is used only to provide
-  or improve the user-facing assistant features you use, never for advertising,
-  sale, credit decisions, or training generalized models, and is not
-  transferred to others except as needed to provide those features (the model
-  provider listed above), for security, or to comply with law. Humans do not
-  read it except with your consent, for security or abuse investigation, or to
-  comply with law.
-- Until Google completes verification of the Gmail integration, connecting
-  Gmail is available only to accounts Abrolia has added as test users.
 
 ## If you connected WhatsApp
 
