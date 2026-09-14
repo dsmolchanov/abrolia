@@ -1,0 +1,21 @@
+{
+  "attachments": [],
+  "attachments_state": "known",
+  "cc": [],
+  "created_at": "2026-09-14T21:15:13Z",
+  "direction": "inbound",
+  "from": {
+    "name": "",
+    "email": "forwarding-noreply@google.com"
+  },
+  "html": "",
+  "id": "00000000-0000-4000-8000-00000000f001",
+  "subject": "(Gmail Forwarding confirmation – Receive mail from family.agent@example.com",
+  "text": "family.agent@example.com has requested to automatically forward mail to\nyour email\naddress fwd-synthetic-relay@abrolia.example.\n\nTo allow family.agent@example.com to automatically forward mail to your address,\nplease click the link below to confirm the request:\n\nhttps://mail-settings.google.com/mail/vf-%5BSYNTHETIC-CONFIRM-TOKEN%5D-synthetic\n\nIf you click the link and it appears to be broken, please copy and paste it\ninto a new browser window.\n\nThanks for using Gmail.\n\nSincerely,\n\nThe Gmail team\n\nIf you do not approve of this request, no further action is required.\nfamily.agent@example.com cannot automatically forward messages to your\nemail address\nunless you confirm the request by clicking the link above. If you accidentally\nclicked the link, but you do not want to allow family.agent@example.com to\nautomatically forward messages to your address, click this link to cancel this\nverification:\nhttps://mail-settings.google.com/mail/uf-%5BSYNTHETIC-CANCEL-TOKEN%5D-synthetic\n\nTo learn more about why you might have received this message, please\nvisit: http://support.google.com/mail/bin/answer.py?answer=184973.\n",
+  "to": [
+    {
+      "name": "",
+      "email": "fwd-synthetic-relay@abrolia.example"
+    }
+  ]
+}
