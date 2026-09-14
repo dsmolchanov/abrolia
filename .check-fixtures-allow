@@ -77,6 +77,7 @@ README.md | email | help@abrolia.com
 docs/onboarding-runbook.md | email | help@abrolia.com
 thoughts/shared/handoffs/general/*.md | email | help@abrolia.com
 .check-fixtures-allow | email | help@abrolia.com
+.check-fixtures-allow | email | forwarding-noreply@google.com
 
 # Managed-inbox address in the late-ProviderWaiting erasure regression. The
 # abrolia.com domain is part of the managed-option CONTRACT here — the
@@ -86,3 +87,10 @@ thoughts/shared/handoffs/general/*.md | email | help@abrolia.com
 tests/control_plane/test_real_email_wiring.py | email | family-agent@abrolia.com
 tests/control_plane/test_managed_email_check.py | email | family-agent@abrolia.com
 .check-fixtures-allow | email | family-agent@abrolia.com
+
+# Google's forwarding-confirmation sender, named by the Gmail forwarding plan,
+# its spike record and the synthetic fixtures the runtime classifier is tested
+# against. An organisation's automated sender, not personal data.
+thoughts/shared/plans/*.md | email | forwarding-noreply@google.com
+thoughts/shared/research/*.md | email | forwarding-noreply@google.com
+tests/fixtures/email/gmail_forwarding/*.json | email | forwarding-noreply@google.com
