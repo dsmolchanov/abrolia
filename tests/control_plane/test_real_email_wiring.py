@@ -11,6 +11,7 @@ from control_plane.container import ControlPlaneContainer
 from control_plane.crypto import normalize_email
 from control_plane.db import new_id
 from control_plane.email.models import (
+    GMAIL_DISCLOSURE,
     EmailDnsPublicStatus,
     EmailGoogleOAuthPublicStatus,
     EmailNerveAttachmentPublicStatus,
@@ -1801,10 +1802,7 @@ def _late_waiting_contract(
     if provider == "google-oauth":
         public = EmailGoogleOAuthPublicStatus(
             state="oauth_required",
-            disclosure=(
-                "Abrolia reads and sends mail only for this dedicated agent"
-                " mailbox; Google data is not used to train a general model."
-            ),
+            disclosure=GMAIL_DISCLOSURE,
         ).model_dump(mode="json", exclude_none=True)
         return {
             "option": "gmail",

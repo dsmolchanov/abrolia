@@ -42,6 +42,7 @@ from hermes_cloud.core.usage import (
 )
 from hermes_cloud.email.contracts import EmailBinding
 from hermes_cloud.email.google_client import (
+    GmailAuthRevoked,
     GmailConfigurationError,
     GmailHttpClient,
     build_gmail_client,
@@ -55,8 +56,6 @@ from hermes_cloud.email.nerve_client import (
     NerveEmailClient,
 )
 from hermes_cloud.email.receipts import EmailBindingStore
-from hermes_cloud.email.service import EmailRuntimeService
-from hermes_cloud.ingest.gmail_api import GmailHistorySource
 from hermes_cloud.ingest.nerve_webhook import (
     MAX_WEBHOOK_BYTES,
     NerveAttachmentWorker,
@@ -110,7 +109,6 @@ ENV_RUNTIME_CONSENT_MARKER = "HERMES_RUNTIME_CONSENT_MARKER"
 ENV_NERVE_RUNTIME_URL = "ABROLIA_NERVE_RUNTIME_URL"
 ENV_NERVE_REST_URL = "ABROLIA_NERVE_REST_URL"
 ENV_NERVE_WORKER_SECONDS = "ABROLIA_NERVE_WORKER_SECONDS"
-ENV_GMAIL_WORKER_SECONDS = "ABROLIA_GMAIL_WORKER_SECONDS"
 ENV_WHATSAPP_INSTANCE = "HERMES_WHATSAPP_INSTANCE"
 ENV_WHATSAPP_RELAY_SECRET = "HERMES_WHATSAPP_RELAY_SECRET"
 ENV_COST_CAP_USD_PER_DAY = "HERMES_COST_CAP_USD_PER_DAY"
@@ -175,10 +173,6 @@ class RuntimeService:
             self.env.get(ENV_RUNTIME_CONSENT_MARKER)
             or self.activation_path.with_name("consent-withdrawn.json")
         )
-        self._gmail_runtime: EmailRuntimeService | None = None
-        self._gmail_client: Any | None = None
-        self._gmail_database: Any | None = None
-        self._gmail_binding_key: tuple[str, int] | None = None
 
     def health(self) -> Probe:
         """Public /health for pilot observability (E7): no content, safe for logs."""
@@ -383,17 +377,12 @@ class RuntimeService:
                 except Exception:
                     payload.update(email_health={"status": "unavailable"})
             elif binding.provider == "gmail":
-                try:
-                    with open_database(self.database_path) as database:
-                        health = EmailRuntimeService(database).health()
-                        payload.update(
-                            email_health={
-                                "status": health.status,
-                                "last_success_at": health.last_success_at,
-                            }
-                        )
-                except Exception:
-                    payload.update(email_health={"status": "unavailable"})
+                # Send-only: the grant is the whole of what this runtime holds
+                # for Gmail, and `_sync_email_binding` above has just refused
+                # to serve without a live one. Inbound arrives through
+                # forwarding into a Nerve relay; its health is reported once
+                # that relay exists.
+                payload.update(email_health={"status": "send_only"})
         return Probe(
             200,
             payload,
@@ -480,7 +469,6 @@ class RuntimeService:
             if response.status_code not in {200, 400}:
                 return False
             store.revoke(binding.identity_id, binding.revision)
-        self._close_gmail_runtime()
         return True
 
     def email_activation_health(self, manifest: RuntimeManifest) -> tuple[str, str]:
@@ -503,10 +491,16 @@ class RuntimeService:
             state = "healthy" if healthy else "failed"
             return state, state
         if provider == "gmail":
+            # One check, reported on both sides: a send-only grant has no inbound
+            # of its own, so the activation receipt says whether the grant is
+            # live. `getProfile` was the earlier probe and needs a read scope;
+            # a token refresh is the only harmless call this grant can make.
             binding = self._sync_email_binding(manifest)
             if binding is None:
                 return "failed", "failed"
             bundle = self._gmail_bundle(binding)
+            if "https://www.googleapis.com/auth/gmail.send" not in bundle.scopes:
+                return "failed", "failed"
             with open_database(self.database_path) as database:
                 client = build_gmail_client(
                     database,
@@ -515,19 +509,14 @@ class RuntimeService:
                     client_factory=self.gmail_client_factory,
                 )
                 try:
-                    profile = client.profile()
-                    inbound = "healthy" if profile.get("historyId") else "failed"
-                    scopes = set(bundle.scopes)
-                    outbound = (
-                        "healthy"
-                        if "https://www.googleapis.com/auth/gmail.send" in scopes
-                        else "failed"
-                    )
-                    return inbound, outbound
+                    client.verify_access()
+                except GmailAuthRevoked:
+                    return "failed", "failed"
                 finally:
                     close = getattr(client, "close", None)
                     if close is not None:
                         close()
+            return "healthy", "healthy"
         return "failed", "failed"
 
     def _nerve_config(self, manifest: RuntimeManifest) -> NerveRuntimeConfig:
@@ -589,48 +578,8 @@ class RuntimeService:
                 if close is not None:
                     close()
 
-    def _close_gmail_runtime(self) -> None:
-        close = getattr(self._gmail_client, "close", None)
-        if close is not None:
-            close()
-        if self._gmail_database is not None:
-            self._gmail_database.close()
-        self._gmail_runtime = None
-        self._gmail_client = None
-        self._gmail_database = None
-        self._gmail_binding_key = None
-
-    def run_gmail_once(self) -> int:
-        manifest = self.require_ready()
-        binding = self._sync_email_binding(manifest)
-        if binding is None or binding.provider != "gmail":
-            self._close_gmail_runtime()
-            raise RuntimeNotReady("runtime email provider is not Gmail")
-        binding_key = (binding.identity_id, binding.revision)
-        if self._gmail_runtime is None or self._gmail_binding_key != binding_key:
-            self._close_gmail_runtime()
-            database = open_database(self.database_path)
-            try:
-                bundle = self._gmail_bundle(binding)
-                client = build_gmail_client(
-                    database,
-                    binding,
-                    bundle,
-                    client_factory=self.gmail_client_factory,
-                )
-                source = GmailHistorySource(database, binding, client)
-                runtime = EmailRuntimeService(database, (source,))
-            except Exception:
-                database.close()
-                raise
-            self._gmail_database = database
-            self._gmail_client = client
-            self._gmail_runtime = runtime
-            self._gmail_binding_key = binding_key
-        return self._gmail_runtime.run_once()
-
     def close(self) -> None:
-        self._close_gmail_runtime()
+        """Nothing is held open between requests since the Gmail poller left."""
 
     def _whatsapp_config(self, manifest: RuntimeManifest) -> WhatsAppRuntimeConfig:
         if not any(binding.channel == "whatsapp" for binding in manifest.verified_bindings):
@@ -1233,29 +1182,6 @@ def _nerve_worker_until_stopped(
         stop.wait(interval)
 
 
-def _gmail_worker_until_stopped(
-    service: RuntimeService,
-    source: Mapping[str, str],
-    stop: threading.Event,
-) -> None:
-    try:
-        interval = max(float(source.get(ENV_GMAIL_WORKER_SECONDS, "60")), 0.1)
-    except ValueError:
-        interval = 60.0
-    while not stop.is_set():
-        if service.can_start_workers:
-            try:
-                service.run_gmail_once()
-            except RuntimeNotReady:
-                pass
-            except Exception as error:
-                print(
-                    f"Gmail ingress pending ({error.__class__.__name__})",
-                    file=sys.stderr,
-                )
-        stop.wait(interval)
-
-
 class _QuietRequestHandler(WSGIRequestHandler):
     def log_message(self, _format: str, *args: object) -> None:
         """Health requests are intentionally absent from application logs."""
@@ -1317,22 +1243,14 @@ def serve_runtime(*, env: Mapping[str, str] | None = None) -> None:
         name="nerve-ingress",
         daemon=True,
     )
-    gmail_worker = threading.Thread(
-        target=_gmail_worker_until_stopped,
-        args=(service, source, stop),
-        name="gmail-history",
-        daemon=True,
-    )
     worker.start()
     nerve_worker.start()
-    gmail_worker.start()
     try:
         server.serve_forever()
     finally:
         stop.set()
         worker.join(timeout=1.0)
         nerve_worker.join(timeout=1.0)
-        gmail_worker.join(timeout=1.0)
         service.close()
         server.server_close()
 

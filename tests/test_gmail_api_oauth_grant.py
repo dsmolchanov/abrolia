@@ -33,7 +33,7 @@ def test_grant_is_encrypted_and_rotates_atomically(tmp_path: Path) -> None:
         revision=1,
         refresh_credential="refresh-one",
         provider_subject="subject-1",
-        scopes=("gmail.readonly", "gmail.send"),
+        scopes=("openid", "email", "gmail.send"),
     )
     assert all(
         b"refresh-one" not in path.read_bytes()
@@ -92,7 +92,6 @@ def test_revoked_grant_is_not_reinstalled_from_stale_runtime_secret(
         scopes=(
             "openid",
             "email",
-            "https://www.googleapis.com/auth/gmail.readonly",
             "https://www.googleapis.com/auth/gmail.send",
         ),
         wrapping_key=b"k" * 32,

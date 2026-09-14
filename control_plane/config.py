@@ -200,7 +200,6 @@ class ControlPlaneConfig:
     gmail_real_enabled: bool = False
     google_oauth_app_verified: bool = False
     google_gmail_scope_approved: bool = False
-    google_casa_current: bool = False
     google_limited_use_disclosed: bool = False
 
     @property
@@ -307,15 +306,19 @@ class ControlPlaneConfig:
         if self.gmail_real_enabled and (
             not self.real_email_enabled
             or not google_configured
+            # Send-only Gmail asks for a sensitive scope, not a restricted one,
+            # so the evidence is Google's sensitive-scope approval; a CASA
+            # assessment is owed only for the restricted read scope, which
+            # nothing requests any more.
             or not all((
                 self.google_oauth_app_verified,
                 self.google_gmail_scope_approved,
-                self.google_casa_current,
                 self.google_limited_use_disclosed,
             ))
         ):
             raise ConfigurationError(
-                "real Gmail requires verified OAuth, scope, CASA and Limited Use evidence"
+                "real Gmail requires verified OAuth, sensitive-scope approval"
+                " and Limited Use evidence"
             )
         active = self.encryption_keys.get(self.active_encryption_key_version)
         if active is None or len(active) != 32:
@@ -491,7 +494,6 @@ class ControlPlaneConfig:
             google_gmail_scope_approved=(
                 source.get("ABROLIA_GOOGLE_GMAIL_SCOPE_APPROVED", "0") == "1"
             ),
-            google_casa_current=source.get("ABROLIA_GOOGLE_CASA_CURRENT", "0") == "1",
             google_limited_use_disclosed=(
                 source.get("ABROLIA_GOOGLE_LIMITED_USE_DISCLOSED", "0") == "1"
             ),
