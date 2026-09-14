@@ -199,12 +199,12 @@ account and a synthetic Nerve canary inbox. No production household is used.
 
 #### 1. Spike record and synthetic fixtures
 
-**Branches:** `docs/gmail-forwarding-spike`.
+**Branches:** `docs/gmail-send-only-plan`, `docs/gmail-forwarding-spike`.
 
 **Files:** `tests/fixtures/email/gmail_forwarding/confirmation.nerve.json`,
 `tests/fixtures/email/gmail_forwarding/forwarded_letter.nerve.json`,
 `tests/fixtures/email/gmail_forwarding/canary_return.nerve.json`,
-`tests/fixtures/PROVENANCE.md`.
+`.check-fixtures-allow`.
 
 **Changes**:
 
@@ -218,8 +218,10 @@ account and a synthetic Nerve canary inbox. No production household is used.
     or not, and whether it lands in spam.
   - S4 A token with exactly openid+email+gmail.send: `messages.send` succeeds
     with `id`/`threadId`/`labelIds`; `getProfile` returns 403.
-- Save sanitised, synthetic reconstructions of S1–S3 as fixtures (RFC-example
-  addresses only) and list them in `tests/fixtures/PROVENANCE.md`.
+- Save sanitised, synthetic reconstructions of S1–S3 as fixtures (reserved
+  documentation domains; Google's automated sender allowlisted in
+  `.check-fixtures-allow`). They are text, so `tests/fixtures/PROVENANCE.md`
+  needs no entry.
 
 **Deterministic outcomes used later**:
 
@@ -231,15 +233,49 @@ account and a synthetic Nerve canary inbox. No production household is used.
   sender, stop and revise this plan before Phase 2: reply targeting would
   change.
 
+### Outcomes (2026-09-14)
+
+Recorded in `thoughts/shared/research/2026-09-14-gmail-forwarding-spike.md`.
+
+- **S1:** sender `forwarding-noreply@google.com`; subject
+  `(Gmail Forwarding confirmation – Receive mail from <agent>`; **no code**, only
+  links on host `mail-settings.google.com`: `/mail/vf-…` confirms, `/mail/uf-…`
+  cancels. Gmail shows "Verify <address>" until a human opens the vf link **and
+  presses Confirm**. Mail that arrived before the forwarding radio was saved was
+  not forwarded.
+- **S2:** a letter forwarded by Gmail arrives in about 6 s. Nerve `from` = the
+  **original sender**; Nerve `to` = **the relay inbox address, not the Gmail
+  address**; subject unchanged, no "Fwd:"; no header fields. Stop condition
+  not met.
+- **S3:** a message from the relay inbox to the agent Gmail is forwarded back in
+  about 11 s (inbound, from = to = relay address). **Strategy A applies.**
+- **S4:** granted exactly openid, userinfo.email, gmail.send.
+  `users.messages.send` → 200 with `id`, `threadId`, `labelIds`. `getProfile` and
+  `messages.list` → 403 `PERMISSION_DENIED` reason `insufficientPermissions`.
+  Two preconditions surfaced: Google's consent screen shows `gmail.send` as a
+  checkbox the user must tick (unticked → only openid+email granted), and the
+  Cloud project must have the Gmail API enabled.
+- **Nerve side:** the runtime MCP `list_threads` tool timed out after the MCP 2026
+  transition, while REST `GET /v1/inboxes/{id}/threads` with
+  `X-Nerve-Cloud-Key` worked. The runtime already uses REST for ingest.
+
+Consequences carried into later phases:
+- Phase 1: distinguish 403 `insufficientPermissions` from a revoked grant.
+- Phase 2: link allowlist = `mail-settings.google.com`, path prefix
+  `/mail/vf-`. The chat copy says "open the link, press Confirm, then choose
+  'Forward a copy of incoming mail' and Save".
+- Phase 5: the onboarding copy tells the family to tick "Send email on your behalf".
+- Phase 6: verify the Gmail API is enabled before the live battery.
+
 ### Success Criteria
 
 #### Automated Verification
 
-- [ ] `python3 scripts/check_fixtures.py --all` passes with the new fixtures.
+- [x] `python3 scripts/check_fixtures.py --all` passes with the new fixtures.
 
 #### Manual Verification
 
-- [ ] Operator performs S1–S4 on synthetic accounts and commits the spike record.
+- [x] Operator performs S1–S4 on synthetic accounts and commits the spike record (2026-09-14).
 
 ---
 
@@ -284,6 +320,9 @@ nothing can issue an insufficient-scope call.
   `ABROLIA_GMAIL_WORKER_SECONDS`. Gmail activation health = outbound only
   (bundle has gmail.send and a token refresh succeeds); inbound health comes
   from Phase 4.
+- `GmailHttpClient._request`: a 403 whose error reason is `insufficientPermissions`
+  raises a new `GmailScopeInsufficient` (health `needs_reconnect`), not
+  `GmailAuthRevoked`; 401 and other 403s keep today's behaviour. Test both.
 - `GmailSendProvider.supports_idempotent_reconcile = False` and remove
   `reconcile`; a send timeout or connection error stays `EmailOutcomeUnknown`
   and `EmailSender` records `outcome_unknown` without retry. Test that path.
@@ -346,14 +385,16 @@ confirmation. Ships before the control plane emits the fields.
   - `classify(message, *, agent_address, relay_address, allowed_link_hosts)` →
     `confirmation(link)` | `check(token)` | `letter`.
   - `confirmation` requires `from == forwarding-noreply@google.com` (per S1)
-    and exactly one https link whose host is in the allowlist; otherwise the
-    message is a `letter`.
+    and exactly one https link with host `mail-settings.google.com` and path
+    prefix `/mail/vf-`; the `/mail/uf-` cancel link and other links are never
+    surfaced. Otherwise the message is a `letter`.
   - `check` requires `from == relay_address` and the Phase 4 token format.
   - A `letter` continues to `ingest_rfc822` unchanged; the original sender is
     Nerve's `from` (per S2), so replies go to the original sender.
 - A `confirmation` never enters extraction. It posts one Web chat message to
-  the owner with the link and the instruction "Open this link, then in Gmail
-  choose 'Forward a copy of incoming mail'". Abrolia never requests the URL.
+  the owner with the link and the instruction "Open this link and press
+  Confirm, then in Gmail on a computer choose 'Forward a copy of incoming mail
+  to …' and Save Changes". Abrolia never requests the URL.
 - Forwarding state table (runtime DB migration): `pending` on first activation
   of a relay binding; `active` on the first `letter` or `check` received
   through the relay. Exposed in `/readyz` `email.forwarding`.
@@ -493,8 +534,9 @@ Detect forwarding that was never finished or later stopped, and tell the family.
   Web chat message with setup steps. `/readyz` shows `email.forwarding`.
 - Chat action "I've turned forwarding on" triggers an immediate check
   (Strategy A) or re-arms the 7-day window (Strategy B).
-- Onboarding Gmail card copy discloses the daily check message (Strategy A) and
-  that forwarding is set up in Gmail on a computer after setup.
+- Onboarding Gmail card copy discloses the daily check message (Strategy A),
+  that forwarding is set up in Gmail on a computer after setup, and that the
+  "Send email on your behalf" checkbox on Google's consent screen must be ticked.
 
 ### Success Criteria
 
@@ -582,6 +624,7 @@ submit sensitive-scope verification.
 No code. Operator steps recorded in
 `thoughts/shared/implementations/2026-09-XX-gmail-send-only-forwarding-validation.md`.
 
+0. Confirm the Gmail API is enabled in the OAuth client's Cloud project (spike S4).
 1. Re-run the read-only production count. If any Gmail identity exists, the
    operator resets that household's email step (revokes the grant) before
    deploying Phase 1.
