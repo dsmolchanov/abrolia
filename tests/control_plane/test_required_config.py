@@ -183,6 +183,61 @@ def test_secrets_are_never_carried_in_fly_toml() -> None:
         assert f"{name} =" not in toml, f"{name} must be a secret, not a fly.toml value"
 
 
+#: Real Gmail is gated on Google's evidence for the SEND-ONLY design: a
+#: verified app, sensitive-scope approval for `gmail.send`, and the Limited
+#: Use disclosure. There is no CASA flag — that assessment is owed for a
+#: restricted scope, and `gmail.readonly` is no longer requested.
+GMAIL_EVIDENCE = (
+    "ABROLIA_GOOGLE_OAUTH_APP_VERIFIED",
+    "ABROLIA_GOOGLE_GMAIL_SCOPE_APPROVED",
+    "ABROLIA_GOOGLE_LIMITED_USE_DISCLOSED",
+)
+
+
+def _real_gmail_env() -> dict[str, str]:
+    env = _production_env()
+    env.update(
+        {
+            "ABROLIA_SYNTHETIC_ONLY": "0",
+            "REAL_FAMILY_DATA_ENABLED": "1",
+            "ABROLIA_REAL_EMAIL_ENABLED": "1",
+            "ABROLIA_NERVE_BASE_URL": "https://nerve.example.test",
+            "ABROLIA_NERVE_ADMIN_KEY": "synthetic-nerve-admin-key",
+            "ABROLIA_NERVE_PLATFORM_ORG_ID": "10000000-0000-4000-8000-000000000001",
+            "ABROLIA_NERVE_PLATFORM_DOMAIN_ID": "10000000-0000-4000-8000-000000000002",
+            "ABROLIA_GMAIL_REAL_ENABLED": "1",
+            **{name: "1" for name in GMAIL_EVIDENCE},
+        }
+    )
+    return env
+
+
+def test_real_gmail_boots_on_the_three_send_only_evidence_flags() -> None:
+    config = ControlPlaneConfig.from_env(_real_gmail_env())
+    assert config.gmail_real_enabled is True
+    assert not hasattr(config, "google_casa_current")
+
+
+@pytest.mark.parametrize("name", GMAIL_EVIDENCE)
+def test_real_gmail_refuses_to_boot_without_each_evidence_flag(name: str) -> None:
+    env = _real_gmail_env()
+    env[name] = "0"
+    with pytest.raises(ConfigurationError, match="sensitive-scope"):
+        ControlPlaneConfig.from_env(env)
+
+
+def test_a_casa_flag_is_neither_required_nor_read() -> None:
+    """A deployment still carrying the old flag must not be blocked by it, and
+    setting it must not stand in for the evidence that is required."""
+    env = _real_gmail_env()
+    env["ABROLIA_GOOGLE_CASA_CURRENT"] = "0"
+    ControlPlaneConfig.from_env(env)
+    env["ABROLIA_GOOGLE_CASA_CURRENT"] = "1"
+    env["ABROLIA_GOOGLE_GMAIL_SCOPE_APPROVED"] = "0"
+    with pytest.raises(ConfigurationError, match="sensitive-scope"):
+        ControlPlaneConfig.from_env(env)
+
+
 def test_an_unoffered_gmail_option_requires_no_google_configuration() -> None:
     """The requirement follows the switch, so a deployment that does not offer
     Gmail is not made to hold OAuth secrets it never uses."""

@@ -14,7 +14,6 @@ from pathlib import Path
 import pytest
 
 from control_plane.privacy.consent import consent_version_and_sha
-from hermes_cloud.core.db import open_database
 from hermes_cloud.core.runtime_manifest import compute_config_sha256, parse_runtime_manifest
 from hermes_cloud.runtime import bootstrap as runtime_bootstrap_module
 from hermes_cloud.runtime import service as runtime_service_module
@@ -613,11 +612,6 @@ def test_serve_runtime_starts_probe_server_while_bootstrap_is_pending(
         return FakeServer(application)
 
     monkeypatch.setattr(runtime_service_module, "make_server", fake_make_server)
-    monkeypatch.setattr(
-        runtime_service_module,
-        "_gmail_worker_until_stopped",
-        lambda _service, _source, _stop: seen.update(gmail_worker_started=True),
-    )
     runtime_service_module.serve_runtime(
         env={
             "HERMES_RUNTIME_HOST": "127.0.0.1",
@@ -632,7 +626,6 @@ def test_serve_runtime_starts_probe_server_while_bootstrap_is_pending(
     assert seen["host"] == "127.0.0.1" and seen["port"] == 8089
     assert seen["status"] == "200 OK"
     assert seen["body"] == {"status": "ok"}
-    assert seen["gmail_worker_started"] is True
     assert seen["closed"] is True
 
 
@@ -649,54 +642,46 @@ def test_fly_runtime_listener_is_dual_stack() -> None:
 
 
 class FakeRuntimeGmailClient:
-    def __init__(self) -> None:
-        self.profile_id = "100"
-        self.history_pages: list[dict] = []
-        self.messages: dict[str, dict] = {}
-        self.history_starts: list[str] = []
+    """A send-only client: the runtime may refresh the grant and send, nothing else."""
+
+    def __init__(self, *, error: Exception | None = None) -> None:
+        self.error = error
+        self.verified = 0
         self.closed = False
 
-    def profile(self):
-        return {"historyId": self.profile_id}
+    def verify_access(self):
+        self.verified += 1
+        if self.error is not None:
+            raise self.error
 
-    def history(self, start_history_id, page_token=None):
-        self.history_starts.append(start_history_id)
-        if self.history_pages:
-            return self.history_pages.pop(0)
-        return {"historyId": start_history_id, "history": []}
-
-    def message(self, message_id):
-        return self.messages[message_id]
-
-    def list_inbox(self, page_token=None, *, max_results):
-        return {"messages": []}
+    def send_raw(self, raw):
+        return {"id": "gmail-message-1"}
 
     def close(self):
         self.closed = True
 
 
-def _gmail_secret_bundle() -> str:
+def _gmail_secret_bundle(*, scopes=None) -> str:
     return json.dumps(
         {
             "client_id": "client-id.apps.googleusercontent.com",
             "client_secret": "client-secret-canary",
             "refresh_credential": "refresh-credential-canary",
             "provider_subject": "google-subject-1",
-            "scopes": [
-                "openid",
-                "email",
-                "https://www.googleapis.com/auth/gmail.readonly",
-                "https://www.googleapis.com/auth/gmail.send",
-            ],
+            "scopes": list(
+                scopes
+                or (
+                    "openid",
+                    "email",
+                    "https://www.googleapis.com/auth/gmail.send",
+                )
+            ),
             "wrapping_key": base64.urlsafe_b64encode(b"k" * 32).rstrip(b"=").decode(),
         }
     )
 
 
-def test_runtime_gmail_worker_baselines_ingests_and_resumes_after_restart(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
+def _active_gmail_runtime(tmp_path: Path, client) -> tuple[RuntimeService, object]:
     content = manifest_toml(with_email_binding=True, email_provider="gmail")
     manifest = parse_runtime_manifest(content)
     manifest_path = atomic_write(tmp_path / "household.toml", content.encode())
@@ -712,53 +697,40 @@ def test_runtime_gmail_worker_baselines_ingests_and_resumes_after_restart(
             updated_at=1.0,
         ),
     )
-    env = {
-        "HERMES_DB": str(tmp_path / "hermes.db"),
-        "HERMES_EMAIL_BINDING": _gmail_secret_bundle(),
-    }
-    first_client = FakeRuntimeGmailClient()
-    first = RuntimeService(
+    service = RuntimeService(
         manifest_path=manifest_path,
         activation_path=activation_path,
         runtime_ref=RUNTIME_REF,
-        env=env,
-        gmail_client_factory=lambda *_args, **_kwargs: first_client,
+        env={
+            "HERMES_DB": str(tmp_path / "hermes.db"),
+            "HERMES_EMAIL_BINDING": _gmail_secret_bundle(),
+        },
+        gmail_client_factory=lambda *_args, **_kwargs: client,
     )
+    return service, manifest
 
-    assert first.run_gmail_once() == 0
-    raw = (
-        b"From: school@example.test\r\nTo: runtime@abrolia.test\r\n"
-        b"Message-ID: <runtime-gmail-1@example.test>\r\nSubject: Test\r\n\r\nBody"
-    )
-    first_client.history_pages = [
-        {
-            "historyId": "102",
-            "history": [{"messagesAdded": [{"message": {"id": "gmail-message-1"}}]}],
-        }
-    ]
-    first_client.messages["gmail-message-1"] = {
-        "id": "gmail-message-1",
-        "labelIds": ["INBOX"],
-        "raw": base64.urlsafe_b64encode(raw).rstrip(b"=").decode(),
-    }
-    assert first.run_gmail_once() == 1
-    first.close()
-    assert first_client.closed is True
 
-    second_client = FakeRuntimeGmailClient()
-    second_client.profile_id = "102"
-    restarted = RuntimeService(
-        manifest_path=manifest_path,
-        activation_path=activation_path,
-        runtime_ref=RUNTIME_REF,
-        env=env,
-        gmail_client_factory=lambda *_args, **_kwargs: second_client,
-    )
-    assert restarted.run_gmail_once() == 0
-    assert second_client.history_starts == ["102"]
-    with open_database(tmp_path / "hermes.db") as database:
-        assert database.query_one("SELECT COUNT(*) AS n FROM events")["n"] == 1
-        assert database.query_one("SELECT cursor FROM email_sync_state")["cursor"] == "102"
+def test_gmail_activation_health_is_the_grant_refresh_and_never_a_read(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Send-only Gmail: activation proves the grant refreshes, readiness shows
+    the grant, and the runtime never starts a Gmail poller or calls a read
+    method — the send-only scope set would answer one with 403."""
+    client = FakeRuntimeGmailClient()
+    service, manifest = _active_gmail_runtime(tmp_path, client)
+
+    assert service.email_activation_health(manifest) == ("healthy", "healthy")
+    assert client.verified == 1
+    assert client.closed is True
+    assert not hasattr(service, "run_gmail_once")
+    assert not hasattr(runtime_service_module, "_gmail_worker_until_stopped")
+
+    ready = service.readyz()
+    assert ready.status_code == 200
+    assert ready.payload["email_provider"] == "gmail"
+    assert ready.payload["email_health"] == {"status": "send_only"}
+
     revoke_calls = []
 
     class Revoked:
@@ -769,10 +741,38 @@ def test_runtime_gmail_worker_baselines_ingests_and_resumes_after_restart(
         "post",
         lambda *_args, **_kwargs: revoke_calls.append(True) or Revoked(),
     )
-    assert restarted._revoke_google_credential(manifest) is True
-    assert restarted._revoke_google_credential(manifest) is True
+    assert service._revoke_google_credential(manifest) is True
+    assert service._revoke_google_credential(manifest) is True
     assert revoke_calls == [True]
-    restarted.close()
+    revoked = service.readyz()
+    assert revoked.status_code == 503
+    assert revoked.payload["reason"] == "email_state_unavailable"
+    service.close()
+
+
+def test_gmail_activation_fails_closed_on_a_revoked_grant(tmp_path: Path) -> None:
+    from hermes_cloud.email.google_client import GmailAuthRevoked
+
+    client = FakeRuntimeGmailClient(error=GmailAuthRevoked("gmail_auth_revoked"))
+    service, manifest = _active_gmail_runtime(tmp_path, client)
+
+    assert service.email_activation_health(manifest) == ("failed", "failed")
+    assert client.closed is True
+
+
+def test_gmail_activation_fails_closed_without_the_send_scope(tmp_path: Path) -> None:
+    """A bundle the control plane would never write, refused here as well:
+    the runtime does not activate a Gmail household it cannot send from."""
+    from hermes_cloud.email.google_client import GmailConfigurationError
+
+    client = FakeRuntimeGmailClient()
+    service, manifest = _active_gmail_runtime(tmp_path, client)
+    service.env["HERMES_EMAIL_BINDING"] = _gmail_secret_bundle(scopes=("openid", "email"))
+
+    with pytest.raises(RuntimeNotReady) as raised:
+        service.email_activation_health(manifest)
+    assert isinstance(raised.value.__cause__, GmailConfigurationError)
+    assert client.verified == 0
 
 
 def test_python_module_entrypoint_is_wired_without_exposing_configuration() -> None:

@@ -236,7 +236,6 @@ def test_provisioned_gmail_selects_oauth_api_sender(tmp_path: Path, monkeypatch)
             "scopes": [
                 "openid",
                 "email",
-                "https://www.googleapis.com/auth/gmail.readonly",
                 "https://www.googleapis.com/auth/gmail.send",
             ],
             "wrapping_key": base64.urlsafe_b64encode(b"k" * 32).rstrip(b"=").decode(),

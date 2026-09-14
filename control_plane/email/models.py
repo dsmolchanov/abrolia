@@ -31,12 +31,23 @@ SYNTHETIC_EMAIL_SECRET_BINDING = "ABROLIA_EMAIL_PROVIDER_KEY"
 NERVE_EMAIL_SECRET_BINDING = "ABROLIA_NERVE_EMAIL_CREDENTIALS"
 NERVE_EMAIL_SCOPES = ("nerve:email.read", "nerve:email.send")
 GMAIL_EMAIL_SECRET_BINDING = "ABROLIA_GMAIL_OAUTH_GRANT"
+#: Send-only (owner decision 2026-09-13): `gmail.send` is a sensitive scope,
+#: the Gmail read scope a restricted one, and only the latter makes Google's
+#: CASA assessment mandatory. Inbound mail reaches Abrolia through forwarding the
+#: family turns on, not through a read scope. `email` is the short name Google
+#: accepts in a request and writes back as `.../auth/userinfo.email`;
+#: `GoogleOAuthClient.exchange` folds that alias before comparing. Must equal
+#: `hermes_cloud.email.google_client.GMAIL_REQUIRED_SCOPES`;
+#: `tests/test_gmail_scope_consistency.py` holds the two together.
 GMAIL_EMAIL_SCOPES = tuple(sorted((
     "openid",
     "email",
-    "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/gmail.send",
 )))
+GMAIL_DISCLOSURE = (
+    "Abrolia sends mail from this dedicated agent mailbox only after you confirm;"
+    " incoming mail reaches Abrolia through forwarding you turn on."
+)
 
 
 # --- Generation-scoped secret handoff (B-02) -------------------------------
@@ -292,8 +303,8 @@ class EmailGoogleOAuthPublicStatus(BaseModel):
 
     state: Literal["oauth_required", "dedicated_account_confirmation"]
     disclosure: Literal[
-        "Abrolia reads and sends mail only for this dedicated agent mailbox; "
-        "Google data is not used to train a general model."
+        "Abrolia sends mail from this dedicated agent mailbox only after you confirm;"
+        " incoming mail reaches Abrolia through forwarding you turn on."
     ]
     connected_address_masked: str | None = Field(default=None, max_length=320)
 

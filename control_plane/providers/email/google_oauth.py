@@ -14,6 +14,7 @@ import httpx
 from control_plane.config import ControlPlaneConfig
 from control_plane.crypto import SecretMaterial, normalize_email
 from control_plane.email.models import (
+    GMAIL_DISCLOSURE,
     GMAIL_EMAIL_SCOPES,
     GMAIL_EMAIL_SECRET_BINDING,
     EmailGoogleOAuthPublicStatus,
@@ -39,10 +40,13 @@ GOOGLE_AUTHORIZATION_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
 GOOGLE_TOKEN_INFO_ENDPOINT = "https://oauth2.googleapis.com/tokeninfo"
 GOOGLE_USER_INFO_ENDPOINT = "https://openidconnect.googleapis.com/v1/userinfo"
-DISCLOSURE = (
-    "Abrolia reads and sends mail only for this dedicated agent mailbox; "
-    "Google data is not used to train a general model."
-)
+#: Google writes the granted set back under the long names. The spike token of
+#: 2026-09-14 carried `gmail.send userinfo.email openid` for a request of
+#: `email gmail.send openid`, and an exact comparison against the requested
+#: short name revoked every good grant.
+_GRANTED_SCOPE_ALIASES = {
+    "https://www.googleapis.com/auth/userinfo.email": "email",
+}
 
 
 class GoogleOAuthError(RuntimeError):
@@ -142,7 +146,10 @@ class GoogleOAuthClient:
             token = response.json()
             access_token = str(token["access_token"])
             refresh_credential = str(token["refresh_token"])
-            scopes = tuple(sorted(str(token.get("scope", "")).split()))
+            scopes = tuple(sorted({
+                _GRANTED_SCOPE_ALIASES.get(scope, scope)
+                for scope in str(token.get("scope", "")).split()
+            }))
             token_info_response = self._client.get(
                 GOOGLE_TOKEN_INFO_ENDPOINT,
                 params={"id_token": str(token["id_token"])},
@@ -472,7 +479,7 @@ class GoogleOAuthService:
                     json.dumps(
                         EmailGoogleOAuthPublicStatus(
                             state="dedicated_account_confirmation",
-                            disclosure=DISCLOSURE,
+                            disclosure=GMAIL_DISCLOSURE,
                             connected_address_masked=masked,
                         ).model_dump(mode="json", exclude_none=True),
                         sort_keys=True,
@@ -573,7 +580,7 @@ class GoogleOAuthProvisioner:
                 if row is not None and row["callback_at"] is not None
                 else "oauth_required"
             ),
-            disclosure=DISCLOSURE,
+            disclosure=GMAIL_DISCLOSURE,
         )
         raise ProviderWaiting(
             "Google OAuth user action is required",

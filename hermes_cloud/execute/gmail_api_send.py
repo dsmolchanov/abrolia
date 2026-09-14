@@ -1,4 +1,11 @@
-"""Gmail API send adapter with exact Message-ID reconciliation."""
+"""Gmail API send adapter for a send-only grant.
+
+`users.messages.send` answers synchronously with the accepted message's `id`,
+so a 200 is the receipt. What the adapter cannot do is look again: settling a
+timed-out send by searching Sent for the Message-ID needs the Gmail read
+scope, which the grant no longer carries. A timeout therefore ends as
+`outcome_unknown`, and `EmailSender` never replays an unknown outcome.
+"""
 
 from __future__ import annotations
 
@@ -12,12 +19,12 @@ from hermes_cloud.execute.email_send import EmailOutcomeUnknown, EmailRejected
 
 class GmailSendApi(Protocol):
     def send_raw(self, raw: str) -> dict[str, Any]: ...
-    def search_sent(self, query: str) -> list[dict[str, Any]]: ...
 
 
 class GmailSendProvider:
     provider = "gmail"
-    supports_idempotent_reconcile = True
+    #: No Sent search without a read scope: an unknown outcome stays unknown.
+    supports_idempotent_reconcile = False
 
     def __init__(self, client: GmailSendApi, *, clock=time.time) -> None:
         self.client = client
@@ -37,23 +44,6 @@ class GmailSendProvider:
             request.approval_id,
             request.message_id,
             provider_ref,
-            self.clock(),
-            "accepted",
-        )
-
-    def reconcile(self, request: EmailSendRequest) -> EmailDeliveryReceipt:
-        try:
-            matches = self.client.search_sent(f"rfc822msgid:{request.message_id}")
-        except (TimeoutError, ConnectionError) as error:
-            raise EmailOutcomeUnknown("Gmail Sent reconciliation is unavailable") from error
-        exact = [item for item in matches if str(item.get("rfc822_message_id")) == request.message_id]
-        if len(exact) != 1 or not exact[0].get("id"):
-            raise EmailOutcomeUnknown("Gmail Sent reconciliation is absent or ambiguous")
-        return EmailDeliveryReceipt(
-            request.effect_id,
-            request.approval_id,
-            request.message_id,
-            str(exact[0]["id"]),
             self.clock(),
             "accepted",
         )

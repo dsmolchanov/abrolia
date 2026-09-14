@@ -301,13 +301,23 @@ nothing can issue an insufficient-scope call.
 `tests/control_plane/email/test_google_oauth.py`, `tests/test_runtime_service.py`,
 `tests/test_config_and_cli.py`, `tests/test_gmail_api_oauth_grant.py`,
 `tests/test_gmail_api_send.py`, `tests/test_gmail_api_ingest.py`,
-`tests/test_gmail_scope_consistency.py`, `tests/control_plane/test_required_config.py`.
+`tests/test_gmail_scope_consistency.py`, `tests/control_plane/test_required_config.py`,
+`tests/control_plane/test_real_email_wiring.py`, `deploy/control-plane/fly.toml`.
 
 **Changes**:
 
-- `GMAIL_EMAIL_SCOPES` and `GMAIL_REQUIRED_SCOPES` → openid, userinfo.email,
+- `GMAIL_EMAIL_SCOPES` and `GMAIL_REQUIRED_SCOPES` → openid, email,
   gmail.send. New `tests/test_gmail_scope_consistency.py` imports both and
   asserts equality, so the two copies cannot drift.
+- **Found while implementing (2026-09-15):** the code requests the short scope
+  name `email`, and Google writes the grant back as
+  `https://www.googleapis.com/auth/userinfo.email` (spike S4 read exactly
+  `gmail.send userinfo.email openid`). `GoogleOAuthClient.exchange` compared
+  the two verbatim, so every real consent would have been revoked as "an
+  unexpected scope set" — unnoticed because production holds no Gmail identity
+  and the spike used its own script. `exchange` now folds the alias before the
+  comparison; the bundle keeps the short name; a test replays the spike's scope
+  string.
 - Fix `test_scope_downgrade_revokes_and_fails_closed` to drop `gmail.send`
   explicitly; add a case granting the old four-scope set (a wider grant) and
   assert it is revoked and rejected.
@@ -321,8 +331,12 @@ nothing can issue an insufficient-scope call.
   (bundle has gmail.send and a token refresh succeeds); inbound health comes
   from Phase 4.
 - `GmailHttpClient._request`: a 403 whose error reason is `insufficientPermissions`
-  raises a new `GmailScopeInsufficient` (health `needs_reconnect`), not
-  `GmailAuthRevoked`; 401 and other 403s keep today's behaviour. Test both.
+  raises a new `GmailScopeInsufficient`, not `GmailAuthRevoked`; 401 and other
+  403s keep today's behaviour. Test both. (The `needs_reconnect` health label
+  named earlier had no writer once the poller's `email_sync_state` rows were
+  gone; `/readyz` reports `email_health.status = send_only` for a live grant
+  and stays `not_ready` for a revoked one, until Phase 4 adds forwarding
+  health.)
 - `GmailSendProvider.supports_idempotent_reconcile = False` and remove
   `reconcile`; a send timeout or connection error stays `EmailOutcomeUnknown`
   and `EmailSender` records `outcome_unknown` without retry. Test that path.
