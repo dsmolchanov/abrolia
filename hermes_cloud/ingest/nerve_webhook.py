@@ -20,6 +20,7 @@ from hermes_cloud.core.dsar import is_deleted
 from hermes_cloud.core.events import DEFAULT_LEASE_SECONDS, DEFAULT_MAX_ATTEMPTS, EventStore
 from hermes_cloud.email.contracts import EmailBinding
 from hermes_cloud.email.nerve_client import NerveCredentialRevoked
+from hermes_cloud.ingest.forwarding import Check, Confirmation, ForwardingRelay, classify
 from hermes_cloud.ingest.rfc822 import ingest_rfc822
 
 DEFAULT_MAX_SKEW_SECONDS = 5 * 60
@@ -90,6 +91,14 @@ class NerveMaterialized:
     canonical_event_id: str
     created: bool
     attachment_count: int
+
+
+@dataclass(frozen=True)
+class NerveDiverted:
+    """A relay message that was not the family's mail: settled, never ingested."""
+
+    nerve_event_id: str
+    kind: str  # confirmation|check
 
 
 class NerveInboundClient(Protocol):
@@ -372,6 +381,23 @@ class NerveWebhookStore:
                 (now, now, event.identity_id, event.binding_revision),
             )
 
+    def mark_diverted(self, event: NerveWebhookEvent, *, now: float | None = None) -> None:
+        """Terminal like `materialized`, with no canonical event behind it."""
+        now = self.clock() if now is None else now
+        with self.db.write() as connection:
+            connection.execute(
+                "UPDATE nerve_webhook_events SET state = 'diverted', canonical_event_id = NULL,"
+                " lease_until = NULL, leased_by = NULL, last_error_code = NULL,"
+                " updated_at = ? WHERE id = ?",
+                (now, event.id),
+            )
+            connection.execute(
+                "UPDATE nerve_runtime_health SET credential_state = 'valid',"
+                " last_error_code = NULL, updated_at = ?"
+                " WHERE binding_identity_id = ? AND binding_revision = ?",
+                (now, event.identity_id, event.binding_revision),
+            )
+
     def mark_failed(
         self,
         event: NerveWebhookEvent,
@@ -554,6 +580,7 @@ class NerveAttachmentWorker:
         worker_id: str = "nerve-runtime",
         clock=time.time,
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+        relay: ForwardingRelay | None = None,
     ) -> None:
         self.db = database
         self.store = NerveWebhookStore(database, clock=clock)
@@ -562,14 +589,22 @@ class NerveAttachmentWorker:
         self.worker_id = worker_id
         self.clock = clock
         self.max_attempts = max_attempts
+        # Set for a Gmail household's relay inbox and for nothing else: a
+        # managed or family-domain inbox has no confirmation to divert and no
+        # check message to expect, so its letters keep the path they had.
+        self.relay = relay
 
-    def run_once(self) -> NerveMaterialized | None:
+    def run_once(self) -> NerveMaterialized | NerveDiverted | None:
         event = self.store.lease(self.worker_id)
         if event is None:
             return None
         try:
             envelope = self.client.get_thread(event.inbox_id, event.thread_id)
             message = _find_message(envelope, event)
+            if self.relay is not None:
+                diverted = self._divert_relay_message(event, message)
+                if diverted is not None:
+                    return diverted
             raw_attachments = message.get("attachments", [])
             if not isinstance(raw_attachments, list) or len(raw_attachments) != event.attachment_count:
                 raise ValueError("attachment_count_mismatch")
@@ -609,18 +644,23 @@ class NerveAttachmentWorker:
             binding = EmailBinding(
                 identity_id=event.identity_id,
                 revision=event.binding_revision,
-                provider="nerve",
+                provider="nerve" if self.relay is None else "gmail",
                 address="provider-bound",
             )
             ingested = ingest_rfc822(
                 self.events,
-                source="nerve",
+                # The receipt says where the letter came THROUGH: a relay
+                # letter was forwarded by Gmail, and the original sender in
+                # `From` is who a reply goes to.
+                source="nerve" if self.relay is None else "gmail-forward",
                 provider_event_id=event.message_id,
                 raw_bytes=_build_rfc822(event, message, stored),
                 received_at=event.received_at,
                 binding=binding,
             )
             self.store.mark_materialized(event, ingested.event_id)
+            if self.relay is not None:
+                self.relay.state.mark_active(binding, letter=True)
             return NerveMaterialized(
                 event.id, ingested.event_id, ingested.created, len(stored)
             )
@@ -641,3 +681,36 @@ class NerveAttachmentWorker:
                 max_attempts=self.max_attempts,
             )
             raise
+
+    def _divert_relay_message(
+        self, event: NerveWebhookEvent, message: dict[str, Any]
+    ) -> NerveDiverted | None:
+        """Settle Google's confirmation and our own check without ingesting them.
+
+        Neither is the family's mail, so neither becomes an event: an event
+        is what extraction reads, and a confirmation link inside a proposal
+        would be content the model was asked to reason about. The
+        confirmation is kept for the owner to open; the check only proves
+        the relay is live.
+        """
+        assert self.relay is not None
+        kind = classify(
+            message,
+            agent_address=self.relay.agent_address,
+            relay_address=self.relay.relay_address,
+        )
+        binding = EmailBinding(
+            identity_id=event.identity_id,
+            revision=event.binding_revision,
+            provider="gmail",
+            address="provider-bound",
+        )
+        if isinstance(kind, Confirmation):
+            self.relay.state.record_confirmation(binding, kind.link)
+            self.store.mark_diverted(event)
+            return NerveDiverted(event.id, "confirmation")
+        if isinstance(kind, Check):
+            self.relay.state.mark_active(binding, letter=False)
+            self.store.mark_diverted(event)
+            return NerveDiverted(event.id, "check")
+        return None

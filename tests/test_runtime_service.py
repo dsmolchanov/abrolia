@@ -729,7 +729,7 @@ def test_gmail_activation_health_is_the_grant_refresh_and_never_a_read(
     ready = service.readyz()
     assert ready.status_code == 200
     assert ready.payload["email_provider"] == "gmail"
-    assert ready.payload["email_health"] == {"status": "send_only"}
+    assert ready.payload["email_health"] == {"status": "send_only", "forwarding": "none"}
 
     revoke_calls = []
 
@@ -842,7 +842,7 @@ def test_a_revocation_google_proves_closes_readiness_durably(
     service, manifest = _active_gmail_runtime_with_google(
         tmp_path, _google_that(refresh=refresh, send=send)
     )
-    assert service.readyz().payload["email_health"] == {"status": "send_only"}
+    assert service.readyz().payload["email_health"] == {"status": "send_only", "forwarding": "none"}
 
     if refresh is DEAD_TOKEN:
         assert service.email_activation_health(manifest) == ("failed", "failed")
@@ -885,7 +885,7 @@ def test_a_gmail_usage_limit_leaves_readiness_open(tmp_path: Path) -> None:
         )
         with pytest.raises(GmailQuotaExceeded):
             client.send_raw("raw")
-    assert service.readyz().payload["email_health"] == {"status": "send_only"}
+    assert service.readyz().payload["email_health"] == {"status": "send_only", "forwarding": "none"}
 
 
 def test_gmail_activation_fails_closed_without_the_send_scope(tmp_path: Path) -> None:

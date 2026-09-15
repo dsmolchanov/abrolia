@@ -94,3 +94,5 @@ tests/control_plane/test_managed_email_check.py | email | family-agent@abrolia.c
 thoughts/shared/plans/*.md | email | forwarding-noreply@google.com
 thoughts/shared/research/*.md | email | forwarding-noreply@google.com
 tests/fixtures/email/gmail_forwarding/*.json | email | forwarding-noreply@google.com
+hermes_cloud/ingest/forwarding.py | email | forwarding-noreply@google.com
+tests/test_gmail_forwarding_runtime.py | email | forwarding-noreply@google.com
