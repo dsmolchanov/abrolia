@@ -281,7 +281,9 @@ On `abrolia-synthetic` with a dedicated `abrolia-agent-test-*@gmail.com` account
 **Hermetic:**
 
 ```bash
-pytest tests/test_gmail_api_ingest.py tests/test_gmail_api_oauth_grant.py -q
+# `tests/test_gmail_api_ingest.py` left with the Gmail read scope
+# (2026-09-13-gmail-send-only-forwarding.md, Phase 1); the send tests remain.
+pytest tests/test_gmail_api_send.py tests/test_gmail_api_oauth_grant.py -q
 pytest tests/control_plane/email -k gmail -q
 rg -n "HERMES_GMAIL_ADDRESS|APP_PASSWORD|legacy_imap" hermes_cloud/ control_plane/ --glob '!tests/**' | grep -v "test_only"
 # expect: zero hits in prod path (only in hermes_cloud/core/config.py legacy gate + tests)
@@ -333,7 +335,7 @@ Only then does `ABROLIA_REAL_EMAIL_ENABLED=1` appear in a separate gated PR with
 
 ```bash
 pytest tests/control_plane/email -q
-pytest tests/test_gmail_api_ingest.py tests/test_gmail_api_oauth_grant.py tests/test_email_send.py -q
+pytest tests/test_gmail_api_send.py tests/test_gmail_api_oauth_grant.py tests/test_email_send.py -q
 pytest -p no:cacheprovider -m "not live" -q
 ```
 

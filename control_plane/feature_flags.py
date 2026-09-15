@@ -104,6 +104,21 @@ def is_real_email_enabled() -> bool:
     return _is_enabled("ABROLIA_REAL_EMAIL_ENABLED")
 
 
+def check_gmail_relay_enabled() -> None:
+    """Both switches a Gmail relay answers to, asked at the provider call.
+
+    The relay is a real Nerve inbox, so the managed/BYO incident brake covers
+    it as well as the Gmail option switch. `ProvisioningWorker` asks the
+    option switch at dispatch for every `google-oauth` job; the brake is asked
+    HERE, inside the provisioner and before its first Nerve request, because
+    only the provisioner knows whether this deployment has a Nerve to reach —
+    a synthetic deployment runs Gmail without a relay and owes no brake.
+    """
+    check_provider_enabled("gmail")
+    if not is_real_email_enabled():
+        raise RuntimeError("provider gmail relay disabled: real email is off (fail-closed)")
+
+
 def check_provider_enabled(provider: str) -> None:
     """Raise if provider is disabled — fail-closed at call time."""
     mapping = {

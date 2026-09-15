@@ -67,9 +67,14 @@ _OPEN_VALUE_CHANNELS = (
     ".external_ref",
     ".provider_refs",
     ".provider_binding_ref",
+    ".inbound_binding_ref",
     ".provider_subject",
     ".granted_scopes",
 )
+#: Fields that NAME a secret rather than carry one: a binding name the runtime
+#: reads from its environment. Validated to the secret-name alphabet, so a
+#: value that is not a name is refused even here.
+_SECRET_BINDING_FIELDS = (".secret_binding_ref", ".inbound_secret_binding_ref")
 _SECRET_BINDING_REF = re.compile(r"[A-Z][A-Z0-9_]{0,127}")
 
 
@@ -91,7 +96,7 @@ def reject_secret_fields(value: Any, *, path: str = "$") -> None:
     if isinstance(value, str):
         open_value_channel = any(channel in path for channel in _OPEN_VALUE_CHANNELS)
         if (
-            path.endswith(".secret_binding_ref")
+            path.endswith(_SECRET_BINDING_FIELDS)
             and value
             and not _SECRET_BINDING_REF.fullmatch(value)
         ):

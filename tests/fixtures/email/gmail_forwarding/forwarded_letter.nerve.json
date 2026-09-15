@@ -1,0 +1,21 @@
+{
+  "attachments": [],
+  "attachments_state": "known",
+  "cc": [],
+  "created_at": "2026-09-14T21:37:45Z",
+  "direction": "inbound",
+  "from": {
+    "name": "",
+    "email": "sekretariat@schule.example"
+  },
+  "html": "",
+  "id": "00000000-0000-4000-8000-00000000f002",
+  "subject": "Wandertag am Donnerstag",
+  "text": "Liebe Eltern, bitte geben Sie Ihrem Kind bis Dienstag 12 EUR mit. Treffpunkt um 8:15 Uhr am Haupteingang.\n",
+  "to": [
+    {
+      "name": "",
+      "email": "fwd-synthetic-relay@abrolia.example"
+    }
+  ]
+}

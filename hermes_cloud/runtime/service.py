@@ -42,6 +42,7 @@ from hermes_cloud.core.usage import (
 )
 from hermes_cloud.email.contracts import EmailBinding
 from hermes_cloud.email.google_client import (
+    GmailAuthRevoked,
     GmailConfigurationError,
     GmailHttpClient,
     build_gmail_client,
@@ -55,8 +56,11 @@ from hermes_cloud.email.nerve_client import (
     NerveEmailClient,
 )
 from hermes_cloud.email.receipts import EmailBindingStore
-from hermes_cloud.email.service import EmailRuntimeService
-from hermes_cloud.ingest.gmail_api import GmailHistorySource
+from hermes_cloud.ingest.forwarding import (
+    CONFIRMATION_GUIDE,
+    ForwardingRelay,
+    ForwardingStateStore,
+)
 from hermes_cloud.ingest.nerve_webhook import (
     MAX_WEBHOOK_BYTES,
     NerveAttachmentWorker,
@@ -110,7 +114,6 @@ ENV_RUNTIME_CONSENT_MARKER = "HERMES_RUNTIME_CONSENT_MARKER"
 ENV_NERVE_RUNTIME_URL = "ABROLIA_NERVE_RUNTIME_URL"
 ENV_NERVE_REST_URL = "ABROLIA_NERVE_REST_URL"
 ENV_NERVE_WORKER_SECONDS = "ABROLIA_NERVE_WORKER_SECONDS"
-ENV_GMAIL_WORKER_SECONDS = "ABROLIA_GMAIL_WORKER_SECONDS"
 ENV_WHATSAPP_INSTANCE = "HERMES_WHATSAPP_INSTANCE"
 ENV_WHATSAPP_RELAY_SECRET = "HERMES_WHATSAPP_RELAY_SECRET"
 ENV_COST_CAP_USD_PER_DAY = "HERMES_COST_CAP_USD_PER_DAY"
@@ -135,6 +138,9 @@ class NerveRuntimeConfig:
     webhook_signing_key: str
     runtime_url: str
     rest_url: str
+    #: The inbox's own address; carried for a Gmail relay, where it is what
+    #: the check message is sent from and therefore what a `check` must be from.
+    address: str | None = None
 
 
 @dataclass(frozen=True)
@@ -175,10 +181,6 @@ class RuntimeService:
             self.env.get(ENV_RUNTIME_CONSENT_MARKER)
             or self.activation_path.with_name("consent-withdrawn.json")
         )
-        self._gmail_runtime: EmailRuntimeService | None = None
-        self._gmail_client: Any | None = None
-        self._gmail_database: Any | None = None
-        self._gmail_binding_key: tuple[str, int] | None = None
 
     def health(self) -> Probe:
         """Public /health for pilot observability (E7): no content, safe for logs."""
@@ -358,7 +360,7 @@ class RuntimeService:
             binding = self._sync_email_binding(manifest)
         except Exception:
             return Probe(503, {"status": "not_ready", "reason": "email_state_unavailable"})
-        if binding is not None and binding.provider.startswith("nerve"):
+        if binding is not None and self._serves_nerve(manifest):
             try:
                 self._nerve_config(manifest)
             except RuntimeNotReady:
@@ -383,17 +385,20 @@ class RuntimeService:
                 except Exception:
                     payload.update(email_health={"status": "unavailable"})
             elif binding.provider == "gmail":
-                try:
-                    with open_database(self.database_path) as database:
-                        health = EmailRuntimeService(database).health()
-                        payload.update(
-                            email_health={
-                                "status": health.status,
-                                "last_success_at": health.last_success_at,
-                            }
-                        )
-                except Exception:
-                    payload.update(email_health={"status": "unavailable"})
+                # Send-only: the grant is the whole of what this runtime holds
+                # for Gmail, and `_sync_email_binding` above has just refused
+                # to serve without a live one. Inbound arrives through
+                # forwarding into a Nerve relay: `pending` until the relay has
+                # delivered anything, `active` from then on, `none` for a
+                # manifest that carries no relay yet.
+                forwarding = "none"
+                if manifest.email.relay:
+                    try:
+                        with open_database(self.database_path) as database:
+                            forwarding = ForwardingStateStore(database).state(binding) or "pending"
+                    except Exception:
+                        forwarding = "unavailable"
+                payload.update(email_health={"status": "send_only", "forwarding": forwarding})
         return Probe(
             200,
             payload,
@@ -409,11 +414,19 @@ class RuntimeService:
             raise RuntimeNotReady(f"runtime is not active ({reason})")
         try:
             binding = self._sync_email_binding(manifest)
-            if binding is not None and binding.provider.startswith("nerve"):
+            if binding is not None and self._serves_nerve(manifest):
                 self._nerve_config(manifest)
         except Exception as error:
             raise RuntimeNotReady("runtime is not active (email_state_unavailable)") from error
         return manifest
+
+    @staticmethod
+    def _serves_nerve(manifest: RuntimeManifest) -> bool:
+        """Whether this runtime reads a Nerve inbox: its own, or a Gmail relay."""
+        email = manifest.email
+        return email.provider_kind.startswith("nerve") or (
+            email.provider_kind == "gmail" and email.relay
+        )
 
     def _sync_email_binding(self, manifest: RuntimeManifest) -> EmailBinding | None:
         binding = self._email_binding_from_manifest(manifest)
@@ -423,6 +436,11 @@ class RuntimeService:
             active = EmailBindingStore(database).activate(binding)
             if active.provider == "gmail":
                 self._install_gmail_grant(database, active)
+                if manifest.email.relay:
+                    # `pending` from the first activation of a relay binding:
+                    # the family has not turned forwarding on yet, and nothing
+                    # has arrived to say otherwise.
+                    ForwardingStateStore(database).ensure_pending(active)
             return active
 
     @staticmethod
@@ -480,7 +498,6 @@ class RuntimeService:
             if response.status_code not in {200, 400}:
                 return False
             store.revoke(binding.identity_id, binding.revision)
-        self._close_gmail_runtime()
         return True
 
     def email_activation_health(self, manifest: RuntimeManifest) -> tuple[str, str]:
@@ -503,10 +520,16 @@ class RuntimeService:
             state = "healthy" if healthy else "failed"
             return state, state
         if provider == "gmail":
+            # One check, reported on both sides: a send-only grant has no inbound
+            # of its own, so the activation receipt says whether the grant is
+            # live. `getProfile` was the earlier probe and needs a read scope;
+            # a token refresh is the only harmless call this grant can make.
             binding = self._sync_email_binding(manifest)
             if binding is None:
                 return "failed", "failed"
             bundle = self._gmail_bundle(binding)
+            if "https://www.googleapis.com/auth/gmail.send" not in bundle.scopes:
+                return "failed", "failed"
             with open_database(self.database_path) as database:
                 client = build_gmail_client(
                     database,
@@ -515,31 +538,33 @@ class RuntimeService:
                     client_factory=self.gmail_client_factory,
                 )
                 try:
-                    profile = client.profile()
-                    inbound = "healthy" if profile.get("historyId") else "failed"
-                    scopes = set(bundle.scopes)
-                    outbound = (
-                        "healthy"
-                        if "https://www.googleapis.com/auth/gmail.send" in scopes
-                        else "failed"
-                    )
-                    return inbound, outbound
+                    client.verify_access()
+                except GmailAuthRevoked:
+                    return "failed", "failed"
                 finally:
                     close = getattr(client, "close", None)
                     if close is not None:
                         close()
+            return "healthy", "healthy"
         return "failed", "failed"
 
     def _nerve_config(self, manifest: RuntimeManifest) -> NerveRuntimeConfig:
-        if not manifest.email.provider_kind.startswith("nerve"):
+        email = manifest.email
+        if email.provider_kind == "gmail" and email.relay:
+            # The relay is a Nerve inbox like any managed one; only the
+            # manifest fields naming it differ, because `provider_binding_ref`
+            # and `secret_binding_ref` already name the Google grant.
+            refs_text, secret_name = email.inbound_binding_ref, email.inbound_secret_binding_ref
+        elif email.provider_kind.startswith("nerve"):
+            refs_text, secret_name = email.provider_binding_ref, email.secret_binding_ref
+        else:
             raise RuntimeNotReady("runtime email provider is not Nerve")
         try:
-            refs = json.loads(manifest.email.provider_binding_ref or "")
+            refs = json.loads(refs_text or "")
         except (TypeError, json.JSONDecodeError) as error:
             raise RuntimeNotReady("Nerve public binding reference is invalid") from error
-        secret_name = manifest.email.secret_binding_ref or ""
         try:
-            secrets = json.loads(self.env.get(secret_name, ""))
+            secrets = json.loads(self.env.get(secret_name or "", ""))
         except (TypeError, json.JSONDecodeError) as error:
             raise RuntimeNotReady("Nerve credential bundle is unavailable") from error
         if not isinstance(refs, dict) or not isinstance(secrets, dict):
@@ -550,12 +575,28 @@ class RuntimeService:
             "api_key": secrets.get("api_key"),
             "webhook_signing_key": secrets.get("webhook_signing_key"),
         }
+        if email.relay:
+            # A relay must know its own address: the check message is sent
+            # from it, and a `check` is recognised by being from it.
+            values["address"] = refs.get("address")
         if any(not isinstance(value, str) or not value for value in values.values()):
             raise RuntimeNotReady("Nerve runtime configuration is incomplete")
         return NerveRuntimeConfig(
             **values,
             runtime_url=self.env.get(ENV_NERVE_RUNTIME_URL, DEFAULT_RUNTIME_URL),
             rest_url=self.env.get(ENV_NERVE_REST_URL, DEFAULT_REST_URL),
+        )
+
+    def _forwarding_relay(
+        self, manifest: RuntimeManifest, config: NerveRuntimeConfig, database
+    ) -> ForwardingRelay | None:
+        if not manifest.email.relay:
+            return None
+        assert config.address is not None
+        return ForwardingRelay(
+            agent_address=manifest.email.agent_inbox,
+            relay_address=config.address,
+            state=ForwardingStateStore(database),
         )
 
     def receive_nerve_webhook(self, payload: bytes, signature: str):
@@ -583,54 +624,16 @@ class RuntimeService:
                 rest_url=config.rest_url,
             )
             try:
-                return NerveAttachmentWorker(database, client).run_once()
+                return NerveAttachmentWorker(
+                    database, client, relay=self._forwarding_relay(manifest, config, database)
+                ).run_once()
             finally:
                 close = getattr(client, "close", None)
                 if close is not None:
                     close()
 
-    def _close_gmail_runtime(self) -> None:
-        close = getattr(self._gmail_client, "close", None)
-        if close is not None:
-            close()
-        if self._gmail_database is not None:
-            self._gmail_database.close()
-        self._gmail_runtime = None
-        self._gmail_client = None
-        self._gmail_database = None
-        self._gmail_binding_key = None
-
-    def run_gmail_once(self) -> int:
-        manifest = self.require_ready()
-        binding = self._sync_email_binding(manifest)
-        if binding is None or binding.provider != "gmail":
-            self._close_gmail_runtime()
-            raise RuntimeNotReady("runtime email provider is not Gmail")
-        binding_key = (binding.identity_id, binding.revision)
-        if self._gmail_runtime is None or self._gmail_binding_key != binding_key:
-            self._close_gmail_runtime()
-            database = open_database(self.database_path)
-            try:
-                bundle = self._gmail_bundle(binding)
-                client = build_gmail_client(
-                    database,
-                    binding,
-                    bundle,
-                    client_factory=self.gmail_client_factory,
-                )
-                source = GmailHistorySource(database, binding, client)
-                runtime = EmailRuntimeService(database, (source,))
-            except Exception:
-                database.close()
-                raise
-            self._gmail_database = database
-            self._gmail_client = client
-            self._gmail_runtime = runtime
-            self._gmail_binding_key = binding_key
-        return self._gmail_runtime.run_once()
-
     def close(self) -> None:
-        self._close_gmail_runtime()
+        """Nothing is held open between requests since the Gmail poller left."""
 
     def _whatsapp_config(self, manifest: RuntimeManifest) -> WhatsAppRuntimeConfig:
         if not any(binding.channel == "whatsapp" for binding in manifest.verified_bindings):
@@ -775,13 +778,33 @@ class RuntimeService:
         )
         daily_cap_usd = parse_daily_cap_usd(self.env.get(ENV_COST_CAP_USD_PER_DAY))
         with open_database(self.database_path) as database:
-            return handle_web_message(
+            reply = handle_web_message(
                 WebChannelMessage(actor_id=manifest.actors.owner, text=text),
                 context=context,
                 loop=self._web_chat_loop(database, config),
                 usage=UsageStore(database),
                 daily_cap_usd=daily_cap_usd,
             )
+            guide = self._forwarding_guide(database, manifest, actor_id=actor_id)
+        return f"{guide}\n\n{reply}" if guide else reply
+
+    def _forwarding_guide(self, database, manifest: RuntimeManifest, *, actor_id: str) -> str | None:
+        """Google's forwarding confirmation, shown to the owner exactly once.
+
+        Web has no push: the control plane proxies one turn and reads one
+        reply, so the runtime cannot post a message on its own. The next turn
+        the owner takes is the earliest anything can be shown, and it is
+        shown there, ahead of the reply, then marked shown so it is not
+        repeated. Only the owner sees it: the link approves forwarding of the
+        household's mail, and the owner is who connected the mailbox.
+        """
+        if actor_id != manifest.actors.owner or not manifest.email.relay:
+            return None
+        binding = self._email_binding_from_manifest(manifest)
+        if binding is None:
+            return None
+        link = ForwardingStateStore(database).take_unshown_confirmation(binding)
+        return None if link is None else CONFIRMATION_GUIDE.format(link=link)
 
     def _web_chat_loop(self, database, config) -> ToolLoop:
         """The dialogue loop against this turn's database connection."""
@@ -1233,29 +1256,6 @@ def _nerve_worker_until_stopped(
         stop.wait(interval)
 
 
-def _gmail_worker_until_stopped(
-    service: RuntimeService,
-    source: Mapping[str, str],
-    stop: threading.Event,
-) -> None:
-    try:
-        interval = max(float(source.get(ENV_GMAIL_WORKER_SECONDS, "60")), 0.1)
-    except ValueError:
-        interval = 60.0
-    while not stop.is_set():
-        if service.can_start_workers:
-            try:
-                service.run_gmail_once()
-            except RuntimeNotReady:
-                pass
-            except Exception as error:
-                print(
-                    f"Gmail ingress pending ({error.__class__.__name__})",
-                    file=sys.stderr,
-                )
-        stop.wait(interval)
-
-
 class _QuietRequestHandler(WSGIRequestHandler):
     def log_message(self, _format: str, *args: object) -> None:
         """Health requests are intentionally absent from application logs."""
@@ -1317,22 +1317,14 @@ def serve_runtime(*, env: Mapping[str, str] | None = None) -> None:
         name="nerve-ingress",
         daemon=True,
     )
-    gmail_worker = threading.Thread(
-        target=_gmail_worker_until_stopped,
-        args=(service, source, stop),
-        name="gmail-history",
-        daemon=True,
-    )
     worker.start()
     nerve_worker.start()
-    gmail_worker.start()
     try:
         server.serve_forever()
     finally:
         stop.set()
         worker.join(timeout=1.0)
         nerve_worker.join(timeout=1.0)
-        gmail_worker.join(timeout=1.0)
         service.close()
         server.server_close()
 

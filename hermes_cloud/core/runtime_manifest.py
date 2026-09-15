@@ -76,6 +76,19 @@ class EmailRouting:
     provider_kind: str = "synthetic"
     provider_binding_ref: str | None = None
     secret_binding_ref: str | None = None
+    #: A Gmail household sends from `agent_inbox` through its Google grant and
+    #: RECEIVES through a hidden Nerve relay inbox that Gmail forwards into:
+    #: the send-only scope has no read path. The three fields travel together,
+    #: only with `provider_kind = "gmail"`, and name the relay's Nerve refs
+    #: (`org_id`, `inbox_id`, `address`) and the secret carrying its runtime
+    #: key. Managed and family-domain households never carry them.
+    inbound_provider_kind: str | None = None
+    inbound_binding_ref: str | None = None
+    inbound_secret_binding_ref: str | None = None
+
+    @property
+    def relay(self) -> bool:
+        return self.inbound_provider_kind is not None
 
 
 @dataclass(frozen=True)
@@ -386,6 +399,14 @@ def parse_runtime_manifest(
         raise ManifestError(f"channels.primary: {detail}")
 
     raw_email = _table(document, "email")
+    inbound = {
+        key: _optional_text(raw_email, key, "email")
+        for key in (
+            "inbound_provider_kind",
+            "inbound_binding_ref",
+            "inbound_secret_binding_ref",
+        )
+    }
     email = EmailRouting(
         agent_inbox=_email(_text(raw_email, "agent_inbox", "email"), "agent_inbox"),
         fallback=_email(_text(raw_email, "fallback", "email"), "fallback"),
@@ -396,9 +417,23 @@ def parse_runtime_manifest(
             raw_email, "provider_binding_ref", "email"
         ),
         secret_binding_ref=_optional_text(raw_email, "secret_binding_ref", "email"),
+        **inbound,
     )
     if email.agent_inbox.casefold() == email.fallback.casefold():
         raise ManifestError("email.agent_inbox must not equal email.fallback")
+    if any(inbound.values()):
+        # All three or none, and only for Gmail: a relay without its secret
+        # cannot be read, a secret without refs cannot be addressed, and a
+        # managed household already receives through its own inbox.
+        if email.provider_kind != "gmail":
+            raise ManifestError("email.inbound_provider_kind: only a gmail household carries a relay")
+        if not all(inbound.values()):
+            raise ManifestError(
+                "email.inbound_provider_kind, inbound_binding_ref and"
+                " inbound_secret_binding_ref are required together"
+            )
+        if email.inbound_provider_kind != "nerve":
+            raise ManifestError("email.inbound_provider_kind: expected 'nerve'")
     raw_provider_refs = _table(document, "provider_refs", required=False)
     raw_consent = document.get("consent")
     consent: ConsentAuthority | None = None

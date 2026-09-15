@@ -133,3 +133,38 @@ Both stubs re-synced byte for byte from the dev-agent fleet template at the
 new pin, in lockstep: the gate's short window and the waker's re-entry are two
 halves of one protocol. Outside comments the only change is the pin; the
 comments now describe the revision the stub pins.
+
+## Step 6 — gate v3.7: a debt record carries a label (2026-09-13)
+
+One change over the revision this repository runs today.
+
+A review-debt record — the issue the gate files when a round past the review
+budget merges over a still-open P1 — carried no label at all. The only way to
+select one was the `[review-debt] ` prefix in its title, which is a convention
+rather than a query, so classifying the fleet's 184 open issues on 2026-09-11
+meant pulling every issue through a script and matching titles. A
+cross-repository triage board cannot be built that way. The gate now creates
+the label and applies it in exactly one request per record: `-f` makes the call
+a POST, so a labelled-then-unlabelled fallback would file the same finding
+twice whenever a create committed on GitHub while the client reported a lost
+response, and two records for one finding is what the identity rule of Step 5
+exists to prevent.
+
+The first cut of that change also skipped the debt write for `dependabot[bot]`
+pull requests, and it was withdrawn: at filing time the gate does not know
+whether a pull request will merge, and bot pull requests do merge on green.
+Abandoned bot branches are handled where the outcome is known — the controller
+now retracts a record when its pull request closes unmerged.
+
+Gate revision `d49bbf81eca6986f40cf1b05cb7951b7f0034924` (codex-review-gate#18).
+
+**Files:** `.github/workflows/codex-verdict-waker.yml`,
+`.github/workflows/codex-review-window.yml`,
+`thoughts/shared/plans/2026-08-29-review-policy-v2-sync.md`.
+
+**Branches:** `chore/gate-pin-v37`.
+
+Both stubs move in lockstep, as in every step before this one: the gate's short
+window and the waker's re-entry are two halves of one protocol. Outside the pin
+nothing changes — trigger, guard, permissions and concurrency are untouched.
+

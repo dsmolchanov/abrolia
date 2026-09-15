@@ -1,4 +1,12 @@
-"""Redacted Google token refresh and Gmail REST client."""
+"""Redacted Google token refresh and a send-only Gmail REST client.
+
+The client can send and nothing else. Owner decision 2026-09-13: the agent
+Gmail grant is `gmail.send` only, so that Google's sensitive-scope verification
+suffices and the restricted-scope CASA assessment is never owed. Every read
+method — profile, history, message, inbox and Sent listing — went with the
+restricted read scope; a call to one would now be an insufficient-scope 403,
+which is why none exists to make.
+"""
 
 from __future__ import annotations
 
@@ -18,21 +26,48 @@ from hermes_cloud.email.google_grant import (
     GoogleGrantStore,
     RefreshedAccess,
 )
-from hermes_cloud.ingest.gmail_api import (
-    GmailAuthRevoked,
-    GmailError,
-    GmailHistoryExpired,
-    GmailQuotaExceeded,
-)
 
 TOKEN_URL = "https://oauth2.googleapis.com/token"
 GMAIL_URL = "https://gmail.googleapis.com/gmail/v1/users/me"
+#: Must equal `control_plane.email.models.GMAIL_EMAIL_SCOPES`;
+#: `tests/test_gmail_scope_consistency.py` holds the two together.
 GMAIL_REQUIRED_SCOPES = frozenset({
     "openid",
     "email",
-    "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/gmail.send",
 })
+#: Gmail's 403 reasons for usage limits (developers.google.com/workspace/gmail/api/guides/handle-errors).
+QUOTA_REASONS = frozenset({
+    "rateLimitExceeded",
+    "userRateLimitExceeded",
+    "dailyLimitExceeded",
+    "quotaExceeded",
+})
+
+
+class GmailError(RuntimeError):
+    pass
+
+
+class GmailQuotaExceeded(GmailError):
+    def __init__(self, retry_after: float = 60.0) -> None:
+        super().__init__("gmail_quota")
+        self.retry_after = retry_after
+
+
+class GmailAuthRevoked(GmailError):
+    """Google no longer honours the grant: the family removed access, or it expired."""
+
+
+class GmailScopeInsufficient(GmailError):
+    """The grant is live but does not cover the call.
+
+    Google answers a call outside the granted scopes with 403 and the reason
+    `insufficientPermissions` (spike S4, 2026-09-14). That is not a revoked
+    grant, and treating it as one would tell the family to reconnect a mailbox
+    that is connected — the fault is Abrolia's, a call the scope set never
+    allowed.
+    """
 
 
 class GmailConfigurationError(RuntimeError):
@@ -165,7 +200,12 @@ class GoogleRefreshClient:
             )
         except (httpx.TimeoutException, httpx.TransportError) as error:
             raise GmailError("gmail_refresh_unavailable") from error
-        if response.status_code in {400, 401, 403}:
+        # Only `invalid_grant` says the refresh credential itself is dead
+        # (revoked by the family, expired, or invalidated by a password
+        # change). The caller zeroes the durable grant on this answer, so a
+        # rejected client secret (`invalid_client`) or any other refusal must
+        # stay a plain error: the family's grant is not the thing at fault.
+        if response.status_code in {400, 401} and _oauth_error(response) == "invalid_grant":
             raise GmailAuthRevoked("gmail_auth_revoked")
         if response.status_code != 200:
             raise GmailError("gmail_refresh_rejected")
@@ -208,8 +248,31 @@ class GmailHttpClient:
 
     def _token(self) -> str:
         if self._access is None or self._access.expires_at <= self.clock() + 30:
-            self._access = self.grants.access_token(self.identity_id, self.revision, self.refresher)
+            try:
+                self._access = self.grants.access_token(
+                    self.identity_id, self.revision, self.refresher
+                )
+            except GmailAuthRevoked:
+                self._revoked()
+                raise
         return self._access.access_token
+
+    def _revoked(self) -> None:
+        """Close the grant durably the moment Google proves it revoked.
+
+        The Gmail poller used to write `auth_revoked` into `email_sync_state`
+        on this exception, and `/readyz` read it back. With the poller gone,
+        nothing else observes a revocation: every caller — activation health,
+        the send path, a refresh — comes through this client, and if it only
+        raised, `oauth_grants.revoked_at` would stay NULL and `/readyz` would
+        answer `send_only` with 200 for ever, keeping workers eligible for
+        mail that can no longer be sent. Zeroing the row makes
+        `_sync_email_binding` refuse, `/readyz` fail closed, and the control
+        plane's runtime health mark the household `needs_attention`. Recovery
+        is a reconnect, which is the only recovery a revoked grant has.
+        """
+        self._access = None
+        self.grants.revoke(self.identity_id, self.revision)
 
     def _request(self, method: str, path: str, **kwargs) -> dict[str, Any]:
         headers = {**kwargs.pop("headers", {}), "Authorization": f"Bearer {self._token()}"}
@@ -219,17 +282,21 @@ class GmailHttpClient:
             raise TimeoutError("gmail_timeout") from error
         except httpx.TransportError as error:
             raise ConnectionError("gmail_transport") from error
-        if response.status_code in {401, 403}:
-            self._access = None
-            raise GmailAuthRevoked("gmail_auth_revoked")
-        if response.status_code == 404 and path.startswith("/history"):
-            raise GmailHistoryExpired("gmail_history_expired")
-        if response.status_code == 429:
+        reason = _error_reason(response) if response.status_code == 403 else ""
+        if reason == "insufficientPermissions":
+            raise GmailScopeInsufficient("gmail_scope_insufficient")
+        if response.status_code == 429 or reason in QUOTA_REASONS:
+            # Gmail answers a burst with 403 as readily as with 429; neither
+            # says anything about the grant, and zeroing it for a rate limit
+            # would turn a busy afternoon into a reconnect.
             try:
                 retry_after = float(response.headers.get("Retry-After", "60"))
             except ValueError:
                 retry_after = 60.0
             raise GmailQuotaExceeded(retry_after)
+        if response.status_code in {401, 403}:
+            self._revoked()
+            raise GmailAuthRevoked("gmail_auth_revoked")
         if response.status_code >= 400:
             raise GmailError(f"gmail_http_{response.status_code}")
         try:
@@ -240,51 +307,38 @@ class GmailHttpClient:
             raise GmailError("gmail_response_malformed")
         return body
 
-    def profile(self) -> dict[str, Any]:
-        return self._request("GET", "/profile")
+    def verify_access(self) -> None:
+        """Prove the grant still refreshes, without a Gmail read.
 
-    def history(self, start_history_id: str, page_token: str | None = None) -> dict[str, Any]:
-        params = {
-            "startHistoryId": start_history_id,
-            "historyTypes": "messageAdded",
-            "labelId": "INBOX",
-        }
-        if page_token:
-            params["pageToken"] = page_token
-        return self._request("GET", "/history", params=params)
-
-    def message(self, message_id: str) -> dict[str, Any]:
-        return self._request("GET", f"/messages/{message_id}", params={"format": "raw"})
-
-    def list_inbox(self, page_token: str | None = None, *, max_results: int) -> dict[str, Any]:
-        params: dict[str, Any] = {"labelIds": "INBOX", "maxResults": max_results}
-        if page_token:
-            params["pageToken"] = page_token
-        return self._request("GET", "/messages", params=params)
+        `users.getProfile` was the activation probe, and it needs a read scope.
+        A refresh is the only call a send-only grant can make that does not
+        send mail: it raises `GmailAuthRevoked` when Google has withdrawn the
+        grant and `GmailError` when the token endpoint is unreachable.
+        """
+        self._token()
 
     def send_raw(self, raw: str) -> dict[str, Any]:
         return self._request("POST", "/messages/send", json={"raw": raw})
 
-    def search_sent(self, query: str) -> list[dict[str, Any]]:
-        listed = self._request("GET", "/messages", params={"labelIds": "SENT", "q": query, "maxResults": 10})
-        results: list[dict[str, Any]] = []
-        for item in listed.get("messages", []):
-            message_id = str(item.get("id") or "")
-            if not message_id:
-                continue
-            metadata = self._request(
-                "GET",
-                f"/messages/{message_id}",
-                params={"format": "metadata", "metadataHeaders": "Message-ID"},
-            )
-            headers = metadata.get("payload", {}).get("headers", [])
-            rfc822_id = next(
-                (
-                    str(header.get("value") or "")
-                    for header in headers
-                    if str(header.get("name") or "").casefold() == "message-id"
-                ),
-                "",
-            )
-            results.append({"id": message_id, "rfc822_message_id": rfc822_id})
-        return results
+
+def _oauth_error(response: httpx.Response) -> str:
+    """The `error` code of an OAuth token-endpoint refusal, or an empty string."""
+    try:
+        error = response.json().get("error")
+    except (ValueError, AttributeError):
+        return ""
+    return error if isinstance(error, str) else ""
+
+
+def _error_reason(response: httpx.Response) -> str:
+    """The first `reason` in a Google API error body, or an empty string."""
+    try:
+        errors = response.json().get("error", {}).get("errors", [])
+    except (ValueError, AttributeError):
+        return ""
+    if not isinstance(errors, list):
+        return ""
+    for item in errors:
+        if isinstance(item, dict) and item.get("reason"):
+            return str(item["reason"])
+    return ""

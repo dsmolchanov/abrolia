@@ -2199,3 +2199,19 @@ Fly.io DPA, TIAs and the Art. 27 representative still open), and
 justifications, demo-video script and CASA preparation. Search Console,
 branding, publishing status, submission and the CASA lab are owner steps. The
 `cryptography` upgrade and dependency scanning follow in their own change.
+
+### Dependency advisories: cryptography ≥ 50 and a standing audit (CASA preparation)
+
+**Branches:** `chore/cryptography-50-dependency-audit`.
+
+**Files:** `requirements.txt`, `pyproject.toml`,
+`.github/workflows/dependency-audit.yml`.
+
+`pip-audit` reported thirteen advisories against `cryptography` 45.0.7, all
+fixed by 50.0.x; the `<46` upper bound kept every fixed release out. The bound
+is now `>=50.0.1,<51` (full non-live suite green on 50.0.1 in a clean venv, and
+`pip-audit -r requirements-dev.txt` reports nothing). A separate
+`dependency-audit` workflow scans on every PR, on main and weekly; it is kept
+out of `ci` so a newly published advisory cannot freeze the deploy that fixes
+it. Household runtimes pick the new wheel up only with the next runtime image
+and `roll-runtime`.

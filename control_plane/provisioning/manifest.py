@@ -36,6 +36,25 @@ class EmailV1(BaseModel):
     provider_kind: str = "synthetic"
     provider_binding_ref: str | None = None
     secret_binding_ref: str | None = None
+    #: A Gmail household's hidden Nerve relay (the runtime's
+    #: `EmailRouting.inbound_*`): all three or none, gmail only.
+    inbound_provider_kind: Literal["nerve"] | None = None
+    inbound_binding_ref: str | None = None
+    inbound_secret_binding_ref: str | None = None
+
+    @model_validator(mode="after")
+    def _relay_is_whole_and_gmail_only(self) -> EmailV1:
+        inbound = (
+            self.inbound_provider_kind,
+            self.inbound_binding_ref,
+            self.inbound_secret_binding_ref,
+        )
+        if any(item is not None for item in inbound):
+            if self.provider_kind != "gmail":
+                raise ValueError("only a gmail household carries an inbound relay")
+            if not all(inbound):
+                raise ValueError("an inbound relay needs its kind, binding and secret together")
+        return self
 
 
 class ConsentReceiptV1(BaseModel):
