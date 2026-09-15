@@ -602,8 +602,12 @@ Detect forwarding that was never finished or later stopped, and tell the family.
 
 **Files:** `hermes_cloud/ingest/forwarding.py`, `hermes_cloud/runtime/service.py`,
 `hermes_cloud/execute/nerve_send.py`, `hermes_cloud/core/observability.py`,
-`hermes_cloud/channels/web.py`, `control_plane/web/templates/onboarding.html`,
-`tests/test_gmail_forwarding_health.py`, `tests/test_observability_health.py`.
+`hermes_cloud/channels/web.py`, `hermes_cloud/runner/tools.py`,
+`hermes_cloud/ingest/nerve_webhook.py`, `hermes_cloud/core/dsar.py`,
+`hermes_cloud/core/migrations/0010_gmail_forwarding_health.sql`,
+`control_plane/web/templates/onboarding.html`,
+`tests/test_gmail_forwarding_health.py`, `tests/test_observability_health.py`,
+`tests/test_gmail_forwarding_runtime.py`, `tests/test_runcontext.py`.
 
 **Changes**:
 
@@ -625,6 +629,31 @@ Detect forwarding that was never finished or later stopped, and tell the family.
 - Onboarding Gmail card copy discloses the daily check message (Strategy A),
   that forwarding is set up in Gmail on a computer after setup, and that the
   "Send email on your behalf" checkbox on Google's consent screen must be ticked.
+
+**Implementation notes (2026-09-15, `feat/gmail-forwarding-health`):**
+
+- `ForwardingHealth.tick` rides the Nerve ingest loop (`run_nerve_once`):
+  one pass counts a missed check, declares `stale`, and sends the day's
+  check. The check is composed directly through the Nerve client from the
+  relay inbox, behind `HERMES_EMAIL_SEND` like every letter — not through
+  `EmailSender`, which builds the message under the household's own address.
+- The HMAC key for the token is the relay's `webhook_signing_key` — a
+  per-household secret the runtime already holds; no new configuration.
+- Only the outstanding token counts: the Nerve worker marks a `check`
+  active only when its token equals the one last sent, so a forged or
+  yesterday's check is diverted and proves nothing (Phase 2's
+  `nerve_webhook.py` tightened accordingly).
+- Only `active` forwarding goes `stale`. A `pending` household — forwarding
+  never turned on — keeps receiving the daily check (the first return flips
+  it `active`) and owes the confirmation guide, not an outage notice.
+- Chat: the stale notice rides the same next-owner-turn mechanism as the
+  confirmation guide (web has no push). The "I've turned forwarding on"
+  action is the `forwarding_recheck` dialogue tool (`hermes_cloud/runner/tools.py`),
+  which asks for a check now; the next loop pass sends it.
+- `/readyz` reports `email_health.forwarding = pending|active|stale|none`.
+- Inventory additions: migration `0010`, `hermes_cloud/core/dsar.py`,
+  `hermes_cloud/runner/tools.py`, `hermes_cloud/ingest/nerve_webhook.py`,
+  `tests/test_gmail_forwarding_runtime.py`.
 
 ### Success Criteria
 

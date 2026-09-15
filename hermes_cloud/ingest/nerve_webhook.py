@@ -710,7 +710,11 @@ class NerveAttachmentWorker:
             self.store.mark_diverted(event)
             return NerveDiverted(event.id, "confirmation")
         if isinstance(kind, Check):
-            self.relay.state.mark_active(binding, letter=False)
+            # Only the check this runtime sent proves anything: a forged one,
+            # or one from a previous day, is diverted like any check (it is
+            # not the family's mail) but leaves the health state alone.
+            if kind.token == self.relay.state.outstanding_check_token(binding):
+                self.relay.state.mark_active(binding, letter=False, token=kind.token)
             self.store.mark_diverted(event)
             return NerveDiverted(event.id, "check")
         return None

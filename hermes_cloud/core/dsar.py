@@ -76,7 +76,8 @@ EXPORTED: dict[str, tuple[str, ...]] = {
     # family's data, and the row's timestamps say everything the family owns.
     "gmail_forwarding_state": (
         "binding_identity_id", "binding_revision", "state", "confirmation_at",
-        "confirmation_shown_at", "last_letter_at", "last_check_at", "created_at",
+        "confirmation_shown_at", "last_letter_at", "last_check_at", "last_check_sent_at",
+        "misses", "check_requested_at", "stale_since", "stale_notified_at", "created_at",
         "updated_at",
     ),
     "email_sends": (
