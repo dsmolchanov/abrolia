@@ -43,9 +43,21 @@ Abrolia requests only these Google OAuth scopes:
 
 | Scope | What it allows | Why Abrolia needs it |
 |---|---|---|
-| `gmail.readonly` | Read messages in the agent mailbox | When a new message arrives in the inbox of the agent mailbox, Abrolia reads its sender, recipients, date, subject, body and the names and types of attachments, to work out what your family needs to do and show you a proposal. Abrolia does not import the mailbox history: it follows new inbox messages only (if Gmail can no longer provide that change feed, Abrolia re-checks at most the 100 most recent inbox messages). Drafts, sent mail and other labels are not processed. |
-| `gmail.send` | Send email from the agent mailbox | To send an email that an adult in your household has reviewed and confirmed on a proposal card. Abrolia never sends email automatically. |
+| `gmail.send` | Send email from the agent mailbox | To send an email that an adult in your household has reviewed and confirmed on a proposal card. Abrolia never sends email automatically. On Google's consent screen this appears as "Send email on your behalf". |
 | `openid`, `email` | Identify the connected Google account | To show you which address was connected and check that it is the separate agent account you intended, not a personal one. |
+
+**Abrolia does not read the agent mailbox** and requests no scope that could.
+If you want the assistant to act on letters that arrive there, you turn on
+Gmail's own *automatic forwarding* to a relay address Abrolia created for your
+household (in Gmail on a computer: Settings → Forwarding and POP/IMAP). Gmail
+asks you to confirm the forwarding address; Abrolia shows you Gmail's
+confirmation link in the web chat and never opens it for you. Forwarded
+messages are received by our email infrastructure (Nerve, operated by us, with
+Resend as its inbound delivery provider) and processed exactly like a letter
+sent to an `@abrolia.com` assistant address. Once a day Abrolia sends a short
+check message from the relay address to the agent account to confirm
+forwarding still works; that message is Abrolia's own and contains no family
+data. You can turn forwarding off in Gmail at any time.
 
 ### How we use it
 
@@ -77,6 +89,9 @@ We transfer Google user data only:
 - to **Anthropic**, for the AI processing described above;
 - to **Fly.io**, which hosts the dedicated environment where it is stored
   (Netherlands, EU);
+- for mail you forward from the agent account: to **Nerve** (our email
+  infrastructure, United States) and **Resend** (its inbound delivery
+  provider, United States), which receive the forwarded copy;
 - to the recipients of an email **you** confirm;
 - when required by applicable law, or to protect against fraud, abuse or
   security threats;
@@ -106,7 +121,8 @@ anonymized for internal operations.
 
 - Remove Abrolia's access at any time in your Google Account at
   [myaccount.google.com/permissions](https://myaccount.google.com/permissions);
-  Abrolia can no longer read or send from the mailbox after that.
+  Abrolia can no longer send from the mailbox after that. Forwarding you
+  turned on in Gmail is Gmail's own setting: turn it off there too.
 - Ask us at `help@abrolia.com` to disconnect the mailbox: we revoke the grant
   with Google and delete the stored tokens.
 - Deleting your Abrolia account revokes the grant, deletes the tokens and

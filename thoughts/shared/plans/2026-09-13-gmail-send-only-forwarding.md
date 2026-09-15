@@ -699,7 +699,7 @@ Builds on PR #165; if #165 is unmerged when this starts, merge it first.
 `control_plane/web/templates/onboarding.html`, `docs/google-verification.md`,
 `docs/privacy/data-map.md`, `docs/privacy/processors.md`,
 `docs/privacy/lawful-bases.md`, `docs/privacy/dpia.md`, `docs/SECURITY.md`,
-`docs/onboarding-runbook.md`, `docs/canon-closure-runbook.md`,
+`docs/onboarding-runbook.md`, `docs/canon-closure-runbook.md`, `README.md`,
 `tests/control_plane/test_ui_contract.py`.
 
 **Changes**:
@@ -724,6 +724,19 @@ Builds on PR #165; if #165 is unmerged when this starts, merge it first.
   inbox), a spoofed confirmation email (sender and host allowlist, never
   fetched), a forged `check` (only affects health).
 - `test_ui_contract.py` disclosure test updated to the new copy.
+
+**Implementation notes (2026-09-15, `docs/gmail-send-only-privacy`):**
+
+- Built on #165 after it merged (its seven Codex blockers were all "rewrite
+  for send-only", which is this phase). The homepage `#pilot` paragraph
+  Codex also flagged — "runs on synthetic test data" beside a footer stating
+  real data since 2026-09-08 — now describes the private pilot and names the
+  open compliance items; the "coming soon" marketing chips were left alone.
+- The in-product disclosure paragraph is asserted equal to
+  `GMAIL_DISCLOSURE`, so the page and the waiting state cannot disagree.
+- `README.md` (not in the original inventory) said real data was still
+  blocked; it now mirrors the notices.
+- Inventory addition: `README.md`.
 
 ### Success Criteria
 

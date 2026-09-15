@@ -60,7 +60,8 @@ DPIA добровольной — формулировка снята ревиз
 | R10 | Потеря данных | семья | средний | SQLite WAL + fsync-before-ACK, бэкапы с тестом восстановления | низкий |
 | R11a | **Shared WhatsApp:** sender ошибочно маршрутизирован в чужой household; общий номер создаёт ложное ожидание внешнего школьного контура | семьи | высокий | только заранее verified номера взрослых; exact/unique sender binding; unknown/ambiguous deny; семейный диалог only; отдельный channel notice; durable ingress удаляется после подтверждённой relay-доставки | низкий → средний |
 | R11b | **Dedicated WhatsApp:** блокировка выделенного номера и доступ linked-device сессии ко всей его переписке | семья, контакты номера | высокий | отдельный risk consent до QR; рекомендация отдельной SIM/eSIM; per-instance keys; общий TTL; staged approval на любую отправку; disconnect | средний (принят сознательно) |
-| R12 | Dedicated Gmail OAuth связан не с тем аккаунтом, grant украден или scopes шире необходимого | семья и корреспонденты agent inbox | высокий | только отдельный Gmail агента; `state` one-time и связан с owner-session+household; account chooser + повторное подтверждение адреса; `gmail.readonly` + `gmail.send`; refresh token envelope-encrypted; disconnect revoke; verification/CASA fail-closed | средний → низкий после gate |
+| R12 | Dedicated Gmail OAuth связан не с тем аккаунтом, grant украден или scopes шире необходимого | семья и корреспонденты agent inbox | высокий | только отдельный Gmail агента; `state` one-time и связан с owner-session+household; account chooser + повторное подтверждение адреса; только `gmail.send` (более широкий или более узкий grant отзывается); refresh token envelope-encrypted; grant, отозванный у Google, обнуляется runtime при первом же наблюдении; disconnect revoke; sensitive-scope verification fail-closed | средний → низкий после gate |
+| R12a | Relay-адрес пересылки узнаёт посторонний и шлёт в него письма; подделанное «подтверждение пересылки» или контрольное письмо | семья | средний | relay-адрес — 26 случайных base32-символов под HMAC, никогда не публикуется; всё входящее в relay — untrusted-контент, который даёт только предложения (та же модель, что и публичный inbox); подтверждение Gmail распознаётся по отправителю Google, единственной ссылке `mail-settings.google.com/mail/vf-…` и адресу агента в тексте, ссылка показывается владельцу и никогда не открывается автоматически; контрольное письмо засчитывается только с токеном, который runtime сам отправил, — подделка влияет разве что на статус здоровья | низкий |
 | R13 | Ошибочно широкий или неполный `/delete` между control plane, runtime и providers | семья | высокий | fresh account re-auth, membership/CSRF/Origin; durable delete intent; runtime+control-plane orchestration; keyed-HMAC tombstone; partial/`outcome_unknown` не выдаётся за complete; честное сообщение о внешних копиях | средний (раскрыт) |
 | R14 | Runaway-цикл модели → расход и лишняя обработка | семья | низкий | лимиты итераций/времени/токенов, дневной cost-cap с деградацией | низкий |
 | R15 | Account takeover, magic-link replay, session fixation/CSRF | account owner, household | высокий | 15-минутный one-time hash-only link; fragment→first-party POST; opaque hash-only session, rotation, Secure/HttpOnly/SameSite cookie; Origin+CSRF; destructive fresh re-auth | низкий |
@@ -82,9 +83,12 @@ Abrolia не подключает существующий личный Gmail и
 2. **OAuth binding.** One-time `state` связан одновременно с owner session и
    household. Google account chooser всегда показывается; после callback UI
    ещё раз показывает выбранный адрес и требует явного подтверждения.
-3. **Минимальные scopes.** Только `gmail.readonly` и `gmail.send`: без Drive,
-   contacts, settings и удаления писем. Ингест идёт через Gmail history/cursor,
-   исходящие — compose после staged approval.
+3. **Минимальные scopes.** Только `gmail.send`: без чтения ящика, Drive,
+   contacts, settings и удаления писем. Входящие попадают к нам не через API, а
+   через пересылку, которую семья включает в самом Gmail, в скрытый relay-ящик
+   Nerve; раз в день runtime шлёт с relay на аккаунт агента контрольное письмо
+   и по его возврату судит, что пересылка жива. Исходящие — compose после
+   staged approval.
 4. **Секрет.** Refresh token передаётся напрямую в ранний household Fly secret
    namespace через `SecretSink`, отсутствует в browser/control-plane DB/API/job
    JSON/runtime manifest/logs и недоступен модели. Disconnect отзывает grant и
@@ -94,8 +98,9 @@ Abrolia не подключает существующий личный Gmail и
    пользовательской email-функции, без рекламы, продажи, credit decisions или
    общего обучения моделей; human access ограничен разрешёнными политикой
    support/security/legal/operations случаями.
-6. **Launch gate.** Gmail restricted scopes требуют OAuth verification и CASA.
-   До их закрытия real adapter fail-closed; Phase 1 использует только `.test`
+6. **Launch gate.** Sensitive scope `gmail.send` требует Google OAuth
+   verification (restricted-скоупов нет, поэтому CASA не требуется).
+   До её закрытия real adapter fail-closed; Phase 1 использует только `.test`
    fake. Исторический IMAP poller остаётся внутренним synthetic test seam и не
    является пользовательским или production-путём.
 
@@ -133,7 +138,7 @@ fallback.
    US, отдельный DPA не требуется), P5 — самостоятельный контролёр по своим
    условиям, доступ выдаёт семья ([`processors.md`](processors.md)).
    Уведомления описывают фактическое состояние, а не намерение.
-4. Gmail OAuth verification/CASA закрыты до включения dedicated Gmail real path.
+4. Google sensitive-scope verification закрыта до включения dedicated Gmail real path.
 5. Shared WhatsApp получает отдельный channel notice receipt; dedicated QR —
    дополнительный informed-risk receipt. Все исходящие — staged approval.
 6. Заполнены реквизиты контролёра (Axiom Atlas, LLC, Делавэр, США) и адрес для

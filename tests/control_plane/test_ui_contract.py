@@ -837,13 +837,23 @@ def test_a_gmail_step_that_can_no_longer_connect_offers_a_way_out(
 def test_the_google_panel_discloses_data_use_and_links_the_policy(api_harness) -> None:
     """Google's verification requires the disclosure before consent, in the app.
 
-    It names what is read and what is sent, states Limited Use, and links the
-    published Privacy Policy section a reviewer checks against.
+    It says what is sent and that nothing is read (the send-only design of
+    plan 2026-09-13), states Limited Use, and links the published Privacy
+    Policy section a reviewer checks against. The one-line disclosure is the
+    same literal the waiting state carries, so the page and the API cannot
+    disagree.
     """
+    from control_plane.email.models import GMAIL_DISCLOSURE
+
     world = api_harness.create_principal("disclosure-owner@family.test")
     api_harness.authenticate(world)
     html = api_harness.client.get("/onboarding").text
+    assert f'<p id="google-disclosure">{GMAIL_DISCLOSURE}</p>' in html
     assert '<ul id="google-data-use">' in html
+    assert "<strong>Does not read</strong> this mailbox" in html
+    assert "Send email on your behalf" in html
+    assert "forwarding you turn on in Gmail" in html
+    assert "<strong>Reads</strong>" not in html
     assert "including the Limited Use requirements" in html
     assert 'href="https://abrolia.com/privacy.html#google"' in html
     assert 'href="https://developers.google.com/terms/api-services-user-data-policy"' in html
