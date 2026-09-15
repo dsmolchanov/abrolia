@@ -390,7 +390,9 @@ confirmation. Ships before the control plane emits the fields.
 `hermes_cloud/runtime/service.py`, `hermes_cloud/email/receipts.py`,
 `hermes_cloud/ingest/nerve_webhook.py`, `hermes_cloud/ingest/forwarding.py`,
 `hermes_cloud/runner/pipeline.py`, `hermes_cloud/channels/web.py`,
-`hermes_cloud/cli.py`, `tests/test_gmail_forwarding_runtime.py`,
+`hermes_cloud/cli.py`, `hermes_cloud/core/migrations/0009_gmail_forwarding.sql`,
+`hermes_cloud/core/dsar.py`, `.check-fixtures-allow`,
+`tests/test_gmail_forwarding_runtime.py`,
 `tests/test_nerve_runtime.py`, `tests/test_runtime_service.py`.
 
 **Changes**:
@@ -421,6 +423,29 @@ confirmation. Ships before the control plane emits the fields.
 - Forwarding state table (runtime DB migration): `pending` on first activation
   of a relay binding; `active` on the first `letter` or `check` received
   through the relay. Exposed in `/readyz` `email.forwarding`.
+
+**Implementation notes (2026-09-15, `feat/gmail-forwarding-runtime`):**
+
+- Web has no push: the control plane proxies one chat turn and reads one
+  reply, and the runtime's Nerve worker has no transport at all. The
+  confirmation is therefore persisted (`gmail_forwarding_state.confirmation_link`)
+  and shown to the **owner** once, ahead of the reply, on their next web
+  turn; a second adult never sees it. Phase 4 may add a primary-channel
+  notice when it has a transport to send from.
+- `inbound_binding_ref` JSON must carry `address` besides `org_id` and
+  `inbox_id`: the relay's own address is what a `check` is recognised by
+  (S3: from = to = relay). Phase 3 emits the managed refs, which include it.
+- `/readyz` reports the state under `email_health.forwarding`
+  (`pending|active|none`; `none` for a Gmail manifest without a relay) —
+  the payload has no `email` object to hang it on.
+- A diverted confirmation or check settles the journal row as
+  `state = 'diverted'` with no canonical event; `health()` counts it as
+  neither dlq nor failure.
+- A confirmation must also name this household's agent address in its body;
+  one for another mailbox is a letter.
+- Inventory additions: the migration, `hermes_cloud/core/dsar.py` (a new table
+  must be exported or excluded — `test_every_table_is_either_exported_or_explicitly_excluded`)
+  and `.check-fixtures-allow` (Google's sender in the classifier and its test).
 
 ### Success Criteria
 

@@ -72,6 +72,13 @@ EXPORTED: dict[str, tuple[str, ...]] = {
         "binding_identity_id", "binding_revision", "cursor", "connected_at",
         "last_success_at", "backoff_until", "health", "updated_at",
     ),
+    # The confirmation link stays out: it is a one-time Google URL, not the
+    # family's data, and the row's timestamps say everything the family owns.
+    "gmail_forwarding_state": (
+        "binding_identity_id", "binding_revision", "state", "confirmation_at",
+        "confirmation_shown_at", "last_letter_at", "last_check_at", "created_at",
+        "updated_at",
+    ),
     "email_sends": (
         "effect_id", "approval_id", "binding_identity_id", "binding_revision",
         "request_sha256", "state", "message_id", "provider_ref", "error_code",
@@ -161,7 +168,7 @@ def wipe_household(database: Database, *, now: float | None = None) -> dict[str,
     order = (
         "nerve_attachments", "nerve_webhook_signatures", "nerve_webhook_events",
         "nerve_runtime_health", "email_delivery_receipts", "email_sends", "email_ingress_receipts",
-        "oauth_grants", "email_sync_state", "email_bindings",
+        "oauth_grants", "gmail_forwarding_state", "email_sync_state", "email_bindings",
         "evidence_refs", "extraction_runs", "effects", "commitments",
         "memory_statements", "reminders", "approval_attempts", "approvals",
         "jobs", "events", "channel_state", "usage_daily",
