@@ -1,9 +1,9 @@
 # Privacy Notice
 
-*Version: pilot draft, 2026-08-12. Controller details, the contact address for
-data-subject requests, and the legal condition for special-category data are
-filled in. A Union representative under Art. 27 GDPR remains to be designated
-before the first real family.*
+*Version: 2026-09-13, production pilot. Controller details, the contact address
+for data-subject requests, and the legal condition for special-category data are
+filled in. A Union representative under Art. 27 GDPR has not yet been
+designated.*
 *The Russian version ([`privacy-notice-ru.md`](privacy-notice-ru.md)) is the
 reference text; both are kept in sync.*
 
@@ -22,12 +22,109 @@ reference text; both are kept in sync.*
   **deletion**; security secrets/hashes are not exported and minimal
   consent/DSAR/tombstone records remain for the stated period.
 
-> **Pilot status.** The service currently runs on test data: provider
-> agreements and international-transfer mechanisms are still being put in
-> place, so we do not process real family correspondence yet. This text
-> describes how processing will work and will be updated with actual details
-> before the first family is connected. Real Gmail, WhatsApp, and Web-push
-> adapters are disabled; Gmail additionally requires OAuth verification/CASA.
+> **Service status.** Since 8 September 2026 Abrolia runs in production and
+> processes real family correspondence. Available today: an `@abrolia.com`
+> assistant inbox, an inbox on your family's own domain, a separate agent Gmail
+> account, and Abrolia Web chat. While Google completes verification of the
+> Gmail integration, Gmail can be connected only by accounts Abrolia has added
+> as test users. WhatsApp, Telegram and Web push are not available yet.
+> Open compliance items are stated below where they apply.
+
+## Google user data (separate agent Gmail)
+
+This section applies if you connect a separate Google account as your
+assistant's mailbox. It describes **all** Google user data Abrolia accesses
+through Google APIs; Abrolia accesses no other Google data. The same
+information is shown in the app before you connect.
+
+### What we access and why
+
+Abrolia requests only these Google OAuth scopes:
+
+| Scope | What it allows | Why Abrolia needs it |
+|---|---|---|
+| `gmail.readonly` | Read messages in the agent mailbox | When a new message arrives in the inbox of the agent mailbox, Abrolia reads its sender, recipients, date, subject, body and the names and types of attachments, to work out what your family needs to do and show you a proposal. Abrolia does not import the mailbox history: it follows new inbox messages only (if Gmail can no longer provide that change feed, Abrolia re-checks at most the 100 most recent inbox messages). Drafts, sent mail and other labels are not processed. |
+| `gmail.send` | Send email from the agent mailbox | To send an email that an adult in your household has reviewed and confirmed on a proposal card. Abrolia never sends email automatically. |
+| `openid`, `email` | Identify the connected Google account | To show you which address was connected and check that it is the separate agent account you intended, not a personal one. |
+
+### How we use it
+
+Google user data is used only to provide and improve the user-facing features
+you use in Abrolia: turning incoming letters into proposals (events, tasks,
+reminders, replies), answering your questions about those letters, and sending
+emails you confirm. We do **not**:
+
+- use Google user data for advertising, including personalized, retargeted or
+  interest-based advertising;
+- sell it, or transfer it to data brokers or information resellers;
+- use it to determine creditworthiness or for lending purposes;
+- use it to develop, improve or train generalized or non-personalized AI or
+  machine-learning models. Problems we find are reproduced with synthetic
+  examples; real messages are not copied into test or training data.
+
+### AI processing
+
+To understand a letter, its content is sent to our AI model provider,
+**Anthropic** (Claude API), which processes it on our behalf under a data
+processing agreement and commercial terms that do not permit using it to train
+models. The result is shown to you as a proposal and is not used to train any
+model.
+
+### Who we share it with
+
+We transfer Google user data only:
+
+- to **Anthropic**, for the AI processing described above;
+- to **Fly.io**, which hosts the dedicated environment where it is stored
+  (Netherlands, EU);
+- to the recipients of an email **you** confirm;
+- when required by applicable law, or to protect against fraud, abuse or
+  security threats;
+- as part of a merger, acquisition or sale of assets, only after telling you
+  and obtaining your consent.
+
+### Storage, security and retention
+
+- Stored in your household's dedicated environment in the Netherlands (EU),
+  on encrypted disks; always transmitted over TLS.
+- OAuth tokens are encrypted with AES-256-GCM and are never exposed to your
+  browser, our account system, the AI model, or logs.
+- Message content is deleted after **30 days**. Details of items you confirm
+  follow the retention table below; emails sent on your confirmation are
+  journaled for 365 days. Logs contain identifiers and statuses only, never
+  message content. Backups roll off within 30 days.
+
+### Human access
+
+No one at Abrolia reads your Google user data, except: with your explicit
+permission for specific messages (for example, when you ask for support);
+when necessary for security purposes, such as investigating a bug or abuse; to
+comply with applicable law; or where the data has been aggregated and
+anonymized for internal operations.
+
+### Revoking access and deleting data
+
+- Remove Abrolia's access at any time in your Google Account at
+  [myaccount.google.com/permissions](https://myaccount.google.com/permissions);
+  Abrolia can no longer read or send from the mailbox after that.
+- Ask us at `help@abrolia.com` to disconnect the mailbox: we revoke the grant
+  with Google and delete the stored tokens.
+- Deleting your Abrolia account revokes the grant, deletes the tokens and
+  deletes the household's data, including Google user data; copies in backups
+  disappear within 30 days.
+
+### Limited Use
+
+Abrolia's use and transfer to any other app of information received from Google
+APIs will adhere to the
+[Google API Services User Data Policy](https://developers.google.com/terms/api-services-user-data-policy),
+including the Limited Use requirements. The use of information received from
+Google Workspace APIs will adhere to the
+[Google Workspace API User Data and Developer Policy](https://developers.google.com/workspace/workspace-api-user-data-developer-policy),
+including the Limited Use requirements.
+
+Until Google completes verification of the Gmail integration, connecting Gmail
+is available only to accounts Abrolia has added as test users.
 
 ## Who processes your data
 
@@ -44,10 +141,9 @@ controller is established outside the EU and has no establishment in the Union.
 The obligation applies to us: the Art. 27(2)(a) derogation is unavailable
 because the processing is not occasional and involves special categories of
 data, and Art. 27(2)(b) concerns public authorities. Until a representative is
-designated in writing, the service runs on synthetic data only: no real family
-data is processed and the real provider adapters are disabled and fail closed.
-The representative's name and address are recorded in this notice before the
-first family is connected.
+designated in writing, you can reach the controller directly at
+`help@abrolia.com`; the representative's name and address will be recorded in
+this notice once designated.
 
 **No Data Protection Officer is required** — determined on 2026-08-12 under
 Art. 37(1): the controller is not a public authority, and neither regular and
@@ -119,18 +215,18 @@ children. See our minors policy for detail.
 | Provider | Role | Where |
 |---|---|---|
 | Anthropic | the model that reads the email text | US / global |
-| Fly.io | metadata-only control plane, dedicated runtime, databases/secrets, and future shared-WA gateway | Netherlands (EU); provider control plane in the US |
+| Fly.io | metadata-only control plane, dedicated runtime, databases/secrets | Netherlands (EU); provider control plane in the US |
 | Resend | account magic-link delivery; delivery for Nerve-managed inboxes | US |
 | Nerve | `@abrolia.com` or family-domain agent inbox (email a/c) | US |
-| Google | calendar; a separate agent Gmail through OAuth only for email option b | global |
-| Telegram / WhatsApp | chosen communication channels; WhatsApp shared/dedicated are separate Beta modes | outside the EU |
-| Web Push provider | optional Abrolia Web push; not yet selected and disabled | TBD |
+| Google | Gmail API for a separate agent Gmail account, if you choose that option — see "Google user data" | global |
+| Telegram / WhatsApp | communication channels — not available yet, no data is shared | outside the EU |
+| Web Push provider | optional Abrolia Web push — not selected, not used | TBD |
 
-Some of these providers are outside the EU. Data processing agreements and
-Standard Contractual Clauses with a transfer risk assessment are **still being
-put in place**: until they are signed, the service does not process real family
-correspondence. You can request a copy of the safeguards in force at the
-contact address. We do **not** claim "EU-only processing" — with today's
+Some of these providers are outside the EU. Data processing agreements with
+Standard Contractual Clauses are **in effect with Anthropic and Resend**. The
+data processing agreement with Fly.io and the transfer impact assessments are
+**still being put in place**. You can request a copy of the safeguards in force
+at the contact address. We do **not** claim "EU-only processing" — with today's
 providers that would be untrue.
 
 ## Retention
@@ -142,7 +238,7 @@ providers that would be untrue.
 | Tasks and reminders | 90 days after completion |
 | Action journal | 365 days |
 | Email delivery receipts | 365 days with us; at the mail provider (Resend) per their own retention policy |
-| Calendar events (our internal mapping to your calendar) | 365 days; the event itself stays in your Google account |
+| Calendar events, where a family calendar is connected (our internal mapping) | 365 days; the event itself stays in that calendar |
 | Memory | until you delete it; we prompt a review every 90 days |
 | Incoming messages on any channel (webhook, WhatsApp) before processing | 30 days — same as other source content |
 | Messages that failed processing: content / technical failure reason | 30 days / 90 days |
@@ -161,35 +257,14 @@ providers that would be untrue.
 | Incident records | 3 years from closing the incident |
 | Family member identifiers and settings | while the account is active + 30 days |
 
-The new control-plane periods are a provisional/configurable synthetic-pilot
-policy, not a production promise; the owner and counsel review them before real
-data. The three-year periods are our choice, not a statutory figure: the law requires
+The control-plane periods are a provisional, configurable pilot policy and are
+reviewed as the pilot grows. The three-year periods are our choice, not a statutory figure: the law requires
 us to be able to demonstrate consent and to keep incident records, but names no
 period. Three years follows the limitation period and will be confirmed by
 counsel before launch.
 
 This table lists every class of data we retain. The technical version with
 storage locations and jurisdictions is in `docs/privacy/data-map.md`.
-
-## If you chose a separate agent Gmail
-
-- You first create a separate Google account for the assistant. We do not
-  connect personal Gmail and never request a password or app password.
-- The OAuth account chooser is always shown; after callback you confirm the
-  selected address again. Scopes are only `gmail.readonly` and `gmail.send`.
-- When this option is enabled, the refresh token goes directly to the
-  household's Fly secret namespace; it is absent from the browser, control-plane
-  database, job records, runtime manifest, model, and logs. Disconnect revokes
-  the grant and removes token material.
-- Immediately before OAuth, we explain what Gmail data Abrolia will access and
-  why. Our use and transfer of that data follows the Google API Services User
-  Data Policy, including its Limited Use requirements: it is used only to
-  provide or improve the user-facing Gmail assistant, never for advertising,
-  sale, credit decisions, or generalized model training. Human access is
-  limited to consented support, security, legal, or operational cases allowed
-  by that policy.
-- This option fails closed for real families until Google verification/CASA;
-  only a synthetic fake is used now.
 
 ## If you connected WhatsApp
 
@@ -207,11 +282,9 @@ and legal review and is not promised as a universal GA path.
 
 ## Where you talk to Abrolia
 
-Telegram is recommended by default; verified WhatsApp and authenticated Abrolia
-Web are alternatives. Primary controls proactive messages; replies stay in the
-verified source channel. The owner's recovery email is only a fallback
-notification (for Web without push, a link without sensitive content) and is
-never the agent inbox. A primary change takes effect after a test receipt.
+Today you talk to Abrolia in authenticated Abrolia Web chat; Telegram and
+WhatsApp are not available yet. The owner's recovery email is only a fallback
+notification (a link without sensitive content) and is never the agent inbox.
 
 ## Special categories of data
 
@@ -225,9 +298,8 @@ sent by mistake, stop using it and request deletion at `help@abrolia.com`.
 
 This restriction defines the permitted pilot scope, but it does not remove
 Abrolia's data-protection obligations or make accidentally received material
-"unprocessed". The law requires a specific condition for processing such data;
-until that condition is documented, real family inboxes and channels are not
-connected.
+"unprocessed". The condition we rely on for special-category data in content you
+send is your explicit consent, described above.
 
 ## Is providing data mandatory
 

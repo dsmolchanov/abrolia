@@ -2178,6 +2178,29 @@ now renders connect eligibility from `GoogleOAuthService.account_allowed`, says
 Gmail is unavailable instead, and offers "Change email option" for a pending
 email step; the polling render keeps both answers.
 
+### Google restricted-scope verification prerequisites (owner decision 2026-09-13)
+
+**Branches:** `feat/google-verification-prereqs`.
+
+**Files:** `landing/privacy.html`, `landing/terms.html`, `landing/index.html`,
+`landing/styles.css`, `landing/sitemap.xml`, `.check-fixtures-allow`,
+`control_plane/web/templates/onboarding.html`,
+`tests/control_plane/test_ui_contract.py`, `docs/google-verification.md`,
+`docs/privacy/privacy-notice-en.md`, `docs/privacy/privacy-notice-ru.md`,
+`bench/README.md`, `.gitleaksignore` (the all-refs secret scan trips on test
+literals in another open branch; the fingerprints are allowlisted here too).
+
+The owner chose full Google verification (gmail.readonly kept, CASA accepted) so
+the agent Gmail option can open beyond test users. This change supplies what the
+repository owns: a public Privacy Policy and Terms of Service on abrolia.com,
+the Limited Use statement, an in-product disclosure that links the policy, both
+privacy notices brought to the production state (real data since 2026-09-08;
+Fly.io DPA, TIAs and the Art. 27 representative still open), and
+`docs/google-verification.md` with the Cloud Console checklist, scope
+justifications, demo-video script and CASA preparation. Search Console,
+branding, publishing status, submission and the CASA lab are owner steps. The
+`cryptography` upgrade and dependency scanning follow in their own change.
+
 ### Dependency advisories: cryptography ≥ 50 and a standing audit (CASA preparation)
 
 **Branches:** `chore/cryptography-50-dependency-audit`.

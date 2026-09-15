@@ -832,3 +832,18 @@ def test_a_gmail_step_that_can_no_longer_connect_offers_a_way_out(
         snapshot = active.onboarding_repository.snapshot(world.household.id)
         email_step = next(step for step in snapshot.steps if step.kind.value == "email_identity")
         assert email_step.status.value == "verified"
+
+
+def test_the_google_panel_discloses_data_use_and_links_the_policy(api_harness) -> None:
+    """Google's verification requires the disclosure before consent, in the app.
+
+    It names what is read and what is sent, states Limited Use, and links the
+    published Privacy Policy section a reviewer checks against.
+    """
+    world = api_harness.create_principal("disclosure-owner@family.test")
+    api_harness.authenticate(world)
+    html = api_harness.client.get("/onboarding").text
+    assert '<ul id="google-data-use">' in html
+    assert "including the Limited Use requirements" in html
+    assert 'href="https://abrolia.com/privacy.html#google"' in html
+    assert 'href="https://developers.google.com/terms/api-services-user-data-policy"' in html

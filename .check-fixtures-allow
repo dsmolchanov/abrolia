@@ -28,6 +28,9 @@ docs/privacy/*.md | email | schule@example.de
 # production domain remains blocked.
 landing/*.html | email | hello@abrolia.com
 landing/*.js | email | hello@abrolia.com
+# The published Privacy Policy and Terms name the controller's data-subject
+# contact, the same organisation address the privacy notices carry.
+landing/*.html | email | help@abrolia.com
 
 # Публичные организационные контакты САМИХ процессоров: адрес поддержки Fly.io
 # из их privacy policy (маршрут запроса DPA записан в реестре и плане) и
@@ -41,6 +44,7 @@ thoughts/shared/plans/*.md | email | support@fly.io
 .check-fixtures-allow | email | privacy@resend.com
 .check-fixtures-allow | email | support@fly.io
 .check-fixtures-allow | email | hello@abrolia.com
+.check-fixtures-allow | email | help@abrolia.com
 
 # Illustrative managed-inbox address in the implementation plan. The concrete
 # value is prose only; runtime tests continue to use reserved .test domains.
