@@ -290,7 +290,7 @@ nothing can issue an insufficient-scope call.
 
 #### 1. Scope constants and consistency
 
-**Branches:** `feat/gmail-send-only-scope`.
+**Branches:** `feat/gmail-send-only-scope`, `fix/gmail-revoked-grant-readiness`.
 
 **Files:** `control_plane/email/models.py`, `control_plane/providers/email/google_oauth.py`,
 `control_plane/provisioning/worker.py`, `control_plane/config.py`,
@@ -337,6 +337,15 @@ nothing can issue an insufficient-scope call.
   gone; `/readyz` reports `email_health.status = send_only` for a live grant
   and stays `not_ready` for a revoked one, until Phase 4 adds forwarding
   health.)
+- **Codex P1 on #169 (fixed forward in `fix/gmail-revoked-grant-readiness`):**
+  the poller was the only writer of `auth_revoked`, so after a family revoked
+  access in Google nothing persisted it and `/readyz` answered `send_only`
+  with 200 for ever. `GmailHttpClient` now zeroes the durable grant where the
+  revocation is observed — a token-endpoint `invalid_grant`, or a Gmail
+  401/403 that is neither `insufficientPermissions` nor a usage limit — so
+  `_sync_email_binding` refuses, `/readyz` returns 503 and the control plane
+  marks the household `needs_attention`. Other token-endpoint refusals
+  (`invalid_client`, 5xx) and usage-limit 403s keep the grant.
 - `GmailSendProvider.supports_idempotent_reconcile = False` and remove
   `reconcile`; a send timeout or connection error stays `EmailOutcomeUnknown`
   and `EmailSender` records `outcome_unknown` without retry. Test that path.

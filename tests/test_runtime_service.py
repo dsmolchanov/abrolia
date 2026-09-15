@@ -760,6 +760,134 @@ def test_gmail_activation_fails_closed_on_a_revoked_grant(tmp_path: Path) -> Non
     assert client.closed is True
 
 
+def _google_that(*, refresh, send):
+    """Google's token endpoint answers `refresh`, Gmail's send answers `send`."""
+    import httpx
+
+    from hermes_cloud.email.google_client import GMAIL_URL, TOKEN_URL
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == TOKEN_URL:
+            return httpx.Response(refresh[0], json=refresh[1])
+        assert str(request.url) == f"{GMAIL_URL}/messages/send"
+        return httpx.Response(send[0], json=send[1])
+
+    return handler
+
+
+def _real_gmail_client(handler):
+    import httpx
+
+    from hermes_cloud.email.google_client import GmailHttpClient
+
+    return lambda store, **kwargs: GmailHttpClient(
+        store, http=httpx.Client(transport=httpx.MockTransport(handler)), **kwargs
+    )
+
+
+def _active_gmail_runtime_with_google(tmp_path: Path, handler):
+    content = manifest_toml(with_email_binding=True, email_provider="gmail")
+    manifest = parse_runtime_manifest(content)
+    manifest_path = atomic_write(tmp_path / "household.toml", content.encode())
+    activation_path = tmp_path / "activation.json"
+    write_activation_state(
+        activation_path,
+        ActivationState(
+            status="active",
+            runtime_ref=RUNTIME_REF,
+            household_id=manifest.household_id,
+            config_revision=manifest.config_revision,
+            config_sha256=manifest.config_sha256,
+            updated_at=1.0,
+        ),
+    )
+    service = RuntimeService(
+        manifest_path=manifest_path,
+        activation_path=activation_path,
+        runtime_ref=RUNTIME_REF,
+        env={
+            "HERMES_DB": str(tmp_path / "hermes.db"),
+            "HERMES_EMAIL_BINDING": _gmail_secret_bundle(),
+        },
+        gmail_client_factory=_real_gmail_client(handler),
+    )
+    return service, manifest
+
+
+OK_TOKEN = (200, {"access_token": "access-canary", "expires_in": 3600})
+DEAD_TOKEN = (400, {"error": "invalid_grant"})
+
+
+@pytest.mark.parametrize(
+    ("refresh", "send"),
+    [
+        pytest.param(DEAD_TOKEN, (200, {"id": "m1"}), id="refresh-invalid_grant"),
+        pytest.param(OK_TOKEN, (401, {"error": {"code": 401}}), id="send-401"),
+        pytest.param(OK_TOKEN, (403, {"error": {"errors": [{"reason": "forbidden"}]}}), id="send-403"),
+    ],
+)
+def test_a_revocation_google_proves_closes_readiness_durably(
+    tmp_path: Path, refresh, send
+) -> None:
+    """After the family revokes access in Google, the next refresh or send is
+    the only place the runtime learns of it. Without the poller writing
+    `auth_revoked`, `/readyz` would keep answering `send_only` with 200 from
+    the locally unrevoked row; the grant is zeroed where the revocation is
+    observed, so readiness fails closed until a reconnect."""
+    from hermes_cloud.email.google_client import (
+        GmailAuthRevoked,
+        build_gmail_client,
+    )
+
+    service, manifest = _active_gmail_runtime_with_google(
+        tmp_path, _google_that(refresh=refresh, send=send)
+    )
+    assert service.readyz().payload["email_health"] == {"status": "send_only"}
+
+    if refresh is DEAD_TOKEN:
+        assert service.email_activation_health(manifest) == ("failed", "failed")
+    else:
+        assert service.email_activation_health(manifest) == ("healthy", "healthy")
+        binding = service._sync_email_binding(manifest)
+        with runtime_service_module.open_database(service.database_path) as database:
+            client = build_gmail_client(
+                database,
+                binding,
+                service._gmail_bundle(binding),
+                client_factory=service.gmail_client_factory,
+            )
+            with pytest.raises(GmailAuthRevoked):
+                client.send_raw("raw")
+
+    revoked = service.readyz()
+    assert revoked.status_code == 503
+    assert revoked.payload["reason"] == "email_state_unavailable"
+    with runtime_service_module.open_database(service.database_path) as database:
+        row = database.query_one("SELECT revoked_at, encrypted_refresh_credential FROM oauth_grants")
+    assert row["revoked_at"] is not None
+    assert bytes(row["encrypted_refresh_credential"]) == b""
+
+
+def test_a_gmail_usage_limit_leaves_readiness_open(tmp_path: Path) -> None:
+    from hermes_cloud.email.google_client import GmailQuotaExceeded, build_gmail_client
+
+    service, manifest = _active_gmail_runtime_with_google(
+        tmp_path,
+        _google_that(
+            refresh=OK_TOKEN,
+            send=(403, {"error": {"errors": [{"reason": "userRateLimitExceeded"}]}}),
+        ),
+    )
+    binding = service._sync_email_binding(manifest)
+    with runtime_service_module.open_database(service.database_path) as database:
+        client = build_gmail_client(
+            database, binding, service._gmail_bundle(binding), client_factory=service.gmail_client_factory
+        )
+        with pytest.raises(GmailQuotaExceeded):
+            client.send_raw("raw")
+    assert service.readyz().payload["email_health"] == {"status": "send_only"}
+
+
 def test_gmail_activation_fails_closed_without_the_send_scope(tmp_path: Path) -> None:
     """A bundle the control plane would never write, refused here as well:
     the runtime does not activate a Gmail household it cannot send from."""

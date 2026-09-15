@@ -36,6 +36,13 @@ GMAIL_REQUIRED_SCOPES = frozenset({
     "email",
     "https://www.googleapis.com/auth/gmail.send",
 })
+#: Gmail's 403 reasons for usage limits (developers.google.com/workspace/gmail/api/guides/handle-errors).
+QUOTA_REASONS = frozenset({
+    "rateLimitExceeded",
+    "userRateLimitExceeded",
+    "dailyLimitExceeded",
+    "quotaExceeded",
+})
 
 
 class GmailError(RuntimeError):
@@ -193,7 +200,12 @@ class GoogleRefreshClient:
             )
         except (httpx.TimeoutException, httpx.TransportError) as error:
             raise GmailError("gmail_refresh_unavailable") from error
-        if response.status_code in {400, 401, 403}:
+        # Only `invalid_grant` says the refresh credential itself is dead
+        # (revoked by the family, expired, or invalidated by a password
+        # change). The caller zeroes the durable grant on this answer, so a
+        # rejected client secret (`invalid_client`) or any other refusal must
+        # stay a plain error: the family's grant is not the thing at fault.
+        if response.status_code in {400, 401} and _oauth_error(response) == "invalid_grant":
             raise GmailAuthRevoked("gmail_auth_revoked")
         if response.status_code != 200:
             raise GmailError("gmail_refresh_rejected")
@@ -236,8 +248,31 @@ class GmailHttpClient:
 
     def _token(self) -> str:
         if self._access is None or self._access.expires_at <= self.clock() + 30:
-            self._access = self.grants.access_token(self.identity_id, self.revision, self.refresher)
+            try:
+                self._access = self.grants.access_token(
+                    self.identity_id, self.revision, self.refresher
+                )
+            except GmailAuthRevoked:
+                self._revoked()
+                raise
         return self._access.access_token
+
+    def _revoked(self) -> None:
+        """Close the grant durably the moment Google proves it revoked.
+
+        The Gmail poller used to write `auth_revoked` into `email_sync_state`
+        on this exception, and `/readyz` read it back. With the poller gone,
+        nothing else observes a revocation: every caller — activation health,
+        the send path, a refresh — comes through this client, and if it only
+        raised, `oauth_grants.revoked_at` would stay NULL and `/readyz` would
+        answer `send_only` with 200 for ever, keeping workers eligible for
+        mail that can no longer be sent. Zeroing the row makes
+        `_sync_email_binding` refuse, `/readyz` fail closed, and the control
+        plane's runtime health mark the household `needs_attention`. Recovery
+        is a reconnect, which is the only recovery a revoked grant has.
+        """
+        self._access = None
+        self.grants.revoke(self.identity_id, self.revision)
 
     def _request(self, method: str, path: str, **kwargs) -> dict[str, Any]:
         headers = {**kwargs.pop("headers", {}), "Authorization": f"Bearer {self._token()}"}
@@ -247,17 +282,21 @@ class GmailHttpClient:
             raise TimeoutError("gmail_timeout") from error
         except httpx.TransportError as error:
             raise ConnectionError("gmail_transport") from error
-        if response.status_code == 403 and _error_reason(response) == "insufficientPermissions":
+        reason = _error_reason(response) if response.status_code == 403 else ""
+        if reason == "insufficientPermissions":
             raise GmailScopeInsufficient("gmail_scope_insufficient")
-        if response.status_code in {401, 403}:
-            self._access = None
-            raise GmailAuthRevoked("gmail_auth_revoked")
-        if response.status_code == 429:
+        if response.status_code == 429 or reason in QUOTA_REASONS:
+            # Gmail answers a burst with 403 as readily as with 429; neither
+            # says anything about the grant, and zeroing it for a rate limit
+            # would turn a busy afternoon into a reconnect.
             try:
                 retry_after = float(response.headers.get("Retry-After", "60"))
             except ValueError:
                 retry_after = 60.0
             raise GmailQuotaExceeded(retry_after)
+        if response.status_code in {401, 403}:
+            self._revoked()
+            raise GmailAuthRevoked("gmail_auth_revoked")
         if response.status_code >= 400:
             raise GmailError(f"gmail_http_{response.status_code}")
         try:
@@ -280,6 +319,15 @@ class GmailHttpClient:
 
     def send_raw(self, raw: str) -> dict[str, Any]:
         return self._request("POST", "/messages/send", json={"raw": raw})
+
+
+def _oauth_error(response: httpx.Response) -> str:
+    """The `error` code of an OAuth token-endpoint refusal, or an empty string."""
+    try:
+        error = response.json().get("error")
+    except (ValueError, AttributeError):
+        return ""
+    return error if isinstance(error, str) else ""
 
 
 def _error_reason(response: httpx.Response) -> str:
