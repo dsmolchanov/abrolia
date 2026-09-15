@@ -209,6 +209,9 @@ EXPECTED_CAPABILITY = {
     "memory_append": WRITE_MEMORY,
     "propose_email": WRITE_EMAIL,
     "propose_whatsapp": WRITE_WHATSAPP,
+    # Asks the runtime for a forwarding check; sends nothing on the family's
+    # behalf, but only who may compose mail may ask the relay to mail itself.
+    "forwarding_recheck": WRITE_EMAIL,
 }
 
 VALID_ARGUMENTS = {
@@ -227,6 +230,7 @@ VALID_ARGUMENTS = {
         "to": "+999123456",
         "text": "Bitte Termin bestätigen.",
     },
+    "forwarding_recheck": {},
 }
 
 ROLES = {

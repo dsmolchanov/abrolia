@@ -36,6 +36,7 @@ from hermes_cloud.core.runcontext import (
 from hermes_cloud.email.contracts import EmailBinding
 from hermes_cloud.execute.gcal import Calendar
 from hermes_cloud.execute.reminder import ReminderStore, due_timestamp
+from hermes_cloud.ingest.forwarding import ForwardingStateStore
 from hermes_cloud.runner.bundle import Item, bundle_payload
 from hermes_cloud.runner.card import KIND_BUNDLE, KIND_EMAIL, KIND_MEMORY, KIND_WHATSAPP
 
@@ -58,6 +59,9 @@ class Services:
     commitments: CommitmentStore | None = None
     calendar: Calendar | None = None
     email_binding: EmailBinding | None = None
+    #: A Gmail household's forwarding state (`hermes_cloud/ingest/forwarding.py`),
+    #: so the family can ask for a check now instead of tomorrow.
+    forwarding: ForwardingStateStore | None = None
 
     @classmethod
     def on(
@@ -75,6 +79,7 @@ class Services:
             commitments=CommitmentStore(database),
             calendar=calendar,
             email_binding=email_binding,
+            forwarding=ForwardingStateStore(database),
         )
 
 
@@ -577,6 +582,31 @@ def propose_whatsapp(
         context_key=f"chat:{context.chat_id}",
     )
     return {"proposal_id": staged.id, "status": "ожидает подтверждения"}
+
+
+@REGISTRY.tool(
+    name="forwarding_recheck",
+    capability=WRITE_EMAIL,
+    description=(
+        "Семья говорит, что включила пересылку из Gmail в Abrolia (или что "
+        "починила её). Попросить проверку сейчас, а не завтра: с релейного "
+        "ящика уйдёт контрольное письмо, и если Gmail вернёт его — пересылка "
+        "снова считается рабочей. Ничего не отправляет от имени семьи."
+    ),
+    input_schema={"type": "object", "properties": {}, "required": []},
+)
+def forwarding_recheck(
+    context: RunContext, services: Services, arguments: dict[str, Any]
+) -> dict[str, Any]:
+    context.require(WRITE_EMAIL)
+    del arguments
+    binding = services.email_binding
+    if services.forwarding is None or binding is None or binding.provider != "gmail":
+        return {"requested": False, "reason": "no_gmail_relay"}
+    if services.forwarding.state(binding) is None:
+        return {"requested": False, "reason": "no_gmail_relay"}
+    services.forwarding.request_check(binding)
+    return {"requested": True, "status": "проверка уйдёт в ближайшую минуту"}
 
 
 # --- разбор аргументов --------------------------------------------------------

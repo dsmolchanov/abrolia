@@ -58,6 +58,8 @@ from hermes_cloud.email.nerve_client import (
 from hermes_cloud.email.receipts import EmailBindingStore
 from hermes_cloud.ingest.forwarding import (
     CONFIRMATION_GUIDE,
+    STALE_GUIDE,
+    ForwardingHealth,
     ForwardingRelay,
     ForwardingStateStore,
 )
@@ -623,10 +625,25 @@ class RuntimeService:
                 runtime_url=config.runtime_url,
                 rest_url=config.rest_url,
             )
+            relay = self._forwarding_relay(manifest, config, database)
             try:
-                return NerveAttachmentWorker(
-                    database, client, relay=self._forwarding_relay(manifest, config, database)
-                ).run_once()
+                result = NerveAttachmentWorker(database, client, relay=relay).run_once()
+                if relay is not None:
+                    # Health rides the same loop as ingest: one pass counts a
+                    # missed check, declares stale, and sends the day's check.
+                    binding = self._email_binding_from_manifest(manifest)
+                    assert binding is not None
+                    ForwardingHealth(
+                        relay.state,
+                        binding=binding,
+                        relay=relay,
+                        client=client,
+                        inbox_id=config.inbox_id,
+                        household_id=manifest.household_id,
+                        secret=config.webhook_signing_key,
+                        env=self.env,
+                    ).tick()
+                return result
             finally:
                 close = getattr(client, "close", None)
                 if close is not None:
@@ -803,14 +820,37 @@ class RuntimeService:
         binding = self._email_binding_from_manifest(manifest)
         if binding is None:
             return None
-        link = ForwardingStateStore(database).take_unshown_confirmation(binding)
-        return None if link is None else CONFIRMATION_GUIDE.format(link=link)
+        store = ForwardingStateStore(database)
+        notices = []
+        link = store.take_unshown_confirmation(binding)
+        if link is not None:
+            notices.append(CONFIRMATION_GUIDE.format(link=link))
+        if store.take_unshown_stale_notice(binding):
+            notices.append(STALE_GUIDE)
+        return "\n\n".join(notices) or None
 
     def _web_chat_loop(self, database, config) -> ToolLoop:
-        """The dialogue loop against this turn's database connection."""
+        """The dialogue loop against this turn's database connection.
+
+        The email binding travels in so the `forwarding_recheck` tool knows
+        which household's relay a check is asked for; `config` already
+        carries it from the manifest, the way `cli._email_binding` reads it.
+        """
+        email_binding = (
+            EmailBinding(
+                identity_id=config.email_identity_id,
+                revision=config.email_binding_revision,
+                provider=config.email_provider,
+                address=config.email_address,
+                provider_ref=config.email_identity_id,
+                secret_names=config.email_secret_names,
+            )
+            if config.has_email_identity
+            else None
+        )
         return ToolLoop(
             journal=EffectJournal(database),
-            services=Services.on(database),
+            services=Services.on(database, email_binding=email_binding),
             model=config.model,
             effort=config.effort,
             family_language=config.language,
