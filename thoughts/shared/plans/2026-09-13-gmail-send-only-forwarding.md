@@ -607,7 +607,8 @@ Detect forwarding that was never finished or later stopped, and tell the family.
 `hermes_cloud/core/migrations/0010_gmail_forwarding_health.sql`,
 `control_plane/web/templates/onboarding.html`,
 `tests/test_gmail_forwarding_health.py`, `tests/test_observability_health.py`,
-`tests/test_gmail_forwarding_runtime.py`, `tests/test_runcontext.py`.
+`tests/test_gmail_forwarding_runtime.py`, `tests/test_runcontext.py`,
+`.gitleaksignore`.
 
 **Changes**:
 
@@ -653,7 +654,16 @@ Detect forwarding that was never finished or later stopped, and tell the family.
 - `/readyz` reports `email_health.forwarding = pending|active|stale|none`.
 - Inventory additions: migration `0010`, `hermes_cloud/core/dsar.py`,
   `hermes_cloud/runner/tools.py`, `hermes_cloud/ingest/nerve_webhook.py`,
-  `tests/test_gmail_forwarding_runtime.py`.
+  `tests/test_gmail_forwarding_runtime.py`, `tests/test_runcontext.py` (the
+  authorization matrix must describe every tool), `.gitleaksignore`.
+- **Codex round on #173 (fixed in place):** the token and Nerve idempotency
+  key now include a per-row attempt counter, so a same-day recheck or a
+  sub-daily interval is a new message; a `check` counts only inside its
+  two-hour window (`record_check_return`), so late arrivals neither reset
+  the miss count nor clear `stale`; an interval that is not finite or not
+  longer than the window falls back to the default. The test literal that
+  tripped the full-history gitleaks scan is allowlisted by fingerprint and
+  no longer key-shaped.
 
 ### Success Criteria
 

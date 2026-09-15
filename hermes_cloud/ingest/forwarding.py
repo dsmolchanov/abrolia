@@ -27,6 +27,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import logging
+import math
 import os
 import re
 import time
@@ -236,10 +237,34 @@ class ForwardingStateStore:
         with self.db.write() as connection:
             connection.execute(
                 "UPDATE gmail_forwarding_state SET last_check_sent_at = ?, last_check_token = ?,"
-                " last_check_miss_counted = 0, check_requested_at = NULL, updated_at = ?"
+                " check_attempts = check_attempts + 1, last_check_miss_counted = 0,"
+                " check_requested_at = NULL, updated_at = ?"
                 " WHERE binding_identity_id = ? AND binding_revision = ?",
                 (now, token, now, binding.identity_id, binding.revision),
             )
+
+    def record_check_return(
+        self, binding: EmailBinding, token: str, *, received_at: float
+    ) -> bool:
+        """A `check` came back through the relay: does it prove anything?
+
+        Only the outstanding token counts, and only inside its return window.
+        A check that arrives after its two-hour deadline has already been
+        counted as a miss — accepting it would reset the count and, after the
+        second miss, clear a `stale` state that the late arrivals had earned:
+        forwarding that takes three hours is not forwarding that works.
+        """
+        row = self.row(binding)
+        if (
+            row is None
+            or row["last_check_token"] is None
+            or token != row["last_check_token"]
+            or row["last_check_sent_at"] is None
+            or received_at - row["last_check_sent_at"] > CHECK_RETURN_WINDOW_SECONDS
+        ):
+            return False
+        self.mark_active(binding, letter=False, token=token, now=received_at)
+        return True
 
     def count_miss(self, binding: EmailBinding, *, now: float | None = None) -> int:
         """One miss per check that did not come back; returns the new count."""
@@ -315,10 +340,20 @@ class ForwardingRelay:
     state: ForwardingStateStore
 
 
-def check_token(secret: str, day: str) -> str:
-    """HMAC(household secret, UTC date): what a check message carries in its
-    subject, so a `check` seen in the relay can be matched to the one sent."""
-    return hmac.new(secret.encode(), day.encode(), hashlib.sha256).hexdigest()[:32]
+def check_token(secret: str, day: str, attempt: int = 1) -> str:
+    """HMAC(household secret, UTC date and attempt number): what a check
+    message carries in its subject, so a `check` seen in the relay can be
+    matched to the one sent.
+
+    The attempt number is what makes a second check on the same day — the
+    family's "I've turned forwarding on", or a sub-daily interval — a NEW
+    message: without it the token and Nerve's idempotency key repeated, the
+    relay sent nothing, and the seen token already equalled the outstanding
+    one, so an unverified recheck read as a success.
+    """
+    return hmac.new(
+        secret.encode(), f"{day}:{attempt}".encode(), hashlib.sha256
+    ).hexdigest()[:32]
 
 
 class CheckComposeClient(Protocol):
@@ -383,11 +418,22 @@ class ForwardingHealth:
         self.logger = logger or logging.getLogger(__name__)
 
     def _check_interval(self) -> float:
+        """Seconds between checks: finite, and longer than the return window.
+
+        `nan` or `inf` would make a check never due again after the first;
+        an interval shorter than the two-hour window would replace
+        `last_check_sent_at` before the previous check could become overdue,
+        so no miss was ever counted. Anything unusable falls back to the
+        default rather than to a monitor that cannot fail.
+        """
         try:
             hours = float(self.env.get(ENV_CHECK_HOURS, DEFAULT_CHECK_HOURS))
-        except ValueError:
+        except (TypeError, ValueError):
             hours = DEFAULT_CHECK_HOURS
-        return max(hours, 0.01) * 3600
+        seconds = hours * 3600
+        if not math.isfinite(seconds) or seconds <= CHECK_RETURN_WINDOW_SECONDS:
+            seconds = DEFAULT_CHECK_HOURS * 3600
+        return seconds
 
     def tick(self, *, now: float | None = None) -> str | None:
         """One pass: count a miss, declare stale, send a due check.
@@ -438,7 +484,9 @@ class ForwardingHealth:
         if self.env.get(ENV_OUTGOING_MAIL, "0") != "1":
             raise EgressBlocked(f"outgoing mail is off (${ENV_OUTGOING_MAIL}=0)")
         day = datetime.fromtimestamp(now, UTC).date().isoformat()
-        token = check_token(self.secret, day)
+        row = self.store.row(self.binding)
+        attempt = int(row["check_attempts"]) + 1 if row is not None else 1
+        token = check_token(self.secret, day, attempt)
         self.client.compose_email(
             inbox_id=self.inbox_id,
             to=self.relay.agent_address,

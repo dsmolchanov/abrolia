@@ -9,3 +9,4 @@ ALTER TABLE gmail_forwarding_state ADD COLUMN misses INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE gmail_forwarding_state ADD COLUMN check_requested_at REAL;
 ALTER TABLE gmail_forwarding_state ADD COLUMN stale_since REAL;
 ALTER TABLE gmail_forwarding_state ADD COLUMN stale_notified_at REAL;
+ALTER TABLE gmail_forwarding_state ADD COLUMN check_attempts INTEGER NOT NULL DEFAULT 0;

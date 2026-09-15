@@ -12,6 +12,8 @@ import logging
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from hermes_cloud.core.db import open_database
 from hermes_cloud.email.contracts import EmailBinding
 from hermes_cloud.ingest.forwarding import (
@@ -70,10 +72,10 @@ def _health(tmp_path: Path, *, env=None):
 
 
 def _returned(store: ForwardingStateStore, client: ComposeRecorder, *, now: float) -> None:
-    """Gmail forwarded the last check back: the worker marks it active."""
+    """Gmail forwarded the last check back: the worker records its return."""
     token = client.sent[-1]["subject"].removeprefix(CHECK_SUBJECT_PREFIX)
     assert token == store.outstanding_check_token(BINDING)
-    store.mark_active(BINDING, letter=False, token=token, now=now)
+    assert store.record_check_return(BINDING, token, received_at=now) is True
 
 
 def test_a_check_is_sent_once_a_day_from_the_relay_to_the_agent(tmp_path: Path) -> None:
@@ -84,7 +86,7 @@ def test_a_check_is_sent_once_a_day_from_the_relay_to_the_agent(tmp_path: Path) 
     assert len(client.sent) == 1
     sent = client.sent[0]
     assert sent["inbox_id"] == INBOX_ID and sent["to"] == AGENT
-    assert sent["subject"] == f"{CHECK_SUBJECT_PREFIX}{check_token(SECRET, '2027-01-15')}"
+    assert sent["subject"] == f"{CHECK_SUBJECT_PREFIX}{check_token(SECRET, '2027-01-15', 1)}"
     assert sent["idempotency_key"].startswith("forwarding-check:identity-1:")
     assert sent["attachments"] == [] and sent["html"] is None
 
@@ -124,8 +126,8 @@ def test_two_missed_checks_declare_stale_once_and_a_return_recovers(
     assert health.tick(now=DAY + 50 * HOUR + 1) is None
     assert len([r for r in caplog.records if "ALERT gmail_forwarding_stale" in r.getMessage()]) == 1
 
-    # The family fixes forwarding and the check comes back.
-    _returned(store, client, now=DAY + 51 * HOUR)
+    # The family fixes forwarding and the check comes back inside its window.
+    _returned(store, client, now=DAY + 49 * HOUR)
     row = store.row(BINDING)
     assert (row["state"], row["misses"], row["stale_since"], row["stale_notified_at"]) == (
         "active", 0, None, None,
@@ -175,6 +177,77 @@ def test_the_check_interval_is_configurable(tmp_path: Path) -> None:
     _returned(store, client, now=DAY + 10)
     assert health.tick(now=DAY + 5 * HOUR) is None
     assert health.tick(now=DAY + 6 * HOUR) == "sent"
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf", "0", "1", "2", "abc", ""])
+def test_an_unusable_interval_falls_back_to_the_default(tmp_path: Path, value: str) -> None:
+    """`nan`/`inf` would make a check never due again; an interval inside the
+    two-hour return window would replace the outstanding check before it
+    could be missed. Either is a monitor that cannot fail."""
+    _store, _client, health = _health(tmp_path, env={"ABROLIA_GMAIL_FORWARD_CHECK_HOURS": value})
+    assert health._check_interval() == 24 * HOUR
+
+
+class IdempotentComposeRecorder(ComposeRecorder):
+    """Nerve's compose is idempotent on the key: a repeated key sends nothing."""
+
+    def compose_email(self, **kwargs):
+        if any(sent["idempotency_key"] == kwargs["idempotency_key"] for sent in self.sent):
+            return {"message_id": "m-dup", "status": "queued"}
+        return super().compose_email(**kwargs)
+
+
+@pytest.mark.parametrize("trigger", ["recheck", "subdaily"])
+def test_a_second_check_on_the_same_day_is_a_new_message(tmp_path: Path, trigger: str) -> None:
+    """Token and idempotency key derive from the attempt too. Without that a
+    same-day recheck reused both: Nerve sent nothing, the seen token already
+    matched, and the recheck reported a success nobody verified."""
+    env = {"ABROLIA_GMAIL_FORWARD_CHECK_HOURS": "3"} if trigger == "subdaily" else {}
+    store, _client, health = _health(tmp_path, env=env)
+    client = IdempotentComposeRecorder()
+    health.client = client
+    health.tick(now=DAY)
+    _returned(store, client, now=DAY + 10)
+
+    if trigger == "recheck":
+        store.request_check(BINDING, now=DAY + HOUR)
+        assert health.tick(now=DAY + HOUR + 1) == "sent"
+    else:
+        assert health.tick(now=DAY + 3 * HOUR) == "sent"
+
+    assert len(client.sent) == 2
+    first, second = client.sent
+    assert first["subject"] != second["subject"]
+    assert first["idempotency_key"] != second["idempotency_key"]
+    assert second["subject"].endswith(check_token(SECRET, "2027-01-15", 2))
+    # The second attempt is outstanding on its own: not back → a miss.
+    later = (DAY + HOUR + 1 if trigger == "recheck" else DAY + 3 * HOUR) + 2 * HOUR + 1
+    health.tick(now=later)
+    assert store.row(BINDING)["misses"] == 1
+
+
+def test_a_check_that_comes_back_after_its_deadline_proves_nothing(tmp_path: Path) -> None:
+    """Forwarding that takes three hours is forwarding that does not work: a
+    late return neither resets the miss count nor clears a stale state."""
+    store, client, health = _health(tmp_path)
+    health.tick(now=DAY)
+    assert health.tick(now=DAY + 2 * HOUR + 1) is None  # miss 1
+    token = client.sent[-1]["subject"].removeprefix(CHECK_SUBJECT_PREFIX)
+
+    assert store.record_check_return(BINDING, token, received_at=DAY + 3 * HOUR) is False
+    assert store.row(BINDING)["misses"] == 1
+
+    health.tick(now=DAY + 24 * HOUR)
+    assert health.tick(now=DAY + 26 * HOUR + 1) == "stale"
+    token = client.sent[-1]["subject"].removeprefix(CHECK_SUBJECT_PREFIX)
+    assert store.record_check_return(BINDING, token, received_at=DAY + 27 * HOUR) is False
+    assert store.state(BINDING) == "stale"
+
+    # A return inside the window ends the episode.
+    health.tick(now=DAY + 48 * HOUR)
+    token = client.sent[-1]["subject"].removeprefix(CHECK_SUBJECT_PREFIX)
+    assert store.record_check_return(BINDING, token, received_at=DAY + 49 * HOUR) is True
+    assert store.state(BINDING) == "active"
 
 
 def test_a_requested_check_goes_out_now(tmp_path: Path) -> None:

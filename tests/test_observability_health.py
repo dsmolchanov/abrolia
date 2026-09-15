@@ -17,7 +17,7 @@ def test_the_forwarding_alert_is_registered_and_hashes_the_household(caplog) -> 
         emit_alert(
             logging.getLogger("test"),
             "gmail_forwarding_stale",
-            env={"ABROLIA_HMAC_KEY": "test-key-1234567890abcdef"},
+            env={"ABROLIA_HMAC_KEY": "k" * 24},
             household_id="hh-1",
             misses="2",
         )
