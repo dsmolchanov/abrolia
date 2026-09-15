@@ -30,6 +30,7 @@ from hermes_cloud.core.runtime_manifest import (
     compute_config_sha256,
     parse_runtime_manifest,
 )
+from hermes_cloud.email.contracts import EmailBinding
 from hermes_cloud.execute.gmail_api_send import GmailSendProvider
 from hermes_cloud.ingest.forwarding import (
     CONFIRMATION_SENDER,
@@ -470,6 +471,13 @@ def test_a_forwarded_letter_is_ingested_with_the_original_sender_and_leaves_thro
 
 def test_our_check_message_marks_forwarding_active_without_an_event(tmp_path: Path) -> None:
     service = _active_gmail_relay_runtime(tmp_path, fixture("canary_return"))
+    # Phase 4: only the check this runtime sent counts, so the fixture's token
+    # has to be the outstanding one.
+    service.readyz()  # activates the binding, so the state row exists
+    with open_database(service.database_path) as database:
+        ForwardingStateStore(database).record_check_sent(
+            EmailBinding("email-identity-1", 7, "gmail", AGENT), "0000synthetic"
+        )
 
     result = _deliver(service, fixture("canary_return"))
 

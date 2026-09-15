@@ -106,6 +106,9 @@ ALERTS = {
     "primary_unavailable": "primary unavailable — routing fallback triggered",
     "backup_stale": "backup stale — backup_age_hours > 26h",
     "budget_exceeded": "budget exceeded — per-household/day cost cap hit",
+    "gmail_forwarding_stale": (
+        "gmail forwarding stale — two daily checks did not return through the relay"
+    ),
 }
 
 

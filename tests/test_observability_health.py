@@ -2,9 +2,33 @@
 
 import io
 import json
+import logging
 
-from hermes_cloud.core.observability import RuntimeStructuredLogger
+import pytest
+
+from hermes_cloud.core.observability import ALERTS, RuntimeStructuredLogger, emit_alert
 from hermes_cloud.runtime.service import RuntimeService
+
+
+def test_the_forwarding_alert_is_registered_and_hashes_the_household(caplog) -> None:
+    """An alert that exists only as a dictionary entry is documentation."""
+    assert "gmail_forwarding_stale" in ALERTS
+    with caplog.at_level(logging.WARNING):
+        emit_alert(
+            logging.getLogger("test"),
+            "gmail_forwarding_stale",
+            env={"ABROLIA_HMAC_KEY": "k" * 24},
+            household_id="hh-1",
+            misses="2",
+        )
+    line = caplog.records[-1].getMessage()
+    assert "ALERT gmail_forwarding_stale" in line and "misses=2" in line
+    assert "hh-1" not in line and "household_id_hash=" in line
+
+
+def test_an_unknown_alert_name_still_raises() -> None:
+    with pytest.raises(KeyError):
+        emit_alert(logging.getLogger("test"), "gmail_forwarding_stal")
 
 
 def test_runtime_health_fields(tmp_path) -> None:
