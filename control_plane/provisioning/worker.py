@@ -29,6 +29,7 @@ from control_plane.email.models import (
     email_secret_generation,
     email_secret_generation_marker,
     email_secret_sink_digest,
+    gmail_relay_binding,
 )
 from control_plane.email.repository import EmailIdentityRepository
 from control_plane.feature_flags import (
@@ -1218,7 +1219,28 @@ class ProvisioningWorker:
             # window: treat as installed if durable receipt or live sink proves it.
             return self._email_secret_installed(job, request, namespace_ref)  # noqa: SIM103
         material_names = [name for name, _value in result.secret_material.items()]
-        if not isinstance(binding_ref, str) or material_names != [binding_ref]:
+        inbound_ref = public_result.get("inbound_secret_binding_ref")
+        if isinstance(inbound_ref, str) and inbound_ref:
+            # A Gmail household with a relay carries TWO secrets. The Google
+            # grant was installed by the OAuth callback under
+            # `secret_binding_ref` and must be proven staged; the material
+            # here is the relay's runtime credential and must be exactly that.
+            provider = self.providers.get(job.provider)
+            verifier = getattr(provider, "pre_staged_secret_verified", None)
+            if not (
+                isinstance(binding_ref, str)
+                and callable(verifier)
+                and verifier(request, namespace_ref, binding_ref)
+            ):
+                result.secret_material.clear()
+                raise OutcomeUnknown("Gmail grant is not staged for this identity")
+            if material_names != [inbound_ref]:
+                result.secret_material.clear()
+                raise OutcomeUnknown(
+                    "email secret material does not match its relay binding"
+                )
+            binding_ref = inbound_ref
+        elif not isinstance(binding_ref, str) or material_names != [binding_ref]:
             result.secret_material.clear()
             raise OutcomeUnknown(
                 "email secret material does not match its public binding"
@@ -1320,10 +1342,54 @@ class ProvisioningWorker:
                 raise ProviderRejected("Gmail identity is missing")
             refs = public_result.get("provider_refs", {})
             expected_ref = f"{GOOGLE_OAUTH_PROVIDER}:{identity_id}"
-            if external_ref != expected_ref or refs.get("google_subject") != (
-                public_result.get("provider_subject")
+            if refs.get("google_subject") != public_result.get("provider_subject"):
+                raise ProviderRejected("Gmail resource reference does not match intent")
+            if public_result.get("inbound_binding_ref") is None:
+                # No relay: a deployment without Nerve, where the Gmail
+                # household is send-only. The reference is then the grant's.
+                if external_ref != expected_ref:
+                    raise ProviderRejected("Gmail resource reference does not match intent")
+                return
+            # Two halves, both named: the Google grant and the relay the
+            # provisioner created for this identity. The relay half is held
+            # to the managed contract exactly — same keys, same computed
+            # org reference — and the runtime-facing binding must be the
+            # relay it names.
+            try:
+                composite = json.loads(external_ref)
+            except (TypeError, ValueError) as error:
+                raise ProviderRejected("Gmail relay reference is invalid") from error
+            if external_ref != json.dumps(composite, sort_keys=True, separators=(",", ":")):
+                raise ProviderRejected("Gmail relay reference is not canonical")
+            if (
+                not isinstance(composite, dict)
+                or set(composite) != {"google", "nerve"}
+                or composite["google"] != expected_ref
             ):
                 raise ProviderRejected("Gmail resource reference does not match intent")
+            relay = composite["nerve"]
+            try:
+                binding = gmail_relay_binding(public_result.get("inbound_binding_ref"))
+            except ValueError as error:
+                raise ProviderRejected(str(error)) from error
+            expected_relay = {
+                "household_id": job.household_id,
+                "stable_ref": request.get("stable_ref", job.intent_key),
+                "org_id": binding["org_id"],
+                "inbox_id": binding["inbox_id"],
+                "address": binding["address"],
+                "org_external_ref": email_org_external_ref(job.household_id, identity_id),
+            }
+            if (
+                not isinstance(relay, dict)
+                or set(relay) != {*expected_relay, "grant_id", "key_id", "webhook_id"}
+                or any(relay[key] != value for key, value in expected_relay.items())
+                or not all(
+                    self._canonical_uuid(relay[key])
+                    for key in ("org_id", "grant_id", "inbox_id", "key_id", "webhook_id")
+                )
+            ):
+                raise ProviderRejected("Gmail relay reference does not match intent")
             return
         try:
             reference = json.loads(external_ref)

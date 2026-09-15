@@ -604,7 +604,16 @@ class GoogleOAuthProvisioner:
                 stable_ref,
             )
         except ProviderWaiting as error:
-            return InspectResult(InspectState.PENDING, public_result=error.public_result)
+            # The reference travels with the wait. Without it the worker fell
+            # back to the job's stored reference, which a fresh "check again"
+            # job does not have, and every re-check while still pending —
+            # the relay awaiting its flag, OAuth not yet started — settled
+            # `outcome_unknown` instead of `waiting_user`.
+            return InspectResult(
+                InspectState.PENDING,
+                public_result=error.public_result,
+                external_ref=error.external_ref,
+            )
         return InspectResult(InspectState.READY, result)
 
     def inspect(self, stable_ref: str) -> InspectResult:

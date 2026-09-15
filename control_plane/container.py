@@ -31,9 +31,9 @@ from control_plane.privacy.export import (
 from control_plane.privacy.retention import RetentionService
 from control_plane.privacy.runtime import PrivateRuntimeDsarClient
 from control_plane.privacy.withdraw import ConsentWithdrawalService
+from control_plane.providers.email.gmail_forwarding import GmailForwardingProvisioner
 from control_plane.providers.email.google_oauth import (
     GoogleOAuthClient,
-    GoogleOAuthProvisioner,
     GoogleOAuthService,
 )
 from control_plane.provisioning.bootstrap import BootstrapService
@@ -196,8 +196,6 @@ class ControlPlaneContainer:
             secret_sink=secret_sink,
             token_hasher=token_hasher,
         )
-        google_provider = GoogleOAuthProvisioner(google_oauth)
-        providers.register("google-oauth", google_provider)
         # Registered when CONFIGURED, not when enabled. Keying this on
         # `real_email_enabled` meant the brake removed the adapters entirely,
         # and teardown resolves a provider by the job's durable `provider`
@@ -207,6 +205,7 @@ class ControlPlaneContainer:
         # with deletion unable to complete. A brake must never disable teardown
         # — see AGENTS.repo-invariants.md. Forward dispatch is braked in
         # `ProvisioningWorker` instead, where shutdown work can be exempted.
+        nerve_managed = None
         if config.nerve_configured:
             from control_plane.providers.email.nerve_byo_domain import (
                 NerveByoDomainProvisioner,
@@ -225,12 +224,17 @@ class ControlPlaneContainer:
                 platform_org_id=config.nerve_platform_org_id or "",
                 platform_domain_id=config.nerve_platform_domain_id or "",
             ))
-            providers.register(
-                "nerve-managed", NerveManagedEmailProvisioner(nerve_client)
-            )
+            nerve_managed = NerveManagedEmailProvisioner(nerve_client)
+            providers.register("nerve-managed", nerve_managed)
             providers.register(
                 "nerve-byo-domain", NerveByoDomainProvisioner(nerve_client)
             )
+        # The Gmail option provisions a hidden Nerve relay before its OAuth
+        # wait states, through the managed adapter's own inbox graph. Without
+        # Nerve configured it refuses to provision and still tears down the
+        # Google side, so the registration is unconditional like the others.
+        google_provider = GmailForwardingProvisioner(google_oauth, nerve_managed)
+        providers.register("google-oauth", google_provider)
         email_provider = "nerve-managed" if config.real_email_enabled else "fake-email"
         byo_domain_provider = (
             "nerve-byo-domain" if config.real_email_enabled else "fake-email"

@@ -78,7 +78,13 @@ def manifest_to_toml(value: DesiredHouseholdSpecV1 | Mapping[str, Any]) -> str:
             f'provider_kind = {_string(document["email"]["provider_kind"])}',
         ]
     )
-    for field in ("provider_binding_ref", "secret_binding_ref"):
+    for field in (
+        "provider_binding_ref",
+        "secret_binding_ref",
+        "inbound_provider_kind",
+        "inbound_binding_ref",
+        "inbound_secret_binding_ref",
+    ):
         if document["email"].get(field) is not None:
             lines.append(f'{field} = {_string(document["email"][field])}')
     lines.extend(

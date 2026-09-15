@@ -57,6 +57,10 @@ class _Refs:
             raise ProviderRejected("invalid managed Nerve resource reference") from error
 
 
+#: The same reference as the Gmail relay carries under its `nerve` key.
+ManagedNerveRefs = _Refs
+
+
 class NerveManagedEmailProvisioner:
     email_public_provider = "nerve"
 
@@ -117,30 +121,53 @@ class NerveManagedEmailProvisioner:
         local_part = parsed.selection.get("local_part")
         if not isinstance(local_part, str):
             raise ProviderRejected("managed address is missing")
-        address = f"{local_part}@abrolia.com"
-        org_external_ref = email_org_external_ref(
-            parsed.household_id, parsed.identity_id
-        )
-        org = self.client.ensure_org(
+        refs, bundle = self.ensure_inbox_graph(
             household_id=parsed.household_id,
             identity_id=parsed.identity_id,
+            address=f"{local_part}@abrolia.com",
+            secret_namespace_ref=parsed.secret_namespace_ref,
+            idempotency_key=idempotency_key,
+        )
+        return self._result(refs, secret=bundle)
+
+    def ensure_inbox_graph(
+        self,
+        *,
+        household_id: str,
+        identity_id: str,
+        address: str,
+        secret_namespace_ref: str,
+        idempotency_key: str,
+    ) -> tuple[_Refs, str]:
+        """Org → grant → inbox → key → webhook, idempotent on external refs.
+
+        The whole of what a Nerve inbox for one identity IS, shared with the
+        Gmail relay: a relay is this graph under a `fwd-…` address, owned by
+        the same identity. Raises `AttachmentFlagPending` until the org's
+        attachments flag is on, and returns the refs with the one-time
+        credential bundle when it is.
+        """
+        org_external_ref = email_org_external_ref(household_id, identity_id)
+        org = self.client.ensure_org(
+            household_id=household_id,
+            identity_id=identity_id,
         )
         org_id = str(org.get("org_id", ""))
         if not org_id:
             raise OutcomeUnknown("Nerve org identity is missing")
-        grant_ref = self._resource_ref(parsed.identity_id, "grant")
+        grant_ref = self._resource_ref(identity_id, "grant")
         grant = self.client.ensure_grant(org_id=org_id, external_ref=grant_ref)
-        inbox_ref = self._resource_ref(parsed.identity_id, "inbox")
+        inbox_ref = self._resource_ref(identity_id, "inbox")
         inbox_envelope = self.client.ensure_inbox(
             org_id=org_id, address=address, external_ref=inbox_ref
         )
         inbox = inbox_envelope.get("inbox", inbox_envelope)
-        key_ref = self._resource_ref(parsed.identity_id, "key")
+        key_ref = self._resource_ref(identity_id, "key")
         key = self.client.issue_key(org_id=org_id, external_ref=key_ref)
-        webhook_ref = self._resource_ref(parsed.identity_id, "webhook")
+        webhook_ref = self._resource_ref(identity_id, "webhook")
         webhook = self.client.ensure_webhook(
             org_id=org_id,
-            url=f"https://{parsed.secret_namespace_ref}.fly.dev/v1/email/nerve/webhook",
+            url=f"https://{secret_namespace_ref}.fly.dev/v1/email/nerve/webhook",
             external_ref=webhook_ref,
         )
         if not key.get("secret_available") or not key.get("key"):
@@ -158,7 +185,7 @@ class NerveManagedEmailProvisioner:
         if not webhook.get("secret_available") or not webhook.get("secret"):
             raise OutcomeUnknown("Nerve webhook recovery lost one-time credential")
         refs = _Refs(
-            household_id=parsed.household_id,
+            household_id=household_id,
             stable_ref=idempotency_key,
             org_id=org_id,
             grant_id=str(grant.get("id", "")),
@@ -176,7 +203,7 @@ class NerveManagedEmailProvisioner:
             sort_keys=True,
             separators=(",", ":"),
         )
-        return self._result(refs, secret=bundle)
+        return refs, bundle
 
     def reconcile(
         self, intent: dict[str, Any], idempotency_key: str

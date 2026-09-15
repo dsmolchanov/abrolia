@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import re
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Literal
@@ -48,6 +50,13 @@ GMAIL_DISCLOSURE = (
     "Abrolia sends mail from this dedicated agent mailbox only after you confirm;"
     " incoming mail reaches Abrolia through forwarding you turn on."
 )
+#: A Gmail household's hidden relay inbox lives on the platform domain under
+#: this prefix. Nothing a family chooses may start with it: a managed address
+#: `fwd-…@abrolia.com` would be indistinguishable from a relay.
+GMAIL_RELAY_LOCAL_PART_PREFIX = "fwd-"
+#: What `inbound_binding_ref` carries for a Gmail relay: the three things the
+#: runtime needs to read the relay and recognise its own check message.
+GMAIL_RELAY_BINDING_KEYS = frozenset({"org_id", "inbox_id", "address"})
 
 
 # --- Generation-scoped secret handoff (B-02) -------------------------------
@@ -241,6 +250,13 @@ class EmailPublicBinding(BaseModel):
         default=None, pattern=r"^[A-Za-z0-9_-]{1,16}$"
     )
     mode: Literal["abrolia_managed", "gmail_agent", "family_domain"] | None = None
+    #: A Gmail household receives through a hidden Nerve relay that Gmail
+    #: forwards into (the send-only grant has no read path). These name the
+    #: relay's Nerve refs and the secret carrying its runtime key; set
+    #: together wherever Nerve is configured, absent where it is not, and
+    #: forbidden for every other provider.
+    inbound_binding_ref: str | None = Field(default=None, max_length=1024)
+    inbound_secret_binding_ref: str | None = None
 
     @field_validator("agent_inbox")
     @classmethod
@@ -292,21 +308,72 @@ class EmailPublicBinding(BaseModel):
                 raise ValueError("Gmail provider returned an invalid secret binding")
             if self.granted_scopes != GMAIL_EMAIL_SCOPES:
                 raise ValueError("Gmail provider returned an invalid scope set")
+            # A relay is whole or absent. Absent is a deployment without
+            # Nerve, where the household is send-only; present, both fields
+            # name the same relay and the secret is the Nerve credential.
+            if (self.inbound_binding_ref is None) != (self.inbound_secret_binding_ref is None):
+                raise ValueError("a Gmail relay needs its binding and its secret together")
+            if self.inbound_binding_ref is not None:
+                if self.inbound_secret_binding_ref != NERVE_EMAIL_SECRET_BINDING:
+                    raise ValueError("Gmail provider returned an invalid relay secret binding")
+                gmail_relay_binding(self.inbound_binding_ref)
+        if self.provider != "gmail" and (
+            self.inbound_binding_ref is not None or self.inbound_secret_binding_ref is not None
+        ):
+            raise ValueError("only a Gmail provider carries an inbound relay")
         return self
 
     def model_post_init(self, _context: Any) -> None:
         reject_secret_fields(self.model_dump(mode="json"))
 
 
+def gmail_relay_binding(value: str | None) -> dict[str, str]:
+    """Decode and check a Gmail relay's `inbound_binding_ref`.
+
+    Canonical JSON of exactly `org_id`, `inbox_id` and `address`, the ids
+    canonical UUIDs and the address a `fwd-…` mailbox on the platform domain.
+    Raises `ValueError` with a message that names no address.
+    """
+    if not isinstance(value, str) or not value:
+        raise ValueError("Gmail provider returned no relay binding")
+    try:
+        decoded = json.loads(value)
+    except ValueError as error:
+        raise ValueError("Gmail relay binding is not JSON") from error
+    if not isinstance(decoded, dict) or set(decoded) != GMAIL_RELAY_BINDING_KEYS:
+        raise ValueError("Gmail relay binding has an unexpected shape")
+    if value != json.dumps(decoded, sort_keys=True, separators=(",", ":")):
+        raise ValueError("Gmail relay binding is not canonical")
+    if any(not isinstance(item, str) or not item for item in decoded.values()):
+        raise ValueError("Gmail relay binding is incomplete")
+    for key in ("org_id", "inbox_id"):
+        if not re.fullmatch(_UUID_TEXT_PATTERN, decoded[key]):
+            raise ValueError("Gmail relay binding carries a non-canonical id")
+    local, _separator, domain = decoded["address"].rpartition("@")
+    if not local.startswith(GMAIL_RELAY_LOCAL_PART_PREFIX) or domain != "abrolia.com":
+        raise ValueError("Gmail relay address is not a relay on the platform domain")
+    return decoded
+
+
 class EmailGoogleOAuthPublicStatus(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    state: Literal["oauth_required", "dedicated_account_confirmation"]
+    #: `relay_pending`: the hidden Nerve relay is created but its org still
+    #: needs the attachments flag — the same operator step a managed inbox
+    #: waits on, carried in `relay`. The OAuth states are unchanged.
+    state: Literal["oauth_required", "dedicated_account_confirmation", "relay_pending"]
     disclosure: Literal[
         "Abrolia sends mail from this dedicated agent mailbox only after you confirm;"
         " incoming mail reaches Abrolia through forwarding you turn on."
     ]
     connected_address_masked: str | None = Field(default=None, max_length=320)
+    relay: EmailNerveAttachmentPublicStatus | None = None
+
+    @model_validator(mode="after")
+    def _relay_travels_with_its_state(self) -> EmailGoogleOAuthPublicStatus:
+        if (self.state == "relay_pending") != (self.relay is not None):
+            raise ValueError("relay readiness belongs to the relay_pending state")
+        return self
 
     def model_post_init(self, _context: Any) -> None:
         reject_secret_fields(self.model_dump(mode="json"))
@@ -376,6 +443,10 @@ class EmailNerveAttachmentPublicStatus(BaseModel):
 
     def model_post_init(self, _context: Any) -> None:
         reject_secret_fields(self.model_dump(mode="json"))
+
+
+# `EmailGoogleOAuthPublicStatus.relay` names the class above, defined after it.
+EmailGoogleOAuthPublicStatus.model_rebuild()
 
 
 @dataclass(frozen=True)
