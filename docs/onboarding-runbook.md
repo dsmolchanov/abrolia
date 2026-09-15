@@ -242,7 +242,28 @@ provider.
 ## Build and deploy
 
 1. Build and publish `deploy/runtime/Dockerfile`; record its immutable digest.
+   Build it through a config whose `[build]` names the runtime Dockerfile —
+   **not** `deploy/control-plane/fly.toml`, whose `[build] dockerfile =
+   "Dockerfile"` overrides `--dockerfile` and produces the control-plane
+   image under a runtime label (2026-09-15: both pilot runtimes were rolled
+   onto exactly that and crash-looped on the control plane's migrate step
+   until the owner put the correct image back):
+
+   ```text
+   printf 'app = "abrolia-control-plane-synthetic"\nprimary_region = "ams"\n\n[build]\n  dockerfile = "deploy/runtime/Dockerfile"\n' > runtime-build.fly.toml
+   fly deploy . --app abrolia-control-plane-synthetic --config runtime-build.fly.toml \
+     --build-only --push --remote-only --image-label runtime-<date>
+   rm runtime-build.fly.toml
+   docker inspect registry.fly.io/abrolia-control-plane-synthetic:runtime-<date> --format '{{.Config.Cmd}}'
+   ```
+
+   The last line must print `[python -m hermes_cloud.runtime.service]`;
+   anything mentioning `control_plane` is the wrong image. Pin by the digest
+   flyctl printed at "pushing manifest".
 2. Set the digest in the control-plane secret/config, never a mutable tag.
+   When updating an existing machine by hand, pass the **tag** form to
+   `fly machine update --image`: given a `@sha256:` reference flyctl appends
+   the digest a second time and the API refuses `config.image`.
 3. Create `control_plane_data` in `ams` and deploy
    `deploy/control-plane/fly.toml` with one Machine.
 4. Set secret values through `fly secrets import` or the Fly secret store. Avoid
