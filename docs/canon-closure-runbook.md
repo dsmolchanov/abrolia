@@ -44,13 +44,15 @@ the battery would make O7 and O8 prerequisites of themselves.
 5. **One manual live gate** on `abrolia-synthetic` for that provider. This is
    what O7 and O8 *are*. They supply item 5; they do not consume it.
 
-Gmail additionally needs **Google OAuth verification and the CASA
-assessment** — but at the real-family boundary, not before the test battery.
-The code is explicit about this: `GoogleOAuthProvisioner._allowed` permits an
-account in `google_oauth_test_users` while `gmail_real_enabled` is false, and
-`ControlPlaneConfig.validate` demands the verification/scope/CASA/Limited-Use
-evidence **only** when `gmail_real_enabled` is on
-(`control_plane/config.py:240`). So CASA gates O10 for Gmail, not O8.
+Gmail additionally needs **Google's sensitive-scope OAuth verification** (no
+CASA: since plan 2026-09-13 the option requests `gmail.send` only, and
+incoming mail arrives through forwarding) — but at the real-family boundary,
+not before the test battery. The code is explicit about this:
+`GoogleOAuthService._allowed` permits an account in `google_oauth_test_users`
+while `gmail_real_enabled` is false, and `ControlPlaneConfig.validate` demands
+the verification/scope/Limited-Use evidence **only** when `gmail_real_enabled`
+is on (`control_plane/config.py`). So Google's approval gates O10 for Gmail,
+not O8.
 
 Reading the dependency graph as "O1, then go" is one error this section exists
 to prevent; reading it as "everything, then go" is the other.
@@ -63,7 +65,7 @@ to prevent; reading it as "everything, then go" is the other.
 O1  legal ───────────────┐
 O2  nerve cross-org ✅ ──┼──► [prerequisites 1-4] ──► O7  BYO battery ──┐
 O3  release tag + drill ─┘                            O8  Gmail battery ┼──► O10 promotion
-                                                          (+O9 rg check)│    (+CASA for Gmail)
+                                                          (+O9 rg check)│    (+Google approval for Gmail)
 O4  backup independence  ✅ closed 2026-09-02 (#121, #131)              │
 O5  dry-run ──► O6 pilot onboarding ────────────────────────────────────┘
 O11 CI deny-patterns — independent, any time
@@ -332,20 +334,33 @@ Closes canon C2 box, blocker **B-05**.
 **Requires: prerequisites 1–4 above**, and the account's recovery address in
 `google_oauth_test_users`. This battery *supplies* gate 5 for Gmail.
 
-**Not** OAuth verification or CASA. Those gate the real-family promotion
-(O10), and requiring them here would block the very battery that is meant to
-run before them: `_allowed` admits an allowlisted test user while
-`gmail_real_enabled` is false, which is the path this box exercises.
+**Not** OAuth verification. It gates the real-family promotion (O10), and
+requiring it here would block the very battery that is meant to run before
+it: `_allowed` admits an allowlisted test user while `gmail_real_enabled` is
+false, which is the path this box exercises. The Gmail API must be enabled in
+the Cloud project first (spike S4).
 
-Each step performed manually, once, and recorded:
+Each step performed manually, once, and recorded (the full list is plan
+2026-09-13 Phase 6 step 3):
 
 1. **Connect** — OAuth with PKCE, `prompt=select_account`, exact scopes
-   (`openid email gmail.readonly gmail.send`), address confirmation.
-2. **Receive** — a message arrives and is ingested through the History cursor.
-3. **Approve and send** — the outbound goes only after ✅.
-4. **Revoke and delete** — disconnect revokes the grant at Google and deletes
-   the stored refresh token. Verify the revocation from the Google account's
-   own permissions page, not only from our side.
+   (`openid email gmail.send`, "Send email on your behalf" ticked), address
+   confirmation; `/readyz` reports `forwarding: pending`.
+2. **Forward** — in Gmail add the relay address the web chat gave; Abrolia
+   shows Gmail's confirmation link in the web chat; open it, press Confirm,
+   select "Forward a copy of incoming mail to …", Save Changes.
+3. **Receive** — a letter sent to the agent Gmail arrives through the relay
+   and becomes a proposal whose reply target is the original sender;
+   `/readyz` reports `forwarding: active`.
+4. **Approve and send** — the outbound goes only after ✅, from the agent
+   address.
+5. **Stale** — disable forwarding in Gmail; after two missed daily checks
+   `/readyz` reports `stale`, the `gmail_forwarding_stale` alert fires once,
+   and the owner's next web turn shows the setup steps.
+6. **Revoke and delete** — disconnect revokes the grant at Google and deletes
+   the stored refresh token; the relay org is torn down. Verify the
+   revocation from the Google account's own permissions page, not only from
+   our side.
 
 **Acceptance commands**
 
@@ -398,10 +413,11 @@ from O7 or O8. Each provider's `ABROLIA_*_ENABLED` flips independently after
 operator-account soak.
 
 **Gmail's real-family promotion additionally requires** Google OAuth
-verification, scope review, CASA and Limited Use evidence. `gmail_real_enabled`
-cannot be turned on without them — `ControlPlaneConfig.validate` refuses with
-"real Gmail requires verified OAuth, scope, CASA and Limited Use evidence"
-(`control_plane/config.py:240`). This is the boundary those checks belong to.
+verification, sensitive-scope approval and Limited Use evidence.
+`gmail_real_enabled` cannot be turned on without them —
+`ControlPlaneConfig.validate` refuses with "real Gmail requires verified OAuth,
+sensitive-scope approval and Limited Use evidence" (`control_plane/config.py`).
+This is the boundary those checks belong to.
 
 Closes go-live **O3**.
 

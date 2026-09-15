@@ -42,7 +42,7 @@ owner-authorized channel binding. Recovery email не становится agent
 | C3a | Обработка данных детей семьи внутри контента | S4 | имя, класс, участие | **ст. 6(1)(b)** (услуга родителю) + **6(1)(f)** | См. [`minors.md`](minors.md); профилей детей нет |
 | C4 | Долговременная память | S1–S3 | факты о быте семьи | **ст. 6(1)(a)** — согласие через staged-подтверждение каждой записи | Отзыв = удаление записи |
 | C5 | Создание agent email identity (`@abrolia.com` или домен семьи) | S1 | выбранный local-part/domain, encrypted provider refs/config | **ст. 6(1)(b)** | Nerve options a/c; DNS только для domain option |
-| C5a | Dedicated Gmail агента через OAuth | S1, S5 (корреспонденты agent inbox) | отдельный Gmail address, `gmail.readonly`/`gmail.send` grant, refresh token напрямую в household secret namespace, письма agent inbox | **ст. 6(1)(b)**; для корреспондентов **6(1)(f)** | Не личный Gmail; contextual OAuth disclosure; Google Limited Use; state/account confirmation; verification/CASA gate; disconnect revoke |
+| C5a | Dedicated Gmail агента через OAuth | S1, S5 (корреспонденты agent inbox) | отдельный Gmail address, `gmail.send` grant (без чтения ящика), refresh token напрямую в household secret namespace; входящие — пересылка Gmail в скрытый relay-ящик Nerve, ежедневное контрольное письмо, состояние пересылки | **ст. 6(1)(b)**; для корреспондентов **6(1)(f)** | Не личный Gmail; contextual OAuth disclosure; Google Limited Use; state/account confirmation; sensitive-scope verification gate; пересылку включает и выключает семья в Gmail; disconnect revoke |
 | C5b | Compose от agent inbox | S1, получатель | письмо/получатель/journal | **ст. 6(1)(b)** | a/c через Nerve, b через Gmail API; только staged approval |
 | C6a | Shared WhatsApp quick start | S1–S3 | verified adult sender binding, family dialogue | **ст. 6(1)(b)** + отдельный channel privacy notice | Внешние school/group chats запрещены; exact sender routing |
 | C6b | Dedicated WhatsApp linked-device | S1–S3, контакты выделенного номера | messages/session metadata | **ст. 6(1)(a)** explicit informed-risk consent; для контактов **6(1)(f)** | Отдельный receipt о linked-device доступе/риске блокировки, не подменяется C6a notice |
@@ -278,7 +278,7 @@ v2 ограничен третьими лицами и этим согласуе
 тоже реальные: письма его семьи содержат тех же третьих лиц и детей, поэтому на
 них распространяется **весь** список предпосылок [`dpia.md`](dpia.md), р. 5.
 Ни один real agent inbox/channel не подключается, пока список не закрыт, а для
-dedicated Gmail дополнительно не пройдены OAuth verification/CASA. Выбранное
+dedicated Gmail дополнительно не пройдена Google sensitive-scope verification. Выбранное
 условие отражается в notice, DPIA и договоре.
 Это ограничение продублировано в [`README.md`](README.md), [`dpia.md`](dpia.md)
 и [`processors.md`](processors.md).

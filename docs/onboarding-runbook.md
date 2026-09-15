@@ -11,9 +11,9 @@
 > `ABROLIA_GMAIL_ENABLED=1` (separate agent Gmail). Gmail connects only for
 > accounts in the `ABROLIA_GOOGLE_OAUTH_TEST_USERS` secret, which must match the
 > test users on the Google OAuth consent screen; everyone else is refused at
-> connect. `ABROLIA_GMAIL_REAL_ENABLED` stays `0` until verification, scope
-> approval, CASA and the Limited Use disclosure exist (see §Gmail operator
-> rollout). The O7 (BYO) and O8 (Gmail) live batteries in
+> connect. `ABROLIA_GMAIL_REAL_ENABLED` stays `0` until verification,
+> sensitive-scope approval and the Limited Use disclosure exist (see §Gmail
+> operator rollout). The O7 (BYO) and O8 (Gmail) live batteries in
 > `docs/canon-closure-runbook.md` were not run before this opening.
 >
 > Telegram/WhatsApp setup is unavailable; do not enable
@@ -242,7 +242,28 @@ provider.
 ## Build and deploy
 
 1. Build and publish `deploy/runtime/Dockerfile`; record its immutable digest.
+   Build it through a config whose `[build]` names the runtime Dockerfile —
+   **not** `deploy/control-plane/fly.toml`, whose `[build] dockerfile =
+   "Dockerfile"` overrides `--dockerfile` and produces the control-plane
+   image under a runtime label (2026-09-15: both pilot runtimes were rolled
+   onto exactly that and crash-looped on the control plane's migrate step
+   until the owner put the correct image back):
+
+   ```text
+   printf 'app = "abrolia-control-plane-synthetic"\nprimary_region = "ams"\n\n[build]\n  dockerfile = "deploy/runtime/Dockerfile"\n' > runtime-build.fly.toml
+   fly deploy . --app abrolia-control-plane-synthetic --config runtime-build.fly.toml \
+     --build-only --push --remote-only --image-label runtime-<date>
+   rm runtime-build.fly.toml
+   docker inspect registry.fly.io/abrolia-control-plane-synthetic:runtime-<date> --format '{{.Config.Cmd}}'
+   ```
+
+   The last line must print `[python -m hermes_cloud.runtime.service]`;
+   anything mentioning `control_plane` is the wrong image. Pin by the digest
+   flyctl printed at "pushing manifest".
 2. Set the digest in the control-plane secret/config, never a mutable tag.
+   When updating an existing machine by hand, pass the **tag** form to
+   `fly machine update --image`: given a `@sha256:` reference flyctl appends
+   the digest a second time and the API refuses `config.image`.
 3. Create `control_plane_data` in `ams` and deploy
    `deploy/control-plane/fly.toml` with one Machine.
 4. Set secret values through `fly secrets import` or the Fly secret store. Avoid
@@ -398,32 +419,44 @@ prefix scans.
 Gmail has an independent connect gate. Keep `ABROLIA_GMAIL_REAL_ENABLED=0`
 for synthetic households; allowlisted operator accounts may exercise OAuth with
 `ABROLIA_GOOGLE_OAUTH_TEST_USERS` while the family-data gate remains closed.
-The public switch may be enabled only when all four evidence flags are `1`:
-verified OAuth app, approved restricted Gmail scopes, current CASA assessment,
-and the in-product Google Limited Use disclosure. Turning Gmail off blocks new
-connections; inspect, exact revoke, cleanup, export, and deletion remain
-available.
+The public switch may be enabled only when all three evidence flags are `1`:
+verified OAuth app, approved sensitive Gmail scope, and the in-product Google
+Limited Use disclosure (no CASA: no restricted scope is requested). Turning
+Gmail off blocks new connections; inspect, exact revoke, cleanup, export, and
+deletion remain available.
 
 Use only a separate agent mailbox. The consent screen must request exactly
-`openid`, `email`, `gmail.readonly`, and `gmail.send`. A recovery/personal
-mailbox match, an extra or missing scope, stale workflow, session/household swap,
-or late callback is a failed connection and must start from a new OAuth state.
-Never retry an authorization code.
+`openid`, `email`, and `gmail.send`; the family must tick "Send email on your
+behalf", or Google grants sign-in only and the callback revokes the grant. A
+recovery/personal mailbox match, an extra or missing scope, stale workflow,
+session/household swap, or late callback is a failed connection and must start
+from a new OAuth state. Never retry an authorization code.
 
-Runtime health exposes only enum/timestamp signals. Alert when Gmail health is
-`auth_revoked`, `needs_attention`, or `stale_cursor` (three missed 60-second
-poll intervals); alert independently on Nerve webhook lag/DLQ, repeated
-credential revocation, address reservations that outlive terminal identities,
-and control-plane `outcome_unknown`. Metrics and alerts must not carry mailbox
-addresses, subjects, Message-IDs, or content.
+Incoming mail never comes through the Gmail API. The provisioner creates a
+hidden Nerve relay inbox `fwd-…@abrolia.com` for the household; after
+activation the family turns on Gmail forwarding to it (the runtime shows
+Gmail's confirmation link in the web chat), and the runtime ingests the relay
+through the ordinary Nerve path. Once a day the relay mails the agent account
+a check that Gmail forwards straight back.
+
+Runtime health exposes only enum/timestamp signals. `/readyz` reports
+`email_health.forwarding` as `pending` (never confirmed), `active`, or `stale`
+(two consecutive daily checks did not come back); alert on `stale` — the
+runtime also raises `gmail_forwarding_stale` — and on a `/readyz` that turns
+503 for a Gmail household, which is what a grant Google reports revoked does.
+Alert independently on Nerve webhook lag/DLQ, repeated credential revocation,
+address reservations that outlive terminal identities, and control-plane
+`outcome_unknown`. Metrics and alerts must not carry mailbox addresses,
+subjects, Message-IDs, or content.
 
 Rollout order is fixed: synthetic fixtures → allowlisted operator Gmail →
-invited pilot families. Before each promotion prove receive, approved send,
-restart/cursor resume, exact Sent reconciliation, reconnect, export, revoke, and
-delete. A Gmail History gap that exceeds bounded overlap is `needs_attention`,
-never a silent baseline. A revoke/delete timeout remains unknown and blocks
-resource tombstoning. Restores may recover encrypted grant rows and cursors, but
-must not be considered usable without the dedicated Fly secret namespace.
+invited pilot families. Before each promotion prove connect with send-only
+consent, the forwarding guide and confirmation, a forwarded letter → proposal
+→ confirmed reply from the agent address, `active` health, `stale` after
+forwarding is disabled, reconnect, export, revoke, and delete. A revoke/delete
+timeout remains unknown and blocks resource tombstoning. Restores may recover
+encrypted grant rows and forwarding state, but must not be considered usable
+without the dedicated Fly secret namespace.
 
 If Gmail is disconnected before the household runtime Machine is launched, the
 control plane creates a deterministic one-shot `abrolia-google-revoker-*`
@@ -567,7 +600,7 @@ bounded reconciliation with `abrolia-control-plane runtime-health`; its output
 contains only runtime refs and status, never response bodies or credentials.
 
 Do not enable real providers or real family data after a successful synthetic
-smoke. Each real integration has its own legal, processor, OAuth/CASA, consent,
+smoke. Each real integration has its own legal, processor, OAuth verification, consent,
 and implementation gate.
 
 ## Observability and alerts (Phase E)
@@ -597,7 +630,7 @@ call site does not belong in this table.
 |------|----------|-------------|---------|
 | `ABROLIA_REAL_EMAIL_ENABLED` | Forward managed `@abrolia.com` **and** BYO domain provisioning | `ProvisioningWorker` (`_run_once`, `_reconcile`), **at call time** — `1→0` stops the next Nerve call including queued work, with no restart. New selections also route to `fake-email` from the next boot. **Teardown is exempt**: cleanup, reconciliation and household deletion still reach Nerve, or the brake would strand the inbox it stopped. Real provisioning additionally requires a non-empty `ABROLIA_REAL_EMAIL_HOUSEHOLD_ALLOWLIST`. | `0` |
 | `ABROLIA_BYO_EMAIL_ENABLED` | Whether the BYO domain option is OFFERED at all | `OnboardingService.select` and `ProvisioningWorker` (`_run_once`, `_reconcile`), **at call time**. `1→0` stops the next provider call without a restart, including work already queued. | `0` |
-| `ABROLIA_GMAIL_ENABLED` | Whether the Gmail option is OFFERED at all (real Gmail additionally needs `ABROLIA_REAL_EMAIL_ENABLED` + `ABROLIA_GMAIL_REAL_ENABLED` + CASA evidence) | `OnboardingService.select` and `ProvisioningWorker` (`_run_once`, `_reconcile`), **at call time**. `1→0` stops the next provider call without a restart, including work already queued. | `0` |
+| `ABROLIA_GMAIL_ENABLED` | Whether the Gmail option is OFFERED at all (real Gmail additionally needs `ABROLIA_REAL_EMAIL_ENABLED` + `ABROLIA_GMAIL_REAL_ENABLED` + the sensitive-scope evidence flags; the relay step also stops at `ABROLIA_REAL_EMAIL_ENABLED=0`) | `OnboardingService.select` and `ProvisioningWorker` (`_run_once`, `_reconcile`), **at call time**. `1→0` stops the next provider call without a restart, including work already queued. | `0` |
 | `ABROLIA_WHATSAPP_SHARED_ENABLED` | Shared WA gateway relay | `gateway.whatsapp_router.handle_webhook` — returns `flag_disabled` before persisting | `0` |
 
 Two kinds of switch, differing in both what they do and how fast:
@@ -634,7 +667,7 @@ and default-off."
 
 Rollout order, each transition gated:
 1. **Synthetic** (`abrolia-synthetic`, `owner@abrolia.test`, fake adapters) — requires `pytest -p no:cacheprovider -m "not live" -q` + `ruff check .` + `gitleaks` + no `TODO` in notices (Phase A docs).
-2. **Operator accounts** (owner's real mailbox on allowlist, `ABROLIA_REAL_EMAIL_HOUSEHOLD_ALLOWLIST` populated, `ABROLIA_REAL_EMAIL_ENABLED=1` in separate PR referencing Phase A+C evidence) — requires Phase A + C1 receipt + one manual live gate per provider (BYO DNS or Gmail History).
+2. **Operator accounts** (owner's real mailbox on allowlist, `ABROLIA_REAL_EMAIL_HOUSEHOLD_ALLOWLIST` populated, `ABROLIA_REAL_EMAIL_ENABLED=1` in separate PR referencing Phase A+C evidence) — requires Phase A + C1 receipt + one manual live gate per provider (BYO DNS or Gmail forwarding).
 3. **Invited pilot families** per provider (managed `@abrolia.com` first, then BYO, then Gmail — each `ABROLIA_*_ENABLED` flipped independently after operator-account soak and `go test ./...` + `pytest -p no:cacheprovider -m "not live" -q` green).
 
-Each flag flip PR must reference Phase A legal + `go test` + `pytest -p no:cacheprovider -m "not live" -q` + one manual live gate on `abrolia-synthetic`. `ABROLIA_GMAIL_ENABLED` additionally requires `ABROLIA_REAL_EMAIL_ENABLED=1` and CASA/Limited Use evidence.
+Each flag flip PR must reference Phase A legal + `go test` + `pytest -p no:cacheprovider -m "not live" -q` + one manual live gate on `abrolia-synthetic`. `ABROLIA_GMAIL_ENABLED` additionally requires `ABROLIA_REAL_EMAIL_ENABLED=1` and, for real families, the sensitive-scope/Limited Use evidence.
