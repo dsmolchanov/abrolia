@@ -79,6 +79,21 @@ def test_the_refusal_names_no_address(cp_stack) -> None:
     assert "abrolia.com" not in str(refused.value)
 
 
+def test_a_relay_shaped_address_is_refused(cp_stack) -> None:
+    """`fwd-…@abrolia.com` is what a Gmail household's hidden relay looks like,
+    and the relay's unguessability is the only thing binding forwarded mail
+    to its household. A family may not choose one."""
+    service = cp_stack.service.email_identities
+
+    with pytest.raises(MailboxRefused, match="reserved"), cp_stack.database.write() as connection:
+        service.select(
+            connection,
+            household_id=cp_stack.household.id,
+            selection={"kind": "abrolia_managed", "local_part": "fwd-family"},
+            now=NOW,
+        )
+
+
 def test_the_suggestion_is_an_address_the_household_can_take(cp_stack) -> None:
     """An offer that is not available is not an offer."""
     cp_stack.complete_profile()

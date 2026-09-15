@@ -293,6 +293,13 @@ class DesiredSpecPlanner:
                     if email_public.get("secret_binding_ref")
                     else None
                 ),
+                # Set only by the Gmail provider, whose public binding carries
+                # the relay it created; every other provider leaves them None.
+                inbound_provider_kind=(
+                    "nerve" if email_public.get("inbound_binding_ref") else None
+                ),
+                inbound_binding_ref=email_public.get("inbound_binding_ref"),
+                inbound_secret_binding_ref=email_public.get("inbound_secret_binding_ref"),
             ),
             consent=ConsentAuthorityV1(
                 required_purposes=tuple(required_purposes),

@@ -483,7 +483,8 @@ the relay fields, and tear everything down by name.
 `control_plane/providers/email/nerve_managed.py`,
 `control_plane/email/models.py`, `control_plane/email/service.py`,
 `control_plane/provisioning/worker.py`, `control_plane/provisioning/planner.py`,
-`control_plane/provisioning/manifest.py`, `control_plane/container.py`,
+`control_plane/provisioning/manifest.py`, `control_plane/provisioning/manifest_toml.py`,
+`control_plane/crypto.py`, `control_plane/container.py`,
 `control_plane/feature_flags.py`,
 `tests/control_plane/email/test_gmail_forwarding_provisioner.py`,
 `tests/control_plane/email/test_google_oauth.py`,
@@ -526,6 +527,45 @@ the relay fields, and tear everything down by name.
 - Planner `EmailV1` gains the three inbound fields, set only for gmail.
 - The local-part validator refuses user-chosen managed local parts starting
   with `fwd-`.
+
+**Implementation notes (2026-09-15, `feat/gmail-forwarding-inbox`):**
+
+- The relay address is **derived, not drawn**: `fwd-<26 base32>@abrolia.com`
+  from the lookup HMAC of the identity id. The plan's "random bits persisted
+  in `external_ref_ciphertext` before the inbox call" needed a row the
+  provisioner has no way to write; a keyed derivation gives the same address
+  on every attempt, computable before the first provider call, still
+  unguessable — the same property `email_org_external_ref` already has.
+- `GmailForwardingProvisioner` subclasses `GoogleOAuthProvisioner` and runs
+  `NerveManagedEmailProvisioner.ensure_inbox_graph` (extracted from `ensure`)
+  first. A relay org awaiting the attachments flag surfaces as
+  `EmailGoogleOAuthPublicStatus(state="relay_pending", relay=<managed
+  attachment status>)` under the `google-oauth:<identity>` reference the
+  worker already validates for Gmail waits.
+- Found on the way: `GoogleOAuthProvisioner.inspect_intent` dropped the
+  waiting `external_ref`, so any re-check while still pending settled
+  `outcome_unknown`. Fixed there.
+- **The relay is conditional on Nerve being configured.** A deployment
+  without Nerve (synthetic, the API test harness) still offers Gmail and
+  runs real Google OAuth for test users; there the household settles in
+  Phase 1's shape — grant only, `forwarding = none` — and the worker accepts
+  a Gmail result with no relay under the bare `google-oauth:<identity>`
+  reference. Production configures Nerve, so there the relay is never
+  optional. The real-email brake for the relay is asked inside the
+  provisioner (`feature_flags.check_gmail_relay_enabled`), before its first
+  Nerve request, rather than in the worker: only the provisioner knows
+  whether this deployment has a Nerve to reach.
+- Teardown accepts three shapes: the settled `{google, nerve}` composite, a
+  bare `google-oauth:<identity>` (the relay's org reference is then computed
+  from the identity's household in the local store), and
+  `nerve-org:<org_external_ref>`. `_derived_teardown_ref` is unchanged.
+- Not done: a boot-time refusal of `ABROLIA_GMAIL_ENABLED=1` without Nerve
+  configured. It would widen `required-runtime-config.txt` by the four Nerve
+  names; the provider-call brake and the provisioner's own refusal already
+  fail closed. Left for the go-live checklist.
+- Inventory additions: `control_plane/crypto.py` (`inbound_binding_ref` is an
+  open value channel; `inbound_secret_binding_ref` is validated as a secret
+  name) and `control_plane/provisioning/manifest_toml.py` (emits the fields).
 
 ### Success Criteria
 

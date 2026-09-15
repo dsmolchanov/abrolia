@@ -8,7 +8,11 @@ from control_plane.email.local_part import (
     normalize_local_part,
     suggest_local_part,
 )
-from control_plane.email.models import EmailIdentityRecord, EmailOption
+from control_plane.email.models import (
+    GMAIL_RELAY_LOCAL_PART_PREFIX,
+    EmailIdentityRecord,
+    EmailOption,
+)
 from control_plane.email.repository import EmailIdentityRepository
 from control_plane.owners import owner_contact_query
 
@@ -41,7 +45,14 @@ class EmailIdentityService:
         option = EmailOption.from_selection(selection["kind"])
         address = None
         if option is EmailOption.MANAGED_ABROLIA:
-            address = f"{normalize_local_part(selection['local_part'])}@abrolia.com"
+            local_part = normalize_local_part(selection["local_part"])
+            # `fwd-…@abrolia.com` is what a Gmail household's hidden relay
+            # looks like. A family choosing one would take a relay's shape on
+            # the platform domain, and the relay's unguessability is the only
+            # thing binding forwarded mail to its household.
+            if local_part.startswith(GMAIL_RELAY_LOCAL_PART_PREFIX):
+                raise MailboxRefused("that address form is reserved; choose another")
+            address = f"{local_part}@abrolia.com"
         elif option is EmailOption.OWN_DOMAIN:
             address = (
                 f"{normalize_local_part(selection['local_part'])}@{selection['domain']}"

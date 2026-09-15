@@ -122,10 +122,18 @@ def _select_gmail(cp_stack, provider, sink):
 
 
 def test_oauth_pkce_confirmation_and_worker_projection(cp_stack) -> None:
+    from control_plane.providers.email.gmail_forwarding import GmailForwardingProvisioner
+    from control_plane.providers.email.nerve_managed import NerveManagedEmailProvisioner
+    from tests.control_plane.email.test_nerve_managed import FakeNerveAdmin
+
     client = FakeGoogleClient()
     sink = InMemorySecretSink()
     service = _service(cp_stack, client, sink)
-    provider = GoogleOAuthProvisioner(service)
+    # The registered `google-oauth` adapter is the relay-carrying one: a Gmail
+    # result without its relay no longer settles (Phase 3).
+    provider = GmailForwardingProvisioner(
+        service, NerveManagedEmailProvisioner(FakeNerveAdmin())
+    )
     worker = _select_gmail(cp_stack, provider, sink)
 
     workflow = cp_stack.onboarding.workflow_for_household(cp_stack.household.id)
