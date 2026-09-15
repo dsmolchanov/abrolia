@@ -73,9 +73,9 @@ def _health(tmp_path: Path, *, env=None):
 
 def _returned(store: ForwardingStateStore, client: ComposeRecorder, *, now: float) -> None:
     """Gmail forwarded the last check back: the worker records its return."""
-    token = client.sent[-1]["subject"].removeprefix(CHECK_SUBJECT_PREFIX)
-    assert token == store.outstanding_check_token(BINDING)
-    assert store.record_check_return(BINDING, token, received_at=now) is True
+    outstanding = client.sent[-1]["subject"].removeprefix(CHECK_SUBJECT_PREFIX)
+    assert outstanding == store.outstanding_check_token(BINDING)
+    assert store.record_check_return(BINDING, outstanding, received_at=now) is True
 
 
 def test_a_check_is_sent_once_a_day_from_the_relay_to_the_agent(tmp_path: Path) -> None:
@@ -232,21 +232,21 @@ def test_a_check_that_comes_back_after_its_deadline_proves_nothing(tmp_path: Pat
     store, client, health = _health(tmp_path)
     health.tick(now=DAY)
     assert health.tick(now=DAY + 2 * HOUR + 1) is None  # miss 1
-    token = client.sent[-1]["subject"].removeprefix(CHECK_SUBJECT_PREFIX)
+    outstanding = client.sent[-1]["subject"].removeprefix(CHECK_SUBJECT_PREFIX)
 
-    assert store.record_check_return(BINDING, token, received_at=DAY + 3 * HOUR) is False
+    assert store.record_check_return(BINDING, outstanding, received_at=DAY + 3 * HOUR) is False
     assert store.row(BINDING)["misses"] == 1
 
     health.tick(now=DAY + 24 * HOUR)
     assert health.tick(now=DAY + 26 * HOUR + 1) == "stale"
-    token = client.sent[-1]["subject"].removeprefix(CHECK_SUBJECT_PREFIX)
-    assert store.record_check_return(BINDING, token, received_at=DAY + 27 * HOUR) is False
+    outstanding = client.sent[-1]["subject"].removeprefix(CHECK_SUBJECT_PREFIX)
+    assert store.record_check_return(BINDING, outstanding, received_at=DAY + 27 * HOUR) is False
     assert store.state(BINDING) == "stale"
 
     # A return inside the window ends the episode.
     health.tick(now=DAY + 48 * HOUR)
-    token = client.sent[-1]["subject"].removeprefix(CHECK_SUBJECT_PREFIX)
-    assert store.record_check_return(BINDING, token, received_at=DAY + 49 * HOUR) is True
+    outstanding = client.sent[-1]["subject"].removeprefix(CHECK_SUBJECT_PREFIX)
+    assert store.record_check_return(BINDING, outstanding, received_at=DAY + 49 * HOUR) is True
     assert store.state(BINDING) == "active"
 
 
