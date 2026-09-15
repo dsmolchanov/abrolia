@@ -19,7 +19,9 @@ from hermes_cloud.email.google_client import (
     GMAIL_URL,
     TOKEN_URL,
     GmailAuthRevoked,
+    GmailError,
     GmailHttpClient,
+    GmailQuotaExceeded,
     GmailScopeInsufficient,
 )
 from hermes_cloud.email.google_grant import GoogleGrantStore
@@ -100,7 +102,7 @@ def test_sender_records_a_timeout_as_unknown_and_never_retries(
         assert EmailSendStore(database).get("child-effect").status == "outcome_unknown"
 
 
-def _http_client(tmp_path: Path, handler) -> GmailHttpClient:
+def _grant_store(tmp_path: Path) -> GoogleGrantStore:
     database = open_database(tmp_path / "runtime.db")
     store = GoogleGrantStore(database, {1: b"k" * 32}, active_version=1)
     store.put(
@@ -110,8 +112,17 @@ def _http_client(tmp_path: Path, handler) -> GmailHttpClient:
         provider_subject="subject-1",
         scopes=("openid", "email", "https://www.googleapis.com/auth/gmail.send"),
     )
+    return store
+
+
+def _grant_is_live(store: GoogleGrantStore) -> bool:
+    row = store.db.query_one("SELECT revoked_at, encrypted_refresh_credential FROM oauth_grants")
+    return row["revoked_at"] is None and len(bytes(row["encrypted_refresh_credential"])) > 0
+
+
+def _http_client(tmp_path: Path, handler) -> GmailHttpClient:
     return GmailHttpClient(
-        store,
+        _grant_store(tmp_path),
         identity_id="identity-1",
         revision=1,
         client_id="client-id",
@@ -120,12 +131,12 @@ def _http_client(tmp_path: Path, handler) -> GmailHttpClient:
     )
 
 
-def _google(status: int, body: dict):
-    """Google's token endpoint answers, then Gmail answers `status` with `body`."""
+def _google(status: int, body: dict, *, token=(200, {"access_token": "access-canary", "expires_in": 3600})):
+    """Google's token endpoint answers `token`, then Gmail answers `status` with `body`."""
 
     def handler(request: httpx.Request) -> httpx.Response:
         if str(request.url) == TOKEN_URL:
-            return httpx.Response(200, json={"access_token": "access-canary", "expires_in": 3600})
+            return httpx.Response(token[0], json=token[1])
         assert str(request.url) == f"{GMAIL_URL}/messages/send"
         assert json.loads(request.content) == {"raw": "raw"}
         return httpx.Response(status, json=body)
@@ -173,9 +184,83 @@ def test_insufficient_scope_is_reported_as_its_own_fault(tmp_path: Path) -> None
 def test_other_401_and_403_answers_still_mean_a_revoked_grant(
     tmp_path: Path, status: int, body: dict
 ) -> None:
+    """Revocation is persisted where it is observed.
+
+    The poller used to write `auth_revoked` into `email_sync_state` and
+    `/readyz` read it back; without the poller, a send that exposes the
+    revocation is the only observer left, so the client zeroes the durable
+    grant itself. `_sync_email_binding` then refuses, `/readyz` fails closed
+    and the control plane marks the household `needs_attention`.
+    """
     client = _http_client(tmp_path, _google(status, body))
     with pytest.raises(GmailAuthRevoked):
         client.send_raw("raw")
+    assert not _grant_is_live(client.grants)
+    # A later call finds no grant, not a stale cached token.
+    with pytest.raises(Exception, match="grant"):
+        client.send_raw("raw")
+
+
+@pytest.mark.parametrize(
+    ("status", "body"),
+    [
+        (400, {"error": "invalid_grant", "error_description": "Token has been expired or revoked."}),
+        (401, {"error": "invalid_grant"}),
+    ],
+)
+def test_a_dead_refresh_credential_revokes_the_grant_durably(
+    tmp_path: Path, status: int, body: dict
+) -> None:
+    client = _http_client(tmp_path, _google(200, {"id": "m1"}, token=(status, body)))
+    with pytest.raises(GmailAuthRevoked):
+        client.verify_access()
+    assert not _grant_is_live(client.grants)
+
+
+@pytest.mark.parametrize(
+    ("status", "body"),
+    [
+        # A rejected client secret is Abrolia's misconfiguration, not the
+        # family's grant; zeroing the grant for it would demand a reconnect
+        # that fixes nothing.
+        (401, {"error": "invalid_client"}),
+        (400, {"error": "invalid_request"}),
+        (403, {}),
+        (500, {}),
+    ],
+)
+def test_other_token_endpoint_refusals_keep_the_grant(
+    tmp_path: Path, status: int, body: dict
+) -> None:
+    client = _http_client(tmp_path, _google(200, {"id": "m1"}, token=(status, body)))
+    with pytest.raises(GmailError) as raised:
+        client.verify_access()
+    assert not isinstance(raised.value, GmailAuthRevoked)
+    assert _grant_is_live(client.grants)
+
+
+@pytest.mark.parametrize(
+    "reason", ["userRateLimitExceeded", "rateLimitExceeded", "dailyLimitExceeded", "quotaExceeded"]
+)
+def test_a_gmail_usage_limit_403_is_quota_and_keeps_the_grant(tmp_path: Path, reason: str) -> None:
+    """Gmail answers a burst with 403 as readily as with 429."""
+    client = _http_client(
+        tmp_path,
+        _google(403, {"error": {"code": 403, "errors": [{"domain": "usageLimits", "reason": reason}]}}),
+    )
+    with pytest.raises(GmailQuotaExceeded):
+        client.send_raw("raw")
+    assert _grant_is_live(client.grants)
+
+
+def test_an_insufficient_scope_403_keeps_the_grant(tmp_path: Path) -> None:
+    client = _http_client(
+        tmp_path,
+        _google(403, {"error": {"errors": [{"reason": "insufficientPermissions"}]}}),
+    )
+    with pytest.raises(GmailScopeInsufficient):
+        client.send_raw("raw")
+    assert _grant_is_live(client.grants)
 
 
 def test_client_has_no_read_method(tmp_path: Path) -> None:
