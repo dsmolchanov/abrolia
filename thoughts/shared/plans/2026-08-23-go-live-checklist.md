@@ -2187,7 +2187,8 @@ email step; the polling render keeps both answers.
 `control_plane/web/templates/onboarding.html`,
 `tests/control_plane/test_ui_contract.py`, `docs/google-verification.md`,
 `docs/privacy/privacy-notice-en.md`, `docs/privacy/privacy-notice-ru.md`,
-`bench/README.md`.
+`bench/README.md`, `.gitleaksignore` (the all-refs secret scan trips on test
+literals in another open branch; the fingerprints are allowlisted here too).
 
 The owner chose full Google verification (gmail.readonly kept, CASA accepted) so
 the agent Gmail option can open beyond test users. This change supplies what the
